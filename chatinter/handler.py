@@ -319,8 +319,11 @@ def _message_matches_known_command_prefix(
             command_text = normalize_message_text(str(command or ""))
             if not command_text:
                 continue
+            command_head = normalize_message_text(command_text.split(" ", 1)[0])
+            if not command_head:
+                continue
             for candidate in candidates:
-                if match_command_head(candidate, command_text):
+                if _match_command_head_or_sticky(candidate, command_head):
                     return True
     return False
 
