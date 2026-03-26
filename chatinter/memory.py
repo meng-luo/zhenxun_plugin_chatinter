@@ -13,24 +13,26 @@ ChatInter - 聊天记忆管理
 """
 
 import asyncio
+from collections import Counter
+import re
 import time
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
+from nonebot_plugin_alconna.uniseg.tools import reply_fetch
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.services import logger
 
 from .config import get_config_value
+from .models.chat_history import ChatInterChatHistory
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
-    uni_to_text_with_tags,
     extract_reply_from_message,
     remove_reply_segment,
+    uni_to_text_with_tags,
 )
-from nonebot_plugin_alconna.uniseg.tools import reply_fetch
-from .models.chat_history import ChatInterChatHistory
 
 
 class ChatMemory:
@@ -42,6 +44,107 @@ class ChatMemory:
         self._user_nickname_cache: dict[str, str] = {}
         self._nickname_cache_time: dict[str, float] = {}
         self._nickname_ttl = 30 * 60
+        self._compression_fetch_factor = 3
+        self._compression_summary_cap = 12
+
+    @staticmethod
+    def _strip_non_final_channel_text(text: str) -> str:
+        normalized = str(text or "")
+        if not normalized:
+            return ""
+        # 兼容历史遗留的通道标记，避免 analysis/commentary 污染后续上下文。
+        normalized = re.sub(r"(?i)\[(analysis|commentary)\]\s*", "", normalized)
+        normalized = re.sub(
+            r"(?im)^\s*(analysis|commentary)\s*[:：]\s*",
+            "",
+            normalized,
+        )
+        return normalized.strip()
+
+    @staticmethod
+    def _extract_http_url(value: object) -> str:
+        text = str(value or "").strip()
+        if text.startswith(("http://", "https://")):
+            return text
+        return ""
+
+    @classmethod
+    def _extract_url_from_get_image_result(cls, payload: object) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("url", "src", "file"):
+                if url := cls._extract_http_url(data.get(key)):
+                    return url
+        for key in ("url", "src", "file"):
+            if url := cls._extract_http_url(payload.get(key)):
+                return url
+        return ""
+
+    async def _resolve_onebot_image_url(self, bot: Bot | None, file_id: str) -> str:
+        if not bot:
+            return ""
+        file_text = str(file_id or "").strip()
+        if not file_text or file_text.startswith(("http://", "https://", "base64://")):
+            return ""
+        try:
+            result = await bot.get_image(file=file_text)
+        except Exception as e:
+            logger.debug(f"Reply 图片 URL 解析失败，file={file_text}, err={e}")
+            return ""
+        return self._extract_url_from_get_image_result(result)
+
+    async def _build_reply_image_segment(
+        self,
+        *,
+        bot: Bot | None,
+        file_value: str = "",
+        url_value: str = "",
+        path_value: str = "",
+    ) -> Image | None:
+        file_text = str(file_value or "").strip()
+        url_text = str(url_value or "").strip()
+        path_text = str(path_value or "").strip()
+
+        if not url_text and file_text and not file_text.startswith(
+            ("http://", "https://", "base64://")
+        ):
+            url_text = await self._resolve_onebot_image_url(bot, file_text)
+
+        if file_text.startswith(("http://", "https://")):
+            url_text = url_text or file_text
+            file_text = ""
+
+        if file_text:
+            return Image(id=file_text, url=url_text or None)
+        if url_text:
+            return Image(url=url_text)
+        if path_text:
+            return Image(path=path_text)
+        return None
+
+    def _summarize_old_dialogs(self, dialogs: list["ChatInterChatHistory"]) -> str:
+        if not dialogs:
+            return ""
+
+        token_pattern = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
+        all_text = " ".join(
+            (
+                f"{uni_to_text_with_tags(item.user_message)} "
+                f"{uni_to_text_with_tags(item.ai_response or '')}"
+            )
+            for item in dialogs[-self._compression_summary_cap :]
+        )
+        tokens = [
+            token.lower()
+            for token in token_pattern.findall(all_text.lower())
+            if token and token not in {"一个", "这个", "那个", "然后", "就是", "功能"}
+        ]
+        topics = ", ".join(word for word, _ in Counter(tokens).most_common(6))
+        if not topics:
+            topics = "无明显主题"
+        return f"更早{len(dialogs)}轮对话摘要: 主要主题[{topics}]"
 
     def _is_nickname_cached(self, user_id: str) -> bool:
         """检查昵称是否在缓存中且未过期"""
@@ -67,9 +170,9 @@ class ChatMemory:
 
         if group_id:
             from zhenxun.models.group_member_info import GroupInfoUser
+
             member = await GroupInfoUser.filter(
-                group_id=group_id,
-                user_id=user_id
+                group_id=group_id, user_id=user_id
             ).first()
             if member:
                 nick = member.nickname or member.user_name
@@ -93,17 +196,16 @@ class ChatMemory:
             return
 
         user_ids_to_fetch = {
-            uid for uid in user_ids
-            if not self._is_nickname_cached(uid)
+            uid for uid in user_ids if not self._is_nickname_cached(uid)
         }
 
         if not user_ids_to_fetch:
             return
 
         from zhenxun.models.group_member_info import GroupInfoUser
+
         members = await GroupInfoUser.filter(
-            group_id=group_id,
-            user_id__in=list(user_ids_to_fetch)
+            group_id=group_id, user_id__in=list(user_ids_to_fetch)
         ).all()
 
         for member in members:
@@ -187,20 +289,24 @@ class ChatMemory:
             if bot:
                 try:
                     group_info = await bot.get_group_info(group_id=int(group_id))
-                    if group_info and group_info.get('group_name'):
-                        group_name = group_info.get('group_name')
+                    if group_info and group_info.get("group_name"):
+                        group_name = group_info.get("group_name")
                 except Exception as e:
                     logger.debug(f"获取群聊名称失败：{e}")
-            qq_context_lines.extend([
-                f"groupId={group_id}",
-                f"groupName={group_name}",
-            ])
-        qq_context_lines.extend([
-            f"senderName={nickname}",
-            f"botName={self._bot_nickname or BotConfig.self_nickname}",
-            f"botId={bot_id or 'unknown'}",
-            "</qq_context>",
-        ])
+            qq_context_lines.extend(
+                [
+                    f"groupId={group_id}",
+                    f"groupName={group_name}",
+                ]
+            )
+        qq_context_lines.extend(
+            [
+                f"senderName={nickname}",
+                f"botName={self._bot_nickname or BotConfig.self_nickname}",
+                f"botId={bot_id or 'unknown'}",
+                "</qq_context>",
+            ]
+        )
         lines.extend(qq_context_lines)
 
         # 2. 对话历史（来自 ChatInterChatHistory）
@@ -213,14 +319,19 @@ class ChatMemory:
             lines.append("</history_context>")
 
         # 3. 群聊背景（最近 5 条群消息，来自 ChatHistory）
-        group_background_lines = await self._build_group_background_xml(user_id, group_id, bot_id)
+        group_background_lines = await self._build_group_background_xml(
+            user_id, group_id, bot_id
+        )
         if group_background_lines:
             lines.append("<history>")
             lines.extend(group_background_lines)
             lines.append("</history>")
 
         # 4. 当前消息层（Layer 0 + 回复链追溯）
-        current_message_layers_lines, reply_images = await self._build_current_message_layers(
+        (
+            current_message_layers_lines,
+            reply_images,
+        ) = await self._build_current_message_layers(
             user_id, group_id, raw_message, nickname, bot_id, bot, event
         )
         if current_message_layers_lines:
@@ -297,13 +408,17 @@ class ChatMemory:
             if not reply_id and event and bot:
                 try:
                     reply_seg = await reply_fetch(event, bot)
-                    if reply_seg and hasattr(reply_seg, 'id') and reply_seg.id:
+                    if reply_seg and hasattr(reply_seg, "id") and reply_seg.id:
                         reply_id = str(reply_seg.id)
                 except Exception as e:
                     logger.debug(f"从 reply_fetch 获取回复 ID 失败：{e}")
 
             if not reply_id:
-                reply_id = extract_reply_from_message(raw_message) if isinstance(raw_message, str) else None
+                reply_id = (
+                    extract_reply_from_message(raw_message)
+                    if isinstance(raw_message, str)
+                    else None
+                )
 
             if reply_id:
                 seen_ids: set[str] = set()
@@ -319,56 +434,113 @@ class ChatMemory:
                         if not msg_data:
                             break
 
-                        msg_user_id = str(msg_data.get('user_id', ''))
-                        raw_msg = msg_data.get('message', '')
+                        msg_user_id = str(msg_data.get("user_id", ""))
+                        raw_msg = msg_data.get("message", "")
 
                         try:
+                            from nonebot.adapters.onebot.v11 import Message as OBMessage
                             if isinstance(raw_msg, list):
-                                from nonebot_plugin_alconna.uniseg import At, Image, Text
+                                from nonebot_plugin_alconna.uniseg import At, Text
+
                                 uni_msg_layer = UniMessage()
                                 for seg in raw_msg:
-                                    seg_type = seg.get('type', '')
-                                    seg_data = seg.get('data', {})
-                                    if seg_type == 'text':
-                                        uni_msg_layer.append(Text(seg_data.get('text', '')))
-                                    elif seg_type == 'at':
-                                        qq = seg_data.get('qq', '')
-                                        uni_msg_layer.append(At(target=qq, flag='user'))
-                                    elif seg_type == 'image':
-                                        file = seg_data.get('file', '')
-                                        url = seg_data.get('url', '')
-                                        if file.startswith('http'):
-                                            uni_msg_layer.append(Image(url=file))
-                                            reply_images.append(Image(url=file))
-                                        elif url:
-                                            uni_msg_layer.append(Image(url=url))
-                                            reply_images.append(Image(url=url))
-                                        else:
-                                            uni_msg_layer.append(Image(path=file))
-                                            reply_images.append(Image(path=file))
-                                    elif seg_type == 'reply':
+                                    seg_type = seg.get("type", "")
+                                    seg_data = seg.get("data", {})
+                                    if seg_type == "text":
+                                        uni_msg_layer.append(
+                                            Text(seg_data.get("text", ""))
+                                        )
+                                    elif seg_type == "at":
+                                        qq = seg_data.get("qq", "")
+                                        uni_msg_layer.append(At(target=qq, flag="user"))
+                                    elif seg_type == "image":
+                                        file = str(seg_data.get("file", "")).strip()
+                                        url = str(seg_data.get("url", "")).strip()
+                                        image_segment = (
+                                            await self._build_reply_image_segment(
+                                                bot=bot,
+                                                file_value=file,
+                                                url_value=url,
+                                            )
+                                        )
+                                        if image_segment:
+                                            uni_msg_layer.append(image_segment)
+                                            reply_images.append(image_segment)
+                                    elif seg_type == "reply":
                                         pass
+                            elif isinstance(raw_msg, str):
+                                parsed_msg = OBMessage(raw_msg)
+                                if parsed_msg:
+                                    from nonebot_plugin_alconna.uniseg import At, Text
+
+                                    uni_msg_layer = UniMessage()
+                                    for seg in parsed_msg:
+                                        seg_type = getattr(seg, "type", "")
+                                        seg_data = getattr(seg, "data", {}) or {}
+                                        if seg_type == "text":
+                                            uni_msg_layer.append(
+                                                Text(str(seg_data.get("text", "")))
+                                            )
+                                        elif seg_type == "at":
+                                            qq = str(seg_data.get("qq", "")).strip()
+                                            if qq:
+                                                uni_msg_layer.append(
+                                                    At(target=qq, flag="user")
+                                                )
+                                        elif seg_type == "image":
+                                            file = str(seg_data.get("file", "")).strip()
+                                            url = str(seg_data.get("url", "")).strip()
+                                            image_segment = (
+                                                await self._build_reply_image_segment(
+                                                    bot=bot,
+                                                    file_value=file,
+                                                    url_value=url,
+                                                )
+                                            )
+                                            if image_segment:
+                                                uni_msg_layer.append(image_segment)
+                                                reply_images.append(image_segment)
+                                        elif seg_type == "reply":
+                                            pass
+                                else:
+                                    uni_msg_layer = UniMessage.text(str(raw_msg))
                             else:
                                 uni_msg_layer = UniMessage.text(str(raw_msg))
                         except Exception as e:
                             logger.debug(f"转换消息为 UniMessage 失败：{e}")
                             uni_msg_layer = None
 
-                        plain_text = uni_msg_layer.extract_plain_text() if uni_msg_layer else str(raw_msg)
+                        plain_text = (
+                            uni_msg_layer.extract_plain_text()
+                            if uni_msg_layer
+                            else str(raw_msg)
+                        )
                         is_bot_msg = bot_id and msg_user_id == str(bot_id)
 
                         if not is_bot_msg:
-                            cached_nick = await self._fetch_user_nickname(msg_user_id, group_id)
+                            cached_nick = await self._fetch_user_nickname(
+                                msg_user_id, group_id
+                            )
                             if cached_nick:
                                 self._user_nickname_cache[msg_user_id] = cached_nick
 
                         if is_bot_msg:
-                            sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
+                            sender = (
+                                f"[{self._bot_nickname or BotConfig.self_nickname}]"
+                            )
                         else:
                             cached_nick = self._user_nickname_cache.get(msg_user_id)
-                            sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{msg_user_id}]"
+                            sender = (
+                                f"[{cached_nick}]"
+                                if cached_nick
+                                else f"[QQ:{msg_user_id}]"
+                            )
 
-                        content = uni_to_text_with_tags(uni_msg_layer) if uni_msg_layer else plain_text
+                        content = (
+                            uni_to_text_with_tags(uni_msg_layer)
+                            if uni_msg_layer
+                            else plain_text
+                        )
                         content = content or "(空消息)"
 
                         lines.append(f"[Layer {layer}][reply][from:{sender}] {content}")
@@ -376,12 +548,14 @@ class ChatMemory:
                         next_reply_id = None
                         if isinstance(raw_msg, list):
                             for seg in raw_msg:
-                                if seg.get('type') == 'reply':
-                                    next_reply_id = seg.get('data', {}).get('id')
+                                if seg.get("type") == "reply":
+                                    next_reply_id = seg.get("data", {}).get("id")
                                     break
 
                         if not next_reply_id:
-                            next_reply_id = extract_reply_from_message(uni_msg_layer or plain_text)
+                            next_reply_id = extract_reply_from_message(
+                                uni_msg_layer or plain_text
+                            )
 
                         if not next_reply_id:
                             break
@@ -415,18 +589,29 @@ class ChatMemory:
         """
         max_context = get_config_value("SESSION_CONTEXT_LIMIT", 20)
         session_id = self.get_session_id(user_id, group_id)
-        dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, max_context)
+        fetch_limit = max(max_context, 1) * self._compression_fetch_factor
+        dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
 
         if not dialogs:
             return []
 
+        history_summary = ""
+        if len(dialogs) > max_context:
+            old_dialogs = dialogs[:-max_context]
+            dialogs = dialogs[-max_context:]
+            history_summary = self._summarize_old_dialogs(old_dialogs)
+
         if group_id:
             user_ids_to_fetch = {
-                dlg.user_id for dlg in dialogs if not self._is_nickname_cached(dlg.user_id)
+                dlg.user_id
+                for dlg in dialogs
+                if not self._is_nickname_cached(dlg.user_id)
             }
             await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
 
         history_lines: list[str] = []
+        if history_summary:
+            history_lines.append(history_summary)
         for dlg in dialogs:
             if dlg.create_time:
                 timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
@@ -439,12 +624,16 @@ class ChatMemory:
             else:
                 sender = f"[{dlg.nickname}]"
 
-            user_msg = uni_to_text_with_tags(dlg.user_message)
+            user_msg = self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dlg.user_message)
+            )
             history_lines.append(f"[{timestamp}] {sender}: {user_msg}")
 
             if dlg.ai_response:
                 ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-                ai_msg = uni_to_text_with_tags(dlg.ai_response)
+                ai_msg = self._strip_non_final_channel_text(
+                    uni_to_text_with_tags(dlg.ai_response)
+                )
                 history_lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
 
         return history_lines
@@ -520,9 +709,21 @@ class ChatMemory:
         use_sign_in_impression = get_config_value("USE_SIGN_IN_IMPRESSION", True)
 
         if chat_style:
-            base = f"你是{self._bot_nickname or BotConfig.self_nickname}，一个{chat_style}机器人助手。回复简洁自然，优先使用中文。"
+            base = (
+                f"你是{self._bot_nickname or BotConfig.self_nickname}，"
+                f"一个{chat_style}机器人助手。回复简洁自然，优先使用中文。"
+                "语气偏日式二次元、软萌中带一点傲娇，避免生硬正式。"
+                "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
+                "结构化任务或命令输出时不要加入口癖修饰。"
+            )
         else:
-            base = f"你是{self._bot_nickname or BotConfig.self_nickname}，一个友好、热情的机器人助手。回复简洁自然，优先使用中文。"
+            base = (
+                f"你是{self._bot_nickname or BotConfig.self_nickname}，"
+                "一个日式二次元、软萌中带一点傲娇的机器人助手。"
+                "回复简洁自然，优先使用中文，避免生硬正式。"
+                "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
+                "结构化任务或命令输出时不要加入口癖修饰。"
+            )
 
         impression_rule = ""
         if use_sign_in_impression:
@@ -531,7 +732,10 @@ class ChatMemory:
                 "排斥/警惕→冷淡简短；一般/可以交流→正常友好；好朋友/是个好人→热情；亲密/恋人→亲密关心。回复风格符合用户好感度态度，即使对方好感度很低，你对他态度再差，也要温柔对待他，言语不能含有攻击性"
             )
 
-        return base + impression_rule
+        custom_prompt = get_config_value("CUSTOM_PROMPT", "")
+        custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
+
+        return base + impression_rule + custom_prompt_text
 
     async def get_user_impression(self, user_id: str) -> tuple[float, str]:
         """获取用户好感度"""

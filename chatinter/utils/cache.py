@@ -7,8 +7,6 @@ ChatInter - 缓存工具
 
 from datetime import datetime
 
-from zhenxun.builtin_plugins.sign_in.utils import get_level_and_next_impression
-from zhenxun.builtin_plugins.sign_in.config import level2attitude
 from zhenxun.models.sign_user import SignUser
 from zhenxun.services.cache.cache_containers import CacheDict
 
@@ -32,12 +30,18 @@ async def get_user_impression_with_cache(user_id: str) -> tuple[float, str]:
     now_ts = datetime.now().timestamp()
     impression_cache = _impression_cache.get(user_id)
 
-    if impression_cache is None or now_ts - impression_cache[1] > _impression_cache.expire:
+    if (
+        impression_cache is None
+        or now_ts - impression_cache[1] > _impression_cache.expire
+    ):
         sign_user = await SignUser.get_user(user_id)
         impression = float(sign_user.impression)
         _impression_cache[user_id] = (impression, now_ts)
     else:
         impression = impression_cache[0]
+
+    from zhenxun.builtin_plugins.sign_in.config import level2attitude
+    from zhenxun.builtin_plugins.sign_in.utils import get_level_and_next_impression
 
     level, _, _ = get_level_and_next_impression(impression)
     attitude = level2attitude.get(str(level), "未知")

@@ -199,7 +199,9 @@ class ChatInterChatHistory(Model):
         返回:
             int: 被重置的对话数量
         """
-        updated = await cls.filter(session_id=session_id, reset=False).update(reset=True)
+        updated = await cls.filter(session_id=session_id, reset=False).update(
+            reset=True
+        )
         return updated or 0
 
     @classmethod

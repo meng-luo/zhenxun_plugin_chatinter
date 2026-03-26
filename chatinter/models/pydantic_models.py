@@ -13,6 +13,9 @@ class PluginIntent(BaseModel):
     """插件调用意图"""
 
     plugin_name: str = Field(description="目标插件名称")
+    plugin_module: str | None = Field(
+        default=None, description="目标插件模块名（优先使用）"
+    )
     command: str = Field(description="要执行的命令，包含参数")
     confidence: float = Field(description="置信度 0.0-1.0", ge=0.0, le=1.0)
     response: str = Field(description="对用户的回复，告知正在执行操作")
@@ -33,9 +36,7 @@ class IntentAnalysisResult(BaseModel):
     - chat: 用户意图是进行普通对话等其他内容
     """
 
-    action: Literal["call_plugin", "chat"] = Field(
-        description="识别出的用户意图类型"
-    )
+    action: Literal["call_plugin", "chat"] = Field(description="识别出的用户意图类型")
     plugin_intent: PluginIntent | None = Field(
         default=None, description="插件调用意图，当 action='call_plugin' 时有效"
     )
@@ -47,10 +48,57 @@ class IntentAnalysisResult(BaseModel):
 class PluginInfo(BaseModel):
     """用于意图分析的插件信息"""
 
+    class PluginCommandMeta(BaseModel):
+        class CommandActorScope:
+            SELF_ONLY = "self_only"
+            ALLOW_OTHER = "allow_other"
+
+        class CommandTargetRequirement:
+            NONE = "none"
+            OPTIONAL = "optional"
+            REQUIRED = "required"
+
+        command: str = Field(description="命令主干")
+        aliases: list[str] = Field(default_factory=list, description="命令别名")
+        params: list[str] = Field(default_factory=list, description="参数提示")
+        examples: list[str] = Field(default_factory=list, description="示例命令")
+        text_min: int | None = Field(default=None, description="文本参数最小数量")
+        text_max: int | None = Field(default=None, description="文本参数最大数量")
+        image_min: int | None = Field(default=None, description="图片参数最小数量")
+        image_max: int | None = Field(default=None, description="图片参数最大数量")
+        allow_at: bool | None = Field(
+            default=None, description="@是否可作为图片参数输入"
+        )
+        actor_scope: Literal["self_only", "allow_other"] = Field(
+            default=CommandActorScope.ALLOW_OTHER,
+            description="执行者范围：self_only=仅本人；allow_other=可作用于他人",
+        )
+        target_requirement: Literal["none", "optional", "required"] = Field(
+            default=CommandTargetRequirement.NONE,
+            description="目标参数要求：none/optional/required",
+        )
+        target_sources: list[Literal["at", "reply", "nickname", "self"]] = Field(
+            default_factory=list,
+            description="可接受的目标来源",
+        )
+        allow_sticky_arg: bool = Field(
+            default=False,
+            description="是否允许命令头和参数粘连（例如：敲葱葱）",
+        )
+
+    module: str = Field(description="插件模块名")
     name: str = Field(description="插件名称")
     description: str = Field(description="插件描述")
     commands: list[str] = Field(default_factory=list, description="可用命令列表")
+    aliases: list[str] = Field(default_factory=list, description="插件别名")
+    command_meta: list[PluginCommandMeta] = Field(
+        default_factory=list, description="命令元信息"
+    )
     usage: str | None = Field(default=None, description="用法说明")
+    admin_level: int | None = Field(default=None, description="插件权限等级要求")
+    limit_superuser: bool = Field(
+        default=False, description="是否限制超级管理员"
+    )
 
 
 class PluginKnowledgeBase(BaseModel):
@@ -58,24 +106,3 @@ class PluginKnowledgeBase(BaseModel):
 
     plugins: list[PluginInfo] = Field(default_factory=list, description="可用插件列表")
     user_role: str = Field(description="用户角色: 普通用户/管理员/超级管理员")
-
-    def to_prompt_text(self) -> str:
-        """转换为可用的提示文本"""
-        if not self.plugins:
-            return "当前没有可用的插件功能。"
-
-        parts = []
-        for i, plugin in enumerate(self.plugins, 1):
-            cmd_str = ", ".join(plugin.commands) if plugin.commands else "无"
-            part = f"{i}. {plugin.name}\n   描述: {plugin.description}\n   命令: {cmd_str}"
-            if plugin.usage:
-                # 限制用法长度，避免 token 过多
-                usage_preview = (
-                    plugin.usage[:500] + "..."
-                    if len(plugin.usage) > 500
-                    else plugin.usage
-                )
-                part += f"\n   用法: {usage_preview}"
-            parts.append(part)
-
-        return "\n\n".join(parts)

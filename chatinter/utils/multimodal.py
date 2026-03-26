@@ -9,6 +9,7 @@ from pathlib import Path
 
 import aiofiles
 from nonebot.adapters import Bot
+from nonebot.adapters import Message as AdapterMessage
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 
 from zhenxun.services.llm.types import LLMContentPart
@@ -35,8 +36,25 @@ async def extract_images_from_message(
     try:
         if isinstance(raw_message, UniMessage):
             uni_msg = raw_message
-        else:
-            uni_msg = UniMessage.of(raw_message)
+            for seg in uni_msg:
+                if isinstance(seg, Image):
+                    image_part = await _process_image_segment(seg)
+                    if image_part:
+                        images.append(image_part)
+            return images
+
+        if isinstance(raw_message, AdapterMessage):
+            for seg in raw_message:
+                if getattr(seg, "type", "") != "image":
+                    continue
+                image_part = await _process_adapter_image_segment(seg)
+                if image_part:
+                    images.append(image_part)
+            return images
+
+        uni_msg = _safe_to_unimessage(raw_message)
+        if uni_msg is None:
+            return images
     except Exception:
         return images
 
@@ -47,6 +65,56 @@ async def extract_images_from_message(
                 images.append(image_part)
 
     return images
+
+
+def _safe_to_unimessage(raw_message) -> UniMessage | None:
+    if isinstance(raw_message, UniMessage):
+        return raw_message
+
+    of_method = getattr(UniMessage, "of", None)
+    if callable(of_method):
+        try:
+            return of_method(raw_message)
+        except Exception:
+            pass
+
+    generate_method = getattr(UniMessage, "generate", None)
+    if callable(generate_method):
+        try:
+            generated = generate_method(message=raw_message)
+            if isinstance(generated, UniMessage):
+                return generated
+        except Exception:
+            pass
+
+    return None
+
+
+async def _process_adapter_image_segment(seg) -> LLMContentPart | None:
+    seg_data = getattr(seg, "data", {}) or {}
+
+    url = seg_data.get("url")
+    if url:
+        try:
+            media_bytes = await AsyncHttpx.get_content(str(url))
+            b64_data = base64.b64encode(media_bytes).decode("utf-8")
+            return LLMContentPart.image_base64_part(b64_data, "image/png")
+        except Exception:
+            pass
+
+    file_value = seg_data.get("file")
+    if file_value:
+        try:
+            path = Path(str(file_value))
+            if path.exists() and path.is_file():
+                async with aiofiles.open(path, "rb") as f:
+                    content = await f.read()
+                b64_data = base64.b64encode(content).decode("utf-8")
+                return LLMContentPart.image_base64_part(b64_data, "image/png")
+        except Exception:
+            pass
+
+    return None
 
 
 async def _process_image_segment(seg: Image) -> LLMContentPart | None:
@@ -101,7 +169,7 @@ async def get_image_description(
     if not image_parts:
         return None
 
-    from zhenxun.services.llm import AI, LLMMessage
+    from zhenxun.services.llm import AI
 
     try:
         ai = AI()
