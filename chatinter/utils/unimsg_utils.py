@@ -5,10 +5,21 @@ ChatInter - UniMessage 消息处理工具
 """
 
 from nonebot.adapters import Message
-from nonebot_plugin_alconna.uniseg import At, Image, Reply, Segment, Text, UniMessage, Video, Voice
+from nonebot_plugin_alconna.uniseg import (
+    At,
+    Image,
+    Reply,
+    Segment,
+    Text,
+    UniMessage,
+    Video,
+    Voice,
+)
 
 
-def uni_to_text_with_tags(message: UniMessage | Message | str, keep_at_id: bool = True) -> str:
+def uni_to_text_with_tags(
+    message: UniMessage | Message | str, keep_at_id: bool = True
+) -> str:
     """将 UniMessage 转换为带标签的文本表示
 
     格式化规则：
@@ -32,7 +43,7 @@ def uni_to_text_with_tags(message: UniMessage | Message | str, keep_at_id: bool 
         return message
 
     if isinstance(message, Message):
-        message = UniMessage.of(message)
+        return _adapter_message_to_text(message, keep_at_id)
 
     if not isinstance(message, UniMessage):
         return str(message)
@@ -73,6 +84,50 @@ def _segment_to_text(seg: Segment, keep_at_id: bool = True) -> str:
     return f"[{seg_type}]"
 
 
+def _adapter_message_to_text(message: Message, keep_at_id: bool = True) -> str:
+    parts: list[str] = []
+    for seg in message:
+        seg_type = getattr(seg, "type", "")
+        seg_data = getattr(seg, "data", {}) or {}
+
+        if seg_type == "text":
+            parts.append(str(seg_data.get("text", "")))
+            continue
+
+        if seg_type == "at":
+            qq_value = str(seg_data.get("qq", "")).strip()
+            if qq_value == "all":
+                parts.append("[@所有人]")
+            elif keep_at_id and qq_value:
+                parts.append(f"[@{qq_value}]")
+            else:
+                parts.append("[@]")
+            continue
+
+        if seg_type == "image":
+            parts.append("[image]")
+            continue
+
+        if seg_type == "reply":
+            parts.append("[reply]")
+            continue
+
+        if seg_type == "video":
+            parts.append("[video]")
+            continue
+
+        if seg_type in {"record", "voice"}:
+            parts.append("[voice]")
+            continue
+
+        if seg_type:
+            parts.append(f"[{seg_type}]")
+        else:
+            parts.append(str(seg))
+
+    return "".join(parts)
+
+
 def extract_reply_from_message(message: UniMessage | Message) -> str | None:
     """从消息中提取回复 ID
 
@@ -89,7 +144,14 @@ def extract_reply_from_message(message: UniMessage | Message) -> str | None:
         return None
 
     if isinstance(message, Message):
-        return extract_reply_from_message(UniMessage.of(message))
+        for seg in message:
+            if getattr(seg, "type", "") != "reply":
+                continue
+            seg_data = getattr(seg, "data", {}) or {}
+            reply_id = seg_data.get("id") or seg_data.get("message_id")
+            if reply_id:
+                return str(reply_id)
+        return None
 
     return None
 
