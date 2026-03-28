@@ -76,6 +76,10 @@ _TEXT_LABELS = (
 _GENERIC_STOPWORDS = {
     "真寻",
     "小真寻",
+    "zhenxun",
+    "nonebot",
+    "plugin",
+    "plugins",
     "机器人",
     "bot",
     "帮我",
@@ -422,7 +426,6 @@ def _build_tokens(
 ) -> tuple[str, ...]:
     values = [
         plugin.name,
-        plugin.module,
         plugin.description,
         " ".join(commands),
         " ".join(aliases),
@@ -475,9 +478,16 @@ def get_skill_registry(knowledge_base: PluginKnowledgeBase) -> SkillRegistry:
         action_commands = _action_commands(commands, helper_commands)
         command_schemas = _extract_command_schemas(plugin, commands)
         kind = _infer_kind(plugin, commands, helper_commands, examples)
-        text_space = " ".join([plugin.usage or "", " ".join(examples), " ".join(commands)])
-        supports_placeholders = any(marker in text_space for marker in ("[image]", "@", "图片", "头像", "自己"))
-        supports_text_payload = any(marker in text_space for marker in ("文字", "文本", "内容", "标题", "歌名", "城市", "地点"))
+        text_space = " ".join(
+            [plugin.usage or "", " ".join(examples), " ".join(commands)]
+        )
+        supports_placeholders = any(
+            marker in text_space for marker in ("[image]", "@", "图片", "头像", "自己")
+        )
+        supports_text_payload = any(
+            marker in text_space
+            for marker in ("文字", "文本", "内容", "标题", "歌名", "城市", "地点")
+        )
         skills.append(
             SkillSpec(
                 skill_id=f"{kind}:{plugin.module}",
@@ -1472,6 +1482,7 @@ def render_skill_namespace(
     limit: int = 10,
     preferred_modules: list[str] | tuple[str, ...] | None = None,
     include_helpers: bool = True,
+    mask_module: bool = False,
 ) -> str:
     registry = get_skill_registry(knowledge_base)
     skills = list(select_relevant_skills(registry, query, limit=limit))
@@ -1523,7 +1534,11 @@ def render_skill_namespace(
         payload.append(
             {
                 "skill": skill.plugin_name,
-                "module": skill.plugin_module,
+                "module": (
+                    skill.plugin_module.rsplit(".", 1)[-1]
+                    if mask_module
+                    else skill.plugin_module
+                ),
                 "kind": skill.kind,
                 "action_commands": selected_actions,
                 "helper_commands": selected_helpers,

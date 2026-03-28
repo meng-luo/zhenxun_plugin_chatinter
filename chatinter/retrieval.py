@@ -8,6 +8,10 @@ from .skill_registry import (
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
 _STOPWORDS = {
+    "zhenxun",
+    "nonebot",
+    "plugin",
+    "plugins",
     "功能",
     "插件",
     "一下",
@@ -41,7 +45,7 @@ def _plugin_text(plugin: PluginInfo) -> str:
     )
     usage = plugin.usage or ""
     return (
-        f"{plugin.name} {plugin.module} {plugin.description} "
+        f"{plugin.name} {plugin.description} "
         f"{joined_commands} {aliases} {command_meta_text} {usage}"
     )
 
@@ -107,8 +111,6 @@ def _score_plugin(query_tokens: set[str], plugin: PluginInfo) -> float:
             score += 1.0
             if plugin.name.lower().startswith(token):
                 score += 1.0
-            if plugin.module.lower().startswith(token):
-                score += 0.8
             if any(cmd.lower().startswith(token) for cmd in plugin.commands):
                 score += 0.8
             if token in alias_tokens:

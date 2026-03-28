@@ -193,6 +193,14 @@ def _resolve_target_plugin(
         for plugin in knowledge_base.plugins:
             if normalize_message_text(plugin.module).casefold() == module_fold:
                 return plugin
+        tail_matches = [
+            plugin
+            for plugin in knowledge_base.plugins
+            if normalize_message_text(plugin.module.rsplit(".", 1)[-1]).casefold()
+            == module_fold
+        ]
+        if len(tail_matches) == 1:
+            return tail_matches[0]
 
     name_text = normalize_message_text(decision.plugin_name or "")
     if name_text:
@@ -445,6 +453,7 @@ def _build_route_prompt(
         limit=max(namespace_limit, 1),
         preferred_modules=preferred_modules or (),
         include_helpers=include_helpers,
+        mask_module=True,
     )
     rag_section = ""
     context_text = normalize_message_text(vector_context)
@@ -469,7 +478,7 @@ def _build_vector_context_from_candidates(candidates: list[PluginInfo]) -> str:
         if len(note) > _MAX_VECTOR_NOTE_LEN:
             note = f"{note[:_MAX_VECTOR_NOTE_LEN]}..."
         lines.append(
-            f"{idx}. [{plugin.module}] {plugin.name} | commands: {commands} | "
+            f"{idx}. {plugin.name} | commands: {commands} | "
             f"note: {note or '暂无说明'}"
         )
     return "\n".join(lines)
