@@ -16,7 +16,7 @@ from zhenxun.services.llm import AI, LLMContentPart, LLMMessage as LLMMessageObj
 
 from .config import get_config_value
 from .prompt_templates import build_intent_prompt
-from .models.pydantic_models import ChatIntent, IntentAnalysisResult, PluginKnowledgeBase
+from .models.pydantic_models import IntentAnalysisResult, PluginKnowledgeBase
 
 
 async def analyze_intent(
@@ -116,8 +116,9 @@ async def analyze_intent_safe(
 
     if result is None:
         return IntentAnalysisResult(
-            action="chat",
-            chat_intent=ChatIntent(response="抱歉，我暂时无法理解您的意思，请稍后再试。"),
+            action="unknown",
+            plugin_intent=None,
+            chat_intent=None,
         )
 
     return result

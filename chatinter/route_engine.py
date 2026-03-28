@@ -1,6 +1,6 @@
+from dataclasses import dataclass
 import json
 import re
-from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -8,8 +8,15 @@ from pydantic import BaseModel, Field
 from zhenxun.services import chat, generate_structured, logger
 
 from .config import get_config_value
+from .knowledge_rag import PluginRAGService
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
-from .route_text import is_usage_question, normalize_message_text
+from .route_text import (
+    ROUTE_ACTION_WORDS,
+    collect_placeholders,
+    contains_any,
+    is_usage_question,
+    normalize_message_text,
+)
 from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
@@ -18,15 +25,21 @@ from .skill_registry import (
     skill_search,
 )
 
-_ROUTE_NAMESPACE_LIMIT = 20
+_ROUTE_NAMESPACE_LIMIT = 16
+_ROUTE_VECTOR_TOP_K = 10
+_ROUTE_VECTOR_FETCH_K = 24
+_ROUTE_VECTOR_MAX_K = 20
+_ROUTE_VECTOR_INCREMENT = 4
 _LLM_ROUTE_INSTRUCTION = """
 你是 ChatInter 的技能路由器，只负责在给定技能命名空间内选择可执行命令。
 必须严格遵守：
 1. 只能从 skills_json 中选择 plugin_module 与命令头。
 2. command 必须是一条可直接发送给插件的命令字符串。
-3. 用户是执行诉求时优先 action_commands；仅在“怎么用/详情/帮助/参数”语义下才选 helper_commands。
-4. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
-5. 如果无法确定，返回 action=skip。
+3. 用户是执行诉求时优先 action_commands；
+   仅在“怎么用/详情/帮助/参数”语义下才选 helper_commands。
+4. 若 schema.text_max 为 0，不要附带额外文本参数；仅保留 [@...] 或 [image] 占位符。
+5. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
+6. 如果无法确定，返回 action=skip。
 """.strip()
 _LLM_ROUTE_RELAXED_SUFFIX = """
 请仅输出一个 JSON 对象，不要输出额外解释。
@@ -39,6 +52,10 @@ _LLM_ROUTE_RELAXED_SUFFIX = """
 }
 """.strip()
 _JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+_MAX_VECTOR_NOTE_LEN = 96
+_AT_PLACEHOLDER_PATTERN = re.compile(r"\[@\d{5,20}\]")
+_AT_INLINE_PATTERN = re.compile(r"@\d{5,20}")
+_IMAGE_PLACEHOLDER_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -176,6 +193,14 @@ def _resolve_target_plugin(
         for plugin in knowledge_base.plugins:
             if normalize_message_text(plugin.module).casefold() == module_fold:
                 return plugin
+        tail_matches = [
+            plugin
+            for plugin in knowledge_base.plugins
+            if normalize_message_text(plugin.module.rsplit(".", 1)[-1]).casefold()
+            == module_fold
+        ]
+        if len(tail_matches) == 1:
+            return tail_matches[0]
 
     name_text = normalize_message_text(decision.plugin_name or "")
     if name_text:
@@ -219,6 +244,143 @@ def _collect_helper_heads(
     return set()
 
 
+def _resolve_namespace_limit(
+    message_text: str,
+    *,
+    helper_mode: bool,
+) -> int:
+    normalized = normalize_message_text(message_text)
+    if helper_mode:
+        return min(max(_ROUTE_NAMESPACE_LIMIT - 2, 8), _ROUTE_NAMESPACE_LIMIT)
+    if contains_any(normalized, ROUTE_ACTION_WORDS):
+        return max(_ROUTE_NAMESPACE_LIMIT - 4, 8)
+    if "[image" in normalized or "[@" in normalized:
+        return max(_ROUTE_NAMESPACE_LIMIT - 4, 8)
+    return max(_ROUTE_NAMESPACE_LIMIT - 6, 8)
+
+
+def _resolve_vector_retrieve_options(
+    message_text: str,
+    *,
+    helper_mode: bool,
+) -> dict[str, object]:
+    normalized = normalize_message_text(message_text)
+    has_at = "[@" in normalized
+    has_image = "[image" in normalized
+    has_action_intent = contains_any(normalized, ROUTE_ACTION_WORDS)
+
+    metadata_filters: dict[str, bool] = {}
+    if helper_mode:
+        metadata_filters["has_helper"] = True
+    if has_at:
+        metadata_filters["target_capable"] = True
+    if has_image:
+        metadata_filters["image_capable"] = True
+
+    if helper_mode:
+        min_score = 0.01
+    elif has_action_intent or has_at or has_image:
+        min_score = 0.02
+    else:
+        min_score = 0.05
+
+    return {
+        "fetch_k": _ROUTE_VECTOR_FETCH_K,
+        "min_score": min_score,
+        "max_k": _ROUTE_VECTOR_MAX_K,
+        "k_increment": _ROUTE_VECTOR_INCREMENT,
+        "metadata_filters": metadata_filters or None,
+        "rerank": True,
+    }
+
+
+def _resolve_command_schema(plugin: PluginInfo, command_head: str):
+    normalized_head = normalize_message_text(command_head).casefold()
+    if not normalized_head:
+        return None
+    for meta in plugin.command_meta:
+        head = normalize_message_text(getattr(meta, "command", "")).casefold()
+        if head and head == normalized_head:
+            return meta
+        for alias in getattr(meta, "aliases", None) or []:
+            alias_text = normalize_message_text(alias).casefold()
+            if alias_text and alias_text == normalized_head:
+                return meta
+    return None
+
+
+def _normalize_placeholder_tokens(command: str) -> tuple[list[str], list[str]]:
+    at_tokens: list[str] = []
+    image_tokens: list[str] = []
+    for token in collect_placeholders(command):
+        normalized = normalize_message_text(token)
+        if not normalized:
+            continue
+        if _AT_INLINE_PATTERN.fullmatch(normalized):
+            normalized = f"[{normalized}]"
+        if _AT_PLACEHOLDER_PATTERN.fullmatch(normalized):
+            if normalized not in at_tokens:
+                at_tokens.append(normalized)
+            continue
+        is_image_token = _IMAGE_PLACEHOLDER_PATTERN.fullmatch(normalized) or (
+            normalized.lower().startswith("[image")
+        )
+        if is_image_token:
+            if normalized not in image_tokens:
+                image_tokens.append(normalized)
+    return at_tokens, image_tokens
+
+
+def _sanitize_command_with_schema(
+    plugin: PluginInfo,
+    *,
+    command: str,
+) -> str:
+    normalized = normalize_message_text(command)
+    if not normalized:
+        return ""
+    parts = normalized.split(" ")
+    head = normalize_message_text(parts[0] if parts else "")
+    if not head:
+        return ""
+
+    schema = _resolve_command_schema(plugin, head)
+    if schema is None:
+        return normalized
+
+    at_tokens, image_tokens = _normalize_placeholder_tokens(normalized)
+    text_tokens: list[str] = []
+    for token in parts[1:]:
+        token_text = normalize_message_text(token)
+        if not token_text:
+            continue
+        if token_text in at_tokens or token_text in image_tokens:
+            continue
+        text_tokens.append(token_text)
+
+    allow_at = getattr(schema, "allow_at", None)
+    if allow_at is False:
+        at_tokens = []
+
+    image_max = getattr(schema, "image_max", None)
+    if image_max is not None:
+        image_max = max(int(image_max), 0)
+        image_tokens = image_tokens[:image_max]
+
+    text_max = getattr(schema, "text_max", None)
+    if text_max is not None:
+        text_max = max(int(text_max), 0)
+        if text_max == 0:
+            text_tokens = []
+        elif text_max == 1 and len(text_tokens) > 1:
+            text_tokens = [" ".join(text_tokens)]
+        elif len(text_tokens) > text_max:
+            text_tokens = text_tokens[:text_max]
+
+    payload = [*text_tokens, *at_tokens, *image_tokens]
+    return normalize_message_text(" ".join([head, *payload]).strip())
+
+
 def _to_route_result(
     decision: _LLMRouteDecision,
     message_text: str,
@@ -253,6 +415,11 @@ def _to_route_result(
     if command_head not in allowed_heads:
         return None
 
+    command = _sanitize_command_with_schema(plugin, command=command)
+    command_head = normalize_message_text(command.split(" ", 1)[0]).casefold()
+    if not command_head or command_head not in allowed_heads:
+        return None
+
     helper_heads = _collect_helper_heads(plugin.module, knowledge_base)
     if (
         helper_heads
@@ -274,17 +441,62 @@ def _to_route_result(
 def _build_route_prompt(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
+    *,
+    preferred_modules: list[str] | None = None,
+    vector_context: str = "",
+    include_helpers: bool = True,
+    namespace_limit: int = _ROUTE_NAMESPACE_LIMIT,
 ) -> str:
     skills_json = render_skill_namespace(
         knowledge_base,
         query=message_text,
-        limit=_ROUTE_NAMESPACE_LIMIT,
+        limit=max(namespace_limit, 1),
+        preferred_modules=preferred_modules or (),
+        include_helpers=include_helpers,
+        mask_module=True,
     )
+    rag_section = ""
+    context_text = normalize_message_text(vector_context)
+    if context_text:
+        rag_section = f"向量召回参考:\n{context_text}\n\n"
     return (
         f"用户消息:\n{message_text}\n\n"
+        f"{rag_section}"
         "可用技能命名空间 JSON:\n"
         f"{skills_json}\n\n"
         "请基于上述命名空间选择路由。"
+    )
+
+
+def _build_vector_context_from_candidates(candidates: list[PluginInfo]) -> str:
+    if not candidates:
+        return ""
+    lines: list[str] = []
+    for idx, plugin in enumerate(candidates[:5], start=1):
+        commands = ", ".join(plugin.commands[:3]) if plugin.commands else "无命令"
+        note = normalize_message_text(plugin.description or plugin.usage or "")
+        if len(note) > _MAX_VECTOR_NOTE_LEN:
+            note = f"{note[:_MAX_VECTOR_NOTE_LEN]}..."
+        lines.append(
+            f"{idx}. {plugin.name} | commands: {commands} | "
+            f"note: {note or '暂无说明'}"
+        )
+    return "\n".join(lines)
+
+
+def _is_schema_parameter_error(exc: Exception) -> bool:
+    text = normalize_message_text(str(exc or "")).lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "invalid_parameter",
+            "invalid_argument",
+            "response_schema",
+            "responsejsonschema",
+            "additionalproperties",
+        )
     )
 
 
@@ -302,7 +514,49 @@ async def resolve_llm_route(
     except (TypeError, ValueError):
         timeout_value = None
 
-    prompt = _build_route_prompt(normalized_message, knowledge_base)
+    helper_mode = is_usage_question(normalized_message)
+    vector_options = _resolve_vector_retrieve_options(
+        normalized_message,
+        helper_mode=helper_mode,
+    )
+    namespace_limit = _resolve_namespace_limit(
+        normalized_message,
+        helper_mode=helper_mode,
+    )
+
+    preferred_modules: list[str] = []
+    vector_context = ""
+    try:
+        vector_candidates = await PluginRAGService.retrieve(
+            query=normalized_message,
+            knowledge=knowledge_base,
+            top_k=_ROUTE_VECTOR_TOP_K,
+            context_text=normalized_message,
+            preferred_modules=preferred_modules,
+            fetch_k=int(vector_options["fetch_k"]),
+            min_score=float(vector_options["min_score"]),
+            max_k=int(vector_options["max_k"]),
+            k_increment=int(vector_options["k_increment"]),
+            metadata_filters=vector_options.get("metadata_filters"),
+            rerank=bool(vector_options.get("rerank", True)),
+        )
+        preferred_modules = [
+            plugin.module
+            for plugin in vector_candidates
+            if normalize_message_text(plugin.module)
+        ]
+        vector_context = _build_vector_context_from_candidates(vector_candidates)
+    except Exception as exc:
+        logger.debug(f"ChatInter 路由向量召回失败，降级为词法命名空间: {exc}")
+
+    prompt = _build_route_prompt(
+        normalized_message,
+        knowledge_base,
+        preferred_modules=preferred_modules,
+        vector_context=vector_context,
+        include_helpers=helper_mode,
+        namespace_limit=namespace_limit,
+    )
     decision: _LLMRouteDecision | None = None
     try:
         decision = await generate_structured(
@@ -313,6 +567,11 @@ async def resolve_llm_route(
             timeout=timeout_value,
         )
     except Exception as exc:
+        if _is_schema_parameter_error(exc):
+            logger.debug(
+                f"ChatInter LLM 严格路由参数错误，跳过宽松解析并回退规则路由: {exc}"
+            )
+            return None, True
         logger.debug(f"ChatInter LLM 严格路由失败，尝试宽松解析: {exc}")
         try:
             relaxed_instruction = (

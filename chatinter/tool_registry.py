@@ -490,6 +490,7 @@ class ChatInterToolRegistry:
         context_text: str = "",
         preferred_names: set[str] | None = None,
         max_tools: int = _MAX_SELECTED_TOOLS,
+        allow_fallback: bool = True,
         selection_context: ToolSelectionContext | None = None,
     ) -> dict[str, ToolExecutable]:
         if selection_context is None:
@@ -520,7 +521,9 @@ class ChatInterToolRegistry:
         }
 
         if not query_tokens and not context_tokens:
-            return dict(list(base_tools.items())[:max(max_tools, 1)])
+            if allow_fallback:
+                return dict(list(base_tools.items())[:max(max_tools, 1)])
+            return {}
 
         scored: list[tuple[str, float]] = []
         for name, executable in base_tools.items():
@@ -543,7 +546,9 @@ class ChatInterToolRegistry:
                 scored.append((name, score))
 
         if not scored:
-            return dict(list(base_tools.items())[:max(max_tools, 1)])
+            if allow_fallback:
+                return dict(list(base_tools.items())[:max(max_tools, 1)])
+            return {}
 
         scored.sort(key=lambda item: item[1], reverse=True)
         selected_names = {name for name, _ in scored[: max(max_tools, 1)]}

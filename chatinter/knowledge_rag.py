@@ -13,8 +13,43 @@ from zhenxun.services.llm import embed_documents, embed_query, list_embedding_mo
 from zhenxun.services.log import logger
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .route_text import contains_any, normalize_message_text
 
 _TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+")
+_RAG_STOPWORDS = {
+    "我",
+    "你",
+    "他",
+    "她",
+    "它",
+    "我们",
+    "你们",
+    "他们",
+    "她们",
+    "这",
+    "那",
+    "这个",
+    "那个",
+    "最近",
+    "现在",
+    "一下",
+    "一下下",
+    "帮我",
+    "请",
+    "麻烦",
+    "什么",
+    "怎么",
+    "如何",
+    "怎样",
+    "可以",
+    "能不能",
+    "群里",
+    "群",
+    "消息",
+    "聊天",
+    "说什么",
+    "说了什么",
+}
 _DEFAULT_TOP_K = 5
 _MAX_SNIPPET_LEN = 220
 _FALLBACK_DIM = 384
@@ -25,10 +60,30 @@ _VECTOR_WEIGHT = 0.62
 _LEXICAL_WEIGHT = 0.20
 _GRAPH_WEIGHT = 0.08
 _SESSION_PREF_WEIGHT = 0.10
+_PREFERRED_MODULE_WEIGHT = 0.08
 _SESSION_PREF_TTL = 2 * 60 * 60
 _SESSION_PREF_KEEP = 48
 _SESSION_PREF_PRUNE = 24
 _SESSION_PREF_MIN_SCORE = 0.04
+_QUERY_CACHE_TTL = 90.0
+_QUERY_CACHE_MAX_SIZE = 256
+_DEFAULT_FETCH_K = 24
+_MAX_FETCH_K = 96
+_DEFAULT_MIN_SCORE = 0.02
+_DEFAULT_MAX_K = 24
+_DEFAULT_K_INCREMENT = 4
+
+
+@dataclass(frozen=True)
+class _RetrieveOptions:
+    top_k: int
+    fetch_k: int
+    min_score: float
+    max_k: int
+    k_increment: int
+    rerank: bool
+    metadata_filters: dict[str, bool]
+    preferred_modules: tuple[str, ...]
 
 
 @dataclass
@@ -38,17 +93,32 @@ class _IndexedDoc:
     vector: list[float]
     vector_type: str
     token_weights: dict[str, float]
+    metadata: dict[str, bool]
 
 
 def _tokenize(text: str) -> list[str]:
     tokens: list[str] = []
     for token in _TOKEN_PATTERN.findall(text or ""):
         lower = token.lower()
+        if lower in _RAG_STOPWORDS:
+            continue
         tokens.append(lower)
         if any("\u4e00" <= char <= "\u9fff" for char in lower):
-            tokens.extend(char for char in lower if "\u4e00" <= char <= "\u9fff")
+            chars = [char for char in lower if "\u4e00" <= char <= "\u9fff"]
+            if len(lower) <= 3:
+                tokens.extend(char for char in chars if char not in _RAG_STOPWORDS)
             if len(lower) >= 2:
-                tokens.extend(lower[i : i + 2] for i in range(len(lower) - 1))
+                tokens.extend(
+                    ngram
+                    for ngram in (lower[i : i + 2] for i in range(len(lower) - 1))
+                    if ngram not in _RAG_STOPWORDS
+                )
+            if len(lower) >= 3:
+                tokens.extend(
+                    ngram
+                    for ngram in (lower[i : i + 3] for i in range(len(lower) - 2))
+                    if ngram not in _RAG_STOPWORDS
+                )
     return tokens
 
 
@@ -69,6 +139,142 @@ def _build_token_weights(text: str) -> dict[str, float]:
         return {}
     total = float(sum(counter.values()))
     return {token: value / total for token, value in counter.items()}
+
+
+def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
+    commands = plugin.commands or []
+    command_text = " ".join(commands)
+    helper_keywords = ("帮助", "详情", "搜索", "说明", "教程", "参数", "列表", "用法")
+    has_helper = any(keyword in command_text for keyword in helper_keywords)
+
+    template_keywords = ("表情", "梗图", "meme", "模板", "头像", "图片")
+    template_text = (
+        f"{plugin.name} {plugin.module} "
+        f"{plugin.description} {plugin.usage or ''} {command_text}"
+    ).lower()
+    is_template_like = any(keyword in template_text for keyword in template_keywords)
+
+    target_capable = False
+    image_capable = False
+    self_only = False
+    for meta in plugin.command_meta:
+        if bool(getattr(meta, "allow_at", False)):
+            target_capable = True
+        target_sources = getattr(meta, "target_sources", None) or []
+        if any(
+            str(source or "").strip().lower() in {"at", "reply", "nickname"}
+            for source in target_sources
+        ):
+            target_capable = True
+        image_min = getattr(meta, "image_min", None)
+        image_max = getattr(meta, "image_max", None)
+        if (image_min is not None and int(image_min) > 0) or (
+            image_max is not None and int(image_max) > 0
+        ):
+            image_capable = True
+        actor_scope = str(getattr(meta, "actor_scope", "") or "").strip().lower()
+        if actor_scope == "self_only":
+            self_only = True
+
+    if not image_capable:
+        usage_l = str(plugin.usage or "").lower()
+        if "[image" in usage_l or "图片" in usage_l or "头像" in usage_l:
+            image_capable = True
+
+    return {
+        "has_helper": has_helper,
+        "is_template_like": is_template_like,
+        "target_capable": target_capable,
+        "image_capable": image_capable,
+        "self_only": self_only,
+    }
+
+
+def _parse_retrieve_options(
+    *,
+    top_k: int,
+    fetch_k: int | None,
+    min_score: float | None,
+    max_k: int | None,
+    k_increment: int,
+    rerank: bool,
+    metadata_filters: dict[str, bool] | None,
+    preferred_modules: list[str] | tuple[str, ...] | None,
+) -> _RetrieveOptions:
+    resolved_top_k = max(int(top_k or 1), 1)
+    resolved_fetch_k = (
+        fetch_k
+        if fetch_k is not None
+        else max(resolved_top_k * 4, _DEFAULT_FETCH_K)
+    )
+    resolved_fetch_k = max(resolved_top_k, min(int(resolved_fetch_k), _MAX_FETCH_K))
+    resolved_min_score = (
+        _DEFAULT_MIN_SCORE
+        if min_score is None
+        else max(float(min_score), 0.0)
+    )
+    resolved_max_k = max_k if max_k is not None else max(resolved_top_k, _DEFAULT_MAX_K)
+    resolved_max_k = max(resolved_top_k, min(int(resolved_max_k), resolved_fetch_k))
+    resolved_k_increment = max(int(k_increment or _DEFAULT_K_INCREMENT), 1)
+    resolved_filters: dict[str, bool] = {}
+    for key, value in (metadata_filters or {}).items():
+        text_key = str(key or "").strip()
+        if not text_key:
+            continue
+        resolved_filters[text_key] = bool(value)
+    normalized_preferred: list[str] = []
+    for module in preferred_modules or ():
+        module_text = normalize_message_text(str(module or ""))
+        if module_text and module_text not in normalized_preferred:
+            normalized_preferred.append(module_text)
+    return _RetrieveOptions(
+        top_k=resolved_top_k,
+        fetch_k=resolved_fetch_k,
+        min_score=resolved_min_score,
+        max_k=resolved_max_k,
+        k_increment=resolved_k_increment,
+        rerank=bool(rerank),
+        metadata_filters=resolved_filters,
+        preferred_modules=tuple(normalized_preferred),
+    )
+
+
+def _matches_metadata_filters(doc: _IndexedDoc, filters: dict[str, bool]) -> bool:
+    if not filters:
+        return True
+    for key, expected in filters.items():
+        if doc.metadata.get(key) is not expected:
+            return False
+    return True
+
+
+def _command_relevance_score(plugin: PluginInfo, query_text: str) -> float:
+    normalized_query = normalize_message_text(query_text or "").lower()
+    if not normalized_query:
+        return 0.0
+    best = 0.0
+    has_template_context = contains_any(
+        normalized_query,
+        ("表情", "梗图", "meme", "头像", "图片", "做", "来", "生成", "制作"),
+    )
+    command_candidates: list[str] = []
+    command_candidates.extend(plugin.commands or [])
+    for meta in plugin.command_meta:
+        command_candidates.append(getattr(meta, "command", ""))
+        command_candidates.extend(getattr(meta, "aliases", None) or [])
+    for raw_command in command_candidates:
+        command = normalize_message_text(str(raw_command or "")).lower()
+        if not command:
+            continue
+        if normalized_query.startswith(command):
+            best = max(best, 0.20)
+            continue
+        if len(command) >= 2 and command in normalized_query:
+            best = max(best, 0.14)
+            continue
+        if len(command) == 1 and has_template_context and command in normalized_query:
+            best = max(best, 0.10)
+    return best
 
 
 def _normalize_vector(values: list[float]) -> list[float]:
@@ -109,6 +315,67 @@ class PluginRAGService:
     _session_preference_time: ClassVar[dict[str, float]] = {}
     _embedding_disabled_until: ClassVar[float] = 0.0
     _embedding_supported: ClassVar[bool | None] = None
+    _index_meta: ClassVar[dict[str, str]] = {}
+    _cache_version: ClassVar[int] = 0
+    _query_cache: ClassVar[dict[str, tuple[float, list[str]]]] = {}
+
+    @classmethod
+    def _query_cache_key(
+        cls,
+        *,
+        query: str,
+        context_text: str,
+        session_id: str | None,
+        options: _RetrieveOptions,
+    ) -> str:
+        filter_part = ",".join(
+            f"{key}:{int(value)}"
+            for key, value in sorted(options.metadata_filters.items())
+        )
+        preferred_part = ",".join(options.preferred_modules)
+        raw = "|".join(
+            (
+                str(cls._cache_version),
+                normalize_message_text(query),
+                normalize_message_text(context_text),
+                str(session_id or ""),
+                str(options.top_k),
+                str(options.fetch_k),
+                str(options.min_score),
+                str(options.max_k),
+                str(options.k_increment),
+                str(int(options.rerank)),
+                filter_part,
+                preferred_part,
+            )
+        )
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _get_cached_modules(cls, cache_key: str) -> list[str] | None:
+        cached = cls._query_cache.get(cache_key)
+        if not cached:
+            return None
+        ts, modules = cached
+        if (time.monotonic() - ts) > _QUERY_CACHE_TTL:
+            cls._query_cache.pop(cache_key, None)
+            return None
+        return modules[:]
+
+    @classmethod
+    def _set_cached_modules(cls, cache_key: str, modules: list[str]) -> None:
+        cls._query_cache[cache_key] = (time.monotonic(), modules[:])
+        if len(cls._query_cache) <= _QUERY_CACHE_MAX_SIZE:
+            return
+        stale_keys = sorted(cls._query_cache.items(), key=lambda item: item[1][0])[
+            : max(8, _QUERY_CACHE_MAX_SIZE // 8)
+        ]
+        for key, _ in stale_keys:
+            cls._query_cache.pop(key, None)
+
+    @classmethod
+    def _clear_query_cache(cls) -> None:
+        cls._query_cache.clear()
 
     @classmethod
     def _prune_session_preference(cls, now: float) -> None:
@@ -175,20 +442,31 @@ class PluginRAGService:
         if cls._loaded:
             return
 
-        def _read_file() -> dict[str, dict]:
+        def _read_file() -> tuple[dict[str, dict], dict[str, str]]:
             if not _INDEX_PATH.exists():
-                return {}
+                return {}, {}
             try:
                 raw = _INDEX_PATH.read_text(encoding="utf-8")
                 payload = json.loads(raw)
             except Exception:
-                return {}
+                return {}, {}
             if not isinstance(payload, dict):
-                return {}
+                return {}, {}
             docs = payload.get("docs", {})
-            return docs if isinstance(docs, dict) else {}
+            meta = payload.get("meta", {})
+            docs_dict = docs if isinstance(docs, dict) else {}
+            meta_dict = (
+                {str(k): str(v) for k, v in meta.items()}
+                if isinstance(meta, dict)
+                else {}
+            )
+            return docs_dict, meta_dict
 
-        cls._persisted = await asyncio.to_thread(_read_file)
+        cls._persisted, cls._index_meta = await asyncio.to_thread(_read_file)
+        try:
+            cls._cache_version = int(cls._index_meta.get("cache_version", "0") or 0)
+        except Exception:
+            cls._cache_version = 0
         cls._loaded = True
 
     @classmethod
@@ -200,8 +478,13 @@ class PluginRAGService:
                 "vector": doc.vector,
                 "vector_type": doc.vector_type,
                 "token_weights": doc.token_weights,
+                "metadata": doc.metadata,
             }
-        payload = {"version": 2, "docs": payload_docs}
+        payload = {
+            "version": 4,
+            "meta": cls._index_meta,
+            "docs": payload_docs,
+        }
 
         def _write_file() -> None:
             _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -282,6 +565,8 @@ class PluginRAGService:
                 existing.plugin = plugin
                 if not existing.token_weights:
                     existing.token_weights = _build_token_weights(text)
+                if not existing.metadata:
+                    existing.metadata = _build_doc_metadata(plugin)
                 continue
 
             persisted = cls._persisted.get(module)
@@ -297,12 +582,22 @@ class PluginRAGService:
                         if isinstance(token_weights_raw, dict)
                         else _build_token_weights(text)
                     )
+                    metadata_raw = persisted.get("metadata")
+                    metadata = (
+                        {
+                            str(key): bool(value)
+                            for key, value in metadata_raw.items()
+                        }
+                        if isinstance(metadata_raw, dict)
+                        else _build_doc_metadata(plugin)
+                    )
                     cls._docs[module] = _IndexedDoc(
                         plugin=plugin,
                         signature=signature,
                         vector=[float(v) for v in vector],
                         vector_type=str(persisted.get("vector_type", "embedding")),
                         token_weights=token_weights,
+                        metadata=metadata,
                     )
                     continue
 
@@ -321,10 +616,18 @@ class PluginRAGService:
                     vector=vector,
                     vector_type=vector_type,
                     token_weights=_build_token_weights(_doc_text(plugin)),
+                    metadata=_build_doc_metadata(plugin),
                 )
             changed = True
 
         if changed:
+            cls._cache_version += 1
+            cls._clear_query_cache()
+            cls._index_meta = {
+                "cache_version": str(cls._cache_version),
+                "updated_at": str(int(time.time())),
+                "vector_count": str(len(cls._docs)),
+            }
             await cls._save_persisted_index()
             cls._persisted = {
                 module: {
@@ -332,6 +635,7 @@ class PluginRAGService:
                     "vector": doc.vector,
                     "vector_type": doc.vector_type,
                     "token_weights": doc.token_weights,
+                    "metadata": doc.metadata,
                 }
                 for module, doc in cls._docs.items()
             }
@@ -374,6 +678,50 @@ class PluginRAGService:
         cls._module_graph = normalized
 
     @classmethod
+    def _preferred_module_scores(
+        cls,
+        preferred_modules: tuple[str, ...],
+    ) -> dict[str, float]:
+        if not preferred_modules:
+            return {}
+        total = len(preferred_modules)
+        if total <= 0:
+            return {}
+        result: dict[str, float] = {}
+        for idx, module in enumerate(preferred_modules):
+            if not module:
+                continue
+            result[module] = max(0.0, 1.0 - (idx / max(total, 1)))
+        return result
+
+    @classmethod
+    def _select_by_threshold(
+        cls,
+        ranked_modules: list[tuple[str, float]],
+        *,
+        options: _RetrieveOptions,
+    ) -> list[str]:
+        if not ranked_modules:
+            return []
+
+        fetch_size = min(options.fetch_k, len(ranked_modules))
+        fetched = ranked_modules[:fetch_size]
+        if not fetched:
+            return []
+
+        probe_k = min(options.top_k, len(fetched))
+        max_probe = min(options.max_k, len(fetched))
+
+        while True:
+            probe = fetched[:probe_k]
+            filtered = [module for module, score in probe if score >= options.min_score]
+            if len(filtered) >= options.top_k or probe_k >= max_probe:
+                if filtered:
+                    return filtered[: options.top_k]
+                return [module for module, _ in probe[: options.top_k]]
+            probe_k = min(probe_k + options.k_increment, max_probe)
+
+    @classmethod
     async def retrieve(
         cls,
         query: str,
@@ -381,14 +729,50 @@ class PluginRAGService:
         top_k: int = _DEFAULT_TOP_K,
         context_text: str = "",
         session_id: str | None = None,
+        *,
+        fetch_k: int | None = None,
+        min_score: float | None = None,
+        max_k: int | None = None,
+        k_increment: int = _DEFAULT_K_INCREMENT,
+        metadata_filters: dict[str, bool] | None = None,
+        preferred_modules: list[str] | tuple[str, ...] | None = None,
+        rerank: bool = True,
     ) -> list[PluginInfo]:
         if not query.strip():
             return []
+        options = _parse_retrieve_options(
+            top_k=top_k,
+            fetch_k=fetch_k,
+            min_score=min_score,
+            max_k=max_k,
+            k_increment=k_increment,
+            rerank=rerank,
+            metadata_filters=metadata_filters,
+            preferred_modules=preferred_modules,
+        )
 
         async with cls._lock:
             await cls._sync_index(knowledge)
             if not cls._docs:
                 return []
+            cache_key = cls._query_cache_key(
+                query=query,
+                context_text=context_text,
+                session_id=session_id,
+                options=options,
+            )
+            cached_modules = cls._get_cached_modules(cache_key)
+            if cached_modules:
+                selected_plugins: list[PluginInfo] = []
+                for module in cached_modules:
+                    doc = cls._docs.get(module)
+                    if doc is None:
+                        continue
+                    if not _matches_metadata_filters(doc, options.metadata_filters):
+                        continue
+                    selected_plugins.append(doc.plugin)
+                if selected_plugins:
+                    return selected_plugins[: options.top_k]
             query_vector = await cls._embed_query(query)
             if not query_vector:
                 return []
@@ -398,11 +782,15 @@ class PluginRAGService:
             lexical_scores: dict[str, float] = {}
 
             for module, doc in cls._docs.items():
+                if not _matches_metadata_filters(doc, options.metadata_filters):
+                    continue
                 vector_scores[module] = _cosine_score(query_vector, doc.vector)
                 lexical_scores[module] = sum(
                     token_weights.get(token, 0.0) * doc.token_weights.get(token, 0.0)
                     for token in token_weights
                 )
+            if not vector_scores:
+                return []
 
             base_rank = sorted(
                 (
@@ -410,7 +798,7 @@ class PluginRAGService:
                         module,
                         vector_scores[module] * 0.75 + lexical_scores[module] * 0.25,
                     )
-                    for module in cls._docs
+                    for module in vector_scores
                 ),
                 key=lambda item: item[1],
                 reverse=True,
@@ -427,24 +815,48 @@ class PluginRAGService:
                 for module in list(graph_scores):
                     graph_scores[module] = graph_scores[module] / max_graph
             session_scores = cls._session_pref_scores(session_id)
+            preferred_scores = cls._preferred_module_scores(options.preferred_modules)
+            lexical_weight = _LEXICAL_WEIGHT
+            vector_weight = _VECTOR_WEIGHT
+            if len(token_weights) <= 3:
+                lexical_weight = min(_LEXICAL_WEIGHT + 0.08, 0.35)
+                vector_weight = max(_VECTOR_WEIGHT - 0.08, 0.50)
 
-            ranked = sorted(
-                (
-                    (
-                        doc.plugin,
-                        _VECTOR_WEIGHT * vector_scores.get(module, 0.0)
-                        + _LEXICAL_WEIGHT * lexical_scores.get(module, 0.0)
-                        + _GRAPH_WEIGHT * graph_scores.get(module, 0.0)
-                        + _SESSION_PREF_WEIGHT * session_scores.get(module, 0.0),
+            ranked_modules: list[tuple[str, float]] = []
+            for module in vector_scores:
+                command_score = _command_relevance_score(
+                    cls._docs[module].plugin,
+                    query,
+                )
+                base_score = (
+                    vector_weight * vector_scores.get(module, 0.0)
+                    + lexical_weight * lexical_scores.get(module, 0.0)
+                    + command_score
+                )
+                if options.rerank:
+                    base_score += (
+                        _GRAPH_WEIGHT * graph_scores.get(module, 0.0)
+                        + _SESSION_PREF_WEIGHT * session_scores.get(module, 0.0)
+                        + _PREFERRED_MODULE_WEIGHT * preferred_scores.get(module, 0.0)
                     )
-                    for module, doc in cls._docs.items()
-                ),
-                key=lambda item: item[1],
-                reverse=True,
+                ranked_modules.append((module, base_score))
+
+            ranked_modules.sort(key=lambda item: item[1], reverse=True)
+            selected_modules = cls._select_by_threshold(
+                ranked_modules,
+                options=options,
             )
-            selected = [plugin for plugin, score in ranked if score > 0][
-                : max(top_k, 1)
-            ]
+            selected: list[PluginInfo] = []
+            for module in selected_modules:
+                doc = cls._docs.get(module)
+                if doc is None:
+                    continue
+                selected.append(doc.plugin)
+            if selected:
+                cls._set_cached_modules(
+                    cache_key,
+                    [plugin.module for plugin in selected if plugin.module],
+                )
             return selected
 
     @classmethod
@@ -455,6 +867,14 @@ class PluginRAGService:
         top_k: int = _DEFAULT_TOP_K,
         context_text: str = "",
         session_id: str | None = None,
+        *,
+        fetch_k: int | None = None,
+        min_score: float | None = None,
+        max_k: int | None = None,
+        k_increment: int = _DEFAULT_K_INCREMENT,
+        metadata_filters: dict[str, bool] | None = None,
+        preferred_modules: list[str] | tuple[str, ...] | None = None,
+        rerank: bool = True,
     ) -> str:
         selected = await cls.retrieve(
             query,
@@ -462,6 +882,13 @@ class PluginRAGService:
             top_k=top_k,
             context_text=context_text,
             session_id=session_id,
+            fetch_k=fetch_k,
+            min_score=min_score,
+            max_k=max_k,
+            k_increment=k_increment,
+            metadata_filters=metadata_filters,
+            preferred_modules=preferred_modules,
+            rerank=rerank,
         )
         if not selected:
             return ""

@@ -4,8 +4,8 @@ ChatInter - Prompt 模板构建
 定义用于 LLM 结构化输出的提示模板。
 """
 
-from .models.pydantic_models import PluginKnowledgeBase
 from .config import get_config_value
+from .models.pydantic_models import PluginKnowledgeBase
 
 
 def build_intent_prompt(
@@ -51,9 +51,12 @@ def build_intent_prompt(
 
 上下文说明：
 - qq_context: 基础信息
+- conversation_focus: 当前消息关键词与建议回复粒度
+- context_mode: 当与历史弱相关时会标记为 single_turn
 - history_context: 你与用户的对话历史
 - history: 群聊最近消息，帮助了解群聊氛围
-- current_message_layers: 当前用户消息及回复链追溯（Layer 0=当前，Layer 1+=被回复的消息）
+- current_message_layers:
+  当前用户消息及回复链追溯（Layer 0=当前，Layer 1+=被回复的消息）
 
 ## 当前消息
 {current_message}

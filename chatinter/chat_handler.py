@@ -44,6 +44,38 @@ _MD_EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@(\d{5,20})\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[的，,。.!！？?]))"
 )
+_COMPLEX_QUERY_HINTS = (
+    "代码",
+    "插件",
+    "报错",
+    "错误",
+    "异常",
+    "调试",
+    "排查",
+    "怎么",
+    "如何",
+    "实现",
+    "步骤",
+    "配置",
+    "脚本",
+    "方案",
+    "traceback",
+    "exception",
+    "nonebot",
+    "python",
+    "api",
+)
+
+
+def _is_complex_query(message_text: str) -> bool:
+    normalized = str(message_text or "").strip().lower()
+    if not normalized:
+        return False
+    if "```" in normalized or "\n" in normalized:
+        return True
+    if len(normalized) >= 36:
+        return True
+    return any(hint in normalized for hint in _COMPLEX_QUERY_HINTS)
 
 
 async def handle_chat_message(
@@ -60,6 +92,7 @@ async def handle_chat_message(
         nickname=nickname,
         group_id=group_id,
         chat_style=chat_style,
+        message_text=message,
     )
 
     logger.debug(f"系统提示词：{system_prompt[:500]}...")
@@ -88,6 +121,7 @@ async def build_chat_system_prompt(
     nickname: str,
     group_id: str | None = None,
     chat_style: str = "",
+    message_text: str = "",
 ) -> str:
     use_sign_in_impression = get_config_value("USE_SIGN_IN_IMPRESSION", True)
 
@@ -99,12 +133,29 @@ async def build_chat_system_prompt(
             f"按态度回复：排斥/警惕→冷淡简短；一般/可以交流→正常友好；好朋友/是个好人→热情；亲密/恋人→亲密关心"
         )
 
-    style_text = f"{chat_style}风格的" if chat_style else "日式二次元、软萌中带一点傲娇的"
+    style_text = (
+        f"{chat_style}风格的"
+        if chat_style
+        else "日式二次元、软萌中带一点傲娇的"
+    )
+    allow_long_for_complex = bool(
+        get_config_value("CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX", True)
+    )
+    is_complex_query = _is_complex_query(message_text)
+    if allow_long_for_complex and is_complex_query:
+        length_rule = (
+            "当前问题偏复杂（如代码/排错/实现类），允许使用分点和步骤化说明，"
+            "优先给出可执行结论，不受80字限制。"
+        )
+    else:
+        length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
+
     base_prompt = (
         f"你是{style_text}机器人助手，优先使用中文。"
         "语气要可爱自然，避免生硬、严肃、正式的客服腔。"
         "可以适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要每句都堆叠。"
-        "默认控制在80字以内，除非用户明确要求详细步骤。"
+        f"{length_rule}"
+        "若上下文信息不足，先问一个最关键的澄清问题，不要凭空猜测。"
         "如果是结构化输出或插件命令，不要加入口癖修饰。"
     )
     group_prompt = f"\n群组 ID：{group_id}" if group_id else ""

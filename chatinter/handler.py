@@ -21,6 +21,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 from zhenxun.utils.message import MessageUtils
 
+from .agent_runner import run_chatinter_agent
 from .chat_handler import (
     handle_chat_message,
     normalize_ai_reply_text,
@@ -30,6 +31,7 @@ from .chat_handler import (
 from .config import get_config_value
 from .lifecycle import LifecyclePayload, get_lifecycle_manager
 from .memory import _chat_memory
+from .knowledge_rag import PluginRAGService
 from .plugin_registry import (
     PluginRegistry,
     PluginSelectionContext,
@@ -1893,6 +1895,7 @@ async def _execute_route_decision(
     user_message,
     bot_id: str | None,
     current_message: str,
+    session_id: str | None = None,
     extra_image_segments=None,
 ) -> bool:
     decision = route_result.decision
@@ -1977,6 +1980,14 @@ async def _execute_route_decision(
         extra_image_segments=extra_image_segments,
     )
     if success:
+        try:
+            await PluginRAGService.update_session_feedback(
+                session_id=session_id,
+                modules=target_modules,
+                reward=1.0,
+            )
+        except Exception as exc:
+            logger.debug(f"更新 ChatInter 路由会话偏好失败: {exc}")
         trace.stage("route")
         trace.finish()
     return success
@@ -2282,6 +2293,7 @@ async def handle_fallback(
             user_message=uni_msg or raw_message,
             bot_id=bot_id,
             current_message=route_message,
+            session_id=session_key,
             extra_image_segments=reply_image_segments_for_reroute,
         ):
             return
@@ -2323,13 +2335,46 @@ async def handle_fallback(
             metadata={"phase": "chat_fallback"},
         )
         await lifecycle.dispatch("before_agent", before_chat_payload)
-        reply = await handle_chat_message(
-            message=before_chat_payload.message_text,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            mention_name_map=mention_name_map,
-        )
+        intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
+        agent_enabled = bool(get_config_value("ENABLE_AGENT_MODE", True))
+        reply: str | UniMessage | None = None
+        if agent_enabled:
+            try:
+                agent_response = await run_chatinter_agent(
+                    bot=bot,
+                    event=event,
+                    user_id=str(user_id),
+                    group_id=str(group_id) if group_id else None,
+                    model=model_name,
+                    timeout=max(intent_timeout, 5),
+                    system_prompt=before_chat_payload.system_prompt,
+                    context_xml=before_chat_payload.context_xml,
+                    message_text=before_chat_payload.message_text,
+                    image_parts=image_parts or None,
+                )
+                if agent_response and str(agent_response.text or "").strip():
+                    reply = str(agent_response.text)
+                usage = (
+                    agent_response.usage_info
+                    if agent_response and isinstance(agent_response.usage_info, dict)
+                    else {}
+                )
+                logger.debug(
+                    "chatinter agent reply ready: "
+                    f"prompt_tokens={usage.get('prompt_tokens', 0)} "
+                    f"completion_tokens={usage.get('completion_tokens', 0)} "
+                    f"total_tokens={usage.get('total_tokens', 0)}"
+                )
+            except Exception as exc:
+                logger.warning(f"ChatInter agent 执行失败，降级普通对话: {exc}")
+        if reply is None:
+            reply = await handle_chat_message(
+                message=before_chat_payload.message_text,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                mention_name_map=mention_name_map,
+            )
         trace.stage("chat_fallback")
         reply_text = (
             str(reply)

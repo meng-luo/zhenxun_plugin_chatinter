@@ -40,6 +40,28 @@ _HELPER_KEYWORDS = (
     "列表",
     "查看",
 )
+_EXPLICIT_HELPER_HINTS = (
+    "怎么用",
+    "如何用",
+    "怎样用",
+    "怎么使用",
+    "如何使用",
+    "怎样使用",
+    "用法",
+    "教程",
+    "参数",
+    "说明",
+    "示例",
+    "例子",
+    "帮助",
+    "详情",
+    "怎么触发",
+    "如何触发",
+    "怎样触发",
+    "怎么调用",
+    "如何调用",
+    "怎样调用",
+)
 _TEXT_LABELS = (
     "内容是",
     "内容为",
@@ -54,6 +76,10 @@ _TEXT_LABELS = (
 _GENERIC_STOPWORDS = {
     "真寻",
     "小真寻",
+    "zhenxun",
+    "nonebot",
+    "plugin",
+    "plugins",
     "机器人",
     "bot",
     "帮我",
@@ -400,7 +426,6 @@ def _build_tokens(
 ) -> tuple[str, ...]:
     values = [
         plugin.name,
-        plugin.module,
         plugin.description,
         " ".join(commands),
         " ".join(aliases),
@@ -453,9 +478,16 @@ def get_skill_registry(knowledge_base: PluginKnowledgeBase) -> SkillRegistry:
         action_commands = _action_commands(commands, helper_commands)
         command_schemas = _extract_command_schemas(plugin, commands)
         kind = _infer_kind(plugin, commands, helper_commands, examples)
-        text_space = " ".join([plugin.usage or "", " ".join(examples), " ".join(commands)])
-        supports_placeholders = any(marker in text_space for marker in ("[image]", "@", "图片", "头像", "自己"))
-        supports_text_payload = any(marker in text_space for marker in ("文字", "文本", "内容", "标题", "歌名", "城市", "地点"))
+        text_space = " ".join(
+            [plugin.usage or "", " ".join(examples), " ".join(commands)]
+        )
+        supports_placeholders = any(
+            marker in text_space for marker in ("[image]", "@", "图片", "头像", "自己")
+        )
+        supports_text_payload = any(
+            marker in text_space
+            for marker in ("文字", "文本", "内容", "标题", "歌名", "城市", "地点")
+        )
         skills.append(
             SkillSpec(
                 skill_id=f"{kind}:{plugin.module}",
@@ -694,6 +726,8 @@ def _resolve_skill_command_schema(
 
 
 def _pick_helper_command(skill: SkillSpec, message_text: str) -> str | None:
+    if not _has_explicit_helper_intent(message_text):
+        return None
     if not skill.helper_commands:
         return None
     normalized = normalize_message_text(message_text).lower()
@@ -708,6 +742,13 @@ def _pick_helper_command(skill: SkillSpec, message_text: str) -> str | None:
         ),
     )
     return ranked[0] if ranked else None
+
+
+def _has_explicit_helper_intent(message_text: str) -> bool:
+    normalized = normalize_message_text(message_text).lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _EXPLICIT_HELPER_HINTS)
 
 
 def _pick_command_by_evidence(
@@ -1211,6 +1252,7 @@ def skill_execute(
 ) -> SkillRouteDecision | None:
     registry = search_result.registry
     is_usage = search_result.is_usage
+    has_explicit_helper_intent = _has_explicit_helper_intent(message_text)
 
     if search_result.fast_match is not None:
         plugin_name, plugin_module, command_head = search_result.fast_match
@@ -1230,6 +1272,15 @@ def skill_execute(
                 message_text=message_text,
                 suggested_command=command_head,
             )
+            command_head_normalized = normalize_message_text(
+                command.split(" ", 1)[0] if command else ""
+            )
+            if (
+                command_head_normalized
+                and command_head_normalized in skill.helper_commands
+                and not has_explicit_helper_intent
+            ):
+                command = ""
             if _passes_conservative_guard(
                 skill,
                 command,
@@ -1284,6 +1335,15 @@ def skill_execute(
             message_text=message_text,
             suggested_command=candidate.matched_command or command_head,
         )
+        command_head_normalized = normalize_message_text(
+            command.split(" ", 1)[0] if command else ""
+        )
+        if (
+            command_head_normalized
+            and command_head_normalized in skill.helper_commands
+            and not has_explicit_helper_intent
+        ):
+            continue
         if not _passes_conservative_guard(
             skill,
             command,
@@ -1392,6 +1452,7 @@ def _select_prompt_schemas(
     selected_commands: list[str],
     *,
     limit: int,
+    fallback_all: bool = True,
 ) -> list[SkillCommandSchema]:
     if not skill.command_schemas:
         return []
@@ -1409,6 +1470,8 @@ def _select_prompt_schemas(
                 return picked
     if picked:
         return picked
+    if not fallback_all:
+        return []
     return list(skill.command_schemas[:limit])
 
 
@@ -1417,11 +1480,32 @@ def render_skill_namespace(
     *,
     query: str = "",
     limit: int = 10,
+    preferred_modules: list[str] | tuple[str, ...] | None = None,
+    include_helpers: bool = True,
+    mask_module: bool = False,
 ) -> str:
     registry = get_skill_registry(knowledge_base)
-    skills = select_relevant_skills(registry, query, limit=limit)
+    skills = list(select_relevant_skills(registry, query, limit=limit))
     if not skills:
-        skills = registry.skills[:limit]
+        skills = list(registry.skills[:limit])
+
+    if preferred_modules:
+        preferred = [
+            normalize_message_text(module)
+            for module in preferred_modules
+            if normalize_message_text(module)
+        ]
+        if preferred:
+            module_to_skill = {skill.plugin_module: skill for skill in registry.skills}
+            merged: list[SkillSpec] = []
+            for module in preferred:
+                skill = module_to_skill.get(module)
+                if skill and skill not in merged:
+                    merged.append(skill)
+            for skill in skills:
+                if skill not in merged:
+                    merged.append(skill)
+            skills = merged[:limit]
 
     payload: list[dict] = []
     for skill in skills:
@@ -1430,24 +1514,31 @@ def render_skill_namespace(
             query,
             limit=24,
         )
-        selected_helpers = _select_prompt_commands(
-            skill.helper_commands,
-            query,
-            limit=8,
-        )
+        selected_helpers: list[str] = []
+        if include_helpers:
+            selected_helpers = _select_prompt_commands(
+                skill.helper_commands,
+                query,
+                limit=8,
+            )
         if not selected_actions:
             selected_actions = list(skill.action_commands[:24])
-        if not selected_helpers:
+        if include_helpers and not selected_helpers:
             selected_helpers = list(skill.helper_commands[:8])
         schema_selection = _select_prompt_schemas(
             skill,
             [*selected_actions, *selected_helpers],
             limit=24,
+            fallback_all=include_helpers,
         )
         payload.append(
             {
                 "skill": skill.plugin_name,
-                "module": skill.plugin_module,
+                "module": (
+                    skill.plugin_module.rsplit(".", 1)[-1]
+                    if mask_module
+                    else skill.plugin_module
+                ),
                 "kind": skill.kind,
                 "action_commands": selected_actions,
                 "helper_commands": selected_helpers,
