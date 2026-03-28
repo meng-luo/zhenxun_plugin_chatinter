@@ -34,6 +34,63 @@ from .utils.unimsg_utils import (
     uni_to_text_with_tags,
 )
 
+_CONTEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,8}", re.IGNORECASE)
+_LOW_VALUE_ONLY_SYMBOLS = re.compile(r"^[\W_]+$", re.UNICODE)
+_COMMAND_LIKE_PREFIX = ("/", ".", "!", "。", "！")
+_CONTEXT_STOPWORDS = {
+    "这个",
+    "那个",
+    "然后",
+    "就是",
+    "一下",
+    "一个",
+    "我们",
+    "你们",
+    "他们",
+    "自己",
+    "可以",
+    "怎么",
+    "如何",
+}
+_COMPLEX_QUERY_HINTS = (
+    "代码",
+    "插件",
+    "报错",
+    "错误",
+    "异常",
+    "调试",
+    "排查",
+    "实现",
+    "方案",
+    "步骤",
+    "配置",
+    "脚本",
+    "traceback",
+    "exception",
+    "nonebot",
+    "python",
+    "api",
+)
+_FOLLOWUP_QUERY_HINTS = (
+    "然后",
+    "接着",
+    "继续",
+    "再来",
+    "再说",
+    "展开",
+    "详细",
+    "具体",
+    "这个",
+    "那个",
+    "它",
+    "他",
+    "她",
+    "刚才",
+    "上面",
+    "上一个",
+    "前面",
+)
+
 
 class ChatMemory:
     """聊天记忆管理"""
@@ -46,6 +103,198 @@ class ChatMemory:
         self._nickname_ttl = 30 * 60
         self._compression_fetch_factor = 3
         self._compression_summary_cap = 12
+
+    @staticmethod
+    def _clip_context_line(text: str, limit: int = 140) -> str:
+        normalized = " ".join(str(text or "").split())
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[: max(24, limit - 1)].rstrip()}…"
+
+    @staticmethod
+    def _normalize_context_text(text: str) -> str:
+        return " ".join(str(text or "").split()).strip()
+
+    @classmethod
+    def _tokenize_context_text(cls, text: str) -> list[str]:
+        normalized = cls._normalize_context_text(text).lower()
+        if not normalized:
+            return []
+        return [
+            token
+            for token in _CONTEXT_TOKEN_PATTERN.findall(normalized)
+            if token and token not in _CONTEXT_STOPWORDS
+        ]
+
+    @classmethod
+    def _similarity_score(cls, query_tokens: list[str], text: str) -> float:
+        if not query_tokens:
+            return 0.0
+        text_tokens = cls._tokenize_context_text(text)
+        if not text_tokens:
+            return 0.0
+
+        query_counter = Counter(query_tokens)
+        text_counter = Counter(text_tokens)
+        overlap = sum(
+            min(count, text_counter.get(token, 0))
+            for token, count in query_counter.items()
+        )
+        if overlap <= 0:
+            return 0.0
+
+        precision = overlap / max(sum(text_counter.values()), 1)
+        recall = overlap / max(sum(query_counter.values()), 1)
+        if precision + recall <= 0:
+            base_score = 0.0
+        else:
+            base_score = 2 * precision * recall / (precision + recall)
+
+        query_text = "".join(query_tokens)
+        normalized_text = cls._normalize_context_text(text).lower()
+        phrase_bonus = 0.0
+        if len(query_text) >= 4 and query_text in normalized_text:
+            phrase_bonus = 0.12
+        return min(base_score + phrase_bonus, 1.0)
+
+    @classmethod
+    def _is_low_value_background_message(cls, text: str) -> bool:
+        normalized = cls._normalize_context_text(text)
+        if not normalized:
+            return True
+        if len(normalized) <= 1:
+            return True
+        if normalized.startswith(_COMMAND_LIKE_PREFIX):
+            return True
+        if normalized.lower().startswith(("http://", "https://")) and len(
+            normalized
+        ) <= 64:
+            return True
+        if _LOW_VALUE_ONLY_SYMBOLS.fullmatch(normalized):
+            return True
+        return False
+
+    @classmethod
+    def _is_complex_query(cls, text: str) -> bool:
+        normalized = cls._normalize_context_text(text).lower()
+        if not normalized:
+            return False
+        if "```" in normalized or "\n" in normalized:
+            return True
+        if len(normalized) >= 36:
+            return True
+        return any(hint in normalized for hint in _COMPLEX_QUERY_HINTS)
+
+    @classmethod
+    def _is_followup_query(cls, text: str) -> bool:
+        normalized = cls._normalize_context_text(text).lower()
+        if not normalized:
+            return False
+        if len(normalized) <= 4:
+            return any(hint in normalized for hint in _FOLLOWUP_QUERY_HINTS)
+        if len(normalized) <= 10 and any(
+            hint in normalized for hint in _FOLLOWUP_QUERY_HINTS
+        ):
+            return True
+        return normalized.startswith(("那", "再", "继续", "然后"))
+
+    async def _should_isolate_context(
+        self,
+        *,
+        session_id: str,
+        group_id: str | None,
+        current_message_text: str,
+    ) -> tuple[bool, str]:
+        if not bool(get_config_value("ENABLE_CONTEXT_RELEVANCE_GATE", True)):
+            return False, "disabled"
+
+        normalized_query = self._normalize_context_text(current_message_text)
+        if not normalized_query:
+            return False, "empty_query"
+
+        if self._is_followup_query(normalized_query):
+            return False, "followup_query"
+
+        query_tokens = self._tokenize_context_text(normalized_query)
+        min_query_tokens = max(
+            int(get_config_value("CONTEXT_RELEVANCE_MIN_QUERY_TOKENS", 1) or 1), 1
+        )
+        if len(query_tokens) < min_query_tokens:
+            return False, "insufficient_query_tokens"
+
+        sample_limit = max(
+            int(get_config_value("CONTEXT_RELEVANCE_SAMPLE_LIMIT", 18) or 18), 4
+        )
+        threshold = float(get_config_value("CONTEXT_RELEVANCE_THRESHOLD", 0.11) or 0.11)
+
+        sample_texts: list[str] = []
+        dialogs = await ChatInterChatHistory.get_recent_dialogs(
+            session_id,
+            sample_limit,
+        )
+        for dialog in dialogs:
+            user_text = self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dialog.user_message)
+            )
+            ai_text = self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dialog.ai_response or "")
+            )
+            merged = self._normalize_context_text(f"{user_text} {ai_text}")
+            if merged:
+                sample_texts.append(merged)
+
+        if group_id:
+            group_msgs = (
+                await ChatHistory.filter(group_id=group_id)
+                .order_by("-create_time", "-id")
+                .limit(sample_limit)
+            )
+            for msg in group_msgs:
+                text = self._normalize_context_text(
+                    uni_to_text_with_tags(msg.plain_text or msg.text or "")
+                )
+                if not text or self._is_low_value_background_message(text):
+                    continue
+                sample_texts.append(text)
+
+        if not sample_texts:
+            return False, "no_samples"
+
+        max_score = 0.0
+        for text in sample_texts:
+            score = self._similarity_score(query_tokens, text)
+            if score > max_score:
+                max_score = score
+
+        if max_score < threshold:
+            return True, f"max_score={max_score:.3f}<threshold={threshold:.3f}"
+        return False, f"max_score={max_score:.3f}"
+
+    def _build_conversation_focus(
+        self,
+        current_message_text: str,
+    ) -> list[str]:
+        normalized = self._normalize_context_text(current_message_text)
+        if not normalized:
+            return []
+
+        tokens = self._tokenize_context_text(normalized)
+        top_keywords: list[str] = []
+        for token in tokens:
+            if token not in top_keywords:
+                top_keywords.append(token)
+            if len(top_keywords) >= 6:
+                break
+        if not top_keywords:
+            top_keywords = ["无"]
+
+        response_mode = "detailed" if self._is_complex_query(normalized) else "concise"
+        return [
+            "<conversation_focus>",
+            f"query_keywords={','.join(top_keywords)}",
+            f"response_mode={response_mode}",
+            "</conversation_focus>",
+        ]
 
     @staticmethod
     def _strip_non_final_channel_text(text: str) -> str:
@@ -277,6 +526,17 @@ class ChatMemory:
         """
         lines: list[str] = []
         reply_images: list[Image] = []
+        current_message_text = ""
+
+        try:
+            if isinstance(raw_message, UniMessage):
+                normalized_current_msg = remove_reply_segment(raw_message)
+                current_message_text = uni_to_text_with_tags(normalized_current_msg)
+            else:
+                current_message_text = uni_to_text_with_tags(str(raw_message or ""))
+        except Exception:
+            current_message_text = str(raw_message or "")
+        current_message_text = self._normalize_context_text(current_message_text)
 
         # 1. QQ Context 元数据
         qq_context_lines = [
@@ -308,24 +568,54 @@ class ChatMemory:
             ]
         )
         lines.extend(qq_context_lines)
+        lines.extend(self._build_conversation_focus(current_message_text))
+
+        session_id = self.get_session_id(user_id, group_id)
+        isolate_context, isolate_reason = await self._should_isolate_context(
+            session_id=session_id,
+            group_id=group_id,
+            current_message_text=current_message_text,
+        )
+        if isolate_context:
+            logger.debug(
+                "ChatInter 上下文门控命中，按单轮对话处理: "
+                f"session={session_id}, reason={isolate_reason}"
+            )
+            lines.extend(
+                [
+                    "<context_mode>",
+                    "mode=single_turn",
+                    f"reason={isolate_reason}",
+                    "</context_mode>",
+                ]
+            )
 
         # 2. 对话历史（来自 ChatInterChatHistory）
-        history_context_lines = await self._build_history_context(
-            user_id, group_id, nickname, bot_id
-        )
-        if history_context_lines:
-            lines.append("<history_context>")
-            lines.extend(history_context_lines)
-            lines.append("</history_context>")
+        if not isolate_context:
+            history_context_lines = await self._build_history_context(
+                user_id,
+                group_id,
+                nickname,
+                bot_id,
+                current_message_text=current_message_text,
+            )
+            if history_context_lines:
+                lines.append("<history_context>")
+                lines.extend(history_context_lines)
+                lines.append("</history_context>")
 
         # 3. 群聊背景（最近 5 条群消息，来自 ChatHistory）
-        group_background_lines = await self._build_group_background_xml(
-            user_id, group_id, bot_id
-        )
-        if group_background_lines:
-            lines.append("<history>")
-            lines.extend(group_background_lines)
-            lines.append("</history>")
+        if not isolate_context:
+            group_background_lines = await self._build_group_background_xml(
+                user_id,
+                group_id,
+                bot_id,
+                current_message_text=current_message_text,
+            )
+            if group_background_lines:
+                lines.append("<history>")
+                lines.extend(group_background_lines)
+                lines.append("</history>")
 
         # 4. 当前消息层（Layer 0 + 回复链追溯）
         (
@@ -351,7 +641,12 @@ class ChatMemory:
             lines.append("</user_state>")
 
         context_xml = "\n".join(lines)
-        system_prompt = self._build_system_prompt(group_id, impression, attitude)
+        system_prompt = self._build_system_prompt(
+            group_id,
+            impression,
+            attitude,
+            current_message_text=current_message_text,
+        )
 
         return system_prompt, context_xml, reply_images
 
@@ -573,6 +868,7 @@ class ChatMemory:
         group_id: str | None,
         nickname: str,
         bot_id: str | None = None,
+        current_message_text: str = "",
     ) -> list[str]:
         """构建对话历史 XML（来自 ChatInterChatHistory）
 
@@ -587,24 +883,56 @@ class ChatMemory:
         返回:
             list[str]: XML 行列表
         """
-        max_context = get_config_value("SESSION_CONTEXT_LIMIT", 20)
+        max_context = max(int(get_config_value("SESSION_CONTEXT_LIMIT", 20) or 20), 1)
         session_id = self.get_session_id(user_id, group_id)
-        fetch_limit = max(max_context, 1) * self._compression_fetch_factor
+        recall_candidate_limit = max(
+            int(get_config_value("HISTORY_RECALL_CANDIDATE_LIMIT", 60) or 60),
+            max_context,
+        )
+        fetch_limit = max(
+            max_context * self._compression_fetch_factor,
+            recall_candidate_limit,
+        )
         dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
 
         if not dialogs:
             return []
 
         history_summary = ""
+        recalled_dialogs: list[ChatInterChatHistory] = []
+        query_tokens = self._tokenize_context_text(current_message_text)
+        recall_limit = max(int(get_config_value("HISTORY_RECALL_LIMIT", 4) or 4), 0)
+        recall_min_score = float(
+            get_config_value("HISTORY_RECALL_MIN_SCORE", 0.18) or 0.18
+        )
         if len(dialogs) > max_context:
             old_dialogs = dialogs[:-max_context]
             dialogs = dialogs[-max_context:]
             history_summary = self._summarize_old_dialogs(old_dialogs)
+            if old_dialogs and query_tokens and recall_limit > 0:
+                recall_candidates: list[tuple[float, ChatInterChatHistory]] = []
+                for dialog in old_dialogs:
+                    merged_text = self._strip_non_final_channel_text(
+                        f"{uni_to_text_with_tags(dialog.user_message)} "
+                        f"{uni_to_text_with_tags(dialog.ai_response or '')}"
+                    )
+                    score = self._similarity_score(query_tokens, merged_text)
+                    if score >= recall_min_score:
+                        recall_candidates.append((score, dialog))
+                recall_candidates.sort(
+                    key=lambda item: (item[0], int(item[1].id or 0)),
+                    reverse=True,
+                )
+                recalled_dialogs = [
+                    dialog for _, dialog in recall_candidates[:recall_limit]
+                ]
+                recalled_dialogs.sort(key=lambda item: int(item.id or 0))
 
         if group_id:
+            display_dialogs = [*dialogs, *recalled_dialogs]
             user_ids_to_fetch = {
                 dlg.user_id
-                for dlg in dialogs
+                for dlg in display_dialogs
                 if not self._is_nickname_cached(dlg.user_id)
             }
             await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
@@ -612,6 +940,43 @@ class ChatMemory:
         history_lines: list[str] = []
         if history_summary:
             history_lines.append(history_summary)
+        if recalled_dialogs:
+            history_lines.append(f"相关历史记忆({len(recalled_dialogs)}条):")
+            for dlg in recalled_dialogs:
+                if dlg.create_time:
+                    timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
+                else:
+                    timestamp = "??:??:??"
+                if group_id:
+                    cached_nick = self._user_nickname_cache.get(dlg.user_id)
+                    sender = (
+                        f"[{cached_nick}]"
+                        if cached_nick
+                        else f"[QQ:{dlg.user_id}]"
+                    )
+                else:
+                    sender = f"[{dlg.nickname}]"
+
+                recalled_user_msg = self._clip_context_line(
+                    self._strip_non_final_channel_text(
+                        uni_to_text_with_tags(dlg.user_message)
+                    ),
+                    120,
+                )
+                history_lines.append(f"[{timestamp}] {sender}: {recalled_user_msg}")
+
+                if dlg.ai_response:
+                    ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
+                    recalled_ai_msg = self._clip_context_line(
+                        self._strip_non_final_channel_text(
+                            uni_to_text_with_tags(dlg.ai_response)
+                        ),
+                        120,
+                    )
+                    history_lines.append(
+                        f"[{timestamp}] {ai_sender}: {recalled_ai_msg}"
+                    )
+
         for dlg in dialogs:
             if dlg.create_time:
                 timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
@@ -643,6 +1008,7 @@ class ChatMemory:
         user_id: str,
         group_id: str | None,
         bot_id: str | None = None,
+        current_message_text: str = "",
     ) -> list[str]:
         """构建群聊背景 XML（最近 5 条群消息，来自 ChatHistory）
 
@@ -657,21 +1023,34 @@ class ChatMemory:
             list[str]: XML 行列表
         """
         lines: list[str] = []
-        prefix_size = get_config_value("CONTEXT_PREFIX_SIZE", 5)
+        prefix_size = max(int(get_config_value("CONTEXT_PREFIX_SIZE", 5) or 5), 1)
+        fetch_multiplier = max(
+            int(get_config_value("GROUP_BACKGROUND_FETCH_MULTIPLIER", 3) or 3),
+            1,
+        )
+        relevant_limit = max(
+            int(get_config_value("GROUP_BACKGROUND_RELEVANT_LIMIT", 3) or 3),
+            0,
+        )
+        relevant_min_score = float(
+            get_config_value("GROUP_BACKGROUND_MIN_SCORE", 0.16) or 0.16
+        )
 
         if not group_id:
             return lines
 
+        fetch_limit = max(prefix_size, prefix_size * fetch_multiplier)
         chat_history_msgs = (
             await ChatHistory.filter(group_id=group_id)
             .order_by("-create_time", "-id")
-            .limit(prefix_size)
+            .limit(fetch_limit)
         )
         chat_history_msgs = list(reversed(chat_history_msgs))
 
         if not chat_history_msgs:
             return lines
 
+        query_tokens = self._tokenize_context_text(current_message_text)
         user_ids_to_fetch = set()
         for msg in chat_history_msgs:
             is_bot_msg = bot_id and msg.user_id == bot_id
@@ -680,7 +1059,48 @@ class ChatMemory:
 
         await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
 
+        scored_msgs: list[tuple[ChatHistory, str, float]] = []
         for msg in chat_history_msgs:
+            content = uni_to_text_with_tags(msg.plain_text or msg.text or "")
+            content = content or "(空消息)"
+            if self._is_low_value_background_message(content):
+                continue
+            score = (
+                self._similarity_score(query_tokens, content)
+                if query_tokens
+                else 0.0
+            )
+            scored_msgs.append((msg, content, score))
+
+        if not scored_msgs:
+            return lines
+
+        baseline_keep = max(prefix_size - relevant_limit, 1)
+        selected: list[tuple[ChatHistory, str, float]] = []
+        selected_ids: set[int] = set()
+        for item in scored_msgs[-baseline_keep:]:
+            selected.append(item)
+            selected_ids.add(int(item[0].id))
+
+        if query_tokens and relevant_limit > 0:
+            related_candidates = [
+                item
+                for item in scored_msgs
+                if int(item[0].id) not in selected_ids and item[2] >= relevant_min_score
+            ]
+            related_candidates.sort(
+                key=lambda item: (item[2], int(item[0].id)),
+                reverse=True,
+            )
+            for item in related_candidates[:relevant_limit]:
+                selected.append(item)
+                selected_ids.add(int(item[0].id))
+
+        selected.sort(key=lambda item: int(item[0].id))
+        if len(selected) > prefix_size:
+            selected = selected[-prefix_size:]
+
+        for msg, content, _score in selected:
             if msg.create_time:
                 timestamp = msg.create_time.strftime("%m-%d %H:%M:%S")
             else:
@@ -692,8 +1112,6 @@ class ChatMemory:
                 cached_nick = self._user_nickname_cache.get(msg.user_id)
                 sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{msg.user_id}]"
 
-            content = uni_to_text_with_tags(msg.plain_text or msg.text or "")
-            content = content or "(空消息)"
             lines.append(f"[{timestamp}] {sender}: {content}")
 
         return lines
@@ -703,10 +1121,21 @@ class ChatMemory:
         group_id: str | None,
         impression: float,
         attitude: str,
+        current_message_text: str = "",
     ) -> str:
         """构建系统提示词"""
         chat_style = get_config_value("CHAT_STYLE", "")
         use_sign_in_impression = get_config_value("USE_SIGN_IN_IMPRESSION", True)
+        allow_long_for_complex = bool(
+            get_config_value("CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX", True)
+        )
+        if allow_long_for_complex and self._is_complex_query(current_message_text):
+            length_rule = (
+                "当前问题偏复杂（如代码/排错/实现类），允许详细分点回答并给出可执行步骤，"
+                "不受80字限制。"
+            )
+        else:
+            length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
 
         if chat_style:
             base = (
@@ -714,6 +1143,8 @@ class ChatMemory:
                 f"一个{chat_style}机器人助手。回复简洁自然，优先使用中文。"
                 "语气偏日式二次元、软萌中带一点傲娇，避免生硬正式。"
                 "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
+                f"{length_rule}"
+                "上下文不足时先追问一个关键澄清问题，不要凭空猜测。"
                 "结构化任务或命令输出时不要加入口癖修饰。"
             )
         else:
@@ -722,6 +1153,8 @@ class ChatMemory:
                 "一个日式二次元、软萌中带一点傲娇的机器人助手。"
                 "回复简洁自然，优先使用中文，避免生硬正式。"
                 "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
+                f"{length_rule}"
+                "上下文不足时先追问一个关键澄清问题，不要凭空猜测。"
                 "结构化任务或命令输出时不要加入口癖修饰。"
             )
 

@@ -56,15 +56,6 @@ QUESTION_WORDS = (
     "是什么",
     "是啥",
     "什么意思",
-    "怎么",
-    "如何",
-    "怎样",
-    "啥",
-    "什么",
-    "能否",
-    "能不能",
-    "可以吗",
-    "为什么",
     "?",
     "？",
 )
@@ -98,6 +89,36 @@ USAGE_WORDS = (
     "是什么",
     "是啥",
     "什么意思",
+)
+
+_USAGE_CONTEXT_HINTS = (
+    "命令",
+    "插件",
+    "功能",
+    "用法",
+    "参数",
+    "说明",
+    "教程",
+    "触发",
+    "调用",
+    "配置",
+    "详情",
+    "搜索",
+    "列表",
+)
+
+_GENERIC_QUESTION_WORDS = (
+    "怎么",
+    "如何",
+    "怎样",
+    "啥",
+    "什么",
+    "能否",
+    "能不能",
+    "可以吗",
+    "为什么",
+    "?",
+    "？",
 )
 
 EXECUTE_WORDS = (
@@ -375,6 +396,11 @@ def is_usage_question(text: str) -> bool:
         return False
     if has_explicit_usage_hint:
         return True
+    # 仅出现“什么/怎么/？”等泛问句，不视为插件帮助请求。
+    if contains_any(normalized, _GENERIC_QUESTION_WORDS) and not contains_any(
+        normalized, _USAGE_CONTEXT_HINTS
+    ):
+        return False
     if contains_any(normalized, STRONG_EXECUTE_WORDS):
         return False
     if contains_any(normalized, EXECUTE_WORDS):
