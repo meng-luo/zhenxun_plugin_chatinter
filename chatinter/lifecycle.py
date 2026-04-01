@@ -30,6 +30,7 @@ _HARD_DROP_ORDER = (
     "history_context",
     "retrieval_knowledge",
 )
+_SMALL_SECTION_TOKEN_THRESHOLD = 48
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]", re.IGNORECASE)
 _HIGH_CONTEXT_BUDGET = 6000
 _MIDDLE_CONTEXT_BUDGET = 3500
@@ -157,8 +158,30 @@ def _drop_sections_to_budget(
     if not sections:
         return _trim_text_by_budget(context_xml, token_budget, model_name), []
 
-    dropped: list[str] = []
+    composed = _compose_sections(sections)
+    current_tokens = _estimate_tokens(composed, model_name)
+    if current_tokens <= token_budget:
+        return composed, []
+
+    overflow_tokens = max(current_tokens - token_budget, 0)
+    dynamic_threshold = max(
+        _SMALL_SECTION_TOKEN_THRESHOLD,
+        int(overflow_tokens * 0.25),
+    )
+    large_sections: list[str] = []
+    small_sections: list[str] = []
     for tag in _HARD_DROP_ORDER:
+        section = sections.get(tag)
+        if not section:
+            continue
+        section_tokens = _estimate_tokens("\n".join(section), model_name)
+        if section_tokens >= dynamic_threshold:
+            large_sections.append(tag)
+        else:
+            small_sections.append(tag)
+
+    dropped: list[str] = []
+    for tag in [*large_sections, *small_sections]:
         section = sections.pop(tag, None)
         if not section:
             continue

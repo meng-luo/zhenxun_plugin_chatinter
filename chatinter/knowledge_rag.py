@@ -12,6 +12,7 @@ from typing import ClassVar
 from zhenxun.services.llm import embed_documents, embed_query, list_embedding_models
 from zhenxun.services.log import logger
 
+from .feedback_keys import FEEDBACK_REASON_ROUTE_SUCCESS
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy
@@ -433,11 +434,14 @@ class PluginRAGService:
                     if reason_penalty[module] < _SESSION_REASON_MIN_SCORE:
                         reason_penalty.pop(module, None)
             normalized_reason = normalize_message_text(str(reason or "")).lower()
-            if normalized_reason and normalized_reason != "route_success":
+            if (
+                normalized_reason
+                and normalized_reason != FEEDBACK_REASON_ROUTE_SUCCESS
+            ):
                 penalty_step = max(abs(min(float(reward), 0.0)), 0.15)
                 for module in normalized_modules:
                     reason_penalty[module] = reason_penalty.get(module, 0.0) + penalty_step
-            elif normalized_reason == "route_success":
+            elif normalized_reason == FEEDBACK_REASON_ROUTE_SUCCESS:
                 for module in normalized_modules:
                     restored = max(0.0, reason_penalty.get(module, 0.0) - 0.08)
                     if restored < _SESSION_REASON_MIN_SCORE:

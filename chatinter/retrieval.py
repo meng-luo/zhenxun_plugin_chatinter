@@ -1,10 +1,12 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 import re
+from types import MappingProxyType
+from typing import Any
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import ROUTE_ACTION_WORDS, contains_any, normalize_message_text
-from .schema_policy import resolve_command_target_policy
 from .skill_registry import get_skill_registry, select_relevant_skills
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
@@ -31,6 +33,161 @@ _STOPWORDS = {
     "please",
     "help",
 }
+
+
+def _normalize_sequence(values: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def _plugin_meta_signature(meta: PluginInfo.PluginCommandMeta) -> tuple[Any, ...]:
+    return (
+        normalize_message_text(meta.command),
+        _normalize_sequence(meta.aliases or ()),
+        _normalize_sequence(meta.params or ()),
+        _normalize_sequence(meta.examples or ()),
+        int(getattr(meta, "image_min", 0) or 0),
+        int(getattr(meta, "image_max", 0) or 0),
+        getattr(meta, "allow_at", None),
+        normalize_message_text(str(getattr(meta, "actor_scope", "") or "")).lower(),
+        normalize_message_text(
+            str(getattr(meta, "target_requirement", "") or "")
+        ).lower(),
+        _normalize_sequence(getattr(meta, "target_sources", None) or ()),
+    )
+
+
+def _plugin_cache_key(plugin: PluginInfo) -> tuple[Any, ...]:
+    return (
+        normalize_message_text(plugin.name),
+        normalize_message_text(plugin.module),
+        normalize_message_text(plugin.description),
+        normalize_message_text(plugin.usage or ""),
+        _normalize_sequence(plugin.commands or ()),
+        _normalize_sequence(plugin.aliases or ()),
+        tuple(_plugin_meta_signature(meta) for meta in plugin.command_meta),
+    )
+
+
+@lru_cache(maxsize=2048)
+def _cached_plugin_terms(cache_key: tuple[Any, ...]) -> frozenset[str]:
+    name, module, description, usage, commands, aliases, meta_signatures = cache_key
+    command_meta_text = " ".join(
+        " ".join(
+            (
+                command,
+                " ".join(meta_aliases),
+                " ".join(params),
+                " ".join(examples),
+            )
+        ).strip()
+        for command, meta_aliases, params, examples, *_ in meta_signatures
+    )
+    haystack = (
+        f"{name} {module} {description} "
+        f"{' '.join(commands)} {' '.join(aliases)} {command_meta_text} {usage}"
+    )
+    terms = set(_tokenize(haystack))
+    if name:
+        terms.add(name.lower())
+    module_tail = _module_tail(module).lower()
+    if module_tail:
+        terms.add(module_tail)
+    for command in commands:
+        if command:
+            terms.add(command.lower())
+    for alias in aliases:
+        if alias:
+            terms.add(alias.lower())
+    for command, meta_aliases, *_ in meta_signatures:
+        if command:
+            terms.add(command.lower())
+        for alias in meta_aliases:
+            if alias:
+                terms.add(alias.lower())
+    return frozenset(term for term in terms if term)
+
+
+@lru_cache(maxsize=2048)
+def _cached_plugin_haystack(cache_key: tuple[Any, ...]) -> str:
+    name, module, description, usage, commands, aliases, meta_signatures = cache_key
+    command_meta_text = " ".join(
+        " ".join(
+            (
+                command,
+                " ".join(meta_aliases),
+                " ".join(params),
+                " ".join(examples),
+            )
+        ).strip()
+        for command, meta_aliases, params, examples, *_ in meta_signatures
+    )
+    return normalize_message_text(
+        (
+            f"{name} {module} {description} "
+            f"{' '.join(commands)} {' '.join(aliases)} {command_meta_text} {usage}"
+        )
+    ).lower()
+
+
+@lru_cache(maxsize=2048)
+def _cached_plugin_metadata(
+    cache_key: tuple[Any, ...],
+) -> MappingProxyType[str, bool]:
+    _, _, _, _, commands, _, meta_signatures = cache_key
+    commands_text = normalize_message_text(" ".join(commands)).lower()
+    has_helper = any(
+        keyword in commands_text
+        for keyword in ("帮助", "详情", "搜索", "用法", "参数", "说明", "列表")
+    )
+    target_capable = False
+    image_capable = False
+    self_only = False
+    for (
+        _command,
+        _aliases,
+        _params,
+        _examples,
+        image_min,
+        image_max,
+        allow_at_raw,
+        actor_scope,
+        target_requirement,
+        target_sources,
+    ) in meta_signatures:
+        normalized_sources = {
+            normalize_message_text(source).lower()
+            for source in target_sources
+            if normalize_message_text(source)
+        }
+        normalized_requirement = normalize_message_text(target_requirement).lower()
+        if normalized_requirement not in {"none", "optional", "required"}:
+            normalized_requirement = "none"
+        normalized_scope = normalize_message_text(actor_scope).lower()
+        allow_at = allow_at_raw is True or (
+            allow_at_raw is not False and "at" in normalized_sources
+        )
+        if normalized_scope == "self_only":
+            allow_at = False
+            normalized_requirement = "none"
+        if allow_at or bool(normalized_sources & {"at", "reply", "nickname"}):
+            target_capable = True
+        if normalized_scope == "self_only":
+            self_only = True
+        if int(image_min) > 0 or int(image_max) > 0:
+            image_capable = True
+    return MappingProxyType(
+        {
+            "has_helper": has_helper,
+            "target_capable": target_capable,
+            "image_capable": image_capable,
+            "self_only": self_only,
+        }
+    )
 
 
 @dataclass
@@ -74,83 +231,39 @@ def _module_tail(module: str) -> str:
     return normalized.rsplit(".", 1)[-1]
 
 
-def _plugin_text(plugin: PluginInfo) -> str:
-    joined_commands = " ".join(plugin.commands or [])
-    aliases = " ".join(plugin.aliases or [])
-    command_meta_text = " ".join(
-        " ".join(
-            [
-                meta.command,
-                " ".join(meta.aliases),
-                " ".join(meta.params),
-                " ".join(meta.examples),
-            ]
-        )
-        for meta in plugin.command_meta
-    )
-    usage = plugin.usage or ""
-    return (
-        f"{plugin.name} {plugin.module} {plugin.description} "
-        f"{joined_commands} {aliases} {command_meta_text} {usage}"
-    )
+def _plugin_terms(
+    plugin: PluginInfo,
+    *,
+    cache_key: tuple[Any, ...] | None = None,
+) -> frozenset[str]:
+    return _cached_plugin_terms(cache_key or _plugin_cache_key(plugin))
 
 
-def _plugin_terms(plugin: PluginInfo) -> set[str]:
-    terms = set(_tokenize(_plugin_text(plugin)))
-    terms.add(normalize_message_text(plugin.name).lower())
-    terms.add(_module_tail(plugin.module).lower())
-    for command in plugin.commands or []:
-        text = normalize_message_text(command).lower()
-        if text:
-            terms.add(text)
-    for alias in plugin.aliases or []:
-        text = normalize_message_text(alias).lower()
-        if text:
-            terms.add(text)
-    for meta in plugin.command_meta:
-        command = normalize_message_text(meta.command).lower()
-        if command:
-            terms.add(command)
-        for alias in meta.aliases or []:
-            text = normalize_message_text(alias).lower()
-            if text:
-                terms.add(text)
-    return {term for term in terms if term}
+def _plugin_metadata(
+    plugin: PluginInfo,
+    *,
+    cache_key: tuple[Any, ...] | None = None,
+) -> MappingProxyType[str, bool]:
+    return _cached_plugin_metadata(cache_key or _plugin_cache_key(plugin))
 
 
-def _plugin_metadata(plugin: PluginInfo) -> dict[str, bool]:
-    has_helper = any(
-        keyword in normalize_message_text(" ".join(plugin.commands or []))
-        for keyword in ("帮助", "详情", "搜索", "用法", "参数", "说明", "列表")
-    )
-    target_capable = False
-    image_capable = False
-    self_only = False
-    for meta in plugin.command_meta:
-        policy = resolve_command_target_policy(meta)
-        if policy.allow_at or bool(policy.target_sources & {"at", "reply", "nickname"}):
-            target_capable = True
-        if policy.actor_scope == "self_only":
-            self_only = True
-        image_min = int(getattr(meta, "image_min", 0) or 0)
-        image_max = int(getattr(meta, "image_max", 0) or 0)
-        if image_min > 0 or image_max > 0:
-            image_capable = True
-    return {
-        "has_helper": has_helper,
-        "target_capable": target_capable,
-        "image_capable": image_capable,
-        "self_only": self_only,
-    }
+def _plugin_haystack(
+    plugin: PluginInfo,
+    *,
+    cache_key: tuple[Any, ...] | None = None,
+) -> str:
+    return _cached_plugin_haystack(cache_key or _plugin_cache_key(plugin))
 
 
 def _satisfies_filters(
     plugin: PluginInfo,
     metadata_filters: dict[str, bool] | None,
+    *,
+    cache_key: tuple[Any, ...] | None = None,
 ) -> bool:
     if not metadata_filters:
         return True
-    metadata = _plugin_metadata(plugin)
+    metadata = _plugin_metadata(plugin, cache_key=cache_key)
     for key, expected in metadata_filters.items():
         if metadata.get(key) is not bool(expected):
             return False
@@ -202,11 +315,12 @@ def _build_candidate(
     query_tokens: set[str],
     required_tokens: set[str],
     has_execute_intent: bool,
+    plugin_cache_key: tuple[Any, ...] | None = None,
 ) -> _PluginCandidate | None:
     candidate = _PluginCandidate(plugin=plugin)
     normalized_query = normalize_message_text(query).lower()
-    haystack = normalize_message_text(_plugin_text(plugin)).lower()
-    terms = _plugin_terms(plugin)
+    haystack = _plugin_haystack(plugin, cache_key=plugin_cache_key)
+    terms = _plugin_terms(plugin, cache_key=plugin_cache_key)
 
     if required_tokens and not required_tokens.issubset(terms):
         return None
@@ -263,7 +377,11 @@ def rank_route_candidates(
         filtered_plugins = [
             plugin
             for plugin in plugins
-            if _satisfies_filters(plugin, metadata_filters)
+            if _satisfies_filters(
+                plugin,
+                metadata_filters,
+                cache_key=_plugin_cache_key(plugin),
+            )
         ]
         if not filtered_plugins:
             return []
@@ -295,7 +413,12 @@ def rank_route_candidates(
 
     score_map: dict[str, _PluginCandidate] = {}
     for plugin in plugins:
-        if not _satisfies_filters(plugin, metadata_filters):
+        cache_key = _plugin_cache_key(plugin)
+        if not _satisfies_filters(
+            plugin,
+            metadata_filters,
+            cache_key=cache_key,
+        ):
             continue
         candidate = _build_candidate(
             plugin=plugin,
@@ -303,6 +426,7 @@ def rank_route_candidates(
             query_tokens=query_tokens,
             required_tokens=required_tokens,
             has_execute_intent=has_execute_intent,
+            plugin_cache_key=cache_key,
         )
         if candidate is None:
             continue

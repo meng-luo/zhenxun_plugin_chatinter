@@ -212,11 +212,13 @@ async def _execute_concurrent_batch_fail_fast(
             invoker.execute_tool_call(batch_calls[0], available_tools, context),
             timeout=max(timeout, 0.2),
         )
+        resolved_call = result_pair[0]
+        tool_result = result_pair[1]
         message = _tool_result_to_message(
-            tool_call=batch_calls[0],
-            tool_result=result_pair[1],
+            tool_call=resolved_call,
+            tool_result=tool_result,
         )
-        failed = _is_tool_result_failed(result_pair[1].output)
+        failed = _is_tool_result_failed(tool_result.output)
         return [message], failed
 
     tasks: dict[asyncio.Task, tuple[int, LLMToolCall]] = {}
