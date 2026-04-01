@@ -46,11 +46,16 @@ _LLM_ROUTE_INSTRUCTION = """
 必须严格遵守：
 1. 只能从 skills_json 中选择 plugin_module 与命令头。
 2. command 必须是一条可直接发送给插件的命令字符串。
-3. 用户是执行诉求时优先 action_commands；
-   仅在“怎么用/详情/帮助/参数”语义下才选 helper_commands。
-4. 若 schema.text_max 为 0，不要附带额外文本参数；仅保留 [@...] 或 [image] 占位符。
-5. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
-6. 如果无法确定，返回 action=skip。
+3. 用户是执行诉求时优先 action_commands。
+4. 当用户是在问“怎么用/用法/帮助/参数/说明”时：
+   优先选择通用帮助命令“帮助 <插件名或命令词>”或“功能 <插件名或命令词>”
+   （推荐口径等价于“真寻帮助<插件名>”）；
+   并尽量从用户问题里抽取目标插件名或命令词作为参数，例如“识图怎么用”=>“帮助 识图”；
+   除非用户明确点名某个 helper 命令，否则不要把“怎么用/帮助”问题路由到
+   业务 helper_commands（如“表情详情”）。
+5. 若 schema.text_max 为 0，不要附带额外文本参数；仅保留 [@...] 或 [image] 占位符。
+6. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
+7. 如果无法确定，返回 action=skip。
 """.strip()
 _LLM_ROUTE_RELAXED_SUFFIX = """
 请仅输出一个 JSON 对象，不要输出额外解释。
@@ -286,8 +291,6 @@ def _resolve_vector_retrieve_options(
     has_action_intent = contains_any(normalized, ROUTE_ACTION_WORDS)
 
     metadata_filters: dict[str, bool] = {}
-    if helper_mode:
-        metadata_filters["has_helper"] = True
     if has_at:
         metadata_filters["target_capable"] = True
     if has_image:
@@ -308,6 +311,16 @@ def _resolve_vector_retrieve_options(
         "metadata_filters": metadata_filters or None,
         "rerank": True,
     }
+
+
+def _find_global_help_plugin(
+    knowledge_base: PluginKnowledgeBase,
+) -> PluginInfo | None:
+    for plugin in knowledge_base.plugins:
+        heads = _collect_allowed_heads(plugin)
+        if "功能" in heads or "帮助" in heads or "help" in heads:
+            return plugin
+    return None
 
 
 def _resolve_command_schema(plugin: PluginInfo, command_head: str):
@@ -799,6 +812,17 @@ async def resolve_llm_route(
             for plugin in knowledge_base.plugins
             if normalize_message_text(plugin.module) in preferred_set
         ]
+
+    if helper_mode:
+        help_plugin = _find_global_help_plugin(knowledge_base)
+        if help_plugin:
+            ranked_candidates = [
+                plugin
+                for plugin in ranked_candidates
+                if plugin.module != help_plugin.module
+            ]
+            ranked_candidates.insert(0, help_plugin)
+
     if not ranked_candidates:
         logger.debug("ChatInter 路由候选检索未命中，跳过插件路由")
         return None, False
