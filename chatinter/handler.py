@@ -212,6 +212,22 @@ _TECHNICAL_REQUEST_HINT_WORDS = (
     "push",
 )
 _NON_SELF_TARGET_PATTERN = re.compile(r"(?:给|帮|替|让|叫|喊|请)(?!我|自己|本人)")
+_FEEDBACK_REASON_ROUTE_SUCCESS = "route_success"
+_FEEDBACK_REASON_MISSING_PARAMS = "missing_params"
+_FEEDBACK_REASON_TARGET_REQUIRED = "target_required"
+_FEEDBACK_REASON_SELF_ONLY_BLOCKED = "self_only_blocked"
+_FEEDBACK_REASON_REROUTE_FAILED = "reroute_failed"
+_FEEDBACK_REASON_FUZZY_CLARIFY = "fuzzy_target_clarify"
+_FEEDBACK_REASON_DIRECT_TARGET_REQUIRED = "direct_target_required"
+_ROUTE_FEEDBACK_REWARD = {
+    _FEEDBACK_REASON_ROUTE_SUCCESS: 1.0,
+    _FEEDBACK_REASON_MISSING_PARAMS: -0.35,
+    _FEEDBACK_REASON_TARGET_REQUIRED: -0.40,
+    _FEEDBACK_REASON_SELF_ONLY_BLOCKED: -0.55,
+    _FEEDBACK_REASON_REROUTE_FAILED: -0.45,
+    _FEEDBACK_REASON_FUZZY_CLARIFY: -0.20,
+    _FEEDBACK_REASON_DIRECT_TARGET_REQUIRED: -0.30,
+}
 _GROUP_MEMBER_PROFILE_CACHE_TTL = 90.0
 _GROUP_MEMBER_PROFILE_CACHE: dict[
     str, tuple[float, list[dict[str, str | tuple[str, ...]]]]
@@ -248,6 +264,10 @@ class RouteExecutionPlan:
     need_followup: bool = False
     followup_message: str | None = None
     wait_for_image: bool = False
+    feedback_reason: str | None = None
+    image_missing: int = 0
+    text_missing: int = 0
+    allow_at: bool | None = None
 
 
 class ChannelName(str, Enum):
@@ -1302,12 +1322,17 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
     head = _normalize_head(decision.command)
     if not head:
         return None
-    for plugin in knowledge_plugins:
-        if (
-            plugin.module != decision.plugin_module
-            and plugin.name != decision.plugin_name
-        ):
-            continue
+    exact_module_plugins = [
+        plugin
+        for plugin in knowledge_plugins
+        if plugin.module == decision.plugin_module
+    ]
+    candidate_plugins = exact_module_plugins or [
+        plugin
+        for plugin in knowledge_plugins
+        if plugin.name == decision.plugin_name
+    ]
+    for plugin in candidate_plugins:
         for meta in plugin.command_meta:
             command_head = normalize_message_text(getattr(meta, "command", ""))
             if not command_head:
@@ -1315,6 +1340,49 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
             if head == command_head or head in _iter_meta_aliases(meta):
                 return meta
     return None
+
+
+def _is_route_command_executable(
+    route_result: RouteResolveResult,
+    knowledge_plugins,
+) -> bool:
+    decision = route_result.decision
+    head = _normalize_head(decision.command)
+    if not head:
+        return False
+    head_fold = head.casefold()
+
+    exact_module_plugins = [
+        plugin
+        for plugin in knowledge_plugins
+        if plugin.module == decision.plugin_module
+    ]
+    candidate_plugins = exact_module_plugins or [
+        plugin
+        for plugin in knowledge_plugins
+        if plugin.name == decision.plugin_name
+    ]
+    if not candidate_plugins:
+        return False
+
+    for plugin in candidate_plugins:
+        allowed_heads: set[str] = set()
+        for meta in getattr(plugin, "command_meta", None) or []:
+            command_head = normalize_message_text(getattr(meta, "command", ""))
+            if command_head:
+                allowed_heads.add(command_head.casefold())
+            for alias in getattr(meta, "aliases", None) or []:
+                alias_head = normalize_message_text(str(alias or ""))
+                if alias_head:
+                    allowed_heads.add(alias_head.casefold())
+        if not allowed_heads:
+            for command in getattr(plugin, "commands", None) or []:
+                command_head = _normalize_head(str(command or ""))
+                if command_head:
+                    allowed_heads.add(command_head.casefold())
+        if head_fold in allowed_heads:
+            return True
+    return False
 
 
 def _is_schema_self_only(schema) -> bool:
@@ -1683,6 +1751,105 @@ def _extract_text_token_count(command_text: str) -> int:
     return len([token for token in payload.split(" ") if token])
 
 
+def _resolve_feedback_reward(reason: str) -> float:
+    return float(_ROUTE_FEEDBACK_REWARD.get(reason, 0.0))
+
+
+def _build_route_slot_feedback(
+    *,
+    reason: str,
+    route_message: str,
+    route_command: str,
+    image_missing: int = 0,
+    text_missing: int = 0,
+    allow_at: bool | None = None,
+) -> dict[str, float]:
+    slot_scores: dict[str, float] = {}
+    has_command_head = bool(_normalize_head(route_command))
+    has_target_signal = bool(_extract_at_tokens(route_message))
+    has_image_signal = bool(_extract_image_tokens(route_message))
+    has_text_signal = _extract_text_token_count(route_command) > 0
+
+    if has_command_head:
+        slot_scores["command_head"] = (
+            1.0 if reason == _FEEDBACK_REASON_ROUTE_SUCCESS else -0.6
+        )
+
+    if reason == _FEEDBACK_REASON_ROUTE_SUCCESS:
+        if has_target_signal:
+            slot_scores["target"] = 0.35
+        if has_image_signal:
+            slot_scores["image"] = 0.35
+        if has_text_signal:
+            slot_scores["text"] = 0.25
+        return slot_scores
+
+    if reason == _FEEDBACK_REASON_SELF_ONLY_BLOCKED:
+        slot_scores["target"] = -0.95
+        return slot_scores
+
+    if reason in {
+        _FEEDBACK_REASON_TARGET_REQUIRED,
+        _FEEDBACK_REASON_DIRECT_TARGET_REQUIRED,
+        _FEEDBACK_REASON_FUZZY_CLARIFY,
+    }:
+        slot_scores["target"] = -0.65
+        return slot_scores
+
+    if reason == _FEEDBACK_REASON_MISSING_PARAMS:
+        if image_missing > 0:
+            slot_scores["image"] = -0.90
+        if text_missing > 0:
+            slot_scores["text"] = -0.75
+        if allow_at and not has_target_signal:
+            slot_scores["target"] = -0.55
+        return slot_scores
+
+    if reason == _FEEDBACK_REASON_REROUTE_FAILED:
+        slot_scores["command_head"] = -0.85
+        return slot_scores
+
+    return slot_scores
+
+
+async def _record_route_feedback(
+    *,
+    session_id: str | None,
+    modules: set[str] | list[str],
+    reason: str,
+    route_message: str,
+    route_command: str,
+    image_missing: int = 0,
+    text_missing: int = 0,
+    allow_at: bool | None = None,
+) -> None:
+    normalized_modules = {
+        normalize_message_text(str(module or ""))
+        for module in modules
+        if normalize_message_text(str(module or ""))
+    }
+    if not session_id or not normalized_modules:
+        return
+    slot_feedback = _build_route_slot_feedback(
+        reason=reason,
+        route_message=route_message,
+        route_command=route_command,
+        image_missing=image_missing,
+        text_missing=text_missing,
+        allow_at=allow_at,
+    )
+    try:
+        await PluginRAGService.update_session_feedback(
+            session_id=session_id,
+            modules=normalized_modules,
+            reward=_resolve_feedback_reward(reason),
+            reason=reason,
+            slot_feedback=slot_feedback or None,
+        )
+    except Exception as exc:
+        logger.debug(f"更新 ChatInter 路由反馈失败: {exc}")
+
+
 def _contains_self_reference(message_text: str) -> bool:
     normalized = normalize_message_text(
         normalize_action_phrases(strip_invoke_prefix(message_text or ""))
@@ -1868,6 +2035,9 @@ def _prepare_route_execution_plan(
         for token in _extract_at_tokens(current_message):
             if token not in merged_at:
                 merged_at.append(token)
+        if target_requirement == "none" and merged_at:
+            command = _remove_tokens_from_command(command, merged_at)
+            merged_at = []
     merged_images = command_images[:]
     for token in message_images:
         if token not in merged_images:
@@ -1888,6 +2058,8 @@ def _prepare_route_execution_plan(
                 need_followup=True,
                 followup_message=_build_target_required_message(schema),
                 wait_for_image=False,
+                feedback_reason=_FEEDBACK_REASON_TARGET_REQUIRED,
+                allow_at=allow_at,
             )
 
     if allow_at:
@@ -1908,6 +2080,10 @@ def _prepare_route_execution_plan(
                 allow_at=allow_at,
             ),
             wait_for_image=image_missing > 0,
+            feedback_reason=_FEEDBACK_REASON_MISSING_PARAMS,
+            image_missing=image_missing,
+            text_missing=text_missing,
+            allow_at=allow_at,
         )
 
     if allow_at and merged_at:
@@ -1973,6 +2149,16 @@ async def _execute_route_decision(
             set_pending_image_followup(user_id, group_id, current_message)
         await MessageUtils.build_message(envelope.final).send()
         trace.stage("notify")
+        await _record_route_feedback(
+            session_id=session_id,
+            modules=target_modules,
+            reason=execution_plan.feedback_reason or _FEEDBACK_REASON_MISSING_PARAMS,
+            route_message=current_message,
+            route_command=execution_plan.command or decision.command,
+            image_missing=execution_plan.image_missing,
+            text_missing=execution_plan.text_missing,
+            allow_at=execution_plan.allow_at,
+        )
         trace.finish()
         return True
 
@@ -2014,16 +2200,23 @@ async def _execute_route_decision(
         extra_image_segments=extra_image_segments,
     )
     if success:
-        try:
-            await PluginRAGService.update_session_feedback(
-                session_id=session_id,
-                modules=target_modules,
-                reward=1.0,
-            )
-        except Exception as exc:
-            logger.debug(f"更新 ChatInter 路由会话偏好失败: {exc}")
+        await _record_route_feedback(
+            session_id=session_id,
+            modules=target_modules,
+            reason=_FEEDBACK_REASON_ROUTE_SUCCESS,
+            route_message=current_message,
+            route_command=route_command,
+        )
         trace.stage("route")
         trace.finish()
+    else:
+        await _record_route_feedback(
+            session_id=session_id,
+            modules=target_modules,
+            reason=_FEEDBACK_REASON_REROUTE_FAILED,
+            route_message=current_message,
+            route_command=route_command,
+        )
     return success
 
 
@@ -2141,6 +2334,29 @@ async def handle_fallback(
         else:
             # 无法解析为 UniMessage 时，使用原始消息文本
             current_message = raw_message.strip()
+
+        before_intent_payload = LifecyclePayload(
+            user_id=user_id,
+            group_id=group_id,
+            message_text=current_message,
+            system_prompt=chat_system_prompt,
+            context_xml=context_xml,
+            model_name=model_name,
+            metadata={"phase": "intent_routing"},
+        )
+        await lifecycle.dispatch("before_intent", before_intent_payload)
+        chat_system_prompt = before_intent_payload.system_prompt
+        context_xml = before_intent_payload.context_xml
+        budget_report = before_intent_payload.metadata.get("budget_report")
+        if isinstance(budget_report, dict):
+            logger.debug(
+                "ChatInter intent budget: "
+                f"before={budget_report.get('before_tokens')} "
+                f"after={budget_report.get('after_tokens')} "
+                f"budget={budget_report.get('budget')} "
+                f"ratio={budget_report.get('ratio')}"
+            )
+        trace.stage("intent_budget")
 
         mention_profiles = await _build_mention_profiles(
             str(group_id) if group_id else None,
@@ -2273,6 +2489,15 @@ async def handle_fallback(
             include_semantic=True,
         )
         if route_result is not None:
+            if not _is_route_command_executable(route_result, knowledge_base.plugins):
+                logger.debug(
+                    "ChatInter 路由结果命令不可执行，降级为对话："
+                    f"stage={route_result.stage}, "
+                    f"module={route_result.decision.plugin_module}, "
+                    f"command={route_result.decision.command}"
+                )
+                route_result = None
+        if route_result is not None:
             route_schema = _find_route_command_schema(route_result, knowledge_base.plugins)
             block_self_only = False
             if route_schema is not None:
@@ -2295,6 +2520,7 @@ async def handle_fallback(
                         or _contains_third_person_reference(current_message)
                     )
             if block_self_only:
+                target_modules = _build_target_modules(route_result, knowledge_base.plugins)
                 envelope = TurnChannelEnvelope()
                 envelope.add(ChannelName.ANALYSIS, "blocked self-only action for others")
                 envelope.add(
@@ -2313,6 +2539,13 @@ async def handle_fallback(
                 trace.stage("persist")
                 await MessageUtils.build_message(envelope.final).send()
                 trace.stage("send")
+                await _record_route_feedback(
+                    session_id=session_key,
+                    modules=target_modules,
+                    reason=_FEEDBACK_REASON_SELF_ONLY_BLOCKED,
+                    route_message=route_message,
+                    route_command=route_result.decision.command,
+                )
                 trace.finish()
                 return
         if route_result is not None and await _execute_route_decision(
@@ -2369,6 +2602,16 @@ async def handle_fallback(
             metadata={"phase": "chat_fallback"},
         )
         await lifecycle.dispatch("before_agent", before_chat_payload)
+        budget_report = before_chat_payload.metadata.get("budget_report")
+        if isinstance(budget_report, dict):
+            logger.debug(
+                "ChatInter agent budget: "
+                f"before={budget_report.get('before_tokens')} "
+                f"after={budget_report.get('after_tokens')} "
+                f"budget={budget_report.get('budget')} "
+                f"ratio={budget_report.get('ratio')}"
+            )
+        trace.stage("agent_budget")
         intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
         agent_enabled = bool(get_config_value("ENABLE_AGENT_MODE", True))
         reply: str | UniMessage | None = None

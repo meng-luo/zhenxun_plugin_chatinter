@@ -737,6 +737,12 @@ class PluginRegistry:
                 commands = matcher_commands
             matcher_meta = cls._build_command_meta_from_commands(commands)
             command_meta = cls._merge_command_meta_groups(command_meta, matcher_meta)
+            if matcher_commands:
+                commands, command_meta = cls._filter_to_matcher_executable(
+                    commands=commands,
+                    command_meta=command_meta,
+                    matcher_commands=matcher_commands,
+                )
         if not commands:
             return None
 
@@ -964,17 +970,116 @@ class PluginRegistry:
                     command_text = regex_head
                 else:
                     continue
-            normalized = cls._normalize_command(command_text)
-            if not normalized:
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            commands.append(normalized)
+            candidates = [command_text]
+            aliases = getattr(alconna_cmd, "aliases", None)
+            if isinstance(aliases, (set, list, tuple, frozenset)):
+                candidates.extend(str(alias).strip() for alias in aliases if str(alias).strip())
+            for candidate in candidates:
+                normalized = cls._normalize_command(candidate)
+                if not normalized:
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                commands.append(normalized)
         commands.sort(key=lambda cmd: (len(cmd), cmd))
         if len(commands) > cls._max_matcher_commands:
             commands = commands[: cls._max_matcher_commands]
         return commands
+
+    @classmethod
+    def _build_matcher_command_lookup(
+        cls,
+        matcher_commands: list[str],
+    ) -> set[str]:
+        lookup: set[str] = set()
+        for raw in matcher_commands:
+            normalized = cls._normalize_command(raw)
+            if not normalized:
+                continue
+            lookup.add(normalized.casefold())
+            lookup.add(normalized.split(" ", 1)[0].casefold())
+        return lookup
+
+    @classmethod
+    def _command_matches_matcher_lookup(
+        cls,
+        command_text: str,
+        matcher_lookup: set[str],
+    ) -> bool:
+        normalized = cls._normalize_command(command_text)
+        if not normalized:
+            return False
+        folded = normalized.casefold()
+        if folded in matcher_lookup:
+            return True
+        return normalized.split(" ", 1)[0].casefold() in matcher_lookup
+
+    @classmethod
+    def _filter_to_matcher_executable(
+        cls,
+        *,
+        commands: list[str],
+        command_meta: list[PluginInfo.PluginCommandMeta],
+        matcher_commands: list[str],
+    ) -> tuple[list[str], list[PluginInfo.PluginCommandMeta]]:
+        if not matcher_commands:
+            return commands, command_meta
+
+        matcher_lookup = cls._build_matcher_command_lookup(matcher_commands)
+        filtered_commands = [
+            command
+            for command in commands
+            if cls._command_matches_matcher_lookup(command, matcher_lookup)
+        ]
+
+        filtered_meta: list[PluginInfo.PluginCommandMeta] = []
+        for meta in command_meta:
+            payload = cls._meta_to_dict(meta)
+            command_text = str(payload.get("command") or "").strip()
+            matched_command = cls._command_matches_matcher_lookup(
+                command_text, matcher_lookup
+            )
+
+            original_aliases = payload.get("aliases", [])
+            matched_aliases = [
+                alias
+                for alias in original_aliases
+                if cls._command_matches_matcher_lookup(alias, matcher_lookup)
+            ]
+
+            if not matched_command and not matched_aliases:
+                continue
+
+            if not matched_command and matched_aliases:
+                payload["command"] = matched_aliases[0]
+                matched_aliases = matched_aliases[1:]
+            normalized_command = cls._normalize_command(str(payload.get("command", "")))
+            payload["aliases"] = [
+                alias
+                for alias in matched_aliases
+                if cls._normalize_command(alias).casefold()
+                != normalized_command.casefold()
+            ]
+            filtered_meta.append(cls._with_command_meta_defaults(**payload))
+
+        filtered_commands = cls._merge_unique_strings(filtered_commands, matcher_commands)
+
+        if not filtered_meta:
+            filtered_meta = cls._build_command_meta_from_commands(filtered_commands)
+        else:
+            filtered_meta = cls._merge_command_meta_groups(
+                filtered_meta,
+                cls._build_command_meta_from_commands(filtered_commands),
+            )
+
+        filtered_commands = cls._extract_commands(
+            PluginExtraData(),
+            filtered_meta,
+        )
+        if not filtered_commands:
+            filtered_commands = matcher_commands[:]
+        return filtered_commands, filtered_meta
 
     @classmethod
     def _normalize_command(cls, command: str) -> str:

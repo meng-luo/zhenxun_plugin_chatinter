@@ -10,6 +10,7 @@ from zhenxun.services import chat, generate_structured, logger
 from .config import get_config_value
 from .knowledge_rag import PluginRAGService
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .retrieval import rank_route_candidates
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
@@ -17,7 +18,7 @@ from .route_text import (
     is_usage_question,
     normalize_message_text,
 )
-from .schema_policy import schema_allows_at
+from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
@@ -31,6 +32,15 @@ _ROUTE_VECTOR_TOP_K = 10
 _ROUTE_VECTOR_FETCH_K = 24
 _ROUTE_VECTOR_MAX_K = 20
 _ROUTE_VECTOR_INCREMENT = 4
+_ROUTE_MIN_NAMESPACE_LIMIT = 6
+_ROUTE_CANDIDATE_INITIAL_LIMIT = 10
+_ROUTE_CANDIDATE_MAX_LIMIT = 20
+_ROUTE_CANDIDATE_EXPAND_STEP = 4
+_ROUTE_CANDIDATE_MIN_SCORE = 0.35
+_ROUTE_PROMPT_TOKEN_PATTERN = re.compile(
+    r"[a-z0-9_]+|[\u4e00-\u9fff]",
+    re.IGNORECASE,
+)
 _LLM_ROUTE_INSTRUCTION = """
 你是 ChatInter 的技能路由器，只负责在给定技能命名空间内选择可执行命令。
 必须严格遵守：
@@ -214,11 +224,11 @@ def _resolve_target_plugin(
 
 def _collect_allowed_heads(plugin: PluginInfo) -> set[str]:
     allowed: set[str] = set()
-    for command in plugin.commands:
-        normalized = normalize_message_text(command)
-        if normalized:
-            allowed.add(normalized.casefold())
-    for meta in plugin.command_meta:
+    if plugin.command_meta:
+        metas = plugin.command_meta
+    else:
+        metas = []
+    for meta in metas:
         command_head = normalize_message_text(getattr(meta, "command", ""))
         if command_head:
             allowed.add(command_head.casefold())
@@ -226,6 +236,11 @@ def _collect_allowed_heads(plugin: PluginInfo) -> set[str]:
             alias_text = normalize_message_text(alias)
             if alias_text:
                 allowed.add(alias_text.casefold())
+    if not allowed:
+        for command in plugin.commands:
+            normalized = normalize_message_text(command)
+            if normalized:
+                allowed.add(normalized.casefold())
     return allowed
 
 
@@ -310,7 +325,24 @@ def _resolve_command_schema(plugin: PluginInfo, command_head: str):
     return None
 
 
-def _normalize_placeholder_tokens(command: str) -> tuple[list[str], list[str]]:
+def _collect_placeholder_tokens(command: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in collect_placeholders(command):
+        normalized = normalize_message_text(token)
+        if not normalized:
+            continue
+        if _AT_INLINE_PATTERN.fullmatch(normalized):
+            normalized = f"[{normalized}]"
+        tokens.add(normalized)
+    return tokens
+
+
+def _normalize_placeholder_tokens(
+    command: str,
+    *,
+    include_at: bool = True,
+    include_image: bool = True,
+) -> tuple[list[str], list[str]]:
     at_tokens: list[str] = []
     image_tokens: list[str] = []
     for token in collect_placeholders(command):
@@ -319,14 +351,14 @@ def _normalize_placeholder_tokens(command: str) -> tuple[list[str], list[str]]:
             continue
         if _AT_INLINE_PATTERN.fullmatch(normalized):
             normalized = f"[{normalized}]"
-        if _AT_PLACEHOLDER_PATTERN.fullmatch(normalized):
+        if include_at and _AT_PLACEHOLDER_PATTERN.fullmatch(normalized):
             if normalized not in at_tokens:
                 at_tokens.append(normalized)
             continue
         is_image_token = _IMAGE_PLACEHOLDER_PATTERN.fullmatch(normalized) or (
             normalized.lower().startswith("[image")
         )
-        if is_image_token:
+        if include_image and is_image_token:
             if normalized not in image_tokens:
                 image_tokens.append(normalized)
     return at_tokens, image_tokens
@@ -348,23 +380,30 @@ def _sanitize_command_with_schema(
     if schema is None:
         return normalized
 
-    at_tokens, image_tokens = _normalize_placeholder_tokens(normalized)
+    policy = resolve_command_target_policy(schema)
+    image_max_raw = getattr(schema, "image_max", None)
+    image_max: int | None = None
+    if image_max_raw is not None:
+        image_max = max(int(image_max_raw), 0)
+    accepts_at_target = policy.allow_at and policy.target_requirement != "none"
+    include_image = image_max is None or image_max > 0
+    placeholder_tokens = _collect_placeholder_tokens(normalized)
+    at_tokens, image_tokens = _normalize_placeholder_tokens(
+        normalized,
+        include_at=accepts_at_target,
+        include_image=include_image,
+    )
+
     text_tokens: list[str] = []
     for token in parts[1:]:
         token_text = normalize_message_text(token)
         if not token_text:
             continue
-        if token_text in at_tokens or token_text in image_tokens:
+        if token_text in placeholder_tokens:
             continue
         text_tokens.append(token_text)
 
-    allow_at = schema_allows_at(schema)
-    if not allow_at:
-        at_tokens = []
-
-    image_max = getattr(schema, "image_max", None)
     if image_max is not None:
-        image_max = max(int(image_max), 0)
         image_tokens = image_tokens[:image_max]
 
     text_max = getattr(schema, "text_max", None)
@@ -468,6 +507,71 @@ def _build_route_prompt(
     )
 
 
+def _estimate_route_prompt_tokens(text: str) -> int:
+    source = str(text or "")
+    if not source:
+        return 0
+    token_hits = len(_ROUTE_PROMPT_TOKEN_PATTERN.findall(source))
+    return max(1, int(token_hits * 0.9))
+
+
+def _fit_route_prompt_budget(
+    *,
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    preferred_modules: list[str],
+    vector_context: str,
+    include_helpers: bool,
+    namespace_limit: int,
+    token_budget: int,
+) -> tuple[str, int, str]:
+    resolved_budget = max(int(token_budget or 0), 800)
+    current_limit = max(
+        int(namespace_limit or _ROUTE_NAMESPACE_LIMIT),
+        _ROUTE_MIN_NAMESPACE_LIMIT,
+    )
+    context_text = vector_context
+
+    prompt = _build_route_prompt(
+        message_text,
+        knowledge_base,
+        preferred_modules=preferred_modules,
+        vector_context=context_text,
+        include_helpers=include_helpers,
+        namespace_limit=current_limit,
+    )
+    while (
+        _estimate_route_prompt_tokens(prompt) > resolved_budget
+        and current_limit > _ROUTE_MIN_NAMESPACE_LIMIT
+    ):
+        current_limit = max(current_limit - 2, _ROUTE_MIN_NAMESPACE_LIMIT)
+        prompt = _build_route_prompt(
+            message_text,
+            knowledge_base,
+            preferred_modules=preferred_modules,
+            vector_context=context_text,
+            include_helpers=include_helpers,
+            namespace_limit=current_limit,
+        )
+
+    if _estimate_route_prompt_tokens(prompt) > resolved_budget and context_text:
+        context_text = ""
+        prompt = _build_route_prompt(
+            message_text,
+            knowledge_base,
+            preferred_modules=preferred_modules,
+            vector_context=context_text,
+            include_helpers=include_helpers,
+            namespace_limit=current_limit,
+        )
+
+    if _estimate_route_prompt_tokens(prompt) > resolved_budget:
+        clipped = max(int(len(prompt) * 0.75), 600)
+        prompt = f"{prompt[:clipped].rstrip()}\n\n[truncated]"
+
+    return prompt, current_limit, context_text
+
+
 def _build_vector_context_from_candidates(candidates: list[PluginInfo]) -> str:
     if not candidates:
         return ""
@@ -497,7 +601,85 @@ def _is_schema_parameter_error(exc: Exception) -> bool:
             "responsejsonschema",
             "additionalproperties",
         )
+        )
+
+
+def _slice_knowledge_base(
+    knowledge_base: PluginKnowledgeBase,
+    plugins: list[PluginInfo],
+) -> PluginKnowledgeBase:
+    return PluginKnowledgeBase(
+        plugins=plugins,
+        user_role=knowledge_base.user_role,
     )
+
+
+def _build_candidate_attempt_sizes(
+    *,
+    candidate_count: int,
+    initial_limit: int,
+    max_limit: int,
+    expand_step: int,
+    deferred_enabled: bool,
+) -> list[int]:
+    if candidate_count <= 0:
+        return []
+    first = min(max(initial_limit, _ROUTE_MIN_NAMESPACE_LIMIT), candidate_count)
+    sizes = [first]
+    if deferred_enabled:
+        ceiling = min(max(max_limit, first), candidate_count)
+        current = first
+        while current < ceiling:
+            current = min(current + max(expand_step, 1), ceiling)
+            if current not in sizes:
+                sizes.append(current)
+    if sizes[-1] < candidate_count:
+        sizes.append(candidate_count)
+    return sizes
+
+
+async def _request_llm_route_decision(
+    *,
+    prompt: str,
+    timeout_value: float | None,
+) -> tuple[_LLMRouteDecision | None, bool]:
+    try:
+        decision = await generate_structured(
+            prompt,
+            _LLMRouteDecision,
+            model=get_config_value("INTENT_MODEL", None),
+            instruction=_LLM_ROUTE_INSTRUCTION,
+            timeout=timeout_value,
+        )
+        return decision, False
+    except Exception as exc:
+        if _is_schema_parameter_error(exc):
+            logger.debug(
+                f"ChatInter LLM 严格路由参数错误，跳过宽松解析并回退规则路由: {exc}"
+            )
+            return None, True
+        logger.debug(f"ChatInter LLM 严格路由失败，尝试宽松解析: {exc}")
+        try:
+            relaxed_instruction = (
+                f"{_LLM_ROUTE_INSTRUCTION}\n\n{_LLM_ROUTE_RELAXED_SUFFIX}"
+            )
+            relaxed_response = await chat(
+                prompt,
+                model=get_config_value("INTENT_MODEL", None),
+                instruction=relaxed_instruction,
+                timeout=timeout_value,
+            )
+            decision = _parse_llm_route_decision_loose(
+                relaxed_response.text if relaxed_response else ""
+            )
+            if decision is None:
+                logger.debug("ChatInter LLM 宽松路由解析失败")
+            else:
+                logger.debug("ChatInter LLM 宽松路由解析成功")
+            return decision, False
+        except Exception as relaxed_exc:
+            logger.debug(f"ChatInter LLM 宽松路由失败: {relaxed_exc}")
+            return None, False
 
 
 async def resolve_llm_route(
@@ -523,9 +705,56 @@ async def resolve_llm_route(
         normalized_message,
         helper_mode=helper_mode,
     )
+    route_prompt_budget = int(
+        get_config_value("ROUTE_PROMPT_TOKEN_BUDGET", 2600) or 2600
+    )
+    deferred_namespace_enabled = bool(
+        get_config_value("ROUTE_DEFERRED_NAMESPACE_ENABLED", True)
+    )
+    initial_candidate_limit = max(
+        int(
+            get_config_value(
+                "ROUTE_CANDIDATE_INITIAL_LIMIT",
+                _ROUTE_CANDIDATE_INITIAL_LIMIT,
+            )
+            or _ROUTE_CANDIDATE_INITIAL_LIMIT
+        ),
+        _ROUTE_MIN_NAMESPACE_LIMIT,
+    )
+    max_candidate_limit = max(
+        int(
+            get_config_value(
+                "ROUTE_CANDIDATE_MAX_LIMIT",
+                _ROUTE_CANDIDATE_MAX_LIMIT,
+            )
+            or _ROUTE_CANDIDATE_MAX_LIMIT
+        ),
+        initial_candidate_limit,
+    )
+    candidate_expand_step = max(
+        int(
+            get_config_value(
+                "ROUTE_CANDIDATE_EXPAND_STEP",
+                _ROUTE_CANDIDATE_EXPAND_STEP,
+            )
+            or _ROUTE_CANDIDATE_EXPAND_STEP
+        ),
+        1,
+    )
+    candidate_min_score = max(
+        float(
+            get_config_value(
+                "ROUTE_CANDIDATE_MIN_SCORE",
+                _ROUTE_CANDIDATE_MIN_SCORE,
+            )
+            or _ROUTE_CANDIDATE_MIN_SCORE
+        ),
+        0.0,
+    )
 
     preferred_modules: list[str] = []
     vector_context = ""
+    ranked_candidates: list[PluginInfo] = []
     try:
         vector_candidates = await PluginRAGService.retrieve(
             query=normalized_message,
@@ -549,68 +778,94 @@ async def resolve_llm_route(
     except Exception as exc:
         logger.debug(f"ChatInter 路由向量召回失败，降级为词法命名空间: {exc}")
 
-    prompt = _build_route_prompt(
-        normalized_message,
+    metadata_filters = vector_options.get("metadata_filters")
+    if not isinstance(metadata_filters, dict):
+        metadata_filters = None
+    ranked_candidates = rank_route_candidates(
         knowledge_base,
+        normalized_message,
         preferred_modules=preferred_modules,
-        vector_context=vector_context,
-        include_helpers=helper_mode,
-        namespace_limit=namespace_limit,
+        metadata_filters=metadata_filters,
+        min_score=candidate_min_score,
     )
-    decision: _LLMRouteDecision | None = None
-    try:
-        decision = await generate_structured(
-            prompt,
-            _LLMRouteDecision,
-            model=get_config_value("INTENT_MODEL", None),
-            instruction=_LLM_ROUTE_INSTRUCTION,
-            timeout=timeout_value,
-        )
-    except Exception as exc:
-        if _is_schema_parameter_error(exc):
-            logger.debug(
-                f"ChatInter LLM 严格路由参数错误，跳过宽松解析并回退规则路由: {exc}"
-            )
-            return None, True
-        logger.debug(f"ChatInter LLM 严格路由失败，尝试宽松解析: {exc}")
-        try:
-            relaxed_instruction = (
-                f"{_LLM_ROUTE_INSTRUCTION}\n\n{_LLM_ROUTE_RELAXED_SUFFIX}"
-            )
-            relaxed_response = await chat(
-                prompt,
-                model=get_config_value("INTENT_MODEL", None),
-                instruction=relaxed_instruction,
-                timeout=timeout_value,
-            )
-            decision = _parse_llm_route_decision_loose(
-                relaxed_response.text if relaxed_response else ""
-            )
-            if decision is None:
-                logger.debug("ChatInter LLM 宽松路由解析失败，回退规则路由")
-                return None, True
-            logger.debug("ChatInter LLM 宽松路由解析成功")
-        except Exception as relaxed_exc:
-            logger.debug(f"ChatInter LLM 宽松路由失败，回退规则路由: {relaxed_exc}")
-            return None, True
+    if not ranked_candidates and preferred_modules:
+        preferred_set = {
+            normalize_message_text(module)
+            for module in preferred_modules
+            if normalize_message_text(module)
+        }
+        ranked_candidates = [
+            plugin
+            for plugin in knowledge_base.plugins
+            if normalize_message_text(plugin.module) in preferred_set
+        ]
+    if not ranked_candidates:
+        logger.debug("ChatInter 路由候选检索未命中，跳过插件路由")
+        return None, False
 
-    if decision is None:
+    candidate_ceiling = min(max_candidate_limit, len(ranked_candidates))
+    attempt_sizes = _build_candidate_attempt_sizes(
+        candidate_count=candidate_ceiling,
+        initial_limit=initial_candidate_limit,
+        max_limit=max_candidate_limit,
+        expand_step=candidate_expand_step,
+        deferred_enabled=deferred_namespace_enabled,
+    )
+    if not attempt_sizes:
         return None, True
 
-    route_result = _to_route_result(
-        decision=decision,
-        message_text=normalized_message,
-        knowledge_base=knowledge_base,
-    )
-    if route_result is None and decision.action == "route":
-        logger.debug(
-            "ChatInter LLM 路由结果未通过校验: "
-            f"module={decision.plugin_module}, command={decision.command}"
+    last_decision: _LLMRouteDecision | None = None
+    for attempt_idx, candidate_size in enumerate(attempt_sizes, start=1):
+        attempt_plugins = ranked_candidates[:candidate_size]
+        attempt_kb = _slice_knowledge_base(knowledge_base, attempt_plugins)
+        attempt_pref_modules = [
+            plugin.module
+            for plugin in attempt_plugins
+            if normalize_message_text(plugin.module)
+        ]
+        prompt, _, _ = _fit_route_prompt_budget(
+            message_text=normalized_message,
+            knowledge_base=attempt_kb,
+            preferred_modules=attempt_pref_modules,
+            vector_context=vector_context,
+            include_helpers=helper_mode,
+            namespace_limit=min(namespace_limit, candidate_size),
+            token_budget=route_prompt_budget,
         )
-    if route_result is not None:
-        return route_result, False
-    # LLM 明确给出 skip 时，不再回退规则路由，避免误触发无关插件
-    if decision.action == "skip":
+        logger.debug(
+            "ChatInter LLM 路由尝试: "
+            f"attempt={attempt_idx}/{len(attempt_sizes)} "
+            f"candidates={candidate_size}"
+        )
+        decision, schema_error = await _request_llm_route_decision(
+            prompt=prompt,
+            timeout_value=timeout_value,
+        )
+        if schema_error:
+            return None, True
+        if decision is None:
+            continue
+
+        last_decision = decision
+        route_result = _to_route_result(
+            decision=decision,
+            message_text=normalized_message,
+            knowledge_base=attempt_kb,
+        )
+        if route_result is not None:
+            return route_result, False
+        if decision.action == "route":
+            logger.debug(
+                "ChatInter LLM 路由结果未通过校验: "
+                f"module={decision.plugin_module}, command={decision.command}"
+            )
+            continue
+        if decision.action == "skip" and attempt_idx < len(attempt_sizes):
+            continue
+        if decision.action == "skip":
+            return None, False
+
+    if last_decision and last_decision.action == "skip":
         return None, False
     return None, True
 

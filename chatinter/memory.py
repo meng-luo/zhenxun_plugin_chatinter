@@ -14,16 +14,18 @@ ChatInter - 聊天记忆管理
 
 import asyncio
 from collections import Counter
+import json
 import re
 import time
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 from nonebot_plugin_alconna.uniseg.tools import reply_fetch
+from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
-from zhenxun.services import logger
+from zhenxun.services import generate_structured, logger
 
 from .config import get_config_value
 from .models.chat_history import ChatInterChatHistory
@@ -90,6 +92,19 @@ _FOLLOWUP_QUERY_HINTS = (
     "上一个",
     "前面",
 )
+_MEMORY_SELECTOR_PROMPT = """
+你是对话记忆筛选器。给你当前用户问题和若干历史记忆摘要，
+请只选择“对当前回答明确有帮助”的历史条目 ID，最多 {limit} 条。
+规则：
+1) 不确定就不要选。
+2) 优先选择包含约束、偏好、长期事实、当前任务延续线索的条目。
+3) 跳过仅寒暄、无关闲聊、重复信息。
+只返回 JSON，不要解释。
+""".strip()
+
+
+class _HistorySelectionResult(BaseModel):
+    selected_ids: list[int] = Field(default_factory=list)
 
 
 class ChatMemory:
@@ -197,6 +212,114 @@ class ChatMemory:
         ):
             return True
         return normalized.startswith(("那", "再", "继续", "然后"))
+
+    def _build_dialog_manifest_item(
+        self,
+        *,
+        dialog: ChatInterChatHistory,
+        lexical_score: float,
+    ) -> str:
+        timestamp = (
+            dialog.create_time.strftime("%m-%d %H:%M:%S")
+            if dialog.create_time
+            else "??:??:??"
+        )
+        user_msg = self._clip_context_line(
+            self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dialog.user_message)
+            ),
+            72,
+        )
+        ai_msg = self._clip_context_line(
+            self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dialog.ai_response or "")
+            ),
+            72,
+        )
+        return (
+            f"- id={int(dialog.id or 0)} | t={timestamp} | score={lexical_score:.3f} | "
+            f"user={json.dumps(user_msg, ensure_ascii=False)} | "
+            f"assistant={json.dumps(ai_msg, ensure_ascii=False)}"
+        )
+
+    async def _select_relevant_history_by_manifest(
+        self,
+        *,
+        query_text: str,
+        candidates: list[tuple[float, ChatInterChatHistory]],
+        recall_limit: int,
+    ) -> list[int]:
+        if not bool(get_config_value("HISTORY_SELECTOR_ENABLED", True)):
+            return []
+        if recall_limit <= 0 or not candidates:
+            return []
+
+        min_candidates = max(
+            int(get_config_value("HISTORY_SELECTOR_MIN_CANDIDATES", 8) or 8),
+            recall_limit + 1,
+        )
+        if len(candidates) < min_candidates:
+            return []
+
+        selector_limit = max(
+            int(get_config_value("HISTORY_SELECTOR_CANDIDATE_LIMIT", 12) or 12),
+            recall_limit,
+        )
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda item: (item[0], int(item[1].id or 0)),
+            reverse=True,
+        )[:selector_limit]
+        if len(sorted_candidates) < min_candidates:
+            return []
+
+        manifest_lines = [
+            self._build_dialog_manifest_item(dialog=dialog, lexical_score=score)
+            for score, dialog in sorted_candidates
+        ]
+        prompt = (
+            f"当前问题:\n{self._normalize_context_text(query_text)}\n\n"
+            "候选历史记忆:\n"
+            f"{chr(10).join(manifest_lines)}\n\n"
+            "返回格式：{\"selected_ids\": [id...]}"
+        )
+        timeout = max(
+            int(get_config_value("HISTORY_SELECTOR_TIMEOUT", 6) or 6),
+            2,
+        )
+        model_name = get_config_value("INTENT_MODEL", None)
+
+        try:
+            result = await generate_structured(
+                prompt,
+                _HistorySelectionResult,
+                model=model_name,
+                instruction=_MEMORY_SELECTOR_PROMPT.format(limit=recall_limit),
+                timeout=float(timeout),
+            )
+        except Exception as exc:
+            logger.debug(f"history selector LLM failed, fallback lexical: {exc}")
+            return []
+
+        valid_ids = {int(dialog.id or 0) for _, dialog in sorted_candidates}
+        deduped_ids: list[int] = []
+        for item in getattr(result, "selected_ids", []) or []:
+            try:
+                dialog_id = int(item)
+            except Exception:
+                continue
+            if dialog_id not in valid_ids or dialog_id in deduped_ids:
+                continue
+            deduped_ids.append(dialog_id)
+            if len(deduped_ids) >= recall_limit:
+                break
+
+        if deduped_ids:
+            logger.debug(
+                "history selector hit: "
+                f"selected={deduped_ids} candidates={len(sorted_candidates)}"
+            )
+        return deduped_ids
 
     async def _should_isolate_context(
         self,
@@ -923,9 +1046,25 @@ class ChatMemory:
                     key=lambda item: (item[0], int(item[1].id or 0)),
                     reverse=True,
                 )
-                recalled_dialogs = [
-                    dialog for _, dialog in recall_candidates[:recall_limit]
+                lexical_selected_ids = [
+                    int(dialog.id or 0)
+                    for _, dialog in recall_candidates[:recall_limit]
+                    if int(dialog.id or 0) > 0
                 ]
+                selected_ids = set(lexical_selected_ids)
+                llm_selected_ids = await self._select_relevant_history_by_manifest(
+                    query_text=current_message_text,
+                    candidates=recall_candidates,
+                    recall_limit=recall_limit,
+                )
+                selected_ids.update(llm_selected_ids)
+                recalled_dialogs = [
+                    dialog
+                    for dialog in old_dialogs
+                    if int(dialog.id or 0) in selected_ids
+                ]
+                if len(recalled_dialogs) > recall_limit:
+                    recalled_dialogs = recalled_dialogs[-recall_limit:]
                 recalled_dialogs.sort(key=lambda item: int(item.id or 0))
 
         if group_id:

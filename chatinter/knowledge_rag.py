@@ -61,11 +61,16 @@ _VECTOR_WEIGHT = 0.62
 _LEXICAL_WEIGHT = 0.20
 _GRAPH_WEIGHT = 0.08
 _SESSION_PREF_WEIGHT = 0.10
+_SESSION_REASON_WEIGHT = 0.08
+_SESSION_SLOT_WEIGHT = 0.10
 _PREFERRED_MODULE_WEIGHT = 0.08
 _SESSION_PREF_TTL = 2 * 60 * 60
 _SESSION_PREF_KEEP = 48
 _SESSION_PREF_PRUNE = 24
 _SESSION_PREF_MIN_SCORE = 0.04
+_SESSION_REASON_MIN_SCORE = 0.03
+_SESSION_FEEDBACK_LOG_KEEP = 64
+_SESSION_SLOT_KEYS = ("command_head", "target", "image", "text")
 _QUERY_CACHE_TTL = 90.0
 _QUERY_CACHE_MAX_SIZE = 256
 _DEFAULT_FETCH_K = 24
@@ -308,6 +313,9 @@ class PluginRAGService:
     _module_graph: ClassVar[dict[str, dict[str, float]]] = {}
     _session_preference: ClassVar[dict[str, dict[str, float]]] = {}
     _session_preference_time: ClassVar[dict[str, float]] = {}
+    _session_reason_penalty: ClassVar[dict[str, dict[str, float]]] = {}
+    _session_slot_feedback: ClassVar[dict[str, dict[str, dict[str, float]]]] = {}
+    _session_feedback_journal: ClassVar[dict[str, list[dict[str, object]]]] = {}
     _embedding_disabled_until: ClassVar[float] = 0.0
     _embedding_supported: ClassVar[bool | None] = None
     _index_meta: ClassVar[dict[str, str]] = {}
@@ -382,6 +390,9 @@ class PluginRAGService:
         for session_id in expired:
             cls._session_preference.pop(session_id, None)
             cls._session_preference_time.pop(session_id, None)
+            cls._session_reason_penalty.pop(session_id, None)
+            cls._session_slot_feedback.pop(session_id, None)
+            cls._session_feedback_journal.pop(session_id, None)
 
     @classmethod
     async def update_session_feedback(
@@ -389,6 +400,8 @@ class PluginRAGService:
         session_id: str | None,
         modules: set[str] | list[str],
         reward: float = 1.0,
+        reason: str | None = None,
+        slot_feedback: dict[str, float] | None = None,
     ) -> None:
         if not session_id:
             return
@@ -402,7 +415,7 @@ class PluginRAGService:
             if pref:
                 for module in list(pref):
                     pref[module] *= 0.94
-                    if pref[module] < _SESSION_PREF_MIN_SCORE:
+                    if abs(pref[module]) < _SESSION_PREF_MIN_SCORE:
                         pref.pop(module, None)
             for module in normalized_modules:
                 pref[module] = pref.get(module, 0.0) + reward
@@ -412,7 +425,70 @@ class PluginRAGService:
                 ]
                 pref = dict(ranked)
             cls._session_preference[session_id] = pref
+
+            reason_penalty = cls._session_reason_penalty.get(session_id, {})
+            if reason_penalty:
+                for module in list(reason_penalty):
+                    reason_penalty[module] *= 0.90
+                    if reason_penalty[module] < _SESSION_REASON_MIN_SCORE:
+                        reason_penalty.pop(module, None)
+            normalized_reason = normalize_message_text(str(reason or "")).lower()
+            if normalized_reason and normalized_reason != "route_success":
+                penalty_step = max(abs(min(float(reward), 0.0)), 0.15)
+                for module in normalized_modules:
+                    reason_penalty[module] = reason_penalty.get(module, 0.0) + penalty_step
+            elif normalized_reason == "route_success":
+                for module in normalized_modules:
+                    restored = max(0.0, reason_penalty.get(module, 0.0) - 0.08)
+                    if restored < _SESSION_REASON_MIN_SCORE:
+                        reason_penalty.pop(module, None)
+                    else:
+                        reason_penalty[module] = restored
+            cls._session_reason_penalty[session_id] = reason_penalty
+
+            slot_store = cls._session_slot_feedback.get(session_id, {})
+            normalized_slot_feedback: dict[str, float] = {}
+            for slot, value in (slot_feedback or {}).items():
+                slot_name = normalize_message_text(str(slot or "")).lower()
+                if slot_name not in _SESSION_SLOT_KEYS:
+                    continue
+                try:
+                    numeric = float(value)
+                except Exception:
+                    continue
+                if abs(numeric) <= 1e-6:
+                    continue
+                normalized_slot_feedback[slot_name] = numeric
+            if normalized_slot_feedback:
+                for module in normalized_modules:
+                    module_slots = slot_store.get(module, {})
+                    for slot_name in list(module_slots):
+                        module_slots[slot_name] *= 0.92
+                        if abs(module_slots[slot_name]) < 0.02:
+                            module_slots.pop(slot_name, None)
+                    for slot_name, delta in normalized_slot_feedback.items():
+                        module_slots[slot_name] = module_slots.get(slot_name, 0.0) + delta
+                    if module_slots:
+                        slot_store[module] = module_slots
+                    else:
+                        slot_store.pop(module, None)
+            cls._session_slot_feedback[session_id] = slot_store
+
+            journal = cls._session_feedback_journal.get(session_id, [])
+            journal.append(
+                {
+                    "ts": int(time.time()),
+                    "modules": normalized_modules,
+                    "reward": float(reward),
+                    "reason": normalized_reason,
+                    "slot_feedback": normalized_slot_feedback,
+                }
+            )
+            if len(journal) > _SESSION_FEEDBACK_LOG_KEEP:
+                journal = journal[-_SESSION_FEEDBACK_LOG_KEEP :]
+            cls._session_feedback_journal[session_id] = journal
             cls._session_preference_time[session_id] = now
+            cls._clear_query_cache()
 
     @classmethod
     def _session_pref_scores(cls, session_id: str | None) -> dict[str, float]:
@@ -429,8 +505,98 @@ class PluginRAGService:
         pref = cls._session_preference.get(session_id, {})
         if not pref:
             return {}
-        max_score = max(pref.values()) or 1.0
-        return {module: score / max_score for module, score in pref.items()}
+        max_abs_score = max(abs(score) for score in pref.values()) or 1.0
+        return {
+            module: max(-1.0, min(score / max_abs_score, 1.0))
+            for module, score in pref.items()
+        }
+
+    @classmethod
+    def _session_reason_penalty_scores(
+        cls, session_id: str | None
+    ) -> dict[str, float]:
+        if not session_id:
+            return {}
+        now = time.monotonic()
+        updated_at = cls._session_preference_time.get(session_id)
+        if not updated_at or now - updated_at >= _SESSION_PREF_TTL:
+            return {}
+        penalties = cls._session_reason_penalty.get(session_id, {})
+        if not penalties:
+            return {}
+        max_score = max(penalties.values()) or 1.0
+        return {
+            module: max(0.0, min(score / max_score, 1.0))
+            for module, score in penalties.items()
+        }
+
+    @classmethod
+    def _session_slot_scores(
+        cls,
+        session_id: str | None,
+        query: str,
+        context_text: str,
+    ) -> dict[str, float]:
+        if not session_id:
+            return {}
+        now = time.monotonic()
+        updated_at = cls._session_preference_time.get(session_id)
+        if not updated_at or now - updated_at >= _SESSION_PREF_TTL:
+            return {}
+        slot_store = cls._session_slot_feedback.get(session_id, {})
+        if not slot_store:
+            return {}
+        merged_query = normalize_message_text(f"{query} {context_text}")
+        active_slot_weights = {"command_head": 1.0}
+        if (
+            "[@" in merged_query
+            or contains_any(merged_query, ("给", "帮", "让", "他", "她", "ta", "@"))
+        ):
+            active_slot_weights["target"] = 1.0
+        if "[image" in merged_query or contains_any(
+            merged_query, ("图", "图片", "头像", "表情")
+        ):
+            active_slot_weights["image"] = 1.0
+        if len(_tokenize(merged_query)) >= 3:
+            active_slot_weights["text"] = 0.6
+
+        raw_scores: dict[str, float] = {}
+        for module, module_slots in slot_store.items():
+            score = 0.0
+            for slot_name, weight in active_slot_weights.items():
+                score += float(module_slots.get(slot_name, 0.0)) * weight
+            if abs(score) > 1e-6:
+                raw_scores[module] = score
+        if not raw_scores:
+            return {}
+        max_abs = max(abs(score) for score in raw_scores.values()) or 1.0
+        return {
+            module: max(-1.0, min(score / max_abs, 1.0))
+            for module, score in raw_scores.items()
+        }
+
+    @classmethod
+    def debug_get_session_feedback(cls, session_id: str) -> dict[str, object]:
+        now = time.monotonic()
+        updated_at = cls._session_preference_time.get(session_id)
+        if not updated_at or now - updated_at >= _SESSION_PREF_TTL:
+            return {
+                "preference": {},
+                "reason_penalty": {},
+                "slot_feedback": {},
+                "journal": [],
+            }
+        return {
+            "preference": dict(cls._session_preference.get(session_id, {})),
+            "reason_penalty": dict(cls._session_reason_penalty.get(session_id, {})),
+            "slot_feedback": {
+                module: dict(slots)
+                for module, slots in cls._session_slot_feedback.get(
+                    session_id, {}
+                ).items()
+            },
+            "journal": list(cls._session_feedback_journal.get(session_id, [])),
+        }
 
     @classmethod
     async def _load_persisted_index(cls) -> None:
@@ -810,6 +976,8 @@ class PluginRAGService:
                 for module in list(graph_scores):
                     graph_scores[module] = graph_scores[module] / max_graph
             session_scores = cls._session_pref_scores(session_id)
+            reason_penalty_scores = cls._session_reason_penalty_scores(session_id)
+            slot_scores = cls._session_slot_scores(session_id, query, context_text)
             preferred_scores = cls._preferred_module_scores(options.preferred_modules)
             lexical_weight = _LEXICAL_WEIGHT
             vector_weight = _VECTOR_WEIGHT
@@ -832,6 +1000,9 @@ class PluginRAGService:
                     base_score += (
                         _GRAPH_WEIGHT * graph_scores.get(module, 0.0)
                         + _SESSION_PREF_WEIGHT * session_scores.get(module, 0.0)
+                        - _SESSION_REASON_WEIGHT
+                        * reason_penalty_scores.get(module, 0.0)
+                        + _SESSION_SLOT_WEIGHT * slot_scores.get(module, 0.0)
                         + _PREFERRED_MODULE_WEIGHT * preferred_scores.get(module, 0.0)
                     )
                 ranked_modules.append((module, base_score))

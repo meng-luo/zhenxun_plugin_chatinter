@@ -37,6 +37,10 @@ _TOOL_CALL_REPEAT_LIMIT = 1
 _AGENT_MIN_TIMEOUT = 5.0
 _AGENT_FINALIZE_TIMEOUT_FLOOR = 1.2
 _AGENT_MAX_EXPANDED_TOOLS = 16
+_PARALLEL_CANCELLED_REASON = "Cancelled: sibling tool call failed in parallel batch"
+_TOOL_BATCH_FAIL_FAST_SYSTEM_NOTE = (
+    "有并行工具调用失败，已停止同批后续工具。请基于已获得信息继续。"
+)
 
 
 def _response_tokens(response: LLMResponse) -> tuple[int, int, int]:
@@ -135,6 +139,240 @@ def _tool_call_signature(tool_call: LLMToolCall) -> str:
         except Exception:
             args_text = str(args)
     return f"{name}:{args_text}"
+
+
+def _tool_call_name(tool_call: LLMToolCall) -> str:
+    return str(getattr(tool_call.function, "name", "") or "").strip()
+
+
+def _tool_result_to_message(
+    *,
+    tool_call: LLMToolCall,
+    tool_result: ToolResult,
+) -> LLMMessage:
+    return LLMMessage.tool_response(
+        tool_call_id=tool_call.id,
+        function_name=_tool_call_name(tool_call) or "unknown_tool",
+        result=tool_result.output,
+    )
+
+
+def _tool_error_message(
+    *,
+    tool_call: LLMToolCall,
+    reason: str,
+) -> LLMMessage:
+    return LLMMessage.tool_response(
+        tool_call_id=tool_call.id,
+        function_name=_tool_call_name(tool_call) or "unknown_tool",
+        result={
+            "status": "failed",
+            "ok": False,
+            "error_type": "ExecutionError",
+            "message": reason,
+            "is_retryable": True,
+        },
+    )
+
+
+def _is_concurrency_safe_tool_call(tool_call: LLMToolCall) -> bool:
+    tool_name = _tool_call_name(tool_call)
+    if not tool_name:
+        return False
+    return ChatInterToolRegistry.is_concurrency_safe(tool_name)
+
+
+def _partition_tool_calls(
+    tool_calls: list[LLMToolCall],
+) -> list[tuple[bool, list[LLMToolCall]]]:
+    batches: list[tuple[bool, list[LLMToolCall]]] = []
+    for call in tool_calls:
+        safe = _is_concurrency_safe_tool_call(call)
+        if safe and batches and batches[-1][0]:
+            batches[-1][1].append(call)
+            continue
+        batches.append((safe, [call]))
+    return batches
+
+
+async def _execute_concurrent_batch_fail_fast(
+    *,
+    invoker: ToolInvoker,
+    batch_calls: list[LLMToolCall],
+    available_tools: dict[str, Any],
+    context: RunContext,
+    timeout: float,
+    abort_on_failure: bool,
+) -> tuple[list[LLMMessage], bool]:
+    if not batch_calls:
+        return [], False
+
+    if len(batch_calls) == 1:
+        result_pair = await asyncio.wait_for(
+            invoker.execute_tool_call(batch_calls[0], available_tools, context),
+            timeout=max(timeout, 0.2),
+        )
+        message = _tool_result_to_message(
+            tool_call=batch_calls[0],
+            tool_result=result_pair[1],
+        )
+        failed = _is_tool_result_failed(result_pair[1].output)
+        return [message], failed
+
+    tasks: dict[asyncio.Task, tuple[int, LLMToolCall]] = {}
+    for index, call in enumerate(batch_calls):
+        task = asyncio.create_task(
+            invoker.execute_tool_call(call, available_tools, context)
+        )
+        tasks[task] = (index, call)
+
+    messages: list[LLMMessage | None] = [None] * len(batch_calls)
+    has_failure = False
+    deadline = time.monotonic() + max(timeout, 0.2)
+    pending: set[asyncio.Task] = set(tasks)
+    try:
+        while pending:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+
+            for finished in done:
+                index, call = tasks[finished]
+                if finished.cancelled():
+                    messages[index] = _tool_error_message(
+                        tool_call=call,
+                        reason=_PARALLEL_CANCELLED_REASON,
+                    )
+                    continue
+                exc = finished.exception()
+                if exc is not None:
+                    logger.error(
+                        "chatinter parallel tool failed with exception: "
+                        f"tool={_tool_call_name(call)} error={exc}"
+                    )
+                    messages[index] = _tool_error_message(
+                        tool_call=call,
+                        reason=f"Tool execution error: {exc}",
+                    )
+                    has_failure = True
+                    continue
+
+                resolved_call, tool_result = finished.result()
+                payload = tool_result.output
+                messages[index] = _tool_result_to_message(
+                    tool_call=resolved_call,
+                    tool_result=tool_result,
+                )
+                if _is_tool_result_failed(payload):
+                    has_failure = True
+
+            if abort_on_failure and has_failure and pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in list(pending):
+                    index, call = tasks[task]
+                    if messages[index] is None:
+                        messages[index] = _tool_error_message(
+                            tool_call=call,
+                            reason=_PARALLEL_CANCELLED_REASON,
+                        )
+                pending.clear()
+                break
+    finally:
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in list(pending):
+                index, call = tasks[task]
+                if messages[index] is None:
+                    messages[index] = _tool_error_message(
+                        tool_call=call,
+                        reason=_PARALLEL_CANCELLED_REASON,
+                    )
+
+    finalized = [
+        message or _tool_error_message(tool_call=batch_calls[idx], reason="Tool execution failed")
+        for idx, message in enumerate(messages)
+    ]
+    return finalized, has_failure
+
+
+async def _execute_tool_calls_partitioned(
+    *,
+    invoker: ToolInvoker,
+    tool_calls: list[LLMToolCall],
+    available_tools: dict[str, Any],
+    context: RunContext,
+    timeout: float,
+    abort_on_failure: bool,
+    parallel_limit: int,
+) -> tuple[list[LLMMessage], bool]:
+    if not tool_calls:
+        return [], False
+
+    deadline = time.monotonic() + max(timeout, 0.2)
+    all_messages: list[LLMMessage] = []
+    had_batch_failure = False
+
+    batches = _partition_tool_calls(tool_calls)
+    for is_safe, batch_calls in batches:
+        if not batch_calls:
+            continue
+        remaining = max(deadline - time.monotonic(), 0.0)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+
+        # read-only batch concurrency; write/unknown batch serial.
+        if is_safe and len(batch_calls) > 1:
+            chunk_size = max(parallel_limit, 1)
+            for start in range(0, len(batch_calls), chunk_size):
+                chunk = batch_calls[start : start + chunk_size]
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                chunk_messages, chunk_failed = await _execute_concurrent_batch_fail_fast(
+                    invoker=invoker,
+                    batch_calls=chunk,
+                    available_tools=available_tools,
+                    context=context,
+                    timeout=remaining,
+                    abort_on_failure=abort_on_failure,
+                )
+                all_messages.extend(chunk_messages)
+                if chunk_failed:
+                    had_batch_failure = True
+                    if abort_on_failure:
+                        break
+            if had_batch_failure and abort_on_failure:
+                break
+            continue
+
+        for call in batch_calls:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            result_pair = await asyncio.wait_for(
+                invoker.execute_tool_call(call, available_tools, context),
+                timeout=remaining,
+            )
+            message = _tool_result_to_message(
+                tool_call=result_pair[0],
+                tool_result=result_pair[1],
+            )
+            all_messages.append(message)
+            if _is_tool_result_failed(result_pair[1].output):
+                had_batch_failure = True
+
+    return all_messages, had_batch_failure
 
 
 def _resolve_superuser(bot: Bot, user_id: str) -> bool:
@@ -364,6 +602,20 @@ async def run_chatinter_agent(
         failed_round_limit = max(
             int(get_config_value("AGENT_FAILED_ROUND_LIMIT", 2) or 2), 1
         )
+        parallel_safe_tools = max(
+            int(get_config_value("AGENT_PARALLEL_SAFE_TOOLS", 4) or 4), 1
+        )
+        abort_parallel_on_failure = bool(
+            get_config_value("AGENT_ABORT_PARALLEL_ON_FAILURE", True)
+        )
+        agent_token_budget = max(
+            int(get_config_value("AGENT_TOKEN_BUDGET", 0) or 0),
+            0,
+        )
+        diminishing_token_delta = max(
+            int(get_config_value("AGENT_DIMINISHING_TOKEN_DELTA", 220) or 220),
+            40,
+        )
 
         lower_message = str(message_text or "").lower()
         has_tool_intent_hint = any(
@@ -431,6 +683,8 @@ async def run_chatinter_agent(
         consecutive_failed_rounds = 0
         expanded_tools_activated = False
         forced_finalize_reason = ""
+        last_total_tokens = 0
+        last_delta_tokens = 0
 
         deadline = time.monotonic() + _resolve_agent_timeout(timeout)
         llm_timeout = _step_timeout(deadline)
@@ -450,11 +704,25 @@ async def run_chatinter_agent(
             total_completion_tokens=total_completion_tokens,
             total_tokens=total_tokens,
         )
+        if agent_token_budget > 0 and total_tokens >= agent_token_budget:
+            forced_finalize_reason = "token_budget_exceeded"
 
         for step in range(max_tool_steps):
             if _remaining_seconds(deadline) <= 0.2:
                 forced_finalize_reason = "deadline_exceeded"
                 break
+            if forced_finalize_reason:
+                break
+            delta_tokens = max(total_tokens - last_total_tokens, 0)
+            if (
+                step >= 2
+                and delta_tokens < diminishing_token_delta
+                and last_delta_tokens < diminishing_token_delta
+            ):
+                forced_finalize_reason = "diminishing_token_returns"
+                break
+            last_total_tokens = total_tokens
+            last_delta_tokens = delta_tokens
 
             tool_calls = _normalize_tool_calls(response.tool_calls)
             if not tool_calls:
@@ -504,13 +772,14 @@ async def run_chatinter_agent(
                 break
 
             try:
-                tool_messages = await asyncio.wait_for(
-                    invoker.execute_batch(
-                        tool_calls=tool_calls,
-                        available_tools=active_tools,
-                        context=context,
-                    ),
+                tool_messages, had_batch_failure = await _execute_tool_calls_partitioned(
+                    invoker=invoker,
+                    tool_calls=tool_calls,
+                    available_tools=active_tools,
+                    context=context,
                     timeout=exec_timeout,
+                    abort_on_failure=abort_parallel_on_failure,
+                    parallel_limit=parallel_safe_tools,
                 )
             except asyncio.TimeoutError:
                 consecutive_failed_rounds += 1
@@ -543,6 +812,10 @@ async def run_chatinter_agent(
                     )
                 )
                 continue
+            if had_batch_failure and abort_parallel_on_failure:
+                messages.append(
+                    LLMMessage.system(_TOOL_BATCH_FAIL_FAST_SYSTEM_NOTE)
+                )
 
             messages.append(_assistant_message_from_response(response))
             messages.extend(tool_messages)
@@ -608,6 +881,9 @@ async def run_chatinter_agent(
                 total_completion_tokens=total_completion_tokens,
                 total_tokens=total_tokens,
             )
+            if agent_token_budget > 0 and total_tokens >= agent_token_budget:
+                forced_finalize_reason = "token_budget_exceeded"
+                break
 
         if not forced_finalize_reason:
             forced_finalize_reason = "tool_step_budget_exhausted"
