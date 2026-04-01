@@ -260,7 +260,33 @@ def rank_route_candidates(
 
     normalized_query = normalize_message_text(query)
     if not normalized_query:
-        return plugins
+        filtered_plugins = [
+            plugin
+            for plugin in plugins
+            if _satisfies_filters(plugin, metadata_filters)
+        ]
+        if not filtered_plugins:
+            return []
+
+        normalized_pref = [
+            normalize_message_text(module).lower()
+            for module in preferred_modules or ()
+            if normalize_message_text(module)
+        ]
+        if not normalized_pref:
+            return filtered_plugins
+
+        pref_order = {
+            module: idx for idx, module in enumerate(normalized_pref)
+        }
+        fallback_index = len(pref_order)
+        filtered_plugins.sort(
+            key=lambda plugin: pref_order.get(
+                normalize_message_text(plugin.module).lower(),
+                fallback_index,
+            )
+        )
+        return filtered_plugins
 
     query_tokens = set(_tokenize(normalized_query))
     required_tokens = _required_tokens(normalized_query)

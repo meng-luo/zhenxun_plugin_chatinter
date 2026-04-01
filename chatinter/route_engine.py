@@ -614,7 +614,7 @@ def _is_schema_parameter_error(exc: Exception) -> bool:
             "responsejsonschema",
             "additionalproperties",
         )
-        )
+    )
 
 
 def _slice_knowledge_base(
