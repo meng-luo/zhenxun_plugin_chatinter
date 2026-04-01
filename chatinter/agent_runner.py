@@ -322,9 +322,11 @@ async def _execute_tool_calls_partitioned(
     deadline = time.monotonic() + max(timeout, 0.2)
     all_messages: list[LLMMessage] = []
     had_batch_failure = False
+    aborted_calls: list[LLMToolCall] = []
+    abort_triggered = False
 
     batches = _partition_tool_calls(tool_calls)
-    for is_safe, batch_calls in batches:
+    for batch_index, (is_safe, batch_calls) in enumerate(batches):
         if not batch_calls:
             continue
         remaining = max(deadline - time.monotonic(), 0.0)
@@ -351,12 +353,18 @@ async def _execute_tool_calls_partitioned(
                 if chunk_failed:
                     had_batch_failure = True
                     if abort_on_failure:
+                        tail_start = start + chunk_size
+                        if tail_start < len(batch_calls):
+                            aborted_calls.extend(batch_calls[tail_start:])
+                        abort_triggered = True
                         break
-            if had_batch_failure and abort_on_failure:
+            if abort_triggered:
+                for _, rest_calls in batches[batch_index + 1 :]:
+                    aborted_calls.extend(rest_calls)
                 break
             continue
 
-        for call in batch_calls:
+        for call_index, call in enumerate(batch_calls):
             remaining = max(deadline - time.monotonic(), 0.0)
             if remaining <= 0:
                 raise asyncio.TimeoutError
@@ -371,6 +379,21 @@ async def _execute_tool_calls_partitioned(
             all_messages.append(message)
             if _is_tool_result_failed(result_pair[1].output):
                 had_batch_failure = True
+                if abort_on_failure:
+                    if call_index + 1 < len(batch_calls):
+                        aborted_calls.extend(batch_calls[call_index + 1 :])
+                    abort_triggered = True
+                    break
+        if abort_triggered:
+            for _, rest_calls in batches[batch_index + 1 :]:
+                aborted_calls.extend(rest_calls)
+            break
+
+    if abort_triggered and aborted_calls:
+        all_messages.extend(
+            _tool_error_message(tool_call=call, reason=_PARALLEL_CANCELLED_REASON)
+            for call in aborted_calls
+        )
 
     return all_messages, had_batch_failure
 
