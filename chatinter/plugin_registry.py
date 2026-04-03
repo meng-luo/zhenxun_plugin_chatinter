@@ -835,9 +835,7 @@ class PluginRegistry:
     def _extract_commands_from_matchers(cls, nb_plugin) -> list[str]:
         commands: list[str] = []
         seen: set[str] = set()
-        module_name = str(getattr(nb_plugin, "module_name", "") or "").strip()
         matcher_meta = AutoMetadataBuilder._extract_matcher_command_data(
-            module_name=module_name,
             loaded_plugin=nb_plugin,
         )
         for payload in matcher_meta:

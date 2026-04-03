@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import re
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
@@ -394,6 +395,17 @@ _ROUTE_CONTEXT_HINT_WORDS = ROUTE_ACTION_WORDS + MEME_TRIGGER_WORDS + (
 )
 
 
+@dataclass(frozen=True)
+class RouteCommandMatch:
+    """命令头命中结果。"""
+
+    command_head: str
+    payload_text: str = ""
+    prefix_text: str = ""
+    variant_text: str = ""
+    match_mode: str = ""
+
+
 def normalize_message_text(text: str) -> str:
     return _WHITESPACE_PATTERN.sub(" ", (text or "").strip())
 
@@ -527,9 +539,27 @@ def match_command_head_fuzzy(
     allow_sticky: bool = False,
     max_prefix_len: int = 8,
 ) -> bool:
+    return (
+        parse_command_with_head(
+            text,
+            command,
+            allow_sticky=allow_sticky,
+            max_prefix_len=max_prefix_len,
+        )
+        is not None
+    )
+
+
+def parse_command_with_head(
+    text: str,
+    command: str,
+    *,
+    allow_sticky: bool = False,
+    max_prefix_len: int = 8,
+) -> RouteCommandMatch | None:
     normalized_command = normalize_message_text(command)
     if not normalized_command:
-        return False
+        return None
 
     for variant in _build_command_match_variants(text):
         if match_command_head_or_sticky(
@@ -537,7 +567,15 @@ def match_command_head_fuzzy(
             normalized_command,
             allow_sticky=allow_sticky,
         ):
-            return True
+            payload = _strip_route_inline_noise(
+                normalize_message_text(variant[len(normalized_command) :])
+            )
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=payload,
+                variant_text=variant,
+                match_mode="head",
+            )
 
         index = variant.find(normalized_command)
         if index <= 0 or index > max_prefix_len:
@@ -546,20 +584,51 @@ def match_command_head_fuzzy(
         suffix = normalize_message_text(variant[index + len(normalized_command) :])
         if not prefix:
             continue
-        has_context_hint = contains_any(prefix, _ROUTE_CONTEXT_HINT_WORDS)
+        has_prefix_hint = contains_any(prefix, _ROUTE_CONTEXT_HINT_WORDS)
+        has_suffix_hint = contains_any(suffix, _ROUTE_CONTEXT_HINT_WORDS)
         compact_suffix = _strip_route_inline_noise(
             _PLACEHOLDER_PATTERN.sub(" ", suffix)
         )
         has_argument_hint = bool(_PLACEHOLDER_PATTERN.search(suffix)) or bool(
             compact_suffix
         )
-        if has_context_hint and (
+        prefix_payload = _strip_route_inline_noise(
+            _PLACEHOLDER_PATTERN.sub(" ", prefix)
+        )
+        if has_prefix_hint and (
             has_argument_hint
             or not allow_sticky
             or not normalize_message_text(suffix)
         ):
-            return True
-    return False
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=_strip_route_inline_noise(suffix),
+                prefix_text=prefix_payload,
+                variant_text=variant,
+                match_mode="prefix_hint",
+            )
+        if has_suffix_hint and prefix_payload:
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=prefix_payload,
+                prefix_text=prefix_payload,
+                variant_text=variant,
+                match_mode="suffix_hint",
+            )
+        if (
+            allow_sticky
+            and prefix_payload
+            and not compact_suffix
+            and len(_STICKY_TOKEN_PATTERN.sub("", prefix_payload).strip()) >= 2
+        ):
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=prefix_payload,
+                prefix_text=prefix_payload,
+                variant_text=variant,
+                match_mode="prefix_target",
+            )
+    return None
 
 
 def rewrite_command_with_head(
@@ -573,26 +642,14 @@ def rewrite_command_with_head(
     if not normalized_command:
         return ""
 
-    for variant in _build_command_match_variants(text):
-        if match_command_head_or_sticky(
-            variant,
-            normalized_command,
-            allow_sticky=allow_sticky,
-        ):
-            payload = normalize_message_text(variant[len(normalized_command) :])
-            payload = _strip_route_inline_noise(payload)
-            if payload:
-                return normalize_message_text(f"{normalized_command} {payload}")
-            return normalized_command
-
-        index = variant.find(normalized_command)
-        if index <= 0 or index > max_prefix_len:
-            continue
-        prefix = normalize_message_text(variant[:index])
-        suffix = normalize_message_text(variant[index + len(normalized_command) :])
-        if not prefix or not contains_any(prefix, _ROUTE_CONTEXT_HINT_WORDS):
-            continue
-        payload = _strip_route_inline_noise(suffix)
+    parsed = parse_command_with_head(
+        text,
+        normalized_command,
+        allow_sticky=allow_sticky,
+        max_prefix_len=max_prefix_len,
+    )
+    if parsed is not None:
+        payload = normalize_message_text(parsed.payload_text)
         if payload:
             return normalize_message_text(f"{normalized_command} {payload}")
         return normalized_command
@@ -819,6 +876,7 @@ def should_force_knowledge_refresh(
 
 __all__ = [
     "ROUTE_ACTION_WORDS",
+    "RouteCommandMatch",
     "collect_placeholders",
     "contains_any",
     "has_negative_route_intent",
@@ -829,6 +887,7 @@ __all__ = [
     "match_command_head_or_sticky",
     "normalize_action_phrases",
     "normalize_message_text",
+    "parse_command_with_head",
     "rewrite_command_with_head",
     "sanitize_template_tail",
     "should_force_knowledge_refresh",

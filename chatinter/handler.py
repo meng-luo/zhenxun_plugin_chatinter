@@ -61,9 +61,9 @@ from .route_text import (
     collect_placeholders,
     has_negative_route_intent,
     is_usage_question,
-    match_command_head_or_sticky,
     normalize_action_phrases,
     normalize_message_text,
+    parse_command_with_head,
     should_force_knowledge_refresh,
     strip_invoke_prefix,
 )
@@ -321,7 +321,11 @@ def _message_matches_known_command_prefix(
             if not command_head:
                 continue
             for candidate in candidates:
-                if _match_command_head_or_sticky(candidate, command_head):
+                if parse_command_with_head(
+                    candidate,
+                    command_head,
+                    allow_sticky=True,
+                ):
                     return True
     return False
 
@@ -558,10 +562,17 @@ def _extract_fuzzy_target_hint(
     if command_heads:
         for head in sorted(command_heads, key=len, reverse=True):
             normalized_head = normalize_message_text(head)
-            if not normalized_head or not normalized.startswith(normalized_head):
+            if not normalized_head:
                 continue
-            tail = normalize_message_text(normalized[len(normalized_head) :])
-            tail = re.sub(r"^(?:给|帮|替|让|叫|喊|请)+", "", tail).strip()
+            parsed = parse_command_with_head(
+                normalized,
+                normalized_head,
+                allow_sticky=True,
+            )
+            if parsed is None:
+                continue
+            tail = normalize_message_text(parsed.payload_text or parsed.prefix_text)
+            tail = re.sub(r"^(?:给|帮|替|让|叫|喊|请|把|将)+", "", tail).strip()
             tail = re.sub(r"(?:做|整|弄|来|发|签|点|查|看|问|生成|制作).*$", "", tail)
             tail = tail.strip(" 的：:,，。.!！？?")
             if not tail:
@@ -873,26 +884,13 @@ def _resolve_fuzzy_trigger_strength(
         return "strong"
     if command_heads:
         for head in sorted(command_heads, key=len, reverse=True):
-            if head and _match_command_head_or_sticky(normalized_route, head):
+            if head and parse_command_with_head(
+                normalized_route,
+                head,
+                allow_sticky=True,
+            ):
                 return "weak"
     return ""
-
-
-def _match_command_head_or_sticky(message_text: str, command_head: str) -> bool:
-    if not match_command_head_or_sticky(
-        message_text,
-        command_head,
-        allow_sticky=True,
-    ):
-        return False
-    normalized_message = normalize_message_text(message_text or "")
-    normalized_head = normalize_message_text(command_head or "")
-    sticky_tail = normalize_message_text(normalized_message[len(normalized_head) :])
-    if not sticky_tail:
-        return False
-    if _is_technical_request_like(sticky_tail):
-        return False
-    return True
 
 
 def _needs_target_for_meme_request(message_text: str, route_message: str) -> bool:
