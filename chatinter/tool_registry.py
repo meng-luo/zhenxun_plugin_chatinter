@@ -52,6 +52,7 @@ class ToolPolicy:
     selector: Callable[[ToolSelectionContext], bool] | None = None
     authorization: Callable[[ToolSelectionContext], bool] | None = None
     enabled_by_default: bool = True
+    concurrency_safe: bool = False
 
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -68,6 +69,7 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
             "查帮助命令",
         ),
         min_score=0.1,
+        concurrency_safe=True,
         selector=lambda ctx: _contains_any(
             f"{ctx.query} {ctx.context_text}",
             ("插件", "命令", "功能", "帮助", "怎么用", "usage"),
@@ -77,6 +79,7 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
         aliases=("数学计算", "表达式计算", "计算器"),
         examples=("1+1", "sqrt(9)", "sin(pi/2)"),
         min_score=0.2,
+        concurrency_safe=True,
         selector=lambda ctx: _contains_any(
             f"{ctx.query} {ctx.context_text}",
             ("计算", "表达式", "算一下", "数学", "eval"),
@@ -305,6 +308,11 @@ class ChatInterToolRegistry:
     @classmethod
     def _get_policy(cls, tool_name: str) -> ToolPolicy:
         return _TOOL_POLICIES.get(tool_name, ToolPolicy())
+
+    @classmethod
+    def is_concurrency_safe(cls, tool_name: str) -> bool:
+        policy = cls._get_policy(tool_name)
+        return bool(policy.concurrency_safe)
 
     @classmethod
     def _is_authorized(

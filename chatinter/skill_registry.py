@@ -12,6 +12,7 @@ from .route_text import (
     has_template_route_context,
     is_usage_question,
     match_command_head,
+    match_command_head_or_sticky,
     normalize_action_phrases,
     normalize_message_text,
     sanitize_template_tail,
@@ -269,9 +270,38 @@ def _signature(knowledge_base: PluginKnowledgeBase) -> str:
     return "\n".join(
         (
             f"{plugin.module}|{plugin.name}|"
-            f"{','.join(plugin.commands)}|{plugin.usage or ''}"
+            f"{','.join(plugin.commands)}|"
+            f"{','.join(plugin.aliases)}|"
+            f"{plugin.usage or ''}|"
+            f"{';'.join(_command_meta_signature(meta) for meta in plugin.command_meta)}"
         )
         for plugin in knowledge_base.plugins
+    )
+
+
+def _command_meta_signature(meta: PluginInfo.PluginCommandMeta) -> str:
+    return "|".join(
+        [
+            str(getattr(meta, "command", "") or "").strip(),
+            ",".join(
+                str(alias).strip()
+                for alias in getattr(meta, "aliases", ()) or ()
+                if str(alias).strip()
+            ),
+            str(getattr(meta, "text_min", "") or ""),
+            str(getattr(meta, "text_max", "") or ""),
+            str(getattr(meta, "image_min", "") or ""),
+            str(getattr(meta, "image_max", "") or ""),
+            str(int(bool(getattr(meta, "allow_at", False)))),
+            str(getattr(meta, "actor_scope", "") or ""),
+            str(getattr(meta, "target_requirement", "") or ""),
+            ",".join(
+                str(source).strip()
+                for source in getattr(meta, "target_sources", ()) or ()
+                if str(source).strip()
+            ),
+            str(int(bool(getattr(meta, "allow_sticky_arg", False)))),
+        ]
     )
 
 
@@ -1183,11 +1213,36 @@ def match_skill_command_fast(
         if not pool:
             pool = skill.commands
         for command in pool:
+            schema = None
+            normalized_command = normalize_message_text(command)
+            for current_schema in skill.command_schemas:
+                if normalize_message_text(current_schema.command) == normalized_command:
+                    schema = current_schema
+                    break
+                if any(
+                    normalize_message_text(alias) == normalized_command
+                    for alias in current_schema.aliases
+                ):
+                    schema = current_schema
+                    break
+            allow_sticky = bool(schema.allow_sticky_arg) if schema is not None else False
             score = 0.0
             if match_command_head(stripped, command):
                 score += 100.0 + len(command)
             elif match_command_head(normalized, command):
                 score += 85.0 + len(command)
+            elif match_command_head_or_sticky(
+                stripped,
+                command,
+                allow_sticky=allow_sticky,
+            ):
+                score += 72.0 + len(command)
+            elif match_command_head_or_sticky(
+                normalized,
+                command,
+                allow_sticky=allow_sticky,
+            ):
+                score += 60.0 + len(command)
             elif len(command) >= 2 and command.lower() in lowered:
                 score += 30.0 + len(command) * 0.1
             if score <= 0:

@@ -20,6 +20,7 @@ from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 
+from .metadata_builder import AutoMetadataBuilder
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 
 
@@ -557,132 +558,15 @@ class PluginRegistry:
                     )
                     continue
             discovered.extend(cls._parse_discovery_payload(payload))
-        discovered.extend(await cls._discover_command_meta_from_runtime_shape(module_obj))
-        return cls._merge_command_meta_groups(discovered)
-
-    @classmethod
-    def _iter_candidate_discovery_managers(cls, module_obj) -> list[object]:
-        manager_candidates: list[object] = []
-        for attr_name in ("meme_manager", "manager", "MemeManager", "MEME_MANAGER"):
-            manager_obj = getattr(module_obj, attr_name, None)
-            if manager_obj is None:
-                continue
-            if manager_obj not in manager_candidates:
-                manager_candidates.append(manager_obj)
-
-        module_dict = getattr(module_obj, "__dict__", {}) or {}
-        for value in module_dict.values():
-            if value in manager_candidates:
-                continue
-            if callable(getattr(value, "get_memes", None)):
-                manager_candidates.append(value)
-        return manager_candidates
-
-    @classmethod
-    async def _extract_meme_like_meta_from_manager(
-        cls,
-        manager_obj: object,
-    ) -> list[PluginInfo.PluginCommandMeta]:
-        memes = None
-        getter = getattr(manager_obj, "get_memes", None)
-        if callable(getter):
-            try:
-                memes = getter()
-            except Exception:
-                memes = None
-
-        if inspect.isawaitable(memes):
-            try:
-                memes = await memes
-            except Exception:
-                memes = None
-
-        if memes is None:
-            for attr_name in ("memes", "meme_dict", "registry", "all_memes"):
-                candidate = getattr(manager_obj, attr_name, None)
-                if candidate is None:
-                    continue
-                if inspect.isawaitable(candidate):
-                    try:
-                        candidate = await candidate
-                    except Exception:
-                        continue
-                memes = candidate
-                if memes is not None:
-                    break
-
-        if isinstance(memes, dict):
-            memes = list(memes.values())
-        if not isinstance(memes, list | tuple | set):
-            return []
-
-        discovered: list[PluginInfo.PluginCommandMeta] = []
-        seen_commands: set[str] = set()
-        for meme in memes:
-            info = getattr(meme, "info", None)
-            params = getattr(info, "params", None) if info is not None else None
-            schema = {
-                "text_min": cls._safe_int(
-                    getattr(params, "min_texts", None) if params is not None else None
-                ),
-                "text_max": cls._safe_int(
-                    getattr(params, "max_texts", None) if params is not None else None
-                ),
-                "image_min": cls._safe_int(
-                    getattr(params, "min_images", None)
-                    if params is not None
-                    else None
-                ),
-                "image_max": cls._safe_int(
-                    getattr(params, "max_images", None)
-                    if params is not None
-                    else None
-                ),
-                "allow_at": True,
-            }
-
-            heads: list[str] = []
-            key = str(getattr(meme, "key", "") or "").strip()
-            if key:
-                heads.append(key)
-            if info is not None:
-                for keyword in getattr(info, "keywords", []) or []:
-                    text = str(keyword or "").strip()
-                    if text:
-                        heads.append(text)
-                for shortcut in getattr(info, "shortcuts", []) or []:
-                    text = str(getattr(shortcut, "humanized", "") or "").strip()
-                    if text:
-                        heads.append(text)
-
-            for command in heads:
-                normalized = cls._normalize_command(command)
-                if not normalized or normalized in seen_commands:
-                    continue
-                seen_commands.add(normalized)
-                discovered.append(
-                    cls._with_command_meta_defaults(
-                        command=normalized,
-                        text_min=schema["text_min"],
-                        text_max=schema["text_max"],
-                        image_min=schema["image_min"],
-                        image_max=schema["image_max"],
-                        allow_at=True,
-                        target_requirement="optional",
-                        target_sources=["at", "reply", "nickname"],
-                        allow_sticky_arg=True,
-                    )
+        discovered.extend(
+            cls._parse_discovery_payload(
+                await AutoMetadataBuilder.build(
+                    module_name=module_name,
+                    module_obj=module_obj,
+                    loaded_plugin=loaded_plugin,
                 )
-        return discovered
-
-    @classmethod
-    async def _discover_command_meta_from_runtime_shape(
-        cls,
-        module_obj,
-    ) -> list[PluginInfo.PluginCommandMeta]:
-        discovered: list[PluginInfo.PluginCommandMeta] = []
-        for manager in cls._iter_candidate_discovery_managers(module_obj):
-            discovered.extend(await cls._extract_meme_like_meta_from_manager(manager))
+            )
+        )
         return cls._merge_command_meta_groups(discovered)
 
     @classmethod
@@ -737,6 +621,12 @@ class PluginRegistry:
                 commands = matcher_commands
             matcher_meta = cls._build_command_meta_from_commands(commands)
             command_meta = cls._merge_command_meta_groups(command_meta, matcher_meta)
+            if matcher_commands:
+                commands, command_meta = cls._filter_to_matcher_executable(
+                    commands=commands,
+                    command_meta=command_meta,
+                    matcher_commands=matcher_commands,
+                )
         if not commands:
             return None
 
@@ -945,36 +835,123 @@ class PluginRegistry:
     def _extract_commands_from_matchers(cls, nb_plugin) -> list[str]:
         commands: list[str] = []
         seen: set[str] = set()
-        matchers = getattr(nb_plugin, "matcher", set()) or set()
-
-        for matcher in matchers:
-            command_builder = getattr(matcher, "command", None)
-            if not callable(command_builder):
-                continue
-            try:
-                alconna_cmd = command_builder()
-            except Exception:
-                continue
-            command_text = str(getattr(alconna_cmd, "command", "")).strip()
-            if not command_text:
-                continue
-            if command_text.startswith("re:"):
-                regex_head = cls._extract_regex_head(command_text[3:])
-                if regex_head:
-                    command_text = regex_head
-                else:
+        module_name = str(getattr(nb_plugin, "module_name", "") or "").strip()
+        matcher_meta = AutoMetadataBuilder._extract_matcher_command_data(
+            module_name=module_name,
+            loaded_plugin=nb_plugin,
+        )
+        for payload in matcher_meta:
+            candidates = [str(payload.get("command") or "").strip()]
+            raw_aliases = payload.get("aliases") or []
+            if isinstance(raw_aliases, (set, list, tuple, frozenset)):
+                candidates.extend(
+                    str(alias).strip() for alias in raw_aliases if str(alias).strip()
+                )
+            for candidate in candidates:
+                normalized = cls._normalize_command(candidate)
+                if not normalized or normalized in seen:
                     continue
-            normalized = cls._normalize_command(command_text)
-            if not normalized:
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            commands.append(normalized)
+                seen.add(normalized)
+                commands.append(normalized)
         commands.sort(key=lambda cmd: (len(cmd), cmd))
         if len(commands) > cls._max_matcher_commands:
             commands = commands[: cls._max_matcher_commands]
         return commands
+
+    @classmethod
+    def _build_matcher_command_lookup(
+        cls,
+        matcher_commands: list[str],
+    ) -> set[str]:
+        lookup: set[str] = set()
+        for raw in matcher_commands:
+            normalized = cls._normalize_command(raw)
+            if not normalized:
+                continue
+            lookup.add(normalized.casefold())
+            lookup.add(normalized.split(" ", 1)[0].casefold())
+        return lookup
+
+    @classmethod
+    def _command_matches_matcher_lookup(
+        cls,
+        command_text: str,
+        matcher_lookup: set[str],
+    ) -> bool:
+        normalized = cls._normalize_command(command_text)
+        if not normalized:
+            return False
+        folded = normalized.casefold()
+        if folded in matcher_lookup:
+            return True
+        return normalized.split(" ", 1)[0].casefold() in matcher_lookup
+
+    @classmethod
+    def _filter_to_matcher_executable(
+        cls,
+        *,
+        commands: list[str],
+        command_meta: list[PluginInfo.PluginCommandMeta],
+        matcher_commands: list[str],
+    ) -> tuple[list[str], list[PluginInfo.PluginCommandMeta]]:
+        if not matcher_commands:
+            return commands, command_meta
+
+        matcher_lookup = cls._build_matcher_command_lookup(matcher_commands)
+        filtered_commands = [
+            command
+            for command in commands
+            if cls._command_matches_matcher_lookup(command, matcher_lookup)
+        ]
+
+        filtered_meta: list[PluginInfo.PluginCommandMeta] = []
+        for meta in command_meta:
+            payload = cls._meta_to_dict(meta)
+            command_text = str(payload.get("command") or "").strip()
+            matched_command = cls._command_matches_matcher_lookup(
+                command_text, matcher_lookup
+            )
+
+            original_aliases = payload.get("aliases", [])
+            matched_aliases = [
+                alias
+                for alias in original_aliases
+                if cls._command_matches_matcher_lookup(alias, matcher_lookup)
+            ]
+
+            if not matched_command and not matched_aliases:
+                continue
+
+            if not matched_command and matched_aliases:
+                payload["command"] = matched_aliases[0]
+                matched_aliases = matched_aliases[1:]
+            normalized_command = cls._normalize_command(str(payload.get("command", "")))
+            alias_source = original_aliases if matched_command else matched_aliases
+            payload["aliases"] = [
+                alias
+                for alias in alias_source
+                if cls._normalize_command(alias).casefold()
+                != normalized_command.casefold()
+            ]
+            filtered_meta.append(cls._with_command_meta_defaults(**payload))
+
+        filtered_commands = cls._merge_unique_strings(filtered_commands, matcher_commands)
+
+        if not filtered_meta:
+            filtered_meta = cls._build_command_meta_from_commands(filtered_commands)
+        else:
+            filtered_meta = cls._merge_command_meta_groups(
+                filtered_meta,
+                cls._build_command_meta_from_commands(filtered_commands),
+            )
+
+        filtered_commands = cls._extract_commands(
+            PluginExtraData(),
+            filtered_meta,
+        )
+        if not filtered_commands:
+            filtered_commands = matcher_commands[:]
+        return filtered_commands, filtered_meta
 
     @classmethod
     def _normalize_command(cls, command: str) -> str:

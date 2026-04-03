@@ -6,6 +6,7 @@ import re
 from typing import Any, Literal
 
 from zhenxun.services.log import logger
+from .config import CONTEXT_TOKEN_BUDGET
 
 LifecycleStage = Literal[
     "before_intent",
@@ -24,9 +25,16 @@ _SECTION_TRIM_ORDER = (
     "retrieval_knowledge",
     "current_message_layers",
 )
+_HARD_DROP_ORDER = (
+    "history",
+    "history_context",
+    "retrieval_knowledge",
+)
+_SMALL_SECTION_TOKEN_THRESHOLD = 48
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]", re.IGNORECASE)
 _HIGH_CONTEXT_BUDGET = 6000
 _MIDDLE_CONTEXT_BUDGET = 3500
+_BUDGET_ALERT_RATIO = 0.90
 
 try:
     import tiktoken
@@ -51,6 +59,8 @@ def _resolve_tokenizer(model_name: str | None):
 
 
 def _resolve_budget(model_name: str | None) -> int:
+    if CONTEXT_TOKEN_BUDGET > 0:
+        return CONTEXT_TOKEN_BUDGET
     if not model_name:
         return _TOKEN_BUDGET
     lower = model_name.lower()
@@ -135,6 +145,54 @@ def _compose_sections(sections: dict[str, list[str]]) -> str:
             continue
         ordered.extend(section)
     return "\n".join(ordered)
+
+
+def _drop_sections_to_budget(
+    context_xml: str,
+    *,
+    token_budget: int,
+    model_name: str | None = None,
+) -> tuple[str, list[str]]:
+    sections = _split_sections(context_xml)
+    if not sections:
+        return _trim_text_by_budget(context_xml, token_budget, model_name), []
+
+    composed = _compose_sections(sections)
+    current_tokens = _estimate_tokens(composed, model_name)
+    if current_tokens <= token_budget:
+        return composed, []
+
+    overflow_tokens = max(current_tokens - token_budget, 0)
+    dynamic_threshold = max(
+        _SMALL_SECTION_TOKEN_THRESHOLD,
+        int(overflow_tokens * 0.25),
+    )
+    large_sections: list[str] = []
+    small_sections: list[str] = []
+    for tag in _HARD_DROP_ORDER:
+        section = sections.get(tag)
+        if not section:
+            continue
+        section_tokens = _estimate_tokens("\n".join(section), model_name)
+        if section_tokens >= dynamic_threshold:
+            large_sections.append(tag)
+        else:
+            small_sections.append(tag)
+
+    dropped: list[str] = []
+    for tag in [*large_sections, *small_sections]:
+        section = sections.pop(tag, None)
+        if not section:
+            continue
+        dropped.append(tag)
+        composed = _compose_sections(sections)
+        if _estimate_tokens(composed, model_name) <= token_budget:
+            return composed, dropped
+
+    composed = _compose_sections(sections)
+    if _estimate_tokens(composed, model_name) > token_budget:
+        composed = _trim_text_by_budget(composed, token_budget, model_name)
+    return composed, dropped
 
 
 def _trim_section_content(section_lines: list[str]) -> list[str]:
@@ -262,13 +320,90 @@ class ChatInterLifecycleManager:
 
 
 async def _context_budget_hook(payload: LifecyclePayload) -> None:
+    token_budget = _resolve_budget(payload.model_name)
+    before_tokens = _estimate_tokens(
+        f"{payload.system_prompt}\n{payload.context_xml}",
+        payload.model_name,
+    )
     compressed_prompt, compressed_context = _compress_context(
         payload.system_prompt,
         payload.context_xml,
         payload.model_name,
     )
+    prompt_tokens = _estimate_tokens(compressed_prompt, payload.model_name)
+    if prompt_tokens >= token_budget:
+        compressed_prompt = _trim_text_by_budget(
+            compressed_prompt,
+            max(token_budget - 32, 1),
+            payload.model_name,
+        )
+        prompt_tokens = _estimate_tokens(compressed_prompt, payload.model_name)
+
+    context_budget = max(token_budget - prompt_tokens, 0)
+    after_tokens = _estimate_tokens(
+        f"{compressed_prompt}\n{compressed_context}",
+        payload.model_name,
+    )
+    dropped_sections: list[str] = []
+    if after_tokens > token_budget and context_budget > 0:
+        compressed_context, dropped_sections = _drop_sections_to_budget(
+            compressed_context,
+            token_budget=context_budget,
+            model_name=payload.model_name,
+        )
+    elif after_tokens > token_budget:
+        compressed_context = ""
+
+    after_tokens = _estimate_tokens(
+        f"{compressed_prompt}\n{compressed_context}",
+        payload.model_name,
+    )
+    if after_tokens > token_budget:
+        context_budget = max(
+            token_budget - _estimate_tokens(compressed_prompt, payload.model_name),
+            0,
+        )
+        compressed_context = _trim_text_by_budget(
+            compressed_context,
+            context_budget,
+            payload.model_name,
+        )
+        after_tokens = _estimate_tokens(
+            f"{compressed_prompt}\n{compressed_context}",
+            payload.model_name,
+        )
+    if after_tokens > token_budget:
+        prompt_budget = max(
+            token_budget - _estimate_tokens(compressed_context, payload.model_name),
+            1,
+        )
+        compressed_prompt = _trim_text_by_budget(
+            compressed_prompt,
+            prompt_budget,
+            payload.model_name,
+        )
+        after_tokens = _estimate_tokens(
+            f"{compressed_prompt}\n{compressed_context}",
+            payload.model_name,
+        )
+
     payload.system_prompt = compressed_prompt
     payload.context_xml = compressed_context
+    report = {
+        "budget": token_budget,
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "ratio": round(after_tokens / max(token_budget, 1), 3),
+        "dropped_sections": dropped_sections,
+        "phase": str(payload.metadata.get("phase") or "unknown"),
+    }
+    payload.metadata["budget_report"] = report
+    if report["ratio"] >= _BUDGET_ALERT_RATIO:
+        logger.debug(
+            "chatinter context budget near limit: "
+            f"phase={report['phase']} before={before_tokens} after={after_tokens} "
+            f"budget={token_budget} dropped={','.join(dropped_sections) or '-'}"
+        )
 
 
 _lifecycle_manager = ChatInterLifecycleManager()

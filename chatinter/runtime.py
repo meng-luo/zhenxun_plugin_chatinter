@@ -178,7 +178,3 @@ def get_runtime_scheduler() -> ChatInterRuntimeScheduler:
     if _scheduler is None:
         _scheduler = ChatInterRuntimeScheduler()
     return _scheduler
-
-
-async def get_runtime_metrics_snapshot() -> dict[str, float | int | dict[str, int]]:
-    return await get_runtime_scheduler().get_metrics_snapshot()
