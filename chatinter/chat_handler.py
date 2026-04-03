@@ -20,7 +20,13 @@ from nonebot_plugin_alconna.uniseg import UniMessage
 from zhenxun.services import chat, logger
 from zhenxun.utils.message import MessageUtils
 
-from .config import build_reasoning_generation_config, get_config_value
+from .config import (
+    CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
+    USE_SIGN_IN_IMPRESSION,
+    build_reasoning_generation_config,
+    get_config_value,
+    get_model_name,
+)
 from .memory import _chat_memory
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
@@ -43,6 +49,10 @@ _MD_STRIKE_PATTERN = re.compile(r"~~(.+?)~~", re.DOTALL)
 _MD_EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@(\d{5,20})\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[的，,。.!！？?]))"
+)
+_UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN = re.compile(
+    r"\[image(?:#\d+)?\]",
+    re.IGNORECASE,
 )
 _COMPLEX_QUERY_HINTS = (
     "代码",
@@ -101,7 +111,7 @@ async def handle_chat_message(
         response = await chat(
             message=message,
             instruction=system_prompt,
-            model=get_config_value("INTENT_MODEL", None),
+            model=get_model_name(),
             config=build_reasoning_generation_config(),
         )
 
@@ -123,10 +133,8 @@ async def build_chat_system_prompt(
     chat_style: str = "",
     message_text: str = "",
 ) -> str:
-    use_sign_in_impression = get_config_value("USE_SIGN_IN_IMPRESSION", True)
-
     impression_prompt = ""
-    if use_sign_in_impression:
+    if USE_SIGN_IN_IMPRESSION:
         impression, attitude = await _chat_memory.get_user_impression(user_id)
         impression_prompt = (
             f"\n\n用户：{nickname} | 好感度：{impression:.0f} | 态度：{attitude}\n"
@@ -138,11 +146,8 @@ async def build_chat_system_prompt(
         if chat_style
         else "日式二次元、软萌中带一点傲娇的"
     )
-    allow_long_for_complex = bool(
-        get_config_value("CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX", True)
-    )
     is_complex_query = _is_complex_query(message_text)
-    if allow_long_for_complex and is_complex_query:
+    if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and is_complex_query:
         length_rule = (
             "当前问题偏复杂（如代码/排错/实现类），允许使用分点和步骤化说明，"
             "优先给出可执行结论，不受80字限制。"
@@ -185,6 +190,23 @@ async def reroute_to_plugin(
             bot_self_id,
             extra_images=extra_image_segments,
         )
+        unresolved_plain_text = ""
+        image_segment_count = 0
+        for segment in new_message:
+            if segment.type == "image":
+                image_segment_count += 1
+                continue
+            if segment.type == "text":
+                unresolved_plain_text += str(segment.data.get("text", ""))
+        if (
+            image_segment_count <= 0
+            and _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN.search(unresolved_plain_text)
+        ):
+            logger.warning(
+                "重路由消息仍包含未解析的 [image] 占位符，"
+                f"取消重投以避免下游插件解析失败：{command_text}"
+            )
+            return False
 
         event_data["message"] = new_message
         event_data["raw_message"] = command_text

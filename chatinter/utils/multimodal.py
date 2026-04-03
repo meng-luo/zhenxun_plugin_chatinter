@@ -8,7 +8,6 @@ import base64
 from pathlib import Path
 
 import aiofiles
-from nonebot.adapters import Bot
 from nonebot.adapters import Message as AdapterMessage
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 
@@ -17,15 +16,11 @@ from zhenxun.utils.http_utils import AsyncHttpx
 
 
 async def extract_images_from_message(
-    bot: Bot,
-    event,
     raw_message: str | UniMessage,
 ) -> list[LLMContentPart]:
     """从消息中提取图片，转换为 LLM 可识别的 Base64 格式
 
     参数:
-        bot: Bot 实例
-        event: 事件对象
         raw_message: 原始消息（字符串、Message 或 UniMessage）
 
     返回:

@@ -8,6 +8,8 @@ ChatInter - AI 意图识别插件
 使用 UniMessage 统一处理消息，支持多模态输入。
 """
 
+import asyncio
+
 from nonebot import get_driver, on_message
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, PrivateMessageEvent
@@ -25,22 +27,14 @@ from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
 from .data_source import _chat_memory, handle_fallback
-from .handler import (
-    build_pending_followup_message,
-    build_pending_target_followup_message,
-    claim_pending_image_followup,
-    clear_pending_target_followup,
-    get_pending_target_followup,
-    has_pending_image_followup,
-    remember_target_resolution,
-    resolve_pending_target_followup_user_id,
-)
 from .lifecycle import ensure_lifecycle_hooks_registered
 from .models.chat_history import ChatInterChatHistory  # noqa: F401
 from .plugin_registry import PluginRegistry
+from .route_observer import render_route_observer_summary
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()
+_DYNAMIC_MATCHER_RESCAN_DELAYS = (2, 8, 20)
 
 
 __plugin_meta__ = PluginMetadata(
@@ -51,7 +45,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="Copaan & meng-luo",
-        version="1.2.1",
+        version="1.2.2",
         plugin_type=PluginType.DEPENDANT,
         menu_type="其他",
         ignore_prompt=True,
@@ -75,17 +69,6 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="chatinter",
-                key="INTENT_MODEL",
-                value="",
-                help=(
-                    "ChatInter 使用的模型名称 (格式: ProviderName/ModelName)，"
-                    "留空时复用 AI.DEFAULT_MODEL_NAME"
-                ),
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
                 key="INTENT_TIMEOUT",
                 value=20,
                 help=(
@@ -105,22 +88,6 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="chatinter",
-                key="AGENT_TOTAL_TIMEOUT",
-                value=0,
-                help="Agent 全链路预算秒数（0=自动跟随 INTENT_TIMEOUT）",
-                default_value=0,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="AGENT_EXPAND_TOOLS_STEP",
-                value=2,
-                help="Agent 第 N 轮后从精准工具池扩展到完整工具池",
-                default_value=2,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
                 key="AGENT_TOOL_FAILURE_LIMIT",
                 value=2,
                 help="单工具连续失败达到阈值后自动熔断禁用",
@@ -134,22 +101,6 @@ __plugin_meta__ = PluginMetadata(
                 help="连续失败回合阈值，达到后停止工具并直接总结",
                 default_value=2,
                 type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="AGENT_STRICT_TOOL_SELECT",
-                value=True,
-                help="是否启用严格工具选择（无匹配时不回退全量工具）",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CONFIDENCE_THRESHOLD",
-                value=0.72,
-                help="插件意图置信度阈值，低于该值时降级为普通聊天",
-                default_value=0.72,
-                type=float,
             ),
             RegisterConfig(
                 module="chatinter",
@@ -186,103 +137,20 @@ __plugin_meta__ = PluginMetadata(
                 default_value="MEDIUM",
                 type=str,
             ),
-            RegisterConfig(
-                module="chatinter",
-                key="HISTORY_RECALL_LIMIT",
-                value=4,
-                help="上下文中额外召回的历史相关对话片段数量",
-                default_value=4,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="HISTORY_RECALL_MIN_SCORE",
-                value=0.18,
-                help="历史片段召回最低相关度阈值（0-1）",
-                default_value=0.18,
-                type=float,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="HISTORY_RECALL_CANDIDATE_LIMIT",
-                value=60,
-                help="历史片段召回候选池大小（从最近历史中取前N条评估）",
-                default_value=60,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="GROUP_BACKGROUND_FETCH_MULTIPLIER",
-                value=3,
-                help="群聊背景候选抓取倍数（最终输出数量=CONTEXT_PREFIX_SIZE）",
-                default_value=3,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="GROUP_BACKGROUND_RELEVANT_LIMIT",
-                value=3,
-                help="群聊背景中按相关度补充的消息上限",
-                default_value=3,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="GROUP_BACKGROUND_MIN_SCORE",
-                value=0.16,
-                help="群聊背景相关补充的最低相关度阈值（0-1）",
-                default_value=0.16,
-                type=float,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX",
-                value=True,
-                help="复杂问题自动放宽对话长度限制（代码/排错/方案类请求）",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="ENABLE_CONTEXT_RELEVANCE_GATE",
-                value=True,
-                help="开启上下文关联门控：新话题与历史低关联时按单轮对话处理",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CONTEXT_RELEVANCE_THRESHOLD",
-                value=0.11,
-                help="上下文关联阈值（0-1），低于该值时隔离历史上下文",
-                default_value=0.11,
-                type=float,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CONTEXT_RELEVANCE_SAMPLE_LIMIT",
-                value=18,
-                help="上下文关联评估采样条数（会话+群背景）",
-                default_value=18,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CONTEXT_RELEVANCE_MIN_QUERY_TOKENS",
-                value=1,
-                help="触发上下文关联评估所需的最少查询关键词数量",
-                default_value=1,
-                type=int,
-            ),
         ],
         commands=[
             Command(
                 command="重置会话",
                 description="重置当前会话历史（超级用户）",
-            )
+            ),
+            Command(
+                command="chatinter统计",
+                description="查看最近 ChatInter 路由统计（超级用户）",
+            ),
         ],
         superuser_help="""
 - `重置会话`
+- `chatinter统计`
         """.strip(),
     ).to_dict(),
 )
@@ -292,11 +160,6 @@ _fallback_matcher = on_message(
     priority=999,
     block=True,
     rule=to_me(),
-)
-
-_pending_image_matcher = on_message(
-    priority=998,
-    block=False,
 )
 
 
@@ -321,113 +184,6 @@ def _is_private_text_only_message(
         return False
     return has_text
 
-
-@_pending_image_matcher.handle()
-async def _handle_pending_image_followup(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
-    msg: UniMsg,
-    state: T_State,
-):
-    if getattr(event, "_ai_triggered", False):
-        return
-    if getattr(event, "_chatinter_pending_consumed", False):
-        return
-    user_id = str(getattr(session.user, "id", "") or "")
-    group_id = str(getattr(session.group, "id", "") or "") or None
-    if not user_id or not has_pending_image_followup(user_id, group_id):
-        return
-
-    try:
-        event_message = event.get_message()
-    except Exception:
-        event_message = None
-    if not _is_private_text_only_message(event, event_message):
-        logger.debug("ChatInter 私聊仅文本策略：忽略非文本消息")
-        return
-    tagged_message = (
-        uni_to_text_with_tags(event_message)
-        if event_message is not None
-        else uni_to_text_with_tags(msg)
-    )
-
-    pending_target = get_pending_target_followup(user_id, group_id)
-    if pending_target is not None:
-        resolved_target_user_id = await resolve_pending_target_followup_user_id(
-            pending_target,
-            tagged_message,
-            group_id,
-        )
-        if resolved_target_user_id:
-            synthetic_message = build_pending_target_followup_message(
-                pending_target.original_message,
-                tagged_message,
-                resolved_target_user_id,
-            )
-            clear_pending_target_followup(user_id, group_id)
-            remember_target_resolution(
-                group_id,
-                pending_target.target_hint,
-                resolved_target_user_id,
-            )
-            setattr(event, "_chatinter_pending_consumed", True)
-            setattr(event, "_ai_triggered", True)
-            logger.info(
-                "[ChatInter] 命中待补目标会话，继续处理："
-                "user="
-                f"{user_id}, "
-                f"group={group_id or 'private'}, "
-                f"target={resolved_target_user_id}"
-            )
-            await handle_fallback(
-                bot,
-                event,
-                session,
-                synthetic_message,
-                msg,
-                route_modules=None,
-                cached_plain_text=state.get("_zx_plain_text"),
-                current_message_override=synthetic_message,
-                from_pending_followup=True,
-            )
-            return
-        if getattr(event, "to_me", False):
-            setattr(event, "_chatinter_pending_consumed", True)
-            setattr(event, "_ai_triggered", True)
-            await MessageUtils.build_message(
-                "我还没确定是群里的哪位，回复我并直接@对方，我就继续。"
-            ).send()
-            return
-
-    if "[image" not in tagged_message:
-        return
-
-    pending = claim_pending_image_followup(user_id, group_id)
-    if pending is None:
-        return
-
-    synthetic_message = build_pending_followup_message(
-        pending.original_message,
-        tagged_message,
-    )
-    setattr(event, "_chatinter_pending_consumed", True)
-    setattr(event, "_ai_triggered", True)
-    logger.info(
-        "[ChatInter] 命中待补图会话，继续处理："
-        f"user={user_id}, group={group_id or 'private'}"
-    )
-    await handle_fallback(
-        bot,
-        event,
-        session,
-        synthetic_message,
-        msg,
-        route_modules=None,
-        cached_plain_text=state.get("_zx_plain_text"),
-        current_message_override=synthetic_message,
-        from_pending_followup=True,
-    )
 
 
 @_fallback_matcher.handle()
@@ -499,10 +255,18 @@ _reset_matcher = on_alconna(
     rule=to_me(),
 )
 
+_stats_matcher = on_alconna(
+    Alconna("chatinter统计"),
+    permission=SUPERUSER,
+    block=True,
+    priority=1,
+    rule=to_me(),
+)
+
 
 @_reset_matcher.handle()
 async def _handle_reset_by_alconna(
-    bot: Bot, event: GroupMessageEvent | PrivateMessageEvent, session: Uninfo
+    _bot: Bot, _event: GroupMessageEvent | PrivateMessageEvent, session: Uninfo
 ):
     """重置当前会话历史（仅超级用户）"""
     user_id = session.user.id if session.user else ""
@@ -519,6 +283,11 @@ async def _handle_reset_by_alconna(
     ).send()
 
 
+@_stats_matcher.handle()
+async def _handle_stats_by_alconna():
+    await MessageUtils.build_message(render_route_observer_summary()).send()
+
+
 @driver.on_startup
 async def _on_startup():
     """插件启动初始化"""
@@ -528,3 +297,15 @@ async def _on_startup():
     await ensure_lifecycle_hooks_registered()
     _chat_memory.set_bot_nickname(BotConfig.self_nickname)
     await PluginRegistry.preload_cache()
+    asyncio.create_task(_rescan_dynamic_matchers_after_startup())
+
+
+async def _rescan_dynamic_matchers_after_startup():
+    """等其它插件 startup 动态 matcher 创建完成后，分批重建知识库。"""
+    for delay_seconds in _DYNAMIC_MATCHER_RESCAN_DELAYS:
+        await asyncio.sleep(delay_seconds)
+        await PluginRegistry.preload_cache()
+        logger.info(
+            "ChatInter 已完成 startup 后动态 matcher 补扫："
+            f"delay={delay_seconds}s"
+        )
