@@ -19,6 +19,7 @@ class AutoMetadataBuilder:
     链路：
     - matcher/parser 反射提取命令头与参数结构
     - matcher 源码 AST 提取 on_xxx(..., aliases={...}) 别名
+    - shortcut(...) / parser.shortcuts / manager.shortcuts 统一提取快捷命令
     - parser dry-run 探针判断是否支持粘连参数
     - meme manager 反射提取模板类命令参数范围
     """
@@ -27,6 +28,7 @@ class AutoMetadataBuilder:
         dict[str, tuple[int, dict[str, list[str]]]]
     ] = {}
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
+    _no_command_log_cache: ClassVar[set[str]] = set()
     _sticky_probe_token: ClassVar[str] = "测试"
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
@@ -73,9 +75,11 @@ class AutoMetadataBuilder:
             )
         extracted = [*matcher_commands, *manager_commands]
         if not extracted:
-            logger.debug(
-                f"ChatInter 自动元数据构建未从插件提取到命令: {module_name}"
-            )
+            if module_name not in cls._no_command_log_cache:
+                cls._no_command_log_cache.add(module_name)
+                logger.debug(
+                    f"ChatInter 自动元数据构建未从插件提取到命令: {module_name}"
+                )
         return cls._merge_command_dicts(extracted)
 
     @classmethod
@@ -94,6 +98,9 @@ class AutoMetadataBuilder:
                 else cls._default_parser_schema()
             )
             handler_hint = cls._extract_handler_hint(matcher)
+            parser_shortcut_aliases = (
+                cls._extract_parser_shortcut_aliases(parser) if parser is not None else []
+            )
             for payload in cls._extract_rule_command_data(
                 matcher=matcher,
                 parser_schema=parser_schema,
@@ -119,6 +126,7 @@ class AutoMetadataBuilder:
                     "aliases": cls._merge_unique_strings(
                         cls._extract_parser_aliases(parser, command_head),
                         alias_map.get(command_head.casefold(), []),
+                        parser_shortcut_aliases,
                     ),
                     "params": parser_schema["params"],
                     "text_min": parser_schema["text_min"],
@@ -398,6 +406,15 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(aliases, [])
 
     @classmethod
+    def _extract_parser_shortcut_aliases(cls, parser: object) -> list[str]:
+        shortcuts: list[str] = []
+        for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
+            shortcuts.extend(
+                cls._extract_shortcut_labels(shortcut_key=shortcut_key, shortcut_obj=shortcut_obj)
+            )
+        return cls._merge_unique_strings(shortcuts, [])
+
+    @classmethod
     def _extract_parser_schema(cls, parser: object) -> dict[str, Any]:
         params: list[str] = []
         text_min = 0
@@ -628,19 +645,28 @@ class AutoMetadataBuilder:
     @staticmethod
     def _iter_meme_heads(meme: object, info: object | None) -> list[str]:
         heads: list[str] = []
+        seen: set[str] = set()
+
+        def add_head(value: object) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            folded = text.casefold()
+            if folded in seen:
+                return
+            seen.add(folded)
+            heads.append(text)
+
         key = str(getattr(meme, "key", "") or "").strip()
         if key:
-            heads.append(key)
+            add_head(key)
         if info is None:
             return heads
         for keyword in getattr(info, "keywords", []) or []:
-            text = str(keyword or "").strip()
-            if text:
-                heads.append(text)
+            add_head(keyword)
         for shortcut in getattr(info, "shortcuts", []) or []:
-            text = str(getattr(shortcut, "humanized", "") or "").strip()
-            if text:
-                heads.append(text)
+            for attr_name in ("humanized", "pattern", "key"):
+                add_head(getattr(shortcut, attr_name, ""))
         return heads
 
     @classmethod
@@ -752,6 +778,15 @@ class AutoMetadataBuilder:
             command = cls._extract_command_from_call_node(node)
             aliases = cls._extract_aliases_from_call_node(node)
             if not command or not aliases:
+                shortcut_command, shortcut_aliases = cls._extract_shortcut_from_call_node(
+                    node
+                )
+                if not shortcut_command or not shortcut_aliases:
+                    continue
+                alias_map[shortcut_command.casefold()] = cls._merge_unique_strings(
+                    alias_map.get(shortcut_command.casefold()),
+                    shortcut_aliases,
+                )
                 continue
             alias_map[command.casefold()] = cls._merge_unique_strings(
                 alias_map.get(command.casefold()),
@@ -811,6 +846,40 @@ class AutoMetadataBuilder:
         return []
 
     @classmethod
+    def _extract_shortcut_from_call_node(cls, node: ast.Call) -> tuple[str, list[str]]:
+        if cls._get_call_name(node.func) != "shortcut" or not node.args:
+            return "", []
+
+        shortcut_key = ""
+        first_arg = node.args[0]
+        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+            shortcut_key = cls._normalize_command(first_arg.value)
+        if not shortcut_key or not cls._looks_like_shortcut_alias(shortcut_key):
+            return "", []
+
+        target_command = ""
+        humanized_aliases: list[str] = [shortcut_key]
+        for keyword in node.keywords or []:
+            if keyword.arg == "command":
+                try:
+                    raw_command = ast.literal_eval(keyword.value)
+                except Exception:
+                    raw_command = ""
+                target_command = cls._normalize_command(str(raw_command or ""))
+                continue
+            if keyword.arg == "humanized":
+                try:
+                    raw_humanized = ast.literal_eval(keyword.value)
+                except Exception:
+                    raw_humanized = ""
+                humanized = cls._normalize_command(str(raw_humanized or ""))
+                if humanized and cls._looks_like_shortcut_alias(humanized):
+                    humanized_aliases.append(humanized)
+        if not target_command:
+            return "", []
+        return target_command, cls._merge_unique_strings(humanized_aliases, [])
+
+    @classmethod
     def _normalize_command(cls, command: str) -> str:
         text = str(command or "").strip()
         if not text:
@@ -818,6 +887,96 @@ class AutoMetadataBuilder:
         text = cls._command_placeholder_pattern.sub(" ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return normalize_message_text(text)
+
+    @classmethod
+    def _looks_like_shortcut_alias(cls, text: str) -> bool:
+        normalized = cls._normalize_command(text)
+        if not normalized:
+            return False
+        if normalized.startswith("re:"):
+            return False
+        if any(char in normalized for char in "\\[]()^$|"):
+            return False
+        return True
+
+    @classmethod
+    def _extract_shortcut_labels(
+        cls,
+        *,
+        shortcut_key: object | None,
+        shortcut_obj: object | None,
+    ) -> list[str]:
+        labels: list[str] = []
+        candidates: list[object] = []
+        if shortcut_key is not None:
+            candidates.append(shortcut_key)
+        if shortcut_obj is not None:
+            for attr_name in ("humanized", "origin_key", "key", "pattern"):
+                candidates.append(getattr(shortcut_obj, attr_name, None))
+        for candidate in candidates:
+            text = cls._normalize_command(str(candidate or ""))
+            if text and cls._looks_like_shortcut_alias(text):
+                labels.append(text)
+        return cls._merge_unique_strings(labels, [])
+
+    @classmethod
+    def _iter_shortcut_records(cls, owner: object) -> list[tuple[str, object]]:
+        records: list[tuple[str, object]] = []
+        seen: set[tuple[str, int]] = set()
+
+        def add_record(key: object, value: object) -> None:
+            key_text = cls._normalize_command(str(key or ""))
+            if not key_text or not cls._looks_like_shortcut_alias(key_text):
+                return
+            marker = (key_text.casefold(), id(value))
+            if marker in seen:
+                return
+            seen.add(marker)
+            records.append((key_text, value))
+
+        formatter = getattr(owner, "formatter", None)
+        data = getattr(formatter, "data", None)
+        shortcut_hash = getattr(owner, "_hash", None)
+        if isinstance(data, dict) and shortcut_hash in data:
+            trace = data.get(shortcut_hash)
+            shortcuts = getattr(trace, "shortcuts", None)
+            if isinstance(shortcuts, dict):
+                for key, value in shortcuts.items():
+                    add_record(key, value)
+
+        for attr_name in ("_get_shortcuts", "get_shortcuts"):
+            getter = getattr(owner, attr_name, None)
+            if not callable(getter):
+                continue
+            try:
+                raw_shortcuts = getter()
+            except Exception:
+                continue
+            if isinstance(raw_shortcuts, dict):
+                for key, value in raw_shortcuts.items():
+                    add_record(key, value)
+            elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+                for item in raw_shortcuts:
+                    add_record(item, item)
+
+        raw_shortcuts = getattr(owner, "shortcuts", None)
+        if isinstance(raw_shortcuts, dict):
+            for key, value in raw_shortcuts.items():
+                add_record(key, value)
+        elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+            for item in raw_shortcuts:
+                add_record(item, item)
+
+        info = getattr(owner, "info", None)
+        nested_shortcuts = getattr(info, "shortcuts", None) if info is not None else None
+        if isinstance(nested_shortcuts, dict):
+            for key, value in nested_shortcuts.items():
+                add_record(key, value)
+        elif isinstance(nested_shortcuts, (list, tuple, set, frozenset)):
+            for item in nested_shortcuts:
+                add_record(item, item)
+
+        return records
 
     @classmethod
     def _extract_regex_head(cls, pattern: str) -> str | None:
@@ -846,10 +1005,11 @@ class AutoMetadataBuilder:
     def _merge_unique_strings(
         left: list[str] | tuple[str, ...] | None,
         right: list[str] | tuple[str, ...] | None,
+        *extra: list[str] | tuple[str, ...] | None,
     ) -> list[str]:
         result: list[str] = []
-        for collection in (left or [], right or []):
-            for value in collection:
+        for collection in (left, right, *extra):
+            for value in collection or []:
                 text = str(value or "").strip()
                 if text and text not in result:
                     result.append(text)

@@ -13,6 +13,7 @@ from .route_text import (
     is_usage_question,
     match_command_head,
     match_command_head_or_sticky,
+    parse_command_with_head,
     normalize_action_phrases,
     normalize_message_text,
     sanitize_template_tail,
@@ -190,12 +191,44 @@ _TEMPLATE_KIND_HINTS = (
 _INLINE_AT_TOKEN_PATTERN = re.compile(
     r"\[@\d{5,20}\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))"
 )
+_NUMERIC_TOKEN_PATTERN = re.compile(r"\d+(?:\.\d+)?")
+_AMOUNT_HINT_PATTERN = re.compile(
+    r"(?:总额|总金|总计|总共|金额|合计|一共|共)\s*(?:为|是|=|:|：)?\s*(\d+(?:\.\d+)?)"
+)
+_COUNT_HINT_PATTERN = re.compile(
+    r"(?:红包数|数量|个数|份数|数目|个)\s*(?:为|是|=|:|：)?\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:个|份|次|张|人)\b"
+)
+_NUMERIC_PARAM_HINTS = (
+    "amount",
+    "num",
+    "count",
+    "total",
+    "money",
+    "gold",
+    "金币数",
+    "price",
+    "quantity",
+    "number",
+    "金额",
+    "总额",
+    "总金",
+    "总计",
+    "总共",
+    "合计",
+    "红包数",
+    "数量",
+    "个数",
+    "份数",
+    "数目",
+)
+_TARGET_PARAM_HINTS = ("user", "target", "at", "nickname", "self")
 
 
 @dataclass(frozen=True)
 class SkillCommandSchema:
     command: str
     aliases: tuple[str, ...] = ()
+    params: tuple[str, ...] = ()
     text_min: int | None = None
     text_max: int | None = None
     image_min: int | None = None
@@ -359,6 +392,14 @@ def _extract_command_schemas(
         metas[command] = SkillCommandSchema(
             command=command,
             aliases=aliases,
+            params=tuple(
+                param
+                for param in (
+                    _normalize_skill_phrase(str(item or ""))
+                    for item in (getattr(raw, "params", None) or [])
+                )
+                if param
+            ),
             text_min=_safe_int(getattr(raw, "text_min", None)),
             text_max=_safe_int(getattr(raw, "text_max", None)),
             image_min=_safe_int(getattr(raw, "image_min", None)),
@@ -857,6 +898,254 @@ def _strip_route_noise(text: str) -> str:
     return ""
 
 
+def _is_numeric_param_name(param_name: str) -> bool:
+    normalized = normalize_message_text(param_name).lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _NUMERIC_PARAM_HINTS)
+
+
+def _is_target_param_name(param_name: str) -> bool:
+    normalized = normalize_message_text(param_name).lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _TARGET_PARAM_HINTS)
+
+
+def _schema_supports_payload(schema: SkillCommandSchema | None) -> bool:
+    if schema is None:
+        return False
+    if schema.params:
+        return True
+    if (schema.text_min or 0) > 0 or (schema.text_max or 0) > 0:
+        return True
+    if (schema.image_min or 0) > 0 or (schema.image_max or 0) > 0:
+        return True
+    if schema.allow_at is not None:
+        return True
+    if schema.target_requirement and schema.target_requirement != "none":
+        return True
+    return bool(schema.target_sources)
+
+
+def _score_schema_payload_fit(
+    schema: SkillCommandSchema,
+    *,
+    head_text: str,
+    argument_text: str,
+) -> float:
+    score = 0.0
+    normalized_head = normalize_message_text(head_text).lower()
+    normalized_argument = normalize_message_text(argument_text).lower()
+    schema_blob = " ".join(
+        [
+            schema.command,
+            " ".join(schema.aliases),
+            " ".join(schema.params),
+        ]
+    ).lower()
+    if not normalized_head and not normalized_argument:
+        return 0.0
+
+    if "金币" in normalized_head and "金币" in schema_blob:
+        score += 12.0
+    if "红包" in normalized_head and "红包" in schema_blob:
+        score += 8.0
+    if any(token in normalized_head for token in ("amount", "money", "gold", "金额", "总额", "总金", "总计", "总共", "合计")) and any(
+        token in schema_blob for token in ("amount", "money", "gold", "金币数", "金币", "金额", "总额", "总金", "总计", "总共", "合计")
+    ):
+        score += 10.0
+    if any(token in normalized_head for token in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")) and any(
+        token in schema_blob for token in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")
+    ):
+        score += 10.0
+
+    schema_tokens = _extract_schema_argument_tokens(argument_text, schema)
+    if schema_tokens:
+        score += 8.0 + len(schema_tokens) * 4.0
+    else:
+        argument_tokens = _parse_argument_tokens(argument_text)
+        if argument_tokens:
+            score += min(len(argument_tokens) * 2.0, 8.0)
+
+    if _NUMERIC_TOKEN_PATTERN.search(normalized_argument):
+        score += 2.0
+    if _INLINE_AT_TOKEN_PATTERN.search(normalized_argument):
+        score += 2.0
+    if "image" in normalized_argument:
+        score += 2.0
+    return score
+
+
+def _message_has_payload_signals(text: str) -> bool:
+    normalized = normalize_message_text(text).lower()
+    if not normalized:
+        return False
+    if _NUMERIC_TOKEN_PATTERN.search(normalized):
+        return True
+    if _INLINE_AT_TOKEN_PATTERN.search(normalized):
+        return True
+    if contains_any(normalized, _TEXT_LABELS):
+        return True
+    if contains_any(
+        normalized,
+        (
+            "总额",
+            "总金",
+            "总计",
+            "总共",
+            "金额",
+            "合计",
+            "个数",
+            "数量",
+            "份数",
+            "数目",
+            "红包数",
+            "金币数",
+            "文字",
+            "文本",
+            "内容",
+            "标题",
+        ),
+    ):
+        return True
+    return False
+
+
+def _select_payload_schema(
+    skill: SkillSpec,
+    *,
+    current_schema: SkillCommandSchema | None,
+    head_text: str,
+    argument_text: str,
+    message_text: str,
+) -> SkillCommandSchema | None:
+    if current_schema is None:
+        return None
+    if _schema_supports_payload(current_schema):
+        return current_schema
+
+    probe_text = normalize_message_text(argument_text or message_text)
+    if not probe_text or not _message_has_payload_signals(probe_text):
+        return current_schema
+
+    best_schema = current_schema
+    best_score = _score_schema_payload_fit(
+        current_schema,
+        head_text=head_text,
+        argument_text=probe_text,
+    )
+    for candidate_schema in skill.command_schemas:
+        if candidate_schema is current_schema:
+            continue
+        if not _schema_supports_payload(candidate_schema):
+            continue
+        candidate_score = _score_schema_payload_fit(
+            candidate_schema,
+            head_text=head_text,
+            argument_text=probe_text,
+        )
+        if candidate_score > best_score:
+            best_schema = candidate_schema
+            best_score = candidate_score
+    return best_schema
+
+
+def _extract_labeled_number(raw_text: str, pattern: re.Pattern[str]) -> str:
+    compact = normalize_message_text(raw_text).replace(" ", "")
+    if not compact:
+        return ""
+    match = pattern.search(compact)
+    if not match:
+        return ""
+    for group in match.groups():
+        if group:
+            return group
+    return ""
+
+
+def _extract_schema_argument_tokens(
+    argument_text: str,
+    schema: SkillCommandSchema | None,
+) -> list[str]:
+    raw = normalize_message_text(argument_text)
+    if not raw or schema is None:
+        return []
+    param_names = tuple(schema.params or ())
+    if not param_names:
+        return []
+
+    numeric_param_count = sum(
+        1 for param in param_names if _is_numeric_param_name(param)
+    )
+    if numeric_param_count < 2:
+        return []
+    if (schema.text_min or 0) > 0:
+        return []
+
+    all_numbers = [token for token in _NUMERIC_TOKEN_PATTERN.findall(raw) if token]
+    if not all_numbers:
+        return []
+
+    amount_value = _extract_labeled_number(raw, _AMOUNT_HINT_PATTERN)
+    count_value = _extract_labeled_number(raw, _COUNT_HINT_PATTERN)
+
+    ordered_tokens: list[str] = []
+    used_numbers: set[str] = set()
+
+    def _consume_next_number() -> str:
+        for token in all_numbers:
+            if token not in used_numbers:
+                used_numbers.add(token)
+                return token
+        return ""
+
+    for param_name in param_names:
+        if _is_target_param_name(param_name):
+            continue
+        if not _is_numeric_param_name(param_name):
+            continue
+        param_l = normalize_message_text(param_name).lower()
+        value = ""
+        if amount_value and any(
+            hint in param_l
+            for hint in (
+                "amount",
+                "money",
+                "gold",
+                "金币数",
+                "金币",
+                "price",
+                "总额",
+                "金额",
+                "总金",
+                "总计",
+                "总共",
+                "合计",
+                "共",
+            )
+        ):
+            value = amount_value
+        elif count_value and any(
+            hint in param_l for hint in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")
+        ):
+            value = count_value
+        if not value:
+            value = _consume_next_number()
+        if value and value not in ordered_tokens:
+            ordered_tokens.append(value)
+
+    if not ordered_tokens:
+        return []
+    if len(ordered_tokens) < numeric_param_count:
+        for token in all_numbers:
+            if token not in ordered_tokens:
+                ordered_tokens.append(token)
+            if len(ordered_tokens) >= numeric_param_count:
+                break
+    return ordered_tokens
+
+
 def _extract_argument_around_head(message_text: str, command_head: str) -> str:
     normalized = normalize_message_text(
         normalize_action_phrases(strip_invoke_prefix(message_text))
@@ -888,13 +1177,39 @@ def _extract_argument_around_head(message_text: str, command_head: str) -> str:
     after = normalize_message_text(
         normalized[index + len(command_head) :].strip(" ：:，,。.!！?？")
     )
-    if after:
-        return after
-
     before_cleaned = _strip_route_noise(before)
+    after_cleaned = _strip_route_noise(after)
+
+    if before_cleaned and after_cleaned:
+        combined = normalize_message_text(f"{before_cleaned} {after_cleaned}")
+        if _message_has_payload_signals(combined):
+            return combined
+
+    if after_cleaned:
+        return after_cleaned
+
     if before_cleaned and len(before_cleaned) <= 30:
         return before_cleaned
     return ""
+
+
+def _extract_command_context(
+    message_text: str,
+    command_head: str,
+    *,
+    schema: SkillCommandSchema | None,
+) -> str:
+    parsed = parse_command_with_head(
+        message_text,
+        command_head,
+        allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
+    )
+    if parsed is not None:
+        fragments = [parsed.prefix_text, parsed.payload_text]
+        combined = normalize_message_text(" ".join(part for part in fragments if part))
+        if combined:
+            return combined
+    return _extract_argument_around_head(message_text, command_head)
 
 
 def _strip_skill_terms(argument: str, skill: SkillSpec) -> str:
@@ -1076,7 +1391,10 @@ def _apply_command_schema(
     placeholders: list[str],
     schema: SkillCommandSchema | None,
 ) -> str:
-    text_tokens = _parse_argument_tokens(argument_text)
+    schema_tokens = _extract_schema_argument_tokens(argument_text, schema)
+    text_tokens = (
+        schema_tokens if schema_tokens else _parse_argument_tokens(argument_text)
+    )
     at_tokens = []
     for token in placeholders:
         normalized_at = _normalize_at_placeholder(token)
@@ -1126,15 +1444,55 @@ def _compose_skill_command(
     )
     command_at_head = match_command_head(normalized_message, head)
     placeholders = collect_placeholders(message_text)
-    argument_text = _extract_argument_around_head(message_text, head)
+    parsed_context = parse_command_with_head(
+        message_text,
+        head,
+        allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
+    )
+    if parsed_context is None and suggested_command:
+        parsed_context = parse_command_with_head(
+            suggested_command,
+            head,
+            allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
+        )
+    if parsed_context is not None:
+        fragments = [parsed_context.prefix_text, parsed_context.payload_text]
+        argument_text = normalize_message_text(
+            " ".join(part for part in fragments if part)
+        )
+    else:
+        argument_text = _extract_command_context(
+            message_text,
+            head,
+            schema=schema,
+        )
 
     if not argument_text and suggested_command:
-        argument_text = _extract_argument_around_head(suggested_command, head)
+        argument_text = _extract_command_context(
+            suggested_command,
+            head,
+            schema=schema,
+        )
     argument_text = _strip_skill_terms(argument_text, skill)
 
-    if not command_at_head and not (
-        schema is not None and schema.allow_sticky_arg and argument_text
-    ) and (schema is None or (schema.text_min or 0) <= 0):
+    best_schema = _select_payload_schema(
+        skill,
+        current_schema=schema,
+        head_text=head,
+        argument_text=argument_text,
+        message_text=message_text,
+    )
+    if best_schema is not None and best_schema is not schema:
+        schema = best_schema
+        head = _normalize_skill_phrase(best_schema.command) or head
+
+    if (
+        parsed_context is None
+        and not command_at_head
+        and not (schema is not None and schema.allow_sticky_arg and argument_text)
+        and not _schema_supports_payload(schema)
+        and not _message_has_payload_signals(message_text)
+    ):
         argument_text = ""
 
     if head in skill.helper_commands:
@@ -1158,6 +1516,31 @@ def _compose_skill_command(
         placeholders=placeholders,
         schema=schema,
     )
+    if (
+        normalize_message_text(command) == head
+        and _message_has_payload_signals(message_text)
+    ):
+        rescued_argument = _strip_skill_terms(
+            _extract_argument_around_head(message_text, head),
+            skill,
+        )
+        if rescued_argument and rescued_argument != argument_text:
+            rescued_schema = _select_payload_schema(
+                skill,
+                current_schema=schema,
+                head_text=head,
+                argument_text=rescued_argument,
+                message_text=message_text,
+            )
+            if rescued_schema is not None and rescued_schema is not schema:
+                schema = rescued_schema
+                head = _normalize_skill_phrase(rescued_schema.command) or head
+            command = _apply_command_schema(
+                head,
+                argument_text=rescued_argument,
+                placeholders=placeholders,
+                schema=schema,
+            )
     return command
 
 
@@ -1450,13 +1833,14 @@ def _render_command_schema(schema: SkillCommandSchema) -> dict:
         result["image_max"] = schema.image_max
     if schema.allow_at is not None:
         result["allow_at"] = schema.allow_at
-    if schema.actor_scope:
+    if schema.actor_scope and schema.actor_scope != "allow_other":
         result["actor_scope"] = schema.actor_scope
-    if schema.target_requirement:
+    if schema.target_requirement and schema.target_requirement != "none":
         result["target_requirement"] = schema.target_requirement
     if schema.target_sources:
         result["target_sources"] = list(schema.target_sources)
-    result["allow_sticky_arg"] = schema.allow_sticky_arg
+    if schema.allow_sticky_arg:
+        result["allow_sticky_arg"] = True
     return result
 
 
@@ -1567,23 +1951,23 @@ def render_skill_namespace(
         selected_actions = _select_prompt_commands(
             skill.action_commands,
             query,
-            limit=24,
+            limit=16,
         )
         selected_helpers: list[str] = []
         if include_helpers:
             selected_helpers = _select_prompt_commands(
                 skill.helper_commands,
                 query,
-                limit=8,
+                limit=4,
             )
         if not selected_actions:
-            selected_actions = list(skill.action_commands[:24])
+            selected_actions = list(skill.action_commands[:16])
         if include_helpers and not selected_helpers:
-            selected_helpers = list(skill.helper_commands[:8])
+            selected_helpers = list(skill.helper_commands[:4])
         schema_selection = _select_prompt_schemas(
             skill,
             [*selected_actions, *selected_helpers],
-            limit=24,
+            limit=12,
             fallback_all=include_helpers,
         )
         payload.append(
@@ -1597,12 +1981,11 @@ def render_skill_namespace(
                 "kind": skill.kind,
                 "action_commands": selected_actions,
                 "helper_commands": selected_helpers,
-                "aliases": list(skill.aliases[:6]),
+                "aliases": list(skill.aliases[:4]),
                 "schemas": [
                     _render_command_schema(schema)
                     for schema in schema_selection
                 ],
-                "hint": skill.hint,
             }
         )
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

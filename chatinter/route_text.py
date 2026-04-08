@@ -389,6 +389,7 @@ _ROUTE_CONTEXT_HINT_WORDS = ROUTE_ACTION_WORDS + MEME_TRIGGER_WORDS + (
     "让",
     "替",
     "去",
+    "发送",
     "先",
     "再",
     "一下",

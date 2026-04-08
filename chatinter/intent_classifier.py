@@ -263,6 +263,11 @@ def _fallback_explicit_command(
                             for alias in meta.aliases or ()
                             if normalize_message_text(alias)
                         ),
+                        params=tuple(
+                            normalize_message_text(param)
+                            for param in getattr(meta, "params", ()) or ()
+                            if normalize_message_text(param)
+                        ),
                         text_min=int(getattr(meta, "text_min", 0) or 0),
                         text_max=getattr(meta, "text_max", None),
                         image_min=int(getattr(meta, "image_min", 0) or 0),

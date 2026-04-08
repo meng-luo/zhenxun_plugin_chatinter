@@ -44,7 +44,7 @@ from .skill_registry import (
     skill_search,
 )
 
-_ROUTE_NAMESPACE_LIMIT = 16
+_ROUTE_NAMESPACE_LIMIT = 12
 _ROUTE_VECTOR_TOP_K = 10
 _ROUTE_VECTOR_FETCH_K = 24
 _ROUTE_VECTOR_MAX_K = 20
@@ -61,18 +61,12 @@ _ROUTE_PROMPT_TOKEN_PATTERN = re.compile(
 _LLM_ROUTE_INSTRUCTION = """
 你是 ChatInter 的技能路由器，只负责在给定技能命名空间内选择可执行命令。
 必须严格遵守：
-1. 只能从 skills_json 中选择 plugin_module 与命令头。
-2. command 必须是一条可直接发送给插件的命令字符串。
-3. 用户是执行诉求时优先 action_commands。
-4. 当用户是在问“怎么用/用法/帮助/参数/说明”时：
-   优先选择通用帮助命令“帮助 <插件名或命令词>”或“功能 <插件名或命令词>”
-   （推荐口径等价于“真寻帮助<插件名>”）；
-   并尽量从用户问题里抽取目标插件名或命令词作为参数，例如“识图怎么用”=>“帮助 识图”；
-   除非用户明确点名某个 helper 命令，否则不要把“怎么用/帮助”问题路由到
-   业务 helper_commands（如“表情详情”）。
-5. 若 schema.text_max 为 0，不要附带额外文本参数；仅保留 [@...] 或 [image] 占位符。
-6. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
-7. 如果无法确定，返回 action=skip。
+1. 只能从 skills_json 里选 plugin_module 与 command。
+2. command 必须能直接发送给插件，不要重复拼写 [@...]、[image] 或 reply。
+3. 执行诉求优先 action_commands；“怎么用/用法/帮助/参数/说明”才看 helper_commands。
+4. 若 schema.text_max 为 0，不要附带纯文本参数。
+5. 保留用户消息里的 [@123456]、[image] 占位符，不要改写成自然语言。
+6. 无法确定时返回 action=skip。
 """.strip()
 _LLM_ROUTE_RELAXED_SUFFIX = """
 请仅输出一个 JSON 对象，不要输出额外解释。
@@ -88,11 +82,11 @@ _TOOL_ROUTE_INSTRUCTION = """
 你是 ChatInter 的工具式路由规划器。
 给你的每个工具都已经绑定到一个明确的插件命令。
 严格遵守：
-1. 如果某个工具明显对应当前用户诉求，就调用且只调用一个工具。
-2. text 参数只填写额外纯文本，不要重复填写命令头、[@...]、[image]、reply 信息。
-3. 如果命令不需要文本参数，不要传 text。
-4. 如果消息更像普通对话、闲聊、澄清或没有足够把握，就不要调用任何工具，直接回复 SKIP。
-5. “怎么用/用法/帮助/参数”类问题优先选择帮助型命令，不要误调用业务动作命令。
+1. 明显对应当前诉求的工具才调用，且只调用一个。
+2. text 只填额外纯文本，不要重复命令头、[@...]、[image]、reply。
+3. 命令不需要文本参数时不要传 text。
+4. 像普通对话、闲聊、澄清或把握不足时，直接回复 SKIP。
+5. “怎么用/用法/帮助/参数”类问题优先帮助型命令，不要误调用业务动作命令。
 """.strip()
 _JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _MAX_VECTOR_NOTE_LEN = 96
@@ -663,9 +657,9 @@ def _build_route_prompt(
     return (
         f"用户消息:\n{message_text}\n\n"
         f"{rag_section}"
-        "可用技能命名空间 JSON:\n"
+        "候选技能 JSON:\n"
         f"{skills_json}\n\n"
-        "请基于上述命名空间选择路由。"
+        "只基于上述候选选择路由。"
     )
 
 

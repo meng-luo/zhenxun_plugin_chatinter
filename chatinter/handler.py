@@ -389,13 +389,13 @@ def _build_route_notify_text(
 
     normalized_command = normalize_message_text(route_command)
     command_head = normalized_command.split(" ", 1)[0] if normalized_command else ""
-    target = command_head or normalize_message_text(plugin_name)
+    target = normalize_message_text(plugin_name) or command_head
     seed_base = f"{plugin_module}|{plugin_name}|{normalized_command}"
     if not target:
         return _render(_CUTE_NOTIFY_TEMPLATES, target="处理一下", seed=seed_base)
 
     is_meme_like = "meme" in (plugin_module or "").lower() or "表情" in (plugin_name or "")
-    if is_meme_like and not target.endswith("表情"):
+    if is_meme_like and "表情" not in target:
         if target in _MEME_HELPER_COMMANDS:
             return _render(_CUTE_MEME_HELPER_TEMPLATES, target=target, seed=f"{seed_base}|helper")
         return _render(_CUTE_MEME_NOTIFY_TEMPLATES, target=f"{target}表情", seed=f"{seed_base}|meme")
@@ -2732,6 +2732,8 @@ async def handle_fallback(
         trace.stage("agent_budget")
         intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
         agent_enabled = bool(get_config_value("ENABLE_AGENT_MODE", True))
+        if intent_profile.kind == "chat":
+            agent_enabled = False
         reply: str | UniMessage | None = None
         if agent_enabled:
             try:

@@ -127,6 +127,10 @@ class PluginRegistry:
                 for param in (getattr(raw, "params", []) or [])
             ]
             params = [param for param in params if param]
+            params = cls._merge_unique_strings(
+                params,
+                cls._extract_command_params_from_text(command_text),
+            )
             examples: list[str] = []
             for item in getattr(raw, "examples", []) or []:
                 exec_text = str(getattr(item, "exec", "") or "").strip()
@@ -149,6 +153,25 @@ class PluginRegistry:
                 )
             )
         return command_metas
+
+    @classmethod
+    def _extract_command_params_from_text(cls, command_text: str) -> list[str]:
+        normalized = str(command_text or "").strip()
+        if not normalized:
+            return []
+        params: list[str] = []
+        for raw_token in re.findall(r"[\[\(<｟]([^]\)>｠]+)[\]\)>｠]", normalized):
+            token = str(raw_token or "").strip()
+            if not token:
+                continue
+            token = token.lstrip("?*+")
+            token = token.split("=", 1)[0]
+            token = token.split(":", 1)[0]
+            token = token.split(" ", 1)[0]
+            token = cls._normalize_command(token)
+            if token:
+                params.append(token)
+        return cls._merge_unique_strings(params, [])
 
     @classmethod
     def _build_command_meta_from_commands(
@@ -409,6 +432,209 @@ class PluginRegistry:
         return sorted(merged.values(), key=lambda item: (len(item.command), item.command))
 
     @classmethod
+    def _command_meta_richness(
+        cls,
+        meta: PluginInfo.PluginCommandMeta,
+    ) -> tuple[int, int, int, int, int, int]:
+        aliases = len(getattr(meta, "aliases", []) or [])
+        params = len(getattr(meta, "params", []) or [])
+        examples = len(getattr(meta, "examples", []) or [])
+        text_score = sum(
+            1
+            for value in (
+                getattr(meta, "text_min", None),
+                getattr(meta, "text_max", None),
+                getattr(meta, "image_min", None),
+                getattr(meta, "image_max", None),
+            )
+            if value is not None
+        )
+        sticky = int(bool(getattr(meta, "allow_sticky_arg", False)))
+        allow_at = int(bool(getattr(meta, "allow_at", False)))
+        return (params, text_score, aliases, examples, sticky, allow_at)
+
+    @classmethod
+    def _canonicalize_command_meta_groups(
+        cls,
+        metas: list[PluginInfo.PluginCommandMeta],
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        if len(metas) <= 1:
+            return metas
+
+        command_to_index: dict[str, int] = {}
+        for index, meta in enumerate(metas):
+            command = str(getattr(meta, "command", "") or "").strip()
+            if command:
+                command_to_index[command.casefold()] = index
+
+        parent: dict[int, int] = {index: index for index in range(len(metas))}
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for index, meta in enumerate(metas):
+            aliases = {
+                str(alias).strip().casefold()
+                for alias in (getattr(meta, "aliases", []) or [])
+                if str(alias).strip()
+            }
+            for alias in aliases:
+                other_index = command_to_index.get(alias)
+                if other_index is None or other_index == index:
+                    continue
+                union(index, other_index)
+
+        groups: dict[int, list[PluginInfo.PluginCommandMeta]] = {}
+        for index, meta in enumerate(metas):
+            groups.setdefault(find(index), []).append(meta)
+
+        canonicalized: list[PluginInfo.PluginCommandMeta] = []
+        for items in groups.values():
+            if len(items) == 1:
+                canonicalized.append(items[0])
+                continue
+            canonical = max(items, key=cls._command_meta_richness)
+            payload = cls._meta_to_dict(canonical)
+            for item in items:
+                if item is canonical:
+                    continue
+                item_payload = cls._meta_to_dict(item)
+                payload["aliases"] = cls._merge_unique_strings(
+                    payload.get("aliases"), [item_payload.get("command") or ""]
+                )
+                payload["aliases"] = cls._merge_unique_strings(
+                    payload.get("aliases"), item_payload.get("aliases")
+                )
+                payload["params"] = cls._merge_unique_strings(
+                    payload.get("params"), item_payload.get("params")
+                )
+                payload["examples"] = cls._merge_unique_strings(
+                    payload.get("examples"), item_payload.get("examples")
+                )
+                payload["target_sources"] = cls._merge_unique_strings(
+                    payload.get("target_sources"), item_payload.get("target_sources")
+                )
+                for field in (
+                    "text_min",
+                    "text_max",
+                    "image_min",
+                    "image_max",
+                    "allow_at",
+                    "actor_scope",
+                    "target_requirement",
+                    "allow_sticky_arg",
+                ):
+                    if payload.get(field) is None and item_payload.get(field) is not None:
+                        payload[field] = item_payload.get(field)
+            canonicalized.append(cls._with_command_meta_defaults(**payload))
+
+        return cls._merge_command_meta_groups(canonicalized)
+
+    @classmethod
+    def _fold_plugin_alias_command_meta(
+        cls,
+        metas: list[PluginInfo.PluginCommandMeta],
+        *,
+        plugin_name: str,
+        plugin_aliases: list[str] | tuple[str, ...] | None = None,
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        alias_heads = {
+            cls._normalize_command(plugin_name).casefold(),
+            *(
+                cls._normalize_command(alias).casefold()
+                for alias in (plugin_aliases or [])
+                if cls._normalize_command(alias)
+            ),
+        }
+        alias_heads = {head for head in alias_heads if head}
+        if not alias_heads or len(metas) <= 1:
+            return metas
+
+        target_candidates = [
+            meta
+            for meta in metas
+            if cls._normalize_command(getattr(meta, "command", "")).casefold()
+            not in alias_heads
+        ]
+        if not target_candidates:
+            return metas
+
+        alias_items = [
+            meta
+            for meta in metas
+            if cls._normalize_command(getattr(meta, "command", "")).casefold()
+            in alias_heads
+        ]
+        if not alias_items:
+            return metas
+
+        target = max(target_candidates, key=cls._command_meta_richness)
+        target_payload = cls._meta_to_dict(target)
+        changed = False
+
+        for item in alias_items:
+            if item is target:
+                continue
+            item_payload = cls._meta_to_dict(item)
+            if not item_payload.get("command"):
+                continue
+            changed = True
+            target_payload["aliases"] = cls._merge_unique_strings(
+                target_payload.get("aliases"),
+                [item_payload.get("command") or ""],
+            )
+            target_payload["aliases"] = cls._merge_unique_strings(
+                target_payload.get("aliases"), item_payload.get("aliases")
+            )
+            target_payload["params"] = cls._merge_unique_strings(
+                target_payload.get("params"), item_payload.get("params")
+            )
+            target_payload["examples"] = cls._merge_unique_strings(
+                target_payload.get("examples"), item_payload.get("examples")
+            )
+            target_payload["target_sources"] = cls._merge_unique_strings(
+                target_payload.get("target_sources"), item_payload.get("target_sources")
+            )
+            for field in (
+                "text_min",
+                "text_max",
+                "image_min",
+                "image_max",
+                "allow_at",
+                "actor_scope",
+                "target_requirement",
+                "allow_sticky_arg",
+            ):
+                if (
+                    target_payload.get(field) is None
+                    and item_payload.get(field) is not None
+                ):
+                    target_payload[field] = item_payload.get(field)
+
+        if not changed:
+            return metas
+
+        folded: list[PluginInfo.PluginCommandMeta] = [target]
+        for item in metas:
+            if item is target:
+                continue
+            command_fold = cls._normalize_command(getattr(item, "command", "")).casefold()
+            if command_fold in alias_heads:
+                continue
+            folded.append(item)
+        folded[0] = cls._with_command_meta_defaults(**target_payload)
+        return cls._merge_command_meta_groups(folded)
+
+    @classmethod
     def _load_plugin_module(cls, module_name: str, loaded_plugin=None):
         module_obj = getattr(loaded_plugin, "module", None)
         if module_obj is not None:
@@ -610,6 +836,17 @@ class PluginRegistry:
             module_name, loaded_plugin
         )
         command_meta = cls._merge_command_meta_groups(command_meta, discovered_meta)
+        resolved_name = (
+            str(fallback_name or getattr(metadata, "name", "") or "").strip()
+            or str(getattr(loaded_plugin, "name", "") or "").strip()
+            or module_name.rsplit(".", 1)[-1]
+        )
+        command_meta = cls._canonicalize_command_meta_groups(command_meta)
+        command_meta = cls._fold_plugin_alias_command_meta(
+            command_meta,
+            plugin_name=resolved_name,
+            plugin_aliases=extra_data.aliases,
+        )
         commands = cls._extract_commands(extra_data, command_meta)
         if loaded_plugin is not None:
             matcher_commands = cls._extract_commands_from_matchers(loaded_plugin)
@@ -627,6 +864,13 @@ class PluginRegistry:
                     command_meta=command_meta,
                     matcher_commands=matcher_commands,
                 )
+            command_meta = cls._fold_plugin_alias_command_meta(
+                command_meta,
+                plugin_name=resolved_name,
+                plugin_aliases=extra_data.aliases,
+            )
+            command_meta = cls._canonicalize_command_meta_groups(command_meta)
+            commands = cls._extract_commands(extra_data, command_meta)
         if not commands:
             return None
 
@@ -638,11 +882,6 @@ class PluginRegistry:
         )
         resolved_admin_level = (
             admin_level if admin_level is not None else extra_data.admin_level
-        )
-        resolved_name = (
-            str(fallback_name or getattr(metadata, "name", "") or "").strip()
-            or str(getattr(loaded_plugin, "name", "") or "").strip()
-            or module_name.rsplit(".", 1)[-1]
         )
         resolved_description = (
             str(getattr(metadata, "description", "") or "").strip()
@@ -1100,14 +1339,16 @@ class PluginRegistry:
                 cls._group_plugin_overrides.pop(str(group_id).strip(), None)
 
     @classmethod
-    async def preload_cache(cls):
+    async def preload_cache(cls, *, force_refresh: bool = False):
         """
         预加载缓存 - 在插件启动时调用，提前缓存普通用户的知识库
         """
         logger.info("开始预加载 ChatInter 插件知识库缓存...")
 
         try:
-            normal_cache = await cls._build_knowledge_base()
+            normal_cache = await cls.get_plugin_knowledge_base(
+                force_refresh=force_refresh
+            )
             cls._cache["normal_user"] = (normal_cache, datetime.now())
             logger.info(
                 f"ChatInter 知识库缓存预加载完成，"

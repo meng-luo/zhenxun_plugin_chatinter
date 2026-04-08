@@ -17,6 +17,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.plugin import get_loaded_plugins
 from nonebot_plugin_alconna.uniseg import UniMessage
 
+from zhenxun.configs.config import BotConfig
 from zhenxun.services import chat, logger
 from zhenxun.utils.message import MessageUtils
 
@@ -28,6 +29,7 @@ from .config import (
     get_model_name,
 )
 from .memory import _chat_memory
+from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
@@ -133,19 +135,11 @@ async def build_chat_system_prompt(
     chat_style: str = "",
     message_text: str = "",
 ) -> str:
-    impression_prompt = ""
     if USE_SIGN_IN_IMPRESSION:
         impression, attitude = await _chat_memory.get_user_impression(user_id)
-        impression_prompt = (
-            f"\n\n用户：{nickname} | 好感度：{impression:.0f} | 态度：{attitude}\n"
-            f"按态度回复：排斥/警惕→冷淡简短；一般/可以交流→正常友好；好朋友/是个好人→热情；亲密/恋人→亲密关心"
-        )
+    else:
+        impression, attitude = 0.0, "一般"
 
-    style_text = (
-        f"{chat_style}风格的"
-        if chat_style
-        else "日式二次元、软萌中带一点傲娇的"
-    )
     is_complex_query = _is_complex_query(message_text)
     if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and is_complex_query:
         length_rule = (
@@ -155,20 +149,27 @@ async def build_chat_system_prompt(
     else:
         length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
 
-    base_prompt = (
-        f"你是{style_text}机器人助手，优先使用中文。"
-        "语气要可爱自然，避免生硬、严肃、正式的客服腔。"
-        "可以适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要每句都堆叠。"
-        f"{length_rule}"
-        "若上下文信息不足，先问一个最关键的澄清问题，不要凭空猜测。"
-        "如果是结构化输出或插件命令，不要加入口癖修饰。"
+    base_prompt = build_chat_base_prompt(
+        BotConfig.self_nickname,
+        chat_style,
+        length_rule,
     )
     group_prompt = f"\n群组 ID：{group_id}" if group_id else ""
+    impression_prompt = (
+        build_user_attitude_prompt(nickname, impression, attitude)
+        if USE_SIGN_IN_IMPRESSION
+        else ""
+    )
 
     custom_prompt = get_config_value("CUSTOM_PROMPT", "")
     custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
 
-    return base_prompt + impression_prompt + group_prompt + custom_prompt_text
+    return (
+        base_prompt
+        + impression_prompt
+        + group_prompt
+        + custom_prompt_text
+    )
 
 
 async def reroute_to_plugin(
