@@ -1333,7 +1333,7 @@ def _build_route_message_with_explicit_context(
     image_tokens = _extract_image_tokens(normalized)
     enriched = normalized
 
-    if not at_tokens and _contains_self_reference(normalized):
+    if not at_tokens and _contains_strong_self_reference(normalized):
         enriched = normalize_message_text(f"{enriched} [@{user_id}]")
         at_tokens.append(f"[@{user_id}]")
 
@@ -1692,6 +1692,18 @@ def _contains_self_reference(message_text: str) -> bool:
     return any(
         marker in normalized
         for marker in ("我", "自己", "本人", "我的", "我自己", "自己的")
+    )
+
+
+def _contains_strong_self_reference(message_text: str) -> bool:
+    normalized = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    )
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in ("我的", "我自己", "自己的", "本人", "本人的", "自己")
     )
 
 

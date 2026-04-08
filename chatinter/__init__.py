@@ -304,9 +304,7 @@ async def _rescan_dynamic_matchers_after_startup():
     """等其它插件 startup 动态 matcher 创建完成后，分批重建知识库。"""
     for delay_seconds in _DYNAMIC_MATCHER_RESCAN_DELAYS:
         await asyncio.sleep(delay_seconds)
-        await PluginRegistry.preload_cache(
-            force_refresh=(delay_seconds == _DYNAMIC_MATCHER_RESCAN_DELAYS[0])
-        )
+        await PluginRegistry.preload_cache(force_refresh=True)
         logger.info(
             "ChatInter 已完成 startup 后动态 matcher 补扫："
             f"delay={delay_seconds}s"

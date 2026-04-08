@@ -123,6 +123,23 @@ _GENERIC_QUESTION_WORDS = (
     "？",
 )
 
+_GENERIC_QUESTION_PAYLOAD_WORDS = (
+    "什么",
+    "啥",
+    "怎么",
+    "如何",
+    "怎样",
+    "为何",
+    "为啥",
+    "吗",
+    "嘛",
+    "呢",
+    "吧",
+    "呀",
+    "啊",
+    "么",
+)
+
 EXECUTE_WORDS = (
     "帮我",
     "请",
@@ -596,6 +613,10 @@ def parse_command_with_head(
         prefix_payload = _strip_route_inline_noise(
             _PLACEHOLDER_PATTERN.sub(" ", prefix)
         )
+        if has_prefix_hint and not has_argument_hint and _is_generic_question_payload(
+            compact_suffix
+        ):
+            continue
         if has_prefix_hint and (
             has_argument_hint
             or not allow_sticky
@@ -687,6 +708,18 @@ def is_usage_question(text: str) -> bool:
     if contains_any(normalized, EXECUTE_WORDS):
         return False
     return has_question_hint
+
+
+def _is_generic_question_payload(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return True
+    compact = re.sub(r"[\s：:，,。.!！？?？`\"'“”‘’]", "", normalized)
+    if not compact:
+        return True
+    if len(compact) > 4:
+        return False
+    return any(word in compact for word in _GENERIC_QUESTION_PAYLOAD_WORDS)
 
 
 def collect_placeholders(text: str) -> list[str]:

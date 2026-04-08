@@ -1091,14 +1091,15 @@ def _extract_schema_argument_tokens(
     count_value = _extract_labeled_number(raw, _COUNT_HINT_PATTERN)
 
     ordered_tokens: list[str] = []
-    used_numbers: set[str] = set()
+    number_index = 0
 
     def _consume_next_number() -> str:
-        for token in all_numbers:
-            if token not in used_numbers:
-                used_numbers.add(token)
-                return token
-        return ""
+        nonlocal number_index
+        if number_index >= len(all_numbers):
+            return ""
+        token = all_numbers[number_index]
+        number_index += 1
+        return token
 
     for param_name in param_names:
         if _is_target_param_name(param_name):
@@ -1132,15 +1133,14 @@ def _extract_schema_argument_tokens(
             value = count_value
         if not value:
             value = _consume_next_number()
-        if value and value not in ordered_tokens:
+        if value:
             ordered_tokens.append(value)
 
     if not ordered_tokens:
         return []
     if len(ordered_tokens) < numeric_param_count:
         for token in all_numbers:
-            if token not in ordered_tokens:
-                ordered_tokens.append(token)
+            ordered_tokens.append(token)
             if len(ordered_tokens) >= numeric_param_count:
                 break
     return ordered_tokens

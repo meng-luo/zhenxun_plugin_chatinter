@@ -544,11 +544,9 @@ class PluginRegistry:
         cls,
         metas: list[PluginInfo.PluginCommandMeta],
         *,
-        plugin_name: str,
         plugin_aliases: list[str] | tuple[str, ...] | None = None,
     ) -> list[PluginInfo.PluginCommandMeta]:
         alias_heads = {
-            cls._normalize_command(plugin_name).casefold(),
             *(
                 cls._normalize_command(alias).casefold()
                 for alias in (plugin_aliases or [])
@@ -841,12 +839,6 @@ class PluginRegistry:
             or str(getattr(loaded_plugin, "name", "") or "").strip()
             or module_name.rsplit(".", 1)[-1]
         )
-        command_meta = cls._canonicalize_command_meta_groups(command_meta)
-        command_meta = cls._fold_plugin_alias_command_meta(
-            command_meta,
-            plugin_name=resolved_name,
-            plugin_aliases=extra_data.aliases,
-        )
         commands = cls._extract_commands(extra_data, command_meta)
         if loaded_plugin is not None:
             matcher_commands = cls._extract_commands_from_matchers(loaded_plugin)
@@ -864,13 +856,12 @@ class PluginRegistry:
                     command_meta=command_meta,
                     matcher_commands=matcher_commands,
                 )
-            command_meta = cls._fold_plugin_alias_command_meta(
-                command_meta,
-                plugin_name=resolved_name,
-                plugin_aliases=extra_data.aliases,
-            )
-            command_meta = cls._canonicalize_command_meta_groups(command_meta)
-            commands = cls._extract_commands(extra_data, command_meta)
+        command_meta = cls._fold_plugin_alias_command_meta(
+            command_meta,
+            plugin_aliases=extra_data.aliases,
+        )
+        command_meta = cls._canonicalize_command_meta_groups(command_meta)
+        commands = cls._extract_commands(extra_data, command_meta)
         if not commands:
             return None
 
