@@ -39,6 +39,7 @@ from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
+    infer_query_families,
     render_skill_namespace,
     skill_execute,
     skill_search,
@@ -861,15 +862,19 @@ async def _request_tool_route_decision(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
     timeout_value: float | None,
+    query_family: str,
 ) -> tuple[RouteResolveResult | None, int, int]:
     if not ROUTE_TOOL_PLANNER_ENABLED:
         return None, 0, 0
 
     max_tools = max(int(ROUTE_TOOL_PLANNER_MAX_TOOLS), 1)
+    tools_per_skill = 3 if query_family in {"search", "template", "transaction"} else 2
     planner_tools, spec_map = build_route_planner_tools(
         message_text=message_text,
         knowledge_base=knowledge_base,
         max_tools=max_tools,
+        tools_per_skill=tools_per_skill,
+        query_family=query_family,
         candidate_modules=tuple(
             normalize_message_text(plugin.module)
             for plugin in knowledge_base.plugins
@@ -997,6 +1002,8 @@ async def resolve_llm_route(
         timeout_value = None
 
     helper_mode = report.helper_mode
+    query_families = infer_query_families(normalized_message)
+    query_family = query_families[0]
     vector_options = _resolve_vector_retrieve_options(
         normalized_message,
         helper_mode=helper_mode,
@@ -1017,6 +1024,9 @@ async def resolve_llm_route(
     )
     candidate_expand_step = max(int(ROUTE_CANDIDATE_EXPAND_STEP), 1)
     candidate_min_score = max(float(ROUTE_CANDIDATE_MIN_SCORE), 0.0)
+    if query_family in {"search", "template", "transaction"}:
+        initial_candidate_limit = max(initial_candidate_limit, 8)
+        max_candidate_limit = max(max_candidate_limit, initial_candidate_limit)
 
     has_action_intent = contains_any(normalized_message, ROUTE_ACTION_WORDS)
     has_target_or_media_hint = "[@" in normalized_message or "[image" in normalized_message
@@ -1189,6 +1199,7 @@ async def resolve_llm_route(
             message_text=normalized_message,
             knowledge_base=attempt_kb,
             timeout_value=timeout_value,
+            query_family=query_family,
         )
         if tool_count > 0:
             report.note_tool_pool(tool_count, tool_choice_count)

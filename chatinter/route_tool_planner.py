@@ -7,12 +7,17 @@ from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .models.pydantic_models import PluginKnowledgeBase
 from .route_text import normalize_message_text
+from .route_text import match_command_head_or_sticky
+from .route_text import match_command_head_fuzzy
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillCommandSchema,
     SkillRankedCandidate,
     SkillSearchResult,
     SkillSpec,
+    _schema_supports_payload,
+    infer_query_families,
+    infer_skill_family,
     skill_search,
 )
 
@@ -78,6 +83,13 @@ def _find_schema(skill: SkillSpec, command_head: str) -> SkillCommandSchema | No
         for alias in schema.aliases:
             if normalize_message_text(alias).casefold() == normalized_head:
                 return schema
+    normalized_aliases = {
+        normalize_message_text(alias).casefold()
+        for alias in (skill.aliases or ())
+        if normalize_message_text(alias)
+    }
+    if normalized_head in normalized_aliases and len(skill.command_schemas) == 1:
+        return skill.command_schemas[0]
     return None
 
 
@@ -236,35 +248,131 @@ def _iter_candidate_heads(
     helper_mode: bool,
     matched_command: str | None,
     exact_head_hit: bool,
+    query_family: str,
+    message_text: str,
     limit: int,
 ) -> list[str]:
-    values: list[str] = []
-
-    def _append(items: tuple[str, ...] | list[str]) -> None:
-        for item in items:
-            command_head = normalize_message_text(item)
-            if command_head and command_head not in values:
-                values.append(command_head)
-            if len(values) >= limit:
-                return
-
+    normalized_message = normalize_message_text(message_text)
     matched = normalize_message_text(matched_command or "")
+    skill_family = infer_skill_family(
+        skill,
+        skill.commands,
+        skill.helper_commands,
+        skill.examples,
+    )
+
+    ranked: list[tuple[float, int, str]] = []
+    seen: set[str] = set()
+
+    def _consider(head: str, *, base: float = 0.0, from_alias: bool = False) -> None:
+        command_head = normalize_message_text(head)
+        if not command_head or command_head in seen:
+            return
+        seen.add(command_head)
+        schema = _find_schema(skill, command_head)
+        score = base
+        if matched and command_head == matched:
+            score += 120.0
+        if exact_head_hit and command_head == matched:
+            score += 20.0
+        if helper_mode and command_head in skill.helper_commands:
+            score += 18.0
+        if from_alias:
+            score += 3.0
+        if skill_family != "general" and skill_family == query_family:
+            score += 6.0
+
+        if query_family == "search":
+            if any(token in command_head for token in ("找", "搜", "查", "查询", "搜索", "寻找")):
+                score += 18.0
+            if any(
+                token in normalized_message
+                for token in ("今天", "今日", "本日", "当日")
+            ) and any(token in command_head for token in ("今天", "今日", "本日", "当日")):
+                score += 24.0
+            if schema is not None and _schema_supports_payload(schema):
+                score += 1.5
+        elif query_family == "template":
+            if any(
+                token in command_head
+                for token in ("表情", "模板", "梗图", "头像", "文字", "文本", "内容", "标题")
+            ):
+                score += 18.0
+            if schema is not None and (
+                _is_text_allowed(schema)
+                or _is_text_required(schema)
+                or (schema.image_min or 0) > 0
+            ):
+                score += 2.0
+        elif query_family == "transaction":
+            if any(
+                token in command_head
+                for token in ("红包", "金币", "转账", "支付", "金额", "总额", "总计", "合计")
+            ):
+                score += 18.0
+            if schema is not None and (
+                (schema.text_min or 0) > 0
+                or (schema.image_min or 0) > 0
+                or schema.params
+            ):
+                score += 2.0
+        elif query_family == "self":
+            if any(token in command_head for token in ("签到", "自我介绍", "我的信息")):
+                score += 18.0
+            if schema is not None and (
+                schema.actor_scope == "self_only" or _is_text_required(schema)
+            ):
+                score += 2.0
+        elif query_family == "utility":
+            if any(
+                token in command_head
+                for token in ("抠图", "超分", "识图", "词云", "关于", "排行", "统计", "管理")
+            ):
+                score += 14.0
+
+        if match_command_head_or_sticky(
+            normalized_message,
+            command_head,
+            allow_sticky=bool(schema.allow_sticky_arg) if schema is not None else False,
+        ):
+            score += 12.0
+        elif match_command_head_fuzzy(
+            normalized_message,
+            command_head,
+            allow_sticky=bool(schema.allow_sticky_arg) if schema is not None else False,
+        ):
+            score += 6.0
+
+        if score > 0:
+            ranked.append((score, len(command_head), command_head))
+
     if matched:
-        _append([matched])
+        _consider(matched, base=100.0)
 
+    pools: list[tuple[str, bool]] = []
     if helper_mode:
-        _append(skill.helper_commands)
-        if not values:
-            _append(skill.commands)
-        return values[:limit]
+        pools.extend((head, False) for head in skill.helper_commands)
+        if not pools:
+            pools.extend((head, False) for head in skill.commands)
+    else:
+        pools.extend((head, False) for head in skill.action_commands)
+        pools.extend((head, False) for head in skill.commands)
+    if query_family != "general" or helper_mode:
+        pools.extend((alias, True) for alias in skill.aliases)
 
-    if matched and matched in skill.helper_commands and exact_head_hit:
-        _append([matched])
+    for head, from_alias in pools:
+        if matched and normalize_message_text(head) == matched:
+            continue
+        _consider(head, from_alias=from_alias)
 
-    _append(skill.action_commands)
-    if len(values) < limit:
-        _append(skill.commands)
-    return values[:limit]
+    ranked.sort(key=lambda item: (item[0], -item[1], item[2]), reverse=True)
+    values: list[str] = []
+    for _, _, head in ranked:
+        if head not in values:
+            values.append(head)
+        if len(values) >= limit:
+            break
+    return values
 
 
 def _pick_global_help_head(skill: SkillSpec) -> str | None:
@@ -359,10 +467,13 @@ def build_route_planner_tools(
     max_tools: int,
     tools_per_skill: int = _DEFAULT_TOOLS_PER_SKILL,
     candidate_modules: tuple[str, ...] | list[str] | None = None,
+    query_family: str = "general",
 ) -> tuple[list[ToolExecutable], dict[str, RoutePlannerToolSpec]]:
     if max_tools <= 0 or not knowledge_base.plugins:
         return [], {}
 
+    query_families = infer_query_families(message_text)
+    query_family = normalize_message_text(query_family).lower() or query_families[0]
     search_result = skill_search(
         message_text,
         knowledge_base,
@@ -370,6 +481,10 @@ def build_route_planner_tools(
         include_similarity=True,
     )
     helper_mode = search_result.is_usage
+    effective_tools_per_skill = max(
+        tools_per_skill,
+        3 if query_family in {"search", "template", "transaction"} else 1,
+    )
     executables: list[ToolExecutable] = []
     spec_map: dict[str, RoutePlannerToolSpec] = {}
     seen: set[tuple[str, str]] = set()
@@ -432,7 +547,9 @@ def build_route_planner_tools(
             helper_mode=helper_mode,
             matched_command=candidate.matched_command,
             exact_head_hit=candidate.exact_head_hit,
-            limit=max(tools_per_skill, 1),
+            query_family=query_family,
+            message_text=message_text,
+            limit=max(effective_tools_per_skill, 1),
         )
         for command_head in candidate_heads:
             if len(executables) >= max_tools:
@@ -474,7 +591,9 @@ def build_route_planner_tools(
             helper_mode=helper_mode,
             matched_command=None,
             exact_head_hit=False,
-            limit=max(tools_per_skill, 1),
+            query_family=query_family,
+            message_text=message_text,
+            limit=max(effective_tools_per_skill, 1),
         )
         for command_head in candidate_heads:
             if len(executables) >= max_tools:

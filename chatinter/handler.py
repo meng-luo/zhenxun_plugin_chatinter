@@ -73,6 +73,8 @@ from .schema_policy import (
     schema_is_self_only,
 )
 from .skill_registry import SkillRouteDecision
+from .skill_registry import _extract_explicit_value
+from .skill_registry import _extract_schema_argument_tokens
 from .trace import StageTrace
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
@@ -401,6 +403,115 @@ def _build_route_notify_text(
         return _render(_CUTE_MEME_NOTIFY_TEMPLATES, target=f"{target}表情", seed=f"{seed_base}|meme")
 
     return _render(_CUTE_NOTIFY_TEMPLATES, target=target, seed=f"{seed_base}|default")
+
+
+async def _build_dialogue_fast_reply(
+    *,
+    intent_profile: IntentClassification,
+    current_message: str,
+    group_id: str | None,
+    user_id: str,
+) -> str | None:
+    chat_subkind = str(getattr(intent_profile, "chat_subkind", "") or "general_chat")
+    target_hint = normalize_message_text(
+        getattr(intent_profile, "chat_target_hint", "") or ""
+    )
+    normalized_message = normalize_message_text(current_message or "")
+
+    if chat_subkind == "recap":
+        return await _chat_memory.build_recent_conversation_recap(
+            user_id=str(user_id),
+            group_id=group_id,
+            limit=4,
+        )
+
+    if chat_subkind == "identity_query":
+        if not target_hint:
+            return "你说的是谁呀？给我一点线索，或者直接@目标成员。"
+        if not group_id:
+            return f"你说的是 {target_hint} 吗？给我一点线索，我再帮你确认。"
+
+        remembered_user_id = _lookup_remembered_target(group_id, target_hint)
+        if remembered_user_id:
+            profiles = await _get_group_member_profiles_for_fuzzy(group_id)
+            remembered_profile = next(
+                (
+                    profile
+                    for profile in profiles
+                    if str(profile.get("user_id") or "").strip() == remembered_user_id
+                ),
+                None,
+            )
+            if remembered_profile is not None:
+                display_name = str(remembered_profile.get("display_name") or "").strip()
+                if display_name:
+                    _remember_target_resolution(group_id, target_hint, remembered_user_id)
+                    return f"你说的是 {display_name}(@{remembered_user_id}) 吧。"
+
+        profiles = await _get_group_member_profiles_for_fuzzy(group_id)
+        if not profiles:
+            return f"我暂时没找到 {target_hint}，你再给我一点线索，或者直接@他。"
+
+        active_scores = await _get_group_recent_active_scores(group_id)
+        matched, ambiguous_candidates, top_score = _pick_fuzzy_target_profile(
+            target_hint,
+            profiles,
+            active_scores,
+            trigger_strength="strong",
+        )
+        if ambiguous_candidates:
+            return _build_member_ambiguity_message(ambiguous_candidates)
+        if matched is None:
+            return f"我暂时没找到 {target_hint}，你再给我一点线索，或者直接@他。"
+
+        resolved_user_id = str(matched.get("user_id") or "").strip()
+        display_name = str(matched.get("display_name") or "").strip()
+        if not resolved_user_id.isdigit() or not display_name:
+            return None
+        if top_score >= 0.90:
+            _remember_target_resolution(group_id, target_hint, resolved_user_id)
+        return f"你说的是 {display_name}(@{resolved_user_id}) 吧。"
+
+    if chat_subkind == "memory_confirm":
+        mention_ids = sorted(_extract_mentioned_user_ids(normalized_message))
+        if group_id and target_hint and mention_ids:
+            resolved_user_id = mention_ids[0]
+            _remember_target_resolution(group_id, target_hint, resolved_user_id)
+            return f"好，我记住啦，以后就把{target_hint}认作这位。"
+
+        if group_id and target_hint:
+            profiles = await _get_group_member_profiles_for_fuzzy(group_id)
+            if profiles:
+                active_scores = await _get_group_recent_active_scores(group_id)
+                matched, ambiguous_candidates, _ = _pick_fuzzy_target_profile(
+                    target_hint,
+                    profiles,
+                    active_scores,
+                    trigger_strength="strong",
+                )
+                if ambiguous_candidates:
+                    return _build_member_ambiguity_message(ambiguous_candidates)
+                if matched is not None:
+                    resolved_user_id = str(matched.get("user_id") or "").strip()
+                    display_name = str(matched.get("display_name") or "").strip()
+                    if resolved_user_id.isdigit() and display_name:
+                        _remember_target_resolution(
+                            group_id,
+                            target_hint,
+                            resolved_user_id,
+                        )
+                        return f"好，我记住啦，以后就把{target_hint}认作{display_name}。"
+
+        if target_hint:
+            return f"好，我记住啦，以后我会记住{target_hint}。"
+        if mention_ids:
+            return "好，我记住啦。"
+        return "好，我记住啦。"
+
+    if chat_subkind == "explain_context":
+        return None
+
+    return None
 
 
 def _is_already_handled(event: Event) -> bool:
@@ -1161,12 +1272,19 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
         if plugin.name == decision.plugin_name
     ]
     for plugin in candidate_plugins:
+        plugin_aliases = {
+            _normalize_head(alias).casefold()
+            for alias in (getattr(plugin, "aliases", None) or [])
+            if _normalize_head(alias)
+        }
         for meta in plugin.command_meta:
             command_head = normalize_message_text(getattr(meta, "command", ""))
             if not command_head:
                 continue
             if head == command_head or head in _iter_meta_aliases(meta):
                 return meta
+        if head in plugin_aliases and len(plugin.command_meta) == 1:
+            return plugin.command_meta[0]
     return None
 
 
@@ -1930,7 +2048,29 @@ def _prepare_route_execution_plan(
             command = _append_unique_tokens(command, merged_tokens)
         return RouteExecutionPlan(command=command)
 
-    command = _clamp_command_text_tokens(command, getattr(schema, "text_max", None))
+    schema_head = _normalize_head(getattr(schema, "command", ""))
+    command_head = _normalize_head(command)
+    if schema_head and command_head and schema_head != command_head:
+        tail = normalize_message_text(command[len(command_head) :].strip())
+        command = normalize_message_text(f"{schema_head} {tail}".strip()) if tail else schema_head
+
+    payload_tokens: list[str] = []
+    explicit_value = normalize_message_text(_extract_explicit_value(current_message))
+    if explicit_value and (max(int(getattr(schema, "text_min", 0) or 0), 0) > 0 or getattr(schema, "params", None)):
+        payload_tokens.extend(
+            token
+            for token in explicit_value.split(" ")
+            if token and token not in payload_tokens
+        )
+    schema_tokens = _extract_schema_argument_tokens(current_message, schema)
+    for token in schema_tokens:
+        if token and token not in payload_tokens:
+            payload_tokens.append(token)
+    if payload_tokens:
+        command = _append_unique_tokens(command, payload_tokens)
+
+    if not getattr(schema, "params", None):
+        command = _clamp_command_text_tokens(command, getattr(schema, "text_max", None))
 
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
@@ -2472,35 +2612,79 @@ async def handle_fallback(
             f"explicit={intent_profile.explicit_command} "
             f"command={intent_profile.command_head or '-'} "
             f"schema_state={intent_profile.schema_state} "
+            f"chat_subkind={getattr(intent_profile, 'chat_subkind', 'general_chat')} "
             f"confidence={intent_profile.confidence:.2f} "
             f"rewrite='{intent_profile.rewrite_command or '-'}'"
         )
 
-        # 对齐原版主流程：先让 LLM 判定是否路由插件，未命中再走对话。
-        # intent_profile 只作为显式命令修复、缺参澄清和 help 引导的兜底信号，
-        # 不再在路由前把 chat/no_route_signal 硬截断。
-        route_result, route_report = await _resolve_route_with_capability_recovery(
-            route_message,
-            knowledge_base,
-            include_semantic=True,
-        )
-        if route_report is not None:
-            trace.update_tags(
-                route_reason=route_report.final_reason,
-                route_candidates=route_report.candidate_total,
-                route_attempts=route_report.attempts,
-                route_tool_candidates=route_report.tool_candidates,
+        if intent_profile.kind == "chat":
+            dialogue_reply = await _build_dialogue_fast_reply(
+                intent_profile=intent_profile,
+                current_message=current_message,
+                group_id=group_id,
+                user_id=str(user_id),
             )
-            logger.debug(
-                "ChatInter route report: "
-                f"reason={route_report.final_reason} "
-                f"candidates={route_report.candidate_total} "
-                f"direct={route_report.direct_candidates} "
-                f"lexical={route_report.lexical_candidates} "
-                f"vector={route_report.vector_candidates} "
-                f"tool_candidates={route_report.tool_candidates} "
-                f"attempts={route_report.attempts}"
+            if dialogue_reply is not None:
+                reply_text = normalize_ai_reply_text(dialogue_reply)
+                reply_text = replace_mention_ids_with_names(
+                    reply_text, mention_name_map
+                )
+                envelope = TurnChannelEnvelope()
+                trace.update_tags(path="chat", outcome=f"dialogue_{intent_profile.chat_subkind}")
+                envelope.add(
+                    ChannelName.ANALYSIS,
+                    f"dialogue fast path kind={intent_profile.chat_subkind}",
+                )
+                envelope.add(ChannelName.FINAL, reply_text)
+                _log_turn_channels(envelope)
+                await _persist_final_only_dialog(
+                    envelope=envelope,
+                    user_id=user_id,
+                    group_id=group_id,
+                    nickname=nickname,
+                    user_message=uni_msg or current_message,
+                    bot_id=bot_id,
+                )
+                trace.stage("persist")
+                await MessageUtils.build_message(envelope.final).send()
+                trace.stage("send")
+                _finish_trace(
+                    trace=trace,
+                    user_id=str(user_id),
+                    group_id=group_id,
+                    message_preview=current_message,
+                    route_report=route_report,
+                )
+                return
+
+        route_result: RouteResolveResult | None = None
+        route_report: RouteAttemptReport | None = None
+        if intent_profile.kind != "chat":
+            # 对齐原版主流程：先让 LLM 判定是否路由插件，未命中再走对话。
+            # intent_profile 只作为显式命令修复、缺参澄清和 help 引导的兜底信号，
+            # 不再在路由前把 chat/no_route_signal 硬截断。
+            route_result, route_report = await _resolve_route_with_capability_recovery(
+                route_message,
+                knowledge_base,
+                include_semantic=True,
             )
+            if route_report is not None:
+                trace.update_tags(
+                    route_reason=route_report.final_reason,
+                    route_candidates=route_report.candidate_total,
+                    route_attempts=route_report.attempts,
+                    route_tool_candidates=route_report.tool_candidates,
+                )
+                logger.debug(
+                    "ChatInter route report: "
+                    f"reason={route_report.final_reason} "
+                    f"candidates={route_report.candidate_total} "
+                    f"direct={route_report.direct_candidates} "
+                    f"lexical={route_report.lexical_candidates} "
+                    f"vector={route_report.vector_candidates} "
+                    f"tool_candidates={route_report.tool_candidates} "
+                    f"attempts={route_report.attempts}"
+                )
         if route_result is not None:
             if not _is_route_command_executable(route_result, knowledge_base.plugins):
                 logger.debug(

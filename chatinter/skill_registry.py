@@ -68,9 +68,13 @@ _TEXT_LABELS = (
     "内容是",
     "内容为",
     "文案是",
+    "文案为",
     "文字是",
+    "文字为",
     "文本是",
+    "文本为",
     "标题是",
+    "标题为",
     "歌名是",
     "城市是",
     "地点是",
@@ -187,6 +191,69 @@ _TEMPLATE_KIND_HINTS = (
     "文字",
     "内容",
     "标题",
+)
+_SEARCH_QUERY_HINTS = (
+    "找",
+    "搜",
+    "查找",
+    "查询",
+    "搜索",
+    "寻找",
+)
+_SEARCH_QUERY_TIME_HINTS = (
+    "今天",
+    "今日",
+    "本日",
+    "当日",
+)
+_TEMPLATE_QUERY_HINTS = (
+    "表情",
+    "表情包",
+    "梗图",
+    "模板",
+    "头像",
+    "图片",
+    "文字",
+    "文本",
+    "内容",
+    "标题",
+    "生成",
+    "制作",
+    "做一张",
+    "做个",
+    "做一个",
+)
+_TRANSACTION_QUERY_HINTS = (
+    "红包",
+    "金币",
+    "金额",
+    "总额",
+    "总计",
+    "总共",
+    "合计",
+    "转账",
+    "支付",
+    "打赏",
+)
+_SELF_QUERY_HINTS = (
+    "签到",
+    "自我介绍",
+    "我的信息",
+    "我自己",
+    "本人",
+    "自己",
+)
+_UTILITY_QUERY_HINTS = (
+    "抠图",
+    "超分",
+    "识图",
+    "词云",
+    "关于",
+    "消息排行",
+    "消息统计",
+    "统计",
+    "管理",
+    "admin",
 )
 _INLINE_AT_TOKEN_PATTERN = re.compile(
     r"\[@\d{5,20}\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))"
@@ -476,6 +543,134 @@ def _infer_kind(
     return "command"
 
 
+def infer_query_families(text: str) -> tuple[str, ...]:
+    normalized = normalize_message_text(normalize_action_phrases(text)).lower()
+    if not normalized:
+        return ("general",)
+
+    families: list[str] = []
+    if contains_any(normalized, _TEMPLATE_QUERY_HINTS):
+        families.append("template")
+    if contains_any(normalized, _TRANSACTION_QUERY_HINTS):
+        families.append("transaction")
+    if contains_any(normalized, _SEARCH_QUERY_HINTS) or (
+        "抽" in normalized
+        and (
+            contains_any(normalized, _SEARCH_QUERY_TIME_HINTS)
+            or "猪" in normalized
+            or "小猪" in normalized
+        )
+    ):
+        families.append("search")
+    if contains_any(normalized, _SELF_QUERY_HINTS):
+        families.append("self")
+    if contains_any(normalized, _UTILITY_QUERY_HINTS):
+        families.append("utility")
+
+    if not families:
+        families.append("general")
+    return tuple(dict.fromkeys(families))
+
+
+def infer_query_family(text: str) -> str:
+    return infer_query_families(text)[0]
+
+
+def infer_skill_family(
+    plugin: Any,
+    commands: tuple[str, ...],
+    helper_commands: tuple[str, ...],
+    examples: tuple[str, ...],
+) -> str:
+    plugin_name = normalize_message_text(
+        str(getattr(plugin, "name", getattr(plugin, "plugin_name", "")) or "")
+    )
+    plugin_module = normalize_message_text(
+        str(getattr(plugin, "module", getattr(plugin, "plugin_module", "")) or "")
+    )
+    plugin_description = normalize_message_text(
+        str(getattr(plugin, "description", "") or "")
+    )
+    plugin_usage = normalize_message_text(str(getattr(plugin, "usage", "") or ""))
+    skill_kind = normalize_message_text(str(getattr(plugin, "kind", "") or "")).lower()
+    command_text = " ".join(commands).lower()
+    helper_text = " ".join(helper_commands).lower()
+    haystack = " ".join(
+        [
+            plugin_name,
+            plugin_module,
+            plugin_description,
+            " ".join(commands),
+            plugin_usage,
+            " ".join(examples),
+        ]
+    ).lower()
+
+    if skill_kind == "template":
+        return "template"
+    if skill_kind == "catalog":
+        return "search"
+
+    if "meme" in plugin_module or "表情" in plugin_name:
+        return "template"
+    if any(marker in haystack for marker in _TRANSACTION_QUERY_HINTS):
+        return "transaction"
+    if (
+        any(marker in haystack for marker in _SEARCH_QUERY_HINTS)
+        or any(marker in command_text for marker in _SEARCH_QUERY_HINTS)
+        or any(marker in helper_text for marker in _SEARCH_QUERY_HINTS)
+    ):
+        return "search"
+    if any(marker in haystack for marker in _SELF_QUERY_HINTS):
+        return "self"
+    if any(marker in haystack for marker in _UTILITY_QUERY_HINTS):
+        return "utility"
+    return "general"
+
+
+def _family_alignment_bonus(
+    skill_family: str,
+    query_families: tuple[str, ...],
+    *,
+    normalized_query: str,
+    commands: tuple[str, ...],
+    aliases: tuple[str, ...],
+) -> float:
+    if not query_families or not skill_family:
+        return 0.0
+
+    bonus = 0.0
+    primary_family = query_families[0]
+    if skill_family == primary_family:
+        bonus += 5.0
+    elif skill_family in query_families[1:]:
+        bonus += 3.0
+    elif primary_family != "general" and skill_family == "general":
+        bonus += 0.5
+
+    family_blob = " ".join([*commands, *aliases]).lower()
+    if skill_family == "search":
+        if any(token in normalized_query for token in _SEARCH_QUERY_TIME_HINTS):
+            if any(token in family_blob for token in _SEARCH_QUERY_TIME_HINTS):
+                bonus += 2.8
+        if any(token in normalized_query for token in _SEARCH_QUERY_HINTS):
+            bonus += 1.6
+    elif skill_family == "template":
+        if contains_any(normalized_query, _TEMPLATE_QUERY_HINTS):
+            bonus += 2.4
+    elif skill_family == "transaction":
+        if contains_any(normalized_query, _TRANSACTION_QUERY_HINTS):
+            bonus += 2.4
+    elif skill_family == "self":
+        if contains_any(normalized_query, _SELF_QUERY_HINTS):
+            bonus += 1.8
+    elif skill_family == "utility":
+        if contains_any(normalized_query, _UTILITY_QUERY_HINTS):
+            bonus += 1.5
+
+    return bonus
+
+
 def _build_examples(plugin: PluginInfo) -> tuple[str, ...]:
     values: list[str] = []
     for meta in plugin.command_meta:
@@ -626,6 +821,7 @@ def _build_ranked_candidate(
     include_similarity: bool,
 ) -> SkillRankedCandidate:
     normalized, stripped, lowered, query_tokens = _prepare_query(query)
+    query_families = infer_query_families(normalized)
     if not normalized:
         return SkillRankedCandidate(
             skill=skill,
@@ -644,6 +840,13 @@ def _build_ranked_candidate(
     exact_head_hit = False
     inline_hit_count = 0
     alias_hit_count = 0
+
+    skill_family = infer_skill_family(
+        skill,
+        skill.commands,
+        skill.helper_commands,
+        skill.examples,
+    )
 
     for command in skill.action_commands:
         command_score, head_hit, inline_hit = _match_score_for_command(
@@ -712,6 +915,13 @@ def _build_ranked_candidate(
         score += 8.0
     if skill.kind == "template" and ("[@" in normalized or "[image" in normalized):
         score += 2.0
+    score += _family_alignment_bonus(
+        skill_family,
+        query_families,
+        normalized_query=normalized,
+        commands=skill.commands,
+        aliases=skill.aliases,
+    )
     if has_negative_route_intent(normalized):
         score -= 12.0
 
@@ -833,13 +1043,29 @@ def _pick_command_by_evidence(
     pool = skill.helper_commands if prefer_helper else skill.action_commands
     if not pool:
         pool = skill.commands
+    pool_values: list[str] = []
+    for command in pool:
+        normalized_command = normalize_message_text(command)
+        if normalized_command and normalized_command not in pool_values:
+            pool_values.append(normalized_command)
+    for alias in skill.aliases:
+        normalized_alias = normalize_message_text(alias)
+        if normalized_alias and normalized_alias not in pool_values:
+            pool_values.append(normalized_alias)
 
     normalized, stripped, lowered, query_tokens = _prepare_query(message_text)
+    query_families = infer_query_families(normalized)
+    skill_family = infer_skill_family(
+        skill,
+        skill.commands,
+        skill.helper_commands,
+        skill.examples,
+    )
     suggested = normalize_message_text(suggested_command or "")
     suggested_lower = suggested.lower()
 
     best: tuple[float, str] | None = None
-    for command in pool:
+    for command in pool_values:
         score = 0.0
         if suggested and (
             match_command_head(suggested, command)
@@ -858,6 +1084,14 @@ def _pick_command_by_evidence(
         if overlap:
             score += min(len(overlap) * 2.0, 8.0)
 
+        score += _family_alignment_bonus(
+            skill_family,
+            query_families,
+            normalized_query=normalized,
+            commands=skill.commands,
+            aliases=skill.aliases,
+        )
+
         if score <= 0:
             continue
         candidate = (score, command)
@@ -867,11 +1101,11 @@ def _pick_command_by_evidence(
     if best is not None:
         return best[1]
 
-    if allow_fallback and len(pool) == 1:
+    if allow_fallback and len(pool_values) == 1:
         if skill.plugin_name.lower() in lowered or any(
             alias.lower() in lowered for alias in skill.aliases
         ):
-            return pool[0]
+            return pool_values[0]
     return None
 
 
@@ -1590,14 +1824,37 @@ def match_skill_command_fast(
         return None
 
     is_usage = is_usage_question(normalized)
+    query_families = infer_query_families(normalized)
     best: tuple[float, SkillSpec, str] | None = None
     for skill in registry.skills:
         pool = skill.helper_commands if is_usage else skill.action_commands
         if not pool:
             pool = skill.commands
+        pool_values: list[str] = []
         for command in pool:
-            schema = None
             normalized_command = normalize_message_text(command)
+            if normalized_command and normalized_command not in pool_values:
+                pool_values.append(normalized_command)
+        for alias in skill.aliases:
+            normalized_alias = normalize_message_text(alias)
+            if normalized_alias and normalized_alias not in pool_values:
+                pool_values.append(normalized_alias)
+        alias_set = {
+            normalize_message_text(alias)
+            for alias in skill.aliases
+            if normalize_message_text(alias)
+        }
+
+        skill_family = infer_skill_family(
+            skill,
+            skill.commands,
+            skill.helper_commands,
+            skill.examples,
+        )
+
+        for command in pool_values:
+            normalized_command = command
+            schema = None
             for current_schema in skill.command_schemas:
                 if normalize_message_text(current_schema.command) == normalized_command:
                     schema = current_schema
@@ -1628,6 +1885,15 @@ def match_skill_command_fast(
                 score += 60.0 + len(command)
             elif len(command) >= 2 and command.lower() in lowered:
                 score += 30.0 + len(command) * 0.1
+            if command in alias_set:
+                score += 1.0
+            score += _family_alignment_bonus(
+                skill_family,
+                query_families,
+                normalized_query=normalized,
+                commands=skill.commands,
+                aliases=skill.aliases,
+            )
             if score <= 0:
                 continue
             candidate = (score, skill, command)
@@ -1635,6 +1901,8 @@ def match_skill_command_fast(
                 best = candidate
 
     if best is None:
+        return None
+    if best[0] < 8.0:
         return None
     _, skill, command = best
     return (skill.plugin_name, skill.plugin_module, command)
@@ -1948,6 +2216,12 @@ def render_skill_namespace(
 
     payload: list[dict] = []
     for skill in skills:
+        family = infer_skill_family(
+            skill,
+            skill.commands,
+            skill.helper_commands,
+            skill.examples,
+        )
         selected_actions = _select_prompt_commands(
             skill.action_commands,
             query,
@@ -1979,6 +2253,7 @@ def render_skill_namespace(
                     else skill.plugin_module
                 ),
                 "kind": skill.kind,
+                "family": family,
                 "action_commands": selected_actions,
                 "helper_commands": selected_helpers,
                 "aliases": list(skill.aliases[:4]),
@@ -1997,6 +2272,9 @@ __all__ = [
     "SkillRouteDecision",
     "SkillSearchResult",
     "SkillSpec",
+    "infer_query_family",
+    "infer_query_families",
+    "infer_skill_family",
     "get_skill_registry",
     "match_skill_command_fast",
     "render_skill_namespace",

@@ -787,6 +787,52 @@ class ChatMemory:
 
         return system_prompt, context_xml, reply_images
 
+    async def build_recent_conversation_recap(
+        self,
+        user_id: str,
+        group_id: str | None,
+        *,
+        limit: int = 4,
+    ) -> str:
+        """生成最近对话的短回顾。
+
+        该路径不调用 LLM，直接从本地历史表抽取最近几轮对话，
+        作为“我们说了些什么”之类问题的固定短回复。
+        """
+        session_id = self.get_session_id(user_id, group_id)
+        recap_limit = max(int(limit or 0), 1)
+        dialogs = await ChatInterChatHistory.get_recent_dialogs(
+            session_id,
+            recap_limit,
+        )
+        if not dialogs:
+            return "最近没有可回顾的聊天记录。"
+
+        lines: list[str] = []
+        for dialog in dialogs[-recap_limit:]:
+            user_text = self._clip_context_line(
+                self._strip_non_final_channel_text(
+                    uni_to_text_with_tags(dialog.user_message)
+                ),
+                36,
+            )
+            ai_text = self._clip_context_line(
+                self._strip_non_final_channel_text(
+                    uni_to_text_with_tags(dialog.ai_response or "")
+                ),
+                36,
+            )
+            if user_text:
+                lines.append(f"你：{user_text}")
+            if ai_text:
+                lines.append(f"我：{ai_text}")
+
+        if not lines:
+            return "最近没有可回顾的聊天记录。"
+
+        lines = lines[-8:]
+        return "最近聊过这些：\n" + "\n".join(lines)
+
     async def _build_current_message_layers(
         self,
         group_id: str | None,

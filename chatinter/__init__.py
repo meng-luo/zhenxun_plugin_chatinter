@@ -26,9 +26,9 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from .data_source import _chat_memory, handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
-from .models.chat_history import ChatInterChatHistory  # noqa: F401
+from .handler import handle_fallback
+from .memory import _chat_memory
 from .plugin_registry import PluginRegistry
 from .route_observer import render_route_observer_summary
 from .utils.unimsg_utils import uni_to_text_with_tags
