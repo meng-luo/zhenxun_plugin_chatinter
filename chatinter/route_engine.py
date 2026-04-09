@@ -32,10 +32,15 @@ from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
     render_skill_namespace,
+    select_relevant_skills,
+    skill_execute,
+    skill_search,
 )
 from .turn_runtime import TurnBudgetController
 
 _ROUTE_NAMESPACE_LIMIT = 12
+_ROUTE_PLUGIN_SHORTLIST_LIMIT = 8
+_ROUTE_TOOLS_PER_SKILL_LIMIT = 2
 _LLM_ROUTE_INSTRUCTION = """
 你是 ChatInter 的技能路由器，只负责在给定技能命名空间内选择可执行命令。
 必须严格遵守：
@@ -539,6 +544,73 @@ def _build_route_prompt(
     )
 
 
+def _subset_knowledge_base_by_modules(
+    knowledge_base: PluginKnowledgeBase,
+    modules: list[str],
+) -> PluginKnowledgeBase:
+    if not modules:
+        return knowledge_base
+    normalized_modules = {
+        normalize_message_text(module)
+        for module in modules
+        if normalize_message_text(module)
+    }
+    if not normalized_modules:
+        return knowledge_base
+    plugins = [
+        plugin
+        for plugin in knowledge_base.plugins
+        if normalize_message_text(plugin.module) in normalized_modules
+    ]
+    if not plugins:
+        return knowledge_base
+    return PluginKnowledgeBase(plugins=plugins, user_role=knowledge_base.user_role)
+
+
+def _build_shortlist_knowledge_base(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    limit: int,
+) -> tuple[PluginKnowledgeBase, list[str]]:
+    shortlist_limit = max(int(limit), 1)
+    registry = get_skill_registry(knowledge_base)
+    selected_skills = select_relevant_skills(
+        registry,
+        message_text,
+        limit=shortlist_limit,
+    )
+    selected_modules = [
+        normalize_message_text(skill.plugin_module)
+        for skill in selected_skills
+        if normalize_message_text(skill.plugin_module)
+    ]
+    subset = _subset_knowledge_base_by_modules(knowledge_base, selected_modules)
+    if not selected_modules:
+        selected_modules = [
+            normalize_message_text(plugin.module)
+            for plugin in subset.plugins
+            if normalize_message_text(plugin.module)
+        ]
+    return subset, selected_modules
+
+
+def _resolve_shortlist_local_route(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+) -> RouteResolveResult | None:
+    search_result = skill_search(
+        message_text,
+        knowledge_base,
+        include_usage=True,
+        include_similarity=True,
+    )
+    decision = skill_execute(search_result, message_text, knowledge_base)
+    if decision is None:
+        return None
+    return RouteResolveResult(decision=decision, stage="shortlist")
+
+
 def _is_schema_parameter_error(exc: Exception) -> bool:
     text = normalize_message_text(str(exc or "")).lower()
     if not text:
@@ -613,7 +685,7 @@ async def _request_tool_route_decision(
         message_text=message_text,
         knowledge_base=knowledge_base,
         max_tools=max_tools,
-        tools_per_skill=max(max_tools, len(knowledge_base.plugins) or 1),
+        tools_per_skill=_ROUTE_TOOLS_PER_SKILL_LIMIT,
         query_family="general",
         candidate_modules=tuple(
             normalize_message_text(plugin.module)
@@ -789,30 +861,75 @@ async def resolve_llm_route(
 
     full_plugins = list(knowledge_base.plugins)
     report.candidate_total = len(full_plugins)
-    report.lexical_candidates = len(full_plugins)
-    report.direct_candidates = len(full_plugins)
+    shortlist_limit = max(
+        int(get_config_value("ROUTE_PLUGIN_SHORTLIST_LIMIT", _ROUTE_PLUGIN_SHORTLIST_LIMIT) or _ROUTE_PLUGIN_SHORTLIST_LIMIT),
+        1,
+    )
+    attempt_kb, shortlisted_modules = _build_shortlist_knowledge_base(
+        normalized_message,
+        knowledge_base,
+        limit=shortlist_limit,
+    )
+    report.lexical_candidates = len(attempt_kb.plugins)
+    report.direct_candidates = len(attempt_kb.plugins)
     report.vector_candidates = 0
 
-    attempt_kb = knowledge_base
+    attempt_modules = shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT]
+    if not attempt_modules:
+        attempt_modules = [
+            normalize_message_text(plugin.module)
+            for plugin in attempt_kb.plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
+        ]
+    logger.debug(
+        "ChatInter 路由短名单: "
+        f"total={len(full_plugins)} "
+        f"shortlist={len(attempt_kb.plugins)} "
+        f"modules={attempt_modules}"
+    )
+    report.note_attempt(attempt_modules)
+
+    shortlist_route_result = _resolve_shortlist_local_route(
+        normalized_message,
+        attempt_kb,
+    )
+    if shortlist_route_result is not None:
+        validated_shortlist_result = _validate_existing_route_result(
+            shortlist_route_result,
+            normalized_message,
+            attempt_kb,
+        )
+        if validated_shortlist_result is not None:
+            report.finalize(
+                reason="shortlist_route",
+                stage=validated_shortlist_result.stage,
+                plugin_name=validated_shortlist_result.decision.plugin_name,
+                plugin_module=validated_shortlist_result.decision.plugin_module,
+                command=validated_shortlist_result.decision.command,
+            )
+            return (
+                RouteResolveResult(
+                    decision=validated_shortlist_result.decision,
+                    stage=validated_shortlist_result.stage,
+                    report=report,
+                ),
+                False,
+                report,
+            )
+
     prompt = _build_route_prompt(
         normalized_message,
         attempt_kb,
         preferred_modules=[],
         vector_context="",
         include_helpers=True,
-        namespace_limit=max(len(full_plugins), _ROUTE_NAMESPACE_LIMIT),
+        namespace_limit=max(len(attempt_kb.plugins), _ROUTE_NAMESPACE_LIMIT),
     )
-    attempt_modules = [
-        normalize_message_text(plugin.module)
-        for plugin in full_plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
-    ]
     logger.debug(
         "ChatInter LLM 路由尝试: "
         f"attempt=1/1 "
-        f"candidates={len(full_plugins)} "
+        f"candidates={len(attempt_kb.plugins)} "
         f"modules={attempt_modules}"
     )
-    report.note_attempt(attempt_modules)
     tool_route_result, tool_count, tool_choice_count = await _request_tool_route_decision(
         message_text=normalized_message,
         knowledge_base=attempt_kb,

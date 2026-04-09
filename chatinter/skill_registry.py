@@ -2221,14 +2221,26 @@ def render_skill_namespace(
             skill.helper_commands,
             skill.examples,
         )
-        selected_actions = list(skill.action_commands or skill.commands)
+        selected_actions = _select_prompt_commands(
+            skill.action_commands or skill.commands,
+            query,
+            limit=3,
+        )
+        if not selected_actions:
+            selected_actions = list((skill.action_commands or skill.commands)[:3])
         selected_helpers: list[str] = []
         if include_helpers:
-            selected_helpers = list(skill.helper_commands or skill.commands)
+            selected_helpers = _select_prompt_commands(
+                skill.helper_commands or skill.commands,
+                query,
+                limit=2,
+            )
+            if not selected_helpers:
+                selected_helpers = list((skill.helper_commands or skill.commands)[:2])
         schema_selection = _select_prompt_schemas(
             skill,
             [*selected_actions, *selected_helpers],
-            limit=12,
+            limit=6,
             fallback_all=True,
         )
         payload.append(
@@ -2243,7 +2255,7 @@ def render_skill_namespace(
                 "family": family,
                 "action_commands": selected_actions,
                 "helper_commands": selected_helpers,
-                "aliases": list(skill.aliases[:4]),
+                "aliases": list(skill.aliases[:3]),
                 "schemas": [
                     _render_command_schema(schema)
                     for schema in schema_selection

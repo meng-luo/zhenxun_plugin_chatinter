@@ -74,6 +74,7 @@ from .schema_policy import (
 from .skill_registry import SkillRouteDecision
 from .skill_registry import _extract_explicit_value
 from .skill_registry import _extract_schema_argument_tokens
+from .skill_registry import skill_search
 from .trace import StageTrace
 from .turn_metrics import build_turn_metrics_snapshot, emit_turn_metrics
 from .turn_runtime import TurnBudgetController
@@ -229,8 +230,49 @@ _GROUP_MEMBER_PROFILE_CACHE: dict[
 ] = {}
 _GROUP_ACTIVE_RANK_CACHE_TTL = 30.0
 _GROUP_ACTIVE_RANK_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
+_ROUTE_CONTINUATION_FRAMES: dict[str, "RouteContinuationFrame"] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
+_CHAT_ROUTE_GATE_SCORE_THRESHOLD = 20.0
+_AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD = 10.0
+_ROUTE_CONTINUATION_FRAME_TTL = 10 * 60.0
+_ROUTE_CONTINUATION_FRAME_CACHE_MAX = 512
+_FOLLOWUP_REUSE_HINTS = (
+    "还是这个",
+    "还是这条",
+    "还是这一个",
+    "还是上次那个",
+    "继续",
+    "照旧",
+    "用上次那个",
+    "用上次的",
+    "上次那个",
+    "上一个",
+    "就这个",
+    "就它",
+    "再来一个",
+    "再来一张",
+    "再来个",
+)
+_FOLLOWUP_REWRITE_HINTS = (
+    "改成",
+    "改为",
+    "换成",
+    "变成",
+    "替换成",
+    "调整为",
+    "设成",
+    "设为",
+)
+_ALIGNMENT_NOISE_PREFIXES = {
+    "帮我",
+    "请",
+    "麻烦",
+    "一下",
+    "一下下",
+    "bot",
+    "机器人",
+}
 
 
 @dataclass(frozen=True)
@@ -242,6 +284,25 @@ class RouteExecutionPlan:
     image_missing: int = 0
     text_missing: int = 0
     allow_at: bool | None = None
+
+
+@dataclass(frozen=True)
+class RouteGateDecision:
+    allowed: bool
+    reason: str
+    top_score: float = 0.0
+    fast_match: tuple[str, str, str] | None = None
+
+
+@dataclass(frozen=True)
+class RouteContinuationFrame:
+    plugin_name: str
+    plugin_module: str
+    command: str
+    command_head: str
+    skill_kind: str
+    context_tokens: tuple[str, ...] = ()
+    updated_at: float = 0.0
 
 
 class ChannelName(str, Enum):
@@ -1338,6 +1399,223 @@ def _extract_image_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _extract_context_tokens(text: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for token in (*_extract_at_tokens(text), *_extract_image_tokens(text)):
+        if token and token not in tokens:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _strip_context_tokens(text: str) -> str:
+    normalized = normalize_message_text(text or "")
+    if not normalized:
+        return ""
+    stripped = _PLACEHOLDER_SEGMENT_PATTERN.sub(" ", normalized)
+    return normalize_message_text(stripped)
+
+
+def _append_context_tokens(message: str, tokens: tuple[str, ...]) -> str:
+    normalized = normalize_message_text(message or "")
+    if not tokens:
+        return normalized
+    existing = set(_extract_context_tokens(normalized))
+    merged = [token for token in tokens if token not in existing]
+    if not merged:
+        return normalized
+    if normalized:
+        return normalize_message_text(f"{normalized} {' '.join(merged)}")
+    return normalize_message_text(" ".join(merged))
+
+
+def _strip_alignment_noise(text: str) -> str:
+    normalized = normalize_message_text(strip_invoke_prefix(text or ""))
+    if not normalized:
+        return ""
+    parts = [item for item in normalized.split(" ") if item]
+    while parts and parts[0] in _ALIGNMENT_NOISE_PREFIXES:
+        parts.pop(0)
+    return normalize_message_text(" ".join(parts))
+
+
+def _is_followup_like(message_text: str) -> tuple[bool, str]:
+    normalized = normalize_message_text(message_text or "")
+    if not normalized:
+        return False, "empty"
+    if contains_any(normalized, _FOLLOWUP_REUSE_HINTS):
+        return True, "reuse"
+    if contains_any(normalized, _FOLLOWUP_REWRITE_HINTS):
+        return True, "rewrite"
+    if _chat_memory._is_followup_query(normalized):
+        return True, "memory_followup"
+    return False, "none"
+
+
+def _extract_followup_payload(message_text: str) -> tuple[str, str]:
+    normalized = normalize_message_text(message_text or "")
+    if not normalized:
+        return "", "empty"
+    if contains_any(normalized, _FOLLOWUP_REUSE_HINTS):
+        return "", "reuse_previous"
+    for marker in _FOLLOWUP_REWRITE_HINTS:
+        if marker not in normalized:
+            continue
+        tail = normalize_message_text(normalized.split(marker, 1)[1])
+        payload = _strip_alignment_noise(tail)
+        if payload:
+            return payload, f"rewrite:{marker}"
+        return "", f"rewrite:{marker}:empty"
+    return "", "none"
+
+
+def _canonicalize_route_command(
+    command: str,
+    message_text: str,
+    *,
+    prev_frame: RouteContinuationFrame | None = None,
+) -> str:
+    normalized_command = normalize_message_text(command or "")
+    if not normalized_command:
+        return ""
+    command_head = _normalize_head(normalized_command)
+    if not command_head:
+        return _strip_context_tokens(normalized_command)
+
+    payload, payload_reason = _extract_followup_payload(message_text)
+    if payload:
+        stripped_payload = _strip_context_tokens(payload)
+        if stripped_payload:
+            return normalize_message_text(f"{command_head} {stripped_payload}")
+    if payload_reason == "reuse_previous" and prev_frame is not None:
+        return prev_frame.command
+
+    followup, followup_reason = _is_followup_like(message_text)
+    if followup and followup_reason == "memory_followup" and prev_frame is not None:
+        return prev_frame.command
+
+    stripped_command = _strip_context_tokens(normalized_command)
+    return stripped_command or normalized_command
+
+
+def _build_continuation_command(
+    frame: RouteContinuationFrame,
+    current_message: str,
+) -> tuple[str, str, str]:
+    followup, reason = _is_followup_like(current_message)
+    if not followup:
+        return "", "", reason
+
+    payload, payload_reason = _extract_followup_payload(current_message)
+    aligned_message = _append_context_tokens(current_message, frame.context_tokens)
+    if payload_reason == "reuse_previous":
+        return frame.command, aligned_message, payload_reason
+    if payload:
+        stripped_payload = _strip_context_tokens(payload)
+        if stripped_payload:
+            return (
+                normalize_message_text(f"{frame.command_head} {stripped_payload}"),
+                aligned_message,
+                payload_reason,
+            )
+    if reason == "memory_followup":
+        return frame.command, aligned_message, reason
+    return "", "", payload_reason
+
+
+def _prune_route_continuation_frames(*, now: float | None = None) -> None:
+    if not _ROUTE_CONTINUATION_FRAMES:
+        return
+    now = now if now is not None else time.monotonic()
+    expired = [
+        session_id
+        for session_id, frame in _ROUTE_CONTINUATION_FRAMES.items()
+        if now - frame.updated_at > _ROUTE_CONTINUATION_FRAME_TTL
+    ]
+    for session_id in expired:
+        _ROUTE_CONTINUATION_FRAMES.pop(session_id, None)
+    if len(_ROUTE_CONTINUATION_FRAMES) <= _ROUTE_CONTINUATION_FRAME_CACHE_MAX:
+        return
+    overflow = len(_ROUTE_CONTINUATION_FRAMES) - _ROUTE_CONTINUATION_FRAME_CACHE_MAX
+    for session_id, _frame in sorted(
+        _ROUTE_CONTINUATION_FRAMES.items(),
+        key=lambda item: item[1].updated_at,
+    )[:overflow]:
+        _ROUTE_CONTINUATION_FRAMES.pop(session_id, None)
+
+
+def _remember_route_continuation_frame(
+    *,
+    session_id: str | None,
+    route_result: RouteResolveResult,
+    route_command: str,
+    current_message: str,
+) -> None:
+    if not session_id:
+        return
+    canonical_command = _canonicalize_route_command(route_command, current_message)
+    if not canonical_command:
+        return
+    now = time.monotonic()
+    _prune_route_continuation_frames(now=now)
+    _ROUTE_CONTINUATION_FRAMES[session_id] = RouteContinuationFrame(
+        plugin_name=str(route_result.decision.plugin_name or ""),
+        plugin_module=str(route_result.decision.plugin_module or ""),
+        command=canonical_command,
+        command_head=_normalize_head(canonical_command),
+        skill_kind=str(route_result.decision.skill_kind or ""),
+        context_tokens=_extract_context_tokens(current_message),
+        updated_at=now,
+    )
+
+
+def _get_route_continuation_frame(
+    session_id: str | None,
+) -> RouteContinuationFrame | None:
+    if not session_id:
+        return None
+    now = time.monotonic()
+    _prune_route_continuation_frames(now=now)
+    frame = _ROUTE_CONTINUATION_FRAMES.get(session_id)
+    if frame is None:
+        return None
+    if now - frame.updated_at > _ROUTE_CONTINUATION_FRAME_TTL:
+        _ROUTE_CONTINUATION_FRAMES.pop(session_id, None)
+        return None
+    return frame
+
+
+def _resolve_route_continuation_alignment(
+    *,
+    session_id: str | None,
+    current_message: str,
+) -> tuple[RouteResolveResult | None, str, str]:
+    frame = _get_route_continuation_frame(session_id)
+    if frame is None:
+        return None, current_message, "no_prev"
+
+    aligned_command, aligned_message, reason = _build_continuation_command(
+        frame,
+        current_message,
+    )
+    if not aligned_command:
+        return None, current_message, reason
+
+    return (
+        RouteResolveResult(
+            decision=SkillRouteDecision(
+                plugin_name=frame.plugin_name,
+                plugin_module=frame.plugin_module,
+                command=aligned_command,
+                source="alignment",
+                skill_kind=frame.skill_kind or "alignment",
+            ),
+            stage="alignment",
+        ),
+        aligned_message or current_message,
+        reason,
+    )
+
+
 def _contains_reply_reference_hint(message_text: str) -> bool:
     normalized = normalize_message_text(message_text or "")
     if not normalized:
@@ -1855,6 +2133,76 @@ def _build_intent_clarification_message(intent: IntentClassification) -> str:
     return "这个请求还缺少关键信息，请补齐参数后重新发送完整命令。"
 
 
+def _decide_route_gate(
+    *,
+    message_text: str,
+    knowledge_base,
+    intent_profile: IntentClassification,
+) -> RouteGateDecision:
+    plugins = getattr(knowledge_base, "plugins", None) or []
+    if not plugins:
+        return RouteGateDecision(allowed=False, reason="empty_knowledge")
+
+    search_result = skill_search(
+        message_text,
+        knowledge_base,
+        include_usage=True,
+        include_similarity=True,
+    )
+    fast_match = search_result.fast_match
+    top_score = (
+        float(search_result.ranked_candidates[0].score)
+        if search_result.ranked_candidates
+        else 0.0
+    )
+
+    if intent_profile.kind in {"execute", "execute_need_arg", "help"}:
+        return RouteGateDecision(
+            allowed=True,
+            reason="strong_intent",
+            top_score=top_score,
+            fast_match=fast_match,
+        )
+
+    if intent_profile.kind == "ambiguous":
+        return RouteGateDecision(
+            allowed=top_score >= _AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD,
+            reason=(
+                "ambiguous_high_score"
+                if top_score >= _AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD
+                else "ambiguous_low_score"
+            ),
+            top_score=top_score,
+            fast_match=fast_match,
+        )
+
+    if intent_profile.kind == "chat":
+        if fast_match is not None:
+            return RouteGateDecision(
+                allowed=True,
+                reason="chat_fast_match",
+                top_score=top_score,
+                fast_match=fast_match,
+            )
+        return RouteGateDecision(
+            allowed=top_score >= _CHAT_ROUTE_GATE_SCORE_THRESHOLD,
+            reason=(
+                "chat_high_score"
+                if top_score >= _CHAT_ROUTE_GATE_SCORE_THRESHOLD
+                else "chat_blocked"
+            ),
+            top_score=top_score,
+            fast_match=fast_match,
+        )
+
+    return RouteGateDecision(
+        allowed=False,
+        reason="unsupported_intent",
+        top_score=top_score,
+        fast_match=fast_match,
+    )
+
+
 def _should_force_chat_by_intent_gate(
     *,
     route_result: RouteResolveResult,
@@ -1914,6 +2262,22 @@ def _append_unique_tokens(command: str, tokens: list[str]) -> str:
     if not merged:
         return normalized_command
     return normalize_message_text(f"{normalized_command} {' '.join(merged)}")
+
+
+def _extract_command_payload_tokens(command: str) -> list[str]:
+    normalized_command = normalize_message_text(command or "")
+    if not normalized_command:
+        return []
+    parts = normalized_command.split(" ", 1)
+    if len(parts) < 2:
+        return []
+    tokens: list[str] = []
+    for raw_token in parts[1].split(" "):
+        token = normalize_message_text(raw_token)
+        if not token:
+            continue
+        tokens.append(token)
+    return tokens
 
 
 def _remove_tokens_from_command(command: str, tokens: list[str]) -> str:
@@ -2005,17 +2369,18 @@ def _prepare_route_execution_plan(
         tail = normalize_message_text(command[len(command_head) :].strip())
         command = normalize_message_text(f"{schema_head} {tail}".strip()) if tail else schema_head
 
+    existing_payload_tokens = set(_extract_command_payload_tokens(command))
     payload_tokens: list[str] = []
     explicit_value = normalize_message_text(_extract_explicit_value(current_message))
     if explicit_value and (max(int(getattr(schema, "text_min", 0) or 0), 0) > 0 or getattr(schema, "params", None)):
         payload_tokens.extend(
             token
             for token in explicit_value.split(" ")
-            if token and token not in payload_tokens
+            if token and token not in payload_tokens and token not in existing_payload_tokens
         )
     schema_tokens = _extract_schema_argument_tokens(current_message, schema)
     for token in schema_tokens:
-        if token and token not in payload_tokens:
+        if token and token not in payload_tokens and token not in existing_payload_tokens:
             payload_tokens.append(token)
     if payload_tokens:
         command = _append_unique_tokens(command, payload_tokens)
@@ -2159,6 +2524,12 @@ async def _execute_route_decision(
             f"command={decision.command}, "
             f"followup={followup_text}"
         )
+        _remember_route_continuation_frame(
+            session_id=session_id,
+            route_result=route_result,
+            route_command=execution_plan.command or decision.command,
+            current_message=current_message,
+        )
         await _persist_final_only_dialog(
             envelope=envelope,
             user_id=user_id,
@@ -2232,6 +2603,12 @@ async def _execute_route_decision(
     )
     if success:
         trace.set_tag("outcome", "plugin_reroute")
+        _remember_route_continuation_frame(
+            session_id=session_id,
+            route_result=route_result,
+            route_command=route_command,
+            current_message=current_message,
+        )
         await _record_route_feedback(
             session_id=session_id,
             modules=target_modules,
@@ -2676,7 +3053,23 @@ async def handle_fallback(
         route_result: RouteResolveResult | None = None
         route_report: RouteAttemptReport | None = None
         route_knowledge_base = knowledge_base
-        should_run_route = route_result is None and intent_profile.kind != "chat"
+        route_gate = _decide_route_gate(
+            message_text=route_message,
+            knowledge_base=route_knowledge_base,
+            intent_profile=intent_profile,
+        )
+        trace.update_tags(
+            route_gate=route_gate.reason,
+            route_gate_allowed=int(route_gate.allowed),
+        )
+        logger.debug(
+            "ChatInter route gate: "
+            f"allowed={route_gate.allowed} "
+            f"reason={route_gate.reason} "
+            f"top_score={route_gate.top_score:.2f} "
+            f"fast_match={route_gate.fast_match or '-'}"
+        )
+        should_run_route = route_result is None and route_gate.allowed
         if should_run_route:
             # 主链路保持“把完整候选发送给 LLM，由模型自行选择”。
             route_result, route_report = await _resolve_route_with_capability_recovery(
@@ -2746,6 +3139,36 @@ async def handle_fallback(
                 logger.debug(
                     "ChatInter 显式命令修复重试命中："
                     f"module={route_result.decision.plugin_module}, "
+                    f"command={route_result.decision.command}"
+                )
+        if route_result is None:
+            aligned_route_result, aligned_route_message, aligned_reason = (
+                _resolve_route_continuation_alignment(
+                    session_id=session_key,
+                    current_message=route_message,
+                )
+            )
+            if (
+                aligned_route_result is not None
+                and _is_route_command_executable(
+                    aligned_route_result,
+                    knowledge_base.plugins,
+                )
+            ):
+                route_result = aligned_route_result
+                route_message = aligned_route_message or route_message
+                middleware_state.route_message = route_message
+                middleware_state.metadata = {
+                    "phase": "route_aligned",
+                    "route_reason": "alignment_followup",
+                    "alignment_reason": aligned_reason,
+                }
+                await middleware.dispatch("after_route", middleware_state)
+                trace.update_tags(route_reason="alignment_followup")
+                logger.debug(
+                    "ChatInter 续接对齐命中："
+                    f"reason={aligned_reason} "
+                    f"module={route_result.decision.plugin_module} "
                     f"command={route_result.decision.command}"
                 )
         if route_result is not None:
@@ -2867,6 +3290,13 @@ async def handle_fallback(
                         )
                         clarify_message = (
                             execution_plan.followup_message or clarify_message
+                        )
+                        _remember_route_continuation_frame(
+                            session_id=session_key,
+                            route_result=command_result,
+                            route_command=execution_plan.command
+                            or command_result.decision.command,
+                            current_message=route_message,
                         )
                 envelope.add(ChannelName.FINAL, clarify_message)
                 _log_turn_channels(envelope)

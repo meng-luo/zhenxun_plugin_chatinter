@@ -364,7 +364,7 @@ def build_route_planner_tools(
     if max_tools <= 0 or not knowledge_base.plugins:
         return [], {}
 
-    _ = (tools_per_skill, query_family)
+    _ = query_family
     helper_mode = is_usage_question(message_text)
     registry = get_skill_registry(knowledge_base)
     executables: list[ToolExecutable] = []
@@ -372,6 +372,7 @@ def build_route_planner_tools(
     seen: set[tuple[str, str]] = set()
     tool_index = 1
     message_snapshot = _build_message_snapshot(message_text)
+    per_skill_limit = max(int(tools_per_skill or _DEFAULT_TOOLS_PER_SKILL), 1)
     module_order = [
         normalize_message_text(module)
         for module in (candidate_modules or ())
@@ -396,18 +397,6 @@ def build_route_planner_tools(
         seen_modules.add(module)
         ordered_skills.append(skill)
 
-    total_head_count = 0
-    for skill in ordered_skills:
-        total_head_count += len(
-            _iter_candidate_heads(
-                skill,
-                helper_mode=helper_mode,
-                limit=10**9,
-            )
-        )
-
-    max_tools = max(max_tools, total_head_count)
-
     if helper_mode:
         tool_index = _append_global_help_tool(
             skills=tuple(ordered_skills),
@@ -425,7 +414,7 @@ def build_route_planner_tools(
         candidate_heads = _iter_candidate_heads(
             skill,
             helper_mode=helper_mode,
-            limit=10**9,
+            limit=per_skill_limit,
         )
         for command_head in candidate_heads:
             if len(executables) >= max_tools:
