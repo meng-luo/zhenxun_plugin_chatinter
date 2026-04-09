@@ -21,6 +21,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 from zhenxun.utils.message import MessageUtils
 
+from .agent_gate import decide_agent_gate
 from .agent_runner import run_chatinter_agent
 from .chat_handler import (
     handle_chat_message,
@@ -28,7 +29,7 @@ from .chat_handler import (
     replace_mention_ids_with_names,
     reroute_to_plugin,
 )
-from .config import get_config_value, get_model_name
+from .config import get_config_value, get_mcp_endpoints, get_model_name
 from .feedback_keys import (
     FEEDBACK_REASON_DIRECT_TARGET_REQUIRED as _FEEDBACK_REASON_DIRECT_TARGET_REQUIRED,
     FEEDBACK_REASON_FUZZY_CLARIFY as _FEEDBACK_REASON_FUZZY_CLARIFY,
@@ -39,8 +40,8 @@ from .feedback_keys import (
     FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
 )
 from .intent_classifier import IntentClassification, classify_message_intent
-from .lifecycle import LifecyclePayload, get_lifecycle_manager
 from .memory import _chat_memory
+from .middleware import TurnMiddlewareState, get_middleware_manager
 from .knowledge_rag import PluginRAGService
 from .plugin_registry import (
     PluginRegistry,
@@ -51,8 +52,6 @@ from .route_engine import (
     RouteAttemptReport,
     RouteResolveResult,
     resolve_llm_route,
-    resolve_pre_route,
-    resolve_semantic_route,
 )
 from .route_observer import record_route_observation
 from .route_text import (
@@ -76,6 +75,8 @@ from .skill_registry import SkillRouteDecision
 from .skill_registry import _extract_explicit_value
 from .skill_registry import _extract_schema_argument_tokens
 from .trace import StageTrace
+from .turn_metrics import build_turn_metrics_snapshot, emit_turn_metrics
+from .turn_runtime import TurnBudgetController
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
 
@@ -329,29 +330,6 @@ def _message_matches_known_command_prefix(
                     allow_sticky=True,
                 ):
                     return True
-    return False
-
-
-def _should_allow_rule_fallback(message_text: str, knowledge_base) -> bool:
-    normalized = normalize_message_text(
-        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
-    )
-    if not normalized:
-        return False
-    if has_negative_route_intent(normalized):
-        return False
-    if contains_any(normalized, _ROUTE_META_CHAT_HINTS):
-        return False
-    if is_usage_question(normalized):
-        return False
-    if _message_matches_known_command_prefix(normalized, knowledge_base):
-        return True
-    if contains_any(normalized, _EXECUTION_INTENT_HINTS):
-        return True
-    if "[image" in normalized:
-        return True
-    if "[@" in normalized and contains_any(normalized, _FOLLOWUP_MEME_HINTS):
-        return True
     return False
 
 
@@ -1152,61 +1130,25 @@ async def _resolve_route_with_capability_recovery(
     knowledge_base,
     *,
     include_semantic: bool = True,
+    session_key: str | None = None,
+    budget_controller: TurnBudgetController | None = None,
 ) -> tuple[RouteResolveResult | None, RouteAttemptReport]:
-    llm_route, allow_rule_fallback, report = await resolve_llm_route(
-        message_text, knowledge_base
-    )
+    try:
+        llm_route, allow_rule_fallback, report = await resolve_llm_route(
+            message_text,
+            knowledge_base,
+            session_key=session_key,
+            budget_controller=budget_controller,
+        )
+    except TypeError:
+        llm_route, allow_rule_fallback, report = await resolve_llm_route(
+            message_text,
+            knowledge_base,
+        )
     if llm_route is not None:
         return llm_route, report
-    if allow_rule_fallback and not _should_allow_rule_fallback(
-        message_text, knowledge_base
-    ):
-        logger.debug(
-            "ChatInter 路由隔离：消息缺少执行信号，跳过 pre/semantic 规则回退"
-        )
-        allow_rule_fallback = False
-    if not allow_rule_fallback:
-        report.finalize(reason="rule_fallback_blocked")
-        return None, report
-
-    pre_route = resolve_pre_route(message_text, knowledge_base)
-    if pre_route is not None:
-        report.finalize(
-            reason="pre_route",
-            stage=pre_route.stage,
-            plugin_name=pre_route.decision.plugin_name,
-            plugin_module=pre_route.decision.plugin_module,
-            command=pre_route.decision.command,
-        )
-        return (
-            RouteResolveResult(
-                decision=pre_route.decision,
-                stage=pre_route.stage,
-                report=report,
-            ),
-            report,
-        )
-    if not include_semantic:
-        report.finalize(reason="semantic_disabled")
-        return None, report
-    semantic_route = resolve_semantic_route(message_text, knowledge_base)
-    if semantic_route is not None:
-        report.finalize(
-            reason="semantic_route",
-            stage=semantic_route.stage,
-            plugin_name=semantic_route.decision.plugin_name,
-            plugin_module=semantic_route.decision.plugin_module,
-            command=semantic_route.decision.command,
-        )
-        return (
-            RouteResolveResult(
-                decision=semantic_route.decision,
-                stage=semantic_route.stage,
-                report=report,
-            ),
-            report,
-        )
-    report.finalize(reason="no_route_after_recovery")
+    _ = (allow_rule_fallback, include_semantic)
+    report.finalize(reason="llm_no_route")
     return None, report
 
 
@@ -1217,8 +1159,17 @@ def _finish_trace(
     group_id: str | None,
     message_preview: str,
     route_report: RouteAttemptReport | None,
+    budget_controller: TurnBudgetController | None = None,
 ) -> None:
-    trace.finish()
+    total_seconds = trace.finish()
+    emit_turn_metrics(
+        build_turn_metrics_snapshot(
+            trace=trace,
+            total_seconds=total_seconds,
+            route_report=route_report,
+            budget_controller=budget_controller,
+        )
+    )
     record_route_observation(
         user_id=user_id,
         group_id=group_id,
@@ -2166,6 +2117,8 @@ async def _execute_route_decision(
     session_id: str | None = None,
     extra_image_segments=None,
     route_report: RouteAttemptReport | None = None,
+    budget_controller: TurnBudgetController | None = None,
+    finalize_callback=None,
 ) -> bool:
     decision = route_result.decision
     route_head = normalize_message_text(
@@ -2227,12 +2180,15 @@ async def _execute_route_decision(
             text_missing=execution_plan.text_missing,
             allow_at=execution_plan.allow_at,
         )
+        if finalize_callback is not None:
+            await finalize_callback()
         _finish_trace(
             trace=trace,
             user_id=str(user_id),
             group_id=group_id,
             message_preview=current_message,
             route_report=route_report,
+            budget_controller=budget_controller,
         )
         return True
 
@@ -2284,12 +2240,15 @@ async def _execute_route_decision(
             route_command=route_command,
         )
         trace.stage("route")
+        if finalize_callback is not None:
+            await finalize_callback()
         _finish_trace(
             trace=trace,
             user_id=str(user_id),
             group_id=group_id,
             message_preview=current_message,
             route_report=route_report,
+            budget_controller=budget_controller,
         )
     else:
         trace.set_tag("outcome", "plugin_reroute_failed")
@@ -2357,7 +2316,8 @@ async def handle_fallback(
     model_name = get_model_name()
     session_key = str(group_id or user_id)
     is_superuser = _resolve_superuser(bot, str(user_id))
-    lifecycle = get_lifecycle_manager()
+    middleware = get_middleware_manager()
+    budget_controller = TurnBudgetController.for_session(session_key)
     current_message = raw_message
     chat_system_prompt = ""
     enriched_context_xml = ""
@@ -2365,12 +2325,43 @@ async def handle_fallback(
     intent_profile: IntentClassification | None = None
     mention_name_map: dict[str, str] = {}
     mention_profiles: dict[str, dict[str, str]] = {}
+    middleware_state = TurnMiddlewareState(
+        session_key=session_key,
+        user_id=str(user_id),
+        group_id=str(group_id) if group_id else None,
+        message_text=raw_message,
+        system_prompt="",
+        context_xml="",
+        model_name=model_name,
+        budget_controller=budget_controller,
+        metadata={"phase": "pre_gate"},
+    )
+    post_gate_dispatched = False
+
+    async def _dispatch_post_gate(
+        *,
+        response_text: str | None = None,
+        phase: str = "post_gate",
+    ) -> None:
+        nonlocal post_gate_dispatched
+        if post_gate_dispatched:
+            return
+        if response_text is not None:
+            middleware_state.response_text = response_text
+        middleware_state.metadata = {
+            **middleware_state.metadata,
+            "phase": phase,
+        }
+        await middleware.dispatch("post_gate", middleware_state)
+        post_gate_dispatched = True
+
     try:
         event_message = event.get_message()
     except Exception:
         event_message = None
 
     try:
+        await middleware.dispatch("pre_gate", middleware_state)
         await _apply_runtime_plugin_overrides(
             event=event,
             session_key=session_key,
@@ -2414,19 +2405,14 @@ async def handle_fallback(
             # 无法解析为 UniMessage 时，使用原始消息文本
             current_message = raw_message.strip()
 
-        before_intent_payload = LifecyclePayload(
-            user_id=user_id,
-            group_id=group_id,
-            message_text=current_message,
-            system_prompt=chat_system_prompt,
-            context_xml=context_xml,
-            model_name=model_name,
-            metadata={"phase": "intent_routing"},
-        )
-        await lifecycle.dispatch("before_intent", before_intent_payload)
-        chat_system_prompt = before_intent_payload.system_prompt
-        context_xml = before_intent_payload.context_xml
-        budget_report = before_intent_payload.metadata.get("budget_report")
+        middleware_state.message_text = current_message
+        middleware_state.system_prompt = chat_system_prompt
+        middleware_state.context_xml = context_xml
+        middleware_state.metadata = {"phase": "intent_routing"}
+        await middleware.dispatch("before_intent", middleware_state)
+        chat_system_prompt = middleware_state.system_prompt
+        context_xml = middleware_state.context_xml
+        budget_report = middleware_state.metadata.get("budget_report")
         if isinstance(budget_report, dict):
             logger.debug(
                 "ChatInter intent budget: "
@@ -2502,12 +2488,17 @@ async def handle_fallback(
             trace.stage("persist")
             await MessageUtils.build_message(envelope.final).send()
             trace.stage("send")
+            await _dispatch_post_gate(
+                response_text=envelope.final,
+                phase="post_gate:fuzzy_target",
+            )
             _finish_trace(
                 trace=trace,
                 user_id=str(user_id),
                 group_id=group_id,
                 message_preview=current_message,
                 route_report=route_report,
+                budget_controller=budget_controller,
             )
             return
 
@@ -2531,12 +2522,17 @@ async def handle_fallback(
             trace.stage("persist")
             await MessageUtils.build_message(envelope.final).send()
             trace.stage("send")
+            await _dispatch_post_gate(
+                response_text=envelope.final,
+                phase="post_gate:target_required",
+            )
             _finish_trace(
                 trace=trace,
                 user_id=str(user_id),
                 group_id=group_id,
                 message_preview=current_message,
                 route_report=route_report,
+                budget_controller=budget_controller,
             )
             return
 
@@ -2545,6 +2541,10 @@ async def handle_fallback(
                 "ChatInter 路由上下文增强："
                 f"before='{current_message}' -> after='{route_message}'"
             )
+        middleware_state.route_message = route_message
+        middleware_state.metadata = {"phase": "route_selection"}
+        await middleware.dispatch("before_route", middleware_state)
+        route_message = middleware_state.route_message or route_message
         selection_context = PluginSelectionContext(
             query=route_message,
             session_id=session_key,
@@ -2616,6 +2616,17 @@ async def handle_fallback(
             f"confidence={intent_profile.confidence:.2f} "
             f"rewrite='{intent_profile.rewrite_command or '-'}'"
         )
+        middleware_state.intent = intent_profile
+        middleware_state.route_message = route_message
+        middleware_state.metadata = {
+            "phase": "after_intent",
+            "intent_kind": intent_profile.kind,
+            "intent_reason": intent_profile.reason,
+        }
+        await middleware.dispatch("after_intent", middleware_state)
+        chat_system_prompt = middleware_state.system_prompt
+        context_xml = middleware_state.context_xml
+        route_message = middleware_state.route_message or route_message
 
         if intent_profile.kind == "chat":
             dialogue_reply = await _build_dialogue_fast_reply(
@@ -2648,26 +2659,38 @@ async def handle_fallback(
                 trace.stage("persist")
                 await MessageUtils.build_message(envelope.final).send()
                 trace.stage("send")
+                await _dispatch_post_gate(
+                    response_text=envelope.final,
+                    phase="post_gate:dialogue_fast_path",
+                )
                 _finish_trace(
                     trace=trace,
                     user_id=str(user_id),
                     group_id=group_id,
                     message_preview=current_message,
                     route_report=route_report,
+                    budget_controller=budget_controller,
                 )
                 return
 
         route_result: RouteResolveResult | None = None
         route_report: RouteAttemptReport | None = None
-        if intent_profile.kind != "chat":
-            # 对齐原版主流程：先让 LLM 判定是否路由插件，未命中再走对话。
-            # intent_profile 只作为显式命令修复、缺参澄清和 help 引导的兜底信号，
-            # 不再在路由前把 chat/no_route_signal 硬截断。
+        route_knowledge_base = knowledge_base
+        should_run_route = route_result is None and intent_profile.kind != "chat"
+        if should_run_route:
+            # 主链路保持“把完整候选发送给 LLM，由模型自行选择”。
             route_result, route_report = await _resolve_route_with_capability_recovery(
                 route_message,
-                knowledge_base,
+                route_knowledge_base,
                 include_semantic=True,
+                session_key=session_key,
+                budget_controller=budget_controller,
             )
+            middleware_state.metadata = {
+                "phase": "route_completed",
+                "route_reason": route_report.final_reason if route_report else "",
+            }
+            await middleware.dispatch("after_route", middleware_state)
             if route_report is not None:
                 trace.update_tags(
                     route_reason=route_report.final_reason,
@@ -2785,12 +2808,17 @@ async def handle_fallback(
                     route_message=route_message,
                     route_command=route_result.decision.command,
                 )
+                await _dispatch_post_gate(
+                    response_text=envelope.final,
+                    phase="post_gate:self_only_blocked",
+                )
                 _finish_trace(
                     trace=trace,
                     user_id=str(user_id),
                     group_id=group_id,
                     message_preview=current_message,
                     route_report=route_report,
+                    budget_controller=budget_controller,
                 )
                 return
         if route_result is not None and await _execute_route_decision(
@@ -2808,6 +2836,8 @@ async def handle_fallback(
             session_id=session_key,
             extra_image_segments=reply_image_segments_for_reroute,
             route_report=route_report,
+            budget_controller=budget_controller,
+            finalize_callback=_dispatch_post_gate,
         ):
             return
         if route_result is not None:
@@ -2851,12 +2881,17 @@ async def handle_fallback(
                 trace.stage("persist")
                 await MessageUtils.build_message(envelope.final).send()
                 trace.stage("send")
+                await _dispatch_post_gate(
+                    response_text=envelope.final,
+                    phase="post_gate:clarify_once",
+                )
                 _finish_trace(
                     trace=trace,
                     user_id=str(user_id),
                     group_id=group_id,
                     message_preview=current_message,
                     route_report=route_report,
+                    budget_controller=budget_controller,
                 )
                 return
             if intent_profile.kind == "help" and intent_profile.command_head:
@@ -2879,12 +2914,17 @@ async def handle_fallback(
                 trace.stage("persist")
                 await MessageUtils.build_message(envelope.final).send()
                 trace.stage("send")
+                await _dispatch_post_gate(
+                    response_text=envelope.final,
+                    phase="post_gate:help_redirect",
+                )
                 _finish_trace(
                     trace=trace,
                     user_id=str(user_id),
                     group_id=group_id,
                     message_preview=current_message,
                     route_report=route_report,
+                    budget_controller=budget_controller,
                 )
                 return
 
@@ -2906,17 +2946,14 @@ async def handle_fallback(
                 logger.debug(f"回复链中包含 {len(reply_images_data)} 张图片")
         trace.stage("media")
         enriched_context_xml = context_xml
-        before_chat_payload = LifecyclePayload(
-            user_id=user_id,
-            group_id=group_id,
-            message_text=current_message,
-            system_prompt=chat_system_prompt,
-            context_xml=enriched_context_xml,
-            model_name=model_name,
-            metadata={"phase": "chat_fallback"},
-        )
-        await lifecycle.dispatch("before_agent", before_chat_payload)
-        budget_report = before_chat_payload.metadata.get("budget_report")
+        middleware_state.message_text = current_message
+        middleware_state.system_prompt = chat_system_prompt
+        middleware_state.context_xml = enriched_context_xml
+        middleware_state.metadata = {"phase": "chat_fallback"}
+        await middleware.dispatch("before_chat", middleware_state)
+        chat_system_prompt = middleware_state.system_prompt
+        enriched_context_xml = middleware_state.context_xml
+        budget_report = middleware_state.metadata.get("budget_report")
         if isinstance(budget_report, dict):
             logger.debug(
                 "ChatInter agent budget: "
@@ -2927,11 +2964,20 @@ async def handle_fallback(
             )
         trace.stage("agent_budget")
         intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
-        agent_enabled = bool(get_config_value("ENABLE_AGENT_MODE", True))
-        if intent_profile.kind == "chat":
-            agent_enabled = False
+        agent_gate = decide_agent_gate(
+            config_enabled=bool(get_config_value("ENABLE_AGENT_MODE", True)),
+            intent=intent_profile,
+            message_text=middleware_state.message_text,
+            has_images=bool(image_parts),
+            has_mcp_endpoints=bool(get_mcp_endpoints()),
+        )
+        agent_enabled = agent_gate.enabled
+        trace.update_tags(agent_gate=agent_gate.reason, agent_enabled=int(agent_enabled))
+        logger.debug(f"ChatInter agent gate: enabled={agent_enabled} reason={agent_gate.reason}")
         reply: str | UniMessage | None = None
         if agent_enabled:
+            middleware_state.metadata = {"phase": "agent_fallback"}
+            await middleware.dispatch("before_agent", middleware_state)
             try:
                 agent_response = await run_chatinter_agent(
                     bot=bot,
@@ -2940,10 +2986,11 @@ async def handle_fallback(
                     group_id=str(group_id) if group_id else None,
                     model=model_name,
                     timeout=max(intent_timeout, 5),
-                    system_prompt=before_chat_payload.system_prompt,
-                    context_xml=before_chat_payload.context_xml,
-                    message_text=before_chat_payload.message_text,
+                    system_prompt=middleware_state.system_prompt,
+                    context_xml=middleware_state.context_xml,
+                    message_text=middleware_state.message_text,
                     image_parts=image_parts or None,
+                    budget_controller=budget_controller,
                 )
                 if agent_response and str(agent_response.text or "").strip():
                     reply = str(agent_response.text)
@@ -2962,11 +3009,13 @@ async def handle_fallback(
                 logger.warning(f"ChatInter agent 执行失败，降级普通对话: {exc}")
         if reply is None:
             reply = await handle_chat_message(
-                message=before_chat_payload.message_text,
+                message=middleware_state.message_text,
                 user_id=user_id,
                 group_id=group_id,
                 nickname=nickname,
                 mention_name_map=mention_name_map,
+                session_key=session_key,
+                budget_controller=budget_controller,
             )
         trace.stage("chat_fallback")
         reply_text = (
@@ -2974,11 +3023,13 @@ async def handle_fallback(
             if reply is not None and str(reply).strip()
             else "我暂时没想好怎么回答你。"
         )
-        before_chat_payload.response_text = reply_text
-        await lifecycle.dispatch("after_agent", before_chat_payload)
+        middleware_state.response_text = reply_text
+        if agent_enabled:
+            await middleware.dispatch("after_agent", middleware_state)
+        await middleware.dispatch("after_chat", middleware_state)
         reply_text = (
-            before_chat_payload.response_text
-            if before_chat_payload.response_text is not None
+            middleware_state.response_text
+            if middleware_state.response_text is not None
             else reply_text
         )
         reply_text = normalize_ai_reply_text(reply_text or "")
@@ -3001,12 +3052,17 @@ async def handle_fallback(
         trace.stage("persist")
         await MessageUtils.build_message(envelope.final).send()
         trace.stage("send")
+        await _dispatch_post_gate(
+            response_text=envelope.final,
+            phase="post_gate:chat_fallback",
+        )
         _finish_trace(
             trace=trace,
             user_id=str(user_id),
             group_id=group_id,
             message_preview=current_message,
             route_report=route_report,
+            budget_controller=budget_controller,
         )
         return
 
@@ -3016,30 +3072,26 @@ async def handle_fallback(
         logger.debug(
             f"ChatInter 当前会话任务被中断: user={user_id}, group={group_name}"
         )
+        await _dispatch_post_gate(phase="post_gate:cancelled")
         return
     except Exception as e:
         trace.update_tags(path="error", outcome="error")
-        await lifecycle.dispatch(
-            "on_error",
-            LifecyclePayload(
-                user_id=user_id,
-                group_id=group_id,
-                message_text=current_message,
-                system_prompt=chat_system_prompt,
-                context_xml=enriched_context_xml,
-                model_name=model_name,
-                metadata={"error": str(e)},
-            ),
-        )
+        middleware_state.message_text = current_message
+        middleware_state.system_prompt = chat_system_prompt
+        middleware_state.context_xml = enriched_context_xml
+        middleware_state.metadata = {"phase": "error", "error": str(e)}
+        await middleware.dispatch("on_error", middleware_state)
         logger.error(f"ChatInter 处理失败：{e}")
         await MessageUtils.build_failure_message().send()
         trace.stage("error")
+        await _dispatch_post_gate(phase="post_gate:error")
         _finish_trace(
             trace=trace,
             user_id=str(user_id),
             group_id=group_id,
             message_preview=current_message,
             route_report=route_report,
+            budget_controller=budget_controller,
         )
         return
 

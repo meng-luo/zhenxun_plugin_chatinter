@@ -24,8 +24,17 @@ from .config import (
     get_config_value,
 )
 from .lifecycle import ToolLifecyclePayload, get_lifecycle_manager
+from .prompt_guard import compact_agent_messages, guard_prompt_sections
 from .runtime import get_runtime_scheduler
+from .subagent_handoff import build_subagent_instruction, decide_subagent_handoff
 from .tool_registry import ChatInterToolRegistry, ToolSelectionContext
+from .tool_orchestration import (
+    ToolExecutionMode,
+    allow_tool_batch,
+    build_tool_execution_plan,
+    record_tool_batch,
+)
+from .turn_runtime import TurnBudgetController
 
 TOOL_EXEC_TIMEOUT = 8.0
 LLM_TIMEOUT_MARGIN = 1.5
@@ -181,26 +190,6 @@ def _tool_error_message(
     )
 
 
-def _is_concurrency_safe_tool_call(tool_call: LLMToolCall) -> bool:
-    tool_name = _tool_call_name(tool_call)
-    if not tool_name:
-        return False
-    return ChatInterToolRegistry.is_concurrency_safe(tool_name)
-
-
-def _partition_tool_calls(
-    tool_calls: list[LLMToolCall],
-) -> list[tuple[bool, list[LLMToolCall]]]:
-    batches: list[tuple[bool, list[LLMToolCall]]] = []
-    for call in tool_calls:
-        safe = _is_concurrency_safe_tool_call(call)
-        if safe and batches and batches[-1][0]:
-            batches[-1][1].append(call)
-            continue
-        batches.append((safe, [call]))
-    return batches
-
-
 async def _execute_concurrent_batch_fail_fast(
     *,
     invoker: ToolInvoker,
@@ -323,6 +312,7 @@ async def _execute_tool_calls_partitioned(
     timeout: float,
     abort_on_failure: bool,
     parallel_limit: int,
+    budget_controller: TurnBudgetController | None,
 ) -> tuple[list[LLMMessage], bool]:
     if not tool_calls:
         return [], False
@@ -333,16 +323,18 @@ async def _execute_tool_calls_partitioned(
     aborted_calls: list[LLMToolCall] = []
     abort_triggered = False
 
-    batches = _partition_tool_calls(tool_calls)
-    for batch_index, (is_safe, batch_calls) in enumerate(batches):
-        if not batch_calls:
+    execution_plan = build_tool_execution_plan(tool_calls)
+    for batch_index, batch in enumerate(execution_plan.batches):
+        batch_calls = batch.tool_calls
+        if not batch_calls or not allow_tool_batch(budget_controller, batch):
             continue
+        batch_started = time.perf_counter()
         remaining = max(deadline - time.monotonic(), 0.0)
         if remaining <= 0:
             raise asyncio.TimeoutError
 
         # read-only batch concurrency; write/unknown batch serial.
-        if is_safe and len(batch_calls) > 1:
+        if batch.mode == ToolExecutionMode.READONLY and batch.concurrency_safe and len(batch_calls) > 1:
             chunk_size = max(parallel_limit, 1)
             for start in range(0, len(batch_calls), chunk_size):
                 chunk = batch_calls[start : start + chunk_size]
@@ -367,9 +359,19 @@ async def _execute_tool_calls_partitioned(
                         abort_triggered = True
                         break
             if abort_triggered:
-                for _, rest_calls in batches[batch_index + 1 :]:
-                    aborted_calls.extend(rest_calls)
+                for rest_batch in execution_plan.batches[batch_index + 1 :]:
+                    aborted_calls.extend(rest_batch.tool_calls)
+                record_tool_batch(
+                    budget_controller,
+                    batch=batch,
+                    duration=time.perf_counter() - batch_started,
+                )
                 break
+            record_tool_batch(
+                budget_controller,
+                batch=batch,
+                duration=time.perf_counter() - batch_started,
+            )
             continue
 
         for call_index, call in enumerate(batch_calls):
@@ -393,9 +395,19 @@ async def _execute_tool_calls_partitioned(
                     abort_triggered = True
                     break
         if abort_triggered:
-            for _, rest_calls in batches[batch_index + 1 :]:
-                aborted_calls.extend(rest_calls)
+            for rest_batch in execution_plan.batches[batch_index + 1 :]:
+                aborted_calls.extend(rest_batch.tool_calls)
+            record_tool_batch(
+                budget_controller,
+                batch=batch,
+                duration=time.perf_counter() - batch_started,
+            )
             break
+        record_tool_batch(
+            budget_controller,
+            batch=batch,
+            duration=time.perf_counter() - batch_started,
+        )
 
     if abort_triggered and aborted_calls:
         all_messages.extend(
@@ -464,6 +476,14 @@ class _ToolLifecycleCallback(BaseCallbackHandler):
         self._user_id = user_id
         self._group_id = group_id
         self._lifecycle = get_lifecycle_manager()
+        self._budget_controller: TurnBudgetController | None = None
+
+    def bind_budget_controller(
+        self,
+        controller: TurnBudgetController | None,
+    ) -> "_ToolLifecycleCallback":
+        self._budget_controller = controller
+        return self
 
     async def on_tool_start(
         self,
@@ -482,7 +502,16 @@ class _ToolLifecycleCallback(BaseCallbackHandler):
                 "tool_call_id": tool_call.id,
             },
         )
-        await self._lifecycle.dispatch("before_tool", payload)
+        started = time.perf_counter()
+        if self._budget_controller is None or self._budget_controller.allow_hook(
+            "before_tool"
+        ):
+            await self._lifecycle.dispatch("before_tool", payload)
+        if self._budget_controller is not None:
+            self._budget_controller.record_hook(
+                "before_tool",
+                time.perf_counter() - started,
+            )
         logger.debug(
             f"chatinter tool start: {payload.tool_name} session={self._session_id}"
         )
@@ -512,7 +541,16 @@ class _ToolLifecycleCallback(BaseCallbackHandler):
                 "tool_call_id": tool_call.id,
             },
         )
-        await self._lifecycle.dispatch("after_tool", payload)
+        started = time.perf_counter()
+        if self._budget_controller is None or self._budget_controller.allow_hook(
+            "after_tool"
+        ):
+            await self._lifecycle.dispatch("after_tool", payload)
+        if self._budget_controller is not None:
+            self._budget_controller.record_hook(
+                "after_tool",
+                time.perf_counter() - started,
+            )
         logger.debug(
             "chatinter tool end: "
             f"{payload.tool_name} session={self._session_id} "
@@ -576,6 +614,7 @@ async def run_chatinter_agent(
     context_xml: str,
     message_text: str,
     image_parts: list[LLMContentPart] | None = None,
+    budget_controller: TurnBudgetController | None = None,
 ) -> LLMResponse:
     scheduler = get_runtime_scheduler()
     session_key = str(group_id or user_id)
@@ -610,18 +649,56 @@ async def run_chatinter_agent(
             "</current_message>"
         )
 
+        guarded_prompt = guard_prompt_sections(
+            session_key=session_key,
+            stage="agent_initial",
+            system_prompt=instruction,
+            context_text=context_xml,
+            user_text=prompt,
+            controller=budget_controller,
+        )
+
         user_content: str | list[LLMContentPart]
         if image_parts:
-            user_content = [LLMContentPart.text_part(prompt), *image_parts]
+            user_content = [LLMContentPart.text_part(guarded_prompt.user_text), *image_parts]
         else:
-            user_content = prompt
+            user_content = guarded_prompt.user_text
 
         ai = AI(session_id=f"chatinter-agent:{session_key}")
         reasoning_config = build_reasoning_generation_config()
         messages: list[LLMMessage] = [
-            LLMMessage.system(instruction),
+            LLMMessage.system(guarded_prompt.system_prompt),
             LLMMessage.user(user_content),
         ]
+
+        async def _generate_with_guard(
+            *,
+            stage: str,
+            request_messages: list[LLMMessage],
+            request_tools: dict[str, Any] | None = None,
+            request_timeout: float | None = None,
+        ) -> LLMResponse:
+            started = time.perf_counter()
+            if budget_controller is not None and not budget_controller.allow_classifier(stage):
+                logger.debug(
+                    "chatinter agent classifier budget exhausted: "
+                    f"session={session_key} stage={stage}"
+                )
+                return LLMResponse(text="", usage_info={})
+            try:
+                return await ai.generate_internal(
+                    request_messages,
+                    model=model,
+                    config=reasoning_config,
+                    tools=request_tools,
+                    timeout=request_timeout,
+                )
+            finally:
+                if budget_controller is not None:
+                    budget_controller.record_classifier(
+                        stage,
+                        time.perf_counter() - started,
+                    )
 
         strict_tool_select = AGENT_STRICT_TOOL_SELECT
         expand_tools_step = max(int(AGENT_EXPAND_TOOLS_STEP), 1)
@@ -669,22 +746,75 @@ async def run_chatinter_agent(
         else:
             active_tools = dict(expanded_tools) if expanded_tools else {}
 
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_tokens = 0
+
         if not active_tools:
-            return await ai.generate_internal(
-                messages,
-                model=model,
-                config=reasoning_config,
-                timeout=max(timeout + LLM_TIMEOUT_MARGIN, _AGENT_MIN_TIMEOUT),
+            compacted_messages, _ = compact_agent_messages(
+                session_key=session_key,
+                stage="agent_plain_chat",
+                messages=messages,
+                controller=budget_controller,
+            )
+            return await _generate_with_guard(
+                stage="agent_plain_chat",
+                request_messages=compacted_messages,
+                request_timeout=max(timeout + LLM_TIMEOUT_MARGIN, _AGENT_MIN_TIMEOUT),
             )
 
-        invoker = ToolInvoker(
-            callbacks=[
-                _ToolLifecycleCallback(
-                    session_id=session_key,
-                    user_id=str(user_id),
-                    group_id=str(group_id) if group_id else None,
+        handoff_decision = decide_subagent_handoff(
+            message_text=message_text,
+            tool_names=tuple(active_tools.keys()),
+            has_images=bool(image_parts),
+        )
+        if handoff_decision.enabled:
+            subagent_instruction = build_subagent_instruction(
+                base_instruction=guarded_prompt.system_prompt,
+                decision=handoff_decision,
+            )
+            subagent_prompt = guard_prompt_sections(
+                session_key=session_key,
+                stage=f"subagent:{handoff_decision.role}",
+                system_prompt=subagent_instruction,
+                context_text=context_xml,
+                user_text=prompt,
+                controller=budget_controller,
+            )
+            subagent_response = await _generate_with_guard(
+                stage=f"subagent:{handoff_decision.role}",
+                request_messages=[
+                    LLMMessage.system(subagent_prompt.system_prompt),
+                    LLMMessage.user(subagent_prompt.user_text),
+                ],
+                request_timeout=max(min(timeout, 10), _AGENT_MIN_TIMEOUT),
+            )
+            total_prompt_tokens, total_completion_tokens, total_tokens = _record_usage(
+                subagent_response,
+                total_prompt_tokens=0,
+                total_completion_tokens=0,
+                total_tokens=0,
+            )
+            if str(subagent_response.text or "").strip():
+                messages.append(
+                    LLMMessage.system(
+                        f"子代理({handoff_decision.role})结论: {subagent_response.text.strip()}"
+                    )
                 )
-            ]
+            if handoff_decision.tool_names:
+                active_tools = {
+                    name: executable
+                    for name, executable in active_tools.items()
+                    if name in handoff_decision.tool_names
+                } or active_tools
+
+        lifecycle_callback = _ToolLifecycleCallback(
+            session_id=session_key,
+            user_id=str(user_id),
+            group_id=str(group_id) if group_id else None,
+        ).bind_budget_controller(budget_controller)
+        invoker = ToolInvoker(
+            callbacks=[lifecycle_callback]
         )
         context = RunContext(
             session_id=session_key,
@@ -692,9 +822,6 @@ async def run_chatinter_agent(
             extra={"user_id": user_id, "group_id": group_id},
         )
         max_tool_steps = _resolve_tool_budget(message_text, len(active_tools))
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        total_tokens = 0
         executed_tool_calls = 0
         seen_tool_signatures: set[tuple[str, ...]] = set()
         repeated_tool_calls = 0
@@ -710,12 +837,17 @@ async def run_chatinter_agent(
         if llm_timeout <= 0:
             llm_timeout = max(timeout + LLM_TIMEOUT_MARGIN, _AGENT_MIN_TIMEOUT)
 
-        response = await ai.generate_internal(
-            messages,
-            model=model,
-            config=reasoning_config,
-            tools=active_tools,
-            timeout=llm_timeout,
+        compacted_messages, _ = compact_agent_messages(
+            session_key=session_key,
+            stage="agent_loop_0",
+            messages=messages,
+            controller=budget_controller,
+        )
+        response = await _generate_with_guard(
+            stage="agent_loop_0",
+            request_messages=compacted_messages,
+            request_tools=active_tools,
+            request_timeout=llm_timeout,
         )
         total_prompt_tokens, total_completion_tokens, total_tokens = _record_usage(
             response,
@@ -799,6 +931,7 @@ async def run_chatinter_agent(
                     timeout=exec_timeout,
                     abort_on_failure=abort_parallel_on_failure,
                     parallel_limit=parallel_safe_tools,
+                    budget_controller=budget_controller,
                 )
             except asyncio.TimeoutError:
                 consecutive_failed_rounds += 1
@@ -815,12 +948,17 @@ async def run_chatinter_agent(
                 if next_timeout <= 0:
                     forced_finalize_reason = "deadline_exceeded"
                     break
-                response = await ai.generate_internal(
-                    messages,
-                    model=model,
-                    config=reasoning_config,
-                    tools=active_tools,
-                    timeout=next_timeout,
+                compacted_messages, _ = compact_agent_messages(
+                    session_key=session_key,
+                    stage=f"agent_loop_retry_{step}",
+                    messages=messages,
+                    controller=budget_controller,
+                )
+                response = await _generate_with_guard(
+                    stage=f"agent_loop_retry_{step}",
+                    request_messages=compacted_messages,
+                    request_tools=active_tools,
+                    request_timeout=next_timeout,
                 )
                 total_prompt_tokens, total_completion_tokens, total_tokens = (
                     _record_usage(
@@ -887,12 +1025,17 @@ async def run_chatinter_agent(
             if next_timeout <= 0:
                 forced_finalize_reason = "deadline_exceeded"
                 break
-            response = await ai.generate_internal(
-                messages,
-                model=model,
-                config=reasoning_config,
-                tools=active_tools,
-                timeout=next_timeout,
+            compacted_messages, _ = compact_agent_messages(
+                session_key=session_key,
+                stage=f"agent_loop_{step + 1}",
+                messages=messages,
+                controller=budget_controller,
+            )
+            response = await _generate_with_guard(
+                stage=f"agent_loop_{step + 1}",
+                request_messages=compacted_messages,
+                request_tools=active_tools,
+                request_timeout=next_timeout,
             )
             total_prompt_tokens, total_completion_tokens, total_tokens = _record_usage(
                 response,
@@ -920,11 +1063,16 @@ async def run_chatinter_agent(
         )
         final_timeout = _step_timeout(deadline)
         if final_timeout > 0:
-            final_response = await ai.generate_internal(
-                messages,
-                model=model,
-                config=reasoning_config,
-                timeout=final_timeout,
+            compacted_messages, _ = compact_agent_messages(
+                session_key=session_key,
+                stage="agent_finalize",
+                messages=messages,
+                controller=budget_controller,
+            )
+            final_response = await _generate_with_guard(
+                stage="agent_finalize",
+                request_messages=compacted_messages,
+                request_timeout=final_timeout,
             )
             total_prompt_tokens, total_completion_tokens, total_tokens = _record_usage(
                 final_response,

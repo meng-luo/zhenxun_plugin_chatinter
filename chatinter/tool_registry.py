@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import re
 import time
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import httpx
 
@@ -53,6 +53,7 @@ class ToolPolicy:
     authorization: Callable[[ToolSelectionContext], bool] | None = None
     enabled_by_default: bool = True
     concurrency_safe: bool = False
+    access_mode: Literal["readonly", "write", "unknown"] = "unknown"
 
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -70,6 +71,7 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
         ),
         min_score=0.1,
         concurrency_safe=True,
+        access_mode="readonly",
         selector=lambda ctx: _contains_any(
             f"{ctx.query} {ctx.context_text}",
             ("插件", "命令", "功能", "帮助", "怎么用", "usage"),
@@ -80,6 +82,7 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
         examples=("1+1", "sqrt(9)", "sin(pi/2)"),
         min_score=0.2,
         concurrency_safe=True,
+        access_mode="readonly",
         selector=lambda ctx: _contains_any(
             f"{ctx.query} {ctx.context_text}",
             ("计算", "表达式", "算一下", "数学", "eval"),
@@ -89,6 +92,7 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
         aliases=("终端命令", "shell", "命令行"),
         examples=("echo hello", "pwd", "ls"),
         min_score=0.3,
+        access_mode="write",
         selector=lambda ctx: _contains_any(
             f"{ctx.query} {ctx.context_text}",
             ("shell", "命令行", "终端", "bash", "执行命令", "cmd"),
@@ -313,6 +317,14 @@ class ChatInterToolRegistry:
     def is_concurrency_safe(cls, tool_name: str) -> bool:
         policy = cls._get_policy(tool_name)
         return bool(policy.concurrency_safe)
+
+    @classmethod
+    def get_access_mode(cls, tool_name: str) -> Literal["readonly", "write", "unknown"]:
+        policy = cls._get_policy(tool_name)
+        access_mode = str(policy.access_mode or "unknown").strip().lower()
+        if access_mode in {"readonly", "write"}:
+            return access_mode
+        return "unknown"
 
     @classmethod
     def _is_authorized(

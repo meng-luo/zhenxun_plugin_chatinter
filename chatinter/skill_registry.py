@@ -2192,9 +2192,8 @@ def render_skill_namespace(
     mask_module: bool = False,
 ) -> str:
     registry = get_skill_registry(knowledge_base)
-    skills = list(select_relevant_skills(registry, query, limit=limit))
-    if not skills:
-        skills = list(registry.skills[:limit])
+    _ = query
+    skills = list(registry.skills[: max(limit, 1)])
 
     if preferred_modules:
         preferred = [
@@ -2222,27 +2221,15 @@ def render_skill_namespace(
             skill.helper_commands,
             skill.examples,
         )
-        selected_actions = _select_prompt_commands(
-            skill.action_commands,
-            query,
-            limit=16,
-        )
+        selected_actions = list(skill.action_commands or skill.commands)
         selected_helpers: list[str] = []
         if include_helpers:
-            selected_helpers = _select_prompt_commands(
-                skill.helper_commands,
-                query,
-                limit=4,
-            )
-        if not selected_actions:
-            selected_actions = list(skill.action_commands[:16])
-        if include_helpers and not selected_helpers:
-            selected_helpers = list(skill.helper_commands[:4])
+            selected_helpers = list(skill.helper_commands or skill.commands)
         schema_selection = _select_prompt_schemas(
             skill,
             [*selected_actions, *selected_helpers],
             limit=12,
-            fallback_all=include_helpers,
+            fallback_all=True,
         )
         payload.append(
             {

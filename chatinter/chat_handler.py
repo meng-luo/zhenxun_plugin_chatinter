@@ -29,7 +29,9 @@ from .config import (
     get_model_name,
 )
 from .memory import _chat_memory
+from .prompt_guard import guard_prompt_sections
 from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
+from .turn_runtime import TurnBudgetController
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
@@ -96,6 +98,8 @@ async def handle_chat_message(
     group_id: str | None = None,
     nickname: str = "用户",
     mention_name_map: dict[str, str] | None = None,
+    session_key: str | None = None,
+    budget_controller: TurnBudgetController | None = None,
 ) -> str | UniMessage:
     chat_style = get_config_value("CHAT_STYLE", "")
 
@@ -110,9 +114,16 @@ async def handle_chat_message(
     logger.debug(f"系统提示词：{system_prompt[:500]}...")
 
     try:
+        guarded = guard_prompt_sections(
+            session_key=session_key or str(group_id or user_id),
+            stage="chat_reply",
+            system_prompt=system_prompt,
+            user_text=message,
+            controller=budget_controller,
+        )
         response = await chat(
-            message=message,
-            instruction=system_prompt,
+            message=guarded.user_text,
+            instruction=guarded.system_prompt,
             model=get_model_name(),
             config=build_reasoning_generation_config(),
         )
