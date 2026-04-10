@@ -64,6 +64,50 @@ _EXPLICIT_HELPER_HINTS = (
     "如何调用",
     "怎样调用",
 )
+_MESSAGE_CREATE_HINTS = (
+    "发",
+    "塞",
+    "创建",
+    "新增",
+    "生成",
+    "制作",
+    "上传",
+    "设置",
+    "绑定",
+    "添加",
+    "开启",
+)
+_MESSAGE_OPEN_HINTS = (
+    "开",
+    "抢",
+    "领取",
+    "领",
+    "抽",
+    "抽签",
+)
+_MESSAGE_RETURN_HINTS = (
+    "退回",
+    "退还",
+    "删除",
+    "取消",
+    "解绑",
+    "关闭",
+)
+_MESSAGE_QUERY_HINTS = (
+    "查",
+    "搜",
+    "搜索",
+    "查询",
+    "查看",
+    "识别",
+    "是什么",
+    "今天",
+    "今日",
+    "本日",
+    "当日",
+    "看看",
+    "看下",
+)
 _TEXT_LABELS = (
     "内容是",
     "内容为",
@@ -401,6 +445,11 @@ def _command_meta_signature(meta: PluginInfo.PluginCommandMeta) -> str:
                 if str(source).strip()
             ),
             str(int(bool(getattr(meta, "allow_sticky_arg", False)))),
+            str(
+                normalize_message_text(
+                    str(getattr(meta, "access_level", "") or "")
+                ).lower()
+            ),
         ]
     )
 
@@ -445,6 +494,13 @@ def _extract_command_schemas(
 ) -> tuple[SkillCommandSchema, ...]:
     metas: dict[str, SkillCommandSchema] = {}
     for raw in plugin.command_meta:
+        if (
+            normalize_message_text(
+                str(getattr(raw, "access_level", "public") or "public")
+            ).lower()
+            != "public"
+        ):
+            continue
         command = _normalize_skill_phrase(getattr(raw, "command", ""))
         if not command:
             continue
@@ -628,6 +684,37 @@ def infer_skill_family(
     return "general"
 
 
+def infer_command_role(command: str, *, family: str = "general") -> str:
+    normalized = normalize_message_text(command).lower()
+    if not normalized:
+        return "other"
+    if any(token in normalized for token in ("帮助", "help", "用法", "说明", "详情", "参数")):
+        return "help"
+    if any(
+        token in normalized
+        for token in ("发", "塞", "创建", "新增", "生成", "制作", "上传", "设置", "绑定", "添加", "开启")
+    ):
+        return "create"
+    if any(token in normalized for token in ("开", "抢", "领取", "领", "抽签")):
+        return "open"
+    if any(token in normalized for token in ("退回", "退还", "删除", "取消", "解绑", "关闭")):
+        return "return"
+    if any(
+        token in normalized
+        for token in ("查", "搜", "搜索", "查询", "查看", "识别", "是什么", "今天", "今日", "本日", "当日")
+    ):
+        return "query"
+    if any(token in normalized for token in ("排行", "统计", "列表", "菜单")):
+        return "catalog"
+    if family == "transaction":
+        return "create"
+    if family == "search":
+        return "query"
+    if family == "template":
+        return "create"
+    return "other"
+
+
 def _family_alignment_bonus(
     skill_family: str,
     query_families: tuple[str, ...],
@@ -641,7 +728,15 @@ def _family_alignment_bonus(
 
     bonus = 0.0
     primary_family = query_families[0]
-    if skill_family == primary_family:
+    if primary_family == "general":
+        # "general" means we do not have a reliable family signal yet.
+        # Do not let every generic plugin inherit the same +5 baseline,
+        # otherwise shortlist/local parse degenerates into registry-order picks.
+        if skill_family == "general":
+            bonus += 0.0
+        elif skill_family in query_families[1:]:
+            bonus += 1.0
+    elif skill_family == primary_family:
         bonus += 5.0
     elif skill_family in query_families[1:]:
         bonus += 3.0
@@ -793,13 +888,62 @@ def _prepare_query(text: str) -> tuple[str, str, str, tuple[str, ...]]:
     return normalized, stripped or normalized, lowered, tokens
 
 
+def infer_message_action_role(message_text: str) -> str:
+    normalized = normalize_message_text(strip_invoke_prefix(message_text or "")).lower()
+    if not normalized:
+        return "other"
+    if contains_any(normalized, _EXPLICIT_HELPER_HINTS):
+        return "help"
+    if contains_any(normalized, _MESSAGE_RETURN_HINTS):
+        return "return"
+    if contains_any(normalized, _MESSAGE_CREATE_HINTS):
+        return "create"
+    if contains_any(normalized, _MESSAGE_OPEN_HINTS):
+        return "open"
+    if contains_any(normalized, _MESSAGE_QUERY_HINTS):
+        return "query"
+    return "other"
+
+
+def _command_role_alignment_bonus(message_role: str, command_role: str) -> float:
+    if not message_role or message_role == "other" or not command_role:
+        return 0.0
+    if message_role == command_role:
+        return 14.0
+    if message_role == "help":
+        return 8.0 if command_role == "help" else -4.0
+    if message_role == "query":
+        if command_role in {"query", "catalog"}:
+            return 10.0
+        return 0.0
+    if message_role == "create":
+        if command_role == "create":
+            return 14.0
+        if command_role in {"open", "return"}:
+            return -8.0
+        return 0.0
+    if message_role == "open":
+        if command_role == "open":
+            return 14.0
+        if command_role in {"create", "return"}:
+            return -8.0
+        return 0.0
+    if message_role == "return":
+        if command_role == "return":
+            return 14.0
+        if command_role in {"create", "open"}:
+            return -8.0
+        return 0.0
+    return 0.0
+
+
 def _match_score_for_command(
     command: str,
     *,
     normalized: str,
     stripped: str,
     lowered: str,
-) -> tuple[float, bool, bool]:
+    ) -> tuple[float, bool, bool]:
     command_text = command.strip()
     if not command_text:
         return 0.0, False, False
@@ -822,6 +966,7 @@ def _build_ranked_candidate(
 ) -> SkillRankedCandidate:
     normalized, stripped, lowered, query_tokens = _prepare_query(query)
     query_families = infer_query_families(normalized)
+    message_role = infer_message_action_role(normalized)
     if not normalized:
         return SkillRankedCandidate(
             skill=skill,
@@ -855,6 +1000,8 @@ def _build_ranked_candidate(
             stripped=stripped,
             lowered=lowered,
         )
+        command_role = infer_command_role(command, family=skill_family)
+        command_score += _command_role_alignment_bonus(message_role, command_role)
         if command_score <= 0:
             continue
         score += command_score
@@ -871,6 +1018,8 @@ def _build_ranked_candidate(
             stripped=stripped,
             lowered=lowered,
         )
+        alias_role = infer_command_role(alias, family=skill_family)
+        alias_score += _command_role_alignment_bonus(message_role, alias_role)
         if alias_score <= 0:
             continue
         score += alias_score * 0.75
@@ -1055,6 +1204,7 @@ def _pick_command_by_evidence(
 
     normalized, stripped, lowered, query_tokens = _prepare_query(message_text)
     query_families = infer_query_families(normalized)
+    message_role = infer_message_action_role(normalized)
     skill_family = infer_skill_family(
         skill,
         skill.commands,
@@ -1067,30 +1217,46 @@ def _pick_command_by_evidence(
     best: tuple[float, str] | None = None
     for command in pool_values:
         score = 0.0
+        has_command_evidence = False
         if suggested and (
             match_command_head(suggested, command)
             or command.lower() in suggested_lower
         ):
             score += 30.0
+            has_command_evidence = True
         command_score, _, _ = _match_score_for_command(
             command,
             normalized=normalized,
             stripped=stripped,
             lowered=lowered,
         )
+        command_role = infer_command_role(command, family=skill_family)
+        role_bonus = _command_role_alignment_bonus(message_role, command_role)
+        command_score += role_bonus
         score += command_score
 
         overlap = [token for token in _tokenize(command) if token in query_tokens]
         if overlap:
             score += min(len(overlap) * 2.0, 8.0)
+            has_command_evidence = True
+        if command_score > 0:
+            has_command_evidence = True
+        if role_bonus > 0:
+            has_command_evidence = True
 
-        score += _family_alignment_bonus(
+        family_bonus = _family_alignment_bonus(
             skill_family,
             query_families,
             normalized_query=normalized,
             commands=skill.commands,
             aliases=skill.aliases,
         )
+        score += family_bonus
+
+        # Family alignment can reorder already-matched candidates, but it must not
+        # create a command match out of thin air.
+        if not has_command_evidence:
+            continue
 
         if score <= 0:
             continue
@@ -1820,6 +1986,7 @@ def match_skill_command_fast(
 ) -> tuple[str, str, str] | None:
     registry = get_skill_registry(knowledge_base)
     normalized, stripped, lowered, _ = _prepare_query(query)
+    message_role = infer_message_action_role(normalized)
     if not normalized:
         return None
 
@@ -1887,6 +2054,8 @@ def match_skill_command_fast(
                 score += 30.0 + len(command) * 0.1
             if command in alias_set:
                 score += 1.0
+            command_role = infer_command_role(command, family=skill_family)
+            score += _command_role_alignment_bonus(message_role, command_role)
             score += _family_alignment_bonus(
                 skill_family,
                 query_families,
@@ -2117,12 +2286,16 @@ def _select_prompt_commands(
     query: str,
     *,
     limit: int,
+    family: str = "general",
 ) -> list[str]:
     if not commands:
         return []
     normalized = normalize_message_text(normalize_action_phrases(query or ""))
     stripped = normalize_message_text(strip_invoke_prefix(normalized))
     query_tokens = tuple(_tokenize(normalized))
+    message_role = infer_message_action_role(normalized)
+    query_has_today_hint = any(token in normalized for token in _SEARCH_QUERY_TIME_HINTS)
+    query_has_pig_hint = any(token in normalized for token in ("猪", "小猪"))
 
     scored: list[tuple[float, str]] = []
     for command in commands:
@@ -2130,6 +2303,7 @@ def _select_prompt_commands(
         if not command_text:
             continue
         score = 0.0
+        command_role = infer_command_role(command_text, family=family)
         if normalized:
             if match_command_head(stripped, command_text) or match_command_head(
                 normalized, command_text
@@ -2141,6 +2315,16 @@ def _select_prompt_commands(
         overlap = len(set(_tokenize(command_text)) & set(query_tokens))
         if overlap > 0:
             score += overlap * 12.0
+        role_bonus = _command_role_alignment_bonus(message_role, command_role)
+        score += role_bonus
+        if family == "search":
+            if query_has_today_hint:
+                if any(token in command_text for token in ("今天", "今日")):
+                    score += 12.0
+                elif any(token in command_text for token in ("本日", "当日")):
+                    score += 6.0
+            if query_has_pig_hint and any(token in command_text for token in ("猪", "小猪")):
+                score += 4.0
 
         scored.append((score, command_text))
 
@@ -2225,6 +2409,7 @@ def render_skill_namespace(
             skill.action_commands or skill.commands,
             query,
             limit=3,
+            family=family,
         )
         if not selected_actions:
             selected_actions = list((skill.action_commands or skill.commands)[:3])
@@ -2234,6 +2419,7 @@ def render_skill_namespace(
                 skill.helper_commands or skill.commands,
                 query,
                 limit=2,
+                family=family,
             )
             if not selected_helpers:
                 selected_helpers = list((skill.helper_commands or skill.commands)[:2])
@@ -2254,6 +2440,13 @@ def render_skill_namespace(
                 "kind": skill.kind,
                 "family": family,
                 "action_commands": selected_actions,
+                "action_roles": [
+                    {
+                        "command": command,
+                        "role": infer_command_role(command, family=family),
+                    }
+                    for command in selected_actions
+                ],
                 "helper_commands": selected_helpers,
                 "aliases": list(skill.aliases[:3]),
                 "schemas": [
@@ -2271,6 +2464,8 @@ __all__ = [
     "SkillRouteDecision",
     "SkillSearchResult",
     "SkillSpec",
+    "infer_command_role",
+    "infer_message_action_role",
     "infer_query_family",
     "infer_query_families",
     "infer_skill_family",

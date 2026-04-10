@@ -6,13 +6,16 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .models.pydantic_models import PluginKnowledgeBase
-from .route_text import normalize_message_text
+from .route_text import normalize_action_phrases
 from .route_text import is_usage_question
+from .route_text import normalize_message_text
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillCommandSchema,
     SkillSpec,
     get_skill_registry,
+    infer_command_role,
+    infer_message_action_role,
 )
 
 _DEFAULT_TOOLS_PER_SKILL = 2
@@ -147,6 +150,12 @@ def _build_tool_definition(
     description_parts = [
         f"调用插件“{spec.plugin_name}”的命令“{spec.command_head}”。",
     ]
+    command_role = infer_command_role(
+        spec.command_head,
+        family=getattr(skill, "kind", "general") or "general",
+    )
+    if command_role != "other":
+        description_parts.append(f"动作角色: {command_role}")
     if skill.description:
         description_parts.append(_trim_text(skill.description))
     if skill.usage:
@@ -241,6 +250,9 @@ def _iter_candidate_heads(
     *,
     helper_mode: bool,
     limit: int,
+    preferred_role: str = "other",
+    query_family: str = "general",
+    query_text: str = "",
 ) -> list[str]:
     seen: set[str] = set()
     pools: list[str] = []
@@ -253,7 +265,10 @@ def _iter_candidate_heads(
     pools.extend(skill.commands)
     pools.extend(skill.aliases)
 
-    values: list[str] = []
+    scored: list[tuple[float, str]] = []
+    normalized_query = normalize_message_text(normalize_action_phrases(query_text or "")).lower()
+    query_has_today_hint = any(token in normalized_query for token in ("今天", "今日"))
+    query_has_pig_hint = any(token in normalized_query for token in ("猪", "小猪"))
     for head in pools:
         command_head = normalize_message_text(head)
         if not command_head:
@@ -261,9 +276,38 @@ def _iter_candidate_heads(
         if command_head in seen:
             continue
         seen.add(command_head)
-        values.append(command_head)
-        if limit > 0 and len(values) >= limit:
-            break
+        score = 0.0
+        command_role = infer_command_role(
+            command_head,
+            family=getattr(skill, "kind", "general") or "general",
+        )
+        if preferred_role and preferred_role != "other":
+            if command_role == preferred_role:
+                score += 12.0
+            elif preferred_role == "query" and command_role in {"query", "catalog"}:
+                score += 10.0
+            elif preferred_role in {"create", "open", "return"} and command_role in {
+                "create",
+                "open",
+                "return",
+            }:
+                score -= 4.0
+        if query_family == "search":
+            if query_has_today_hint:
+                if any(token in command_head for token in ("今天", "今日")):
+                    score += 12.0
+                elif any(token in command_head for token in ("本日", "当日")):
+                    score += 6.0
+            if query_has_pig_hint and any(token in command_head for token in ("猪", "小猪")):
+                score += 4.0
+        if helper_mode and command_role == "help":
+            score += 4.0
+        scored.append((score, command_head))
+
+    scored.sort(key=lambda item: (item[0], -len(item[1]), item[1]), reverse=True)
+    values = [command for _, command in scored]
+    if limit > 0:
+        values = values[:limit]
     return values
 
 
@@ -364,7 +408,6 @@ def build_route_planner_tools(
     if max_tools <= 0 or not knowledge_base.plugins:
         return [], {}
 
-    _ = query_family
     helper_mode = is_usage_question(message_text)
     registry = get_skill_registry(knowledge_base)
     executables: list[ToolExecutable] = []
@@ -408,6 +451,7 @@ def build_route_planner_tools(
             message_snapshot=message_snapshot,
         )
 
+    preferred_role = infer_message_action_role(message_text)
     for skill in ordered_skills:
         if len(executables) >= max_tools:
             break
@@ -415,6 +459,9 @@ def build_route_planner_tools(
             skill,
             helper_mode=helper_mode,
             limit=per_skill_limit,
+            preferred_role=preferred_role,
+            query_family=query_family,
+            query_text=message_text,
         )
         for command_head in candidate_heads:
             if len(executables) >= max_tools:

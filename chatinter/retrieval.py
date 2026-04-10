@@ -124,6 +124,7 @@ def _plugin_meta_signature(meta: PluginInfo.PluginCommandMeta) -> tuple[Any, ...
             str(getattr(meta, "target_requirement", "") or "")
         ).lower(),
         _normalize_sequence(getattr(meta, "target_sources", None) or ()),
+        normalize_message_text(str(getattr(meta, "access_level", "") or "")).lower(),
     )
 
 

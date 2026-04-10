@@ -27,6 +27,7 @@ class AutoMetadataBuilder:
     _module_alias_cache: ClassVar[
         dict[str, tuple[int, dict[str, list[str]]]]
     ] = {}
+    _module_access_cache: ClassVar[dict[str, tuple[int, dict[str, str]]]] = {}
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
     _no_command_log_cache: ClassVar[set[str]] = set()
     _sticky_probe_token: ClassVar[str] = "测试"
@@ -91,6 +92,12 @@ class AutoMetadataBuilder:
         alias_map = cls._build_module_alias_map(loaded_plugin)
         result: list[dict[str, Any]] = []
         for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            access_map = (
+                cls._load_module_access_map(module_obj)
+                if module_obj is not None
+                else {}
+            )
             parser = cls._get_matcher_parser(matcher)
             parser_schema = (
                 cls._extract_parser_schema(parser)
@@ -105,6 +112,7 @@ class AutoMetadataBuilder:
                 matcher=matcher,
                 parser_schema=parser_schema,
                 handler_hint=handler_hint,
+                access_map=access_map,
             ):
                 command_head = str(payload.get("command") or "").strip()
                 if not command_head:
@@ -120,6 +128,10 @@ class AutoMetadataBuilder:
             command_head = cls._extract_parser_command_head(parser)
             if not command_head:
                 continue
+            access_level = cls._resolve_access_level(
+                access_map.get(command_head.casefold()),
+                handler_hint.get("requires_superuser"),
+            )
             result.append(
                 {
                     "command": command_head,
@@ -143,6 +155,7 @@ class AutoMetadataBuilder:
                         command_head=command_head,
                         sample_text=parser_schema["sample_text"],
                     ),
+                    "access_level": access_level,
                 }
             )
         return result
@@ -228,6 +241,7 @@ class AutoMetadataBuilder:
         matcher: object,
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
+        access_map: dict[str, str],
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         rule = getattr(matcher, "rule", None)
@@ -239,45 +253,65 @@ class AutoMetadataBuilder:
             if checker_name in {"CommandRule", "ShellCommandRule"}:
                 allow_sticky_arg = cls._extract_rule_allow_sticky_arg(checker_call)
                 for command_head in cls._iter_command_rule_heads(checker_call):
+                    access_level = cls._resolve_access_level(
+                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
                             allow_sticky_arg=allow_sticky_arg,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "StartswithRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    access_level = cls._resolve_access_level(
+                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "FullmatchRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    access_level = cls._resolve_access_level(
+                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
                             allow_sticky_arg=False,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "KeywordsRule":
                 for command_head in getattr(checker_call, "keywords", ()) or ():
+                    access_level = cls._resolve_access_level(
+                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
                 continue
@@ -286,12 +320,17 @@ class AutoMetadataBuilder:
                     str(getattr(checker_call, "regex", "") or "")
                 )
                 if command_head:
+                    access_level = cls._resolve_access_level(
+                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
         return result
@@ -304,6 +343,7 @@ class AutoMetadataBuilder:
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
         allow_sticky_arg: bool | None,
+        access_level: str = "public",
     ) -> dict[str, Any]:
         command = cls._normalize_command(str(command_head or ""))
         if not command:
@@ -323,6 +363,7 @@ class AutoMetadataBuilder:
             "allow_sticky_arg": allow_sticky_arg
             if allow_sticky_arg is not None
             else True,
+            "access_level": access_level,
         }
 
     @classmethod
@@ -524,6 +565,7 @@ class AutoMetadataBuilder:
     def _extract_handler_hint(cls, matcher: object) -> dict[str, Any]:
         allow_at: bool | None = None
         target_sources: list[str] = []
+        requires_superuser = False
         for handler in getattr(matcher, "handlers", []) or []:
             call = getattr(handler, "call", None)
             if call is None:
@@ -539,7 +581,13 @@ class AutoMetadataBuilder:
                         target_sources.append(source)
             if hint.get("self_source") and "self" not in target_sources:
                 target_sources.append("self")
-        return {"allow_at": allow_at, "target_sources": target_sources}
+            if hint.get("requires_superuser"):
+                requires_superuser = True
+        return {
+            "allow_at": allow_at,
+            "target_sources": target_sources,
+            "requires_superuser": requires_superuser,
+        }
 
     @classmethod
     def _load_handler_hint(cls, call: object) -> dict[str, bool]:
@@ -572,9 +620,166 @@ class AutoMetadataBuilder:
             or "\"at\"" in lowered
             or "'at'" in lowered,
             "self_source": "自己" in source or "user_id" in lowered,
+            "requires_superuser": "dependssuperuser" in lowered
+            or "depends(superuser" in lowered
+            or "depends(superuser()" in lowered
+            or "is_superuser" in lowered and "depends(" in lowered,
         }
         cls._handler_hint_cache[cache_key] = (mtime_ns, hint)
         return hint
+
+    @classmethod
+    def _load_module_access_map(cls, module_obj: object) -> dict[str, str]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_access_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        symbol_levels: dict[str, str] = {}
+        access_map: dict[str, str] = {}
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                level = cls._infer_access_level_from_expr(node.value, symbol_levels)
+                if level == "public":
+                    continue
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        symbol_levels[target.id.casefold()] = level
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command_head = cls._extract_command_from_call_node(node)
+            if not command_head:
+                continue
+            level = "public"
+            for keyword in node.keywords or []:
+                if keyword.arg == "permission":
+                    level = cls._merge_access_level(
+                        level,
+                        cls._infer_access_level_from_expr(
+                            keyword.value, symbol_levels
+                        ),
+                    )
+                elif keyword.arg == "rule":
+                    level = cls._merge_access_level(
+                        level,
+                        cls._extract_rule_access_level(keyword.value, symbol_levels),
+                    )
+            if level != "public":
+                access_map[command_head.casefold()] = cls._merge_access_level(
+                    access_map.get(command_head.casefold(), "public"),
+                    level,
+                )
+
+        cls._module_access_cache[cache_key] = (mtime_ns, access_map)
+        return access_map
+
+    @classmethod
+    def _infer_access_level_from_expr(
+        cls,
+        expr: object,
+        symbol_levels: dict[str, str],
+    ) -> str:
+        if isinstance(expr, ast.Name):
+            mapped = symbol_levels.get(expr.id.casefold())
+            if mapped:
+                return mapped
+        try:
+            text = ast.unparse(expr)
+        except Exception:
+            text = str(expr or "")
+        return cls._infer_access_level_from_text(text, symbol_levels)
+
+    @classmethod
+    def _infer_access_level_from_text(
+        cls,
+        text: str,
+        symbol_levels: dict[str, str] | None = None,
+    ) -> str:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return "public"
+        symbol_levels = symbol_levels or {}
+        if normalized in symbol_levels:
+            return symbol_levels[normalized]
+        if normalized in {"admin", "superuser", "restricted"}:
+            return normalized
+        if normalized.endswith(".admin") or normalized.endswith("admin()"):
+            return "admin"
+        if normalized.endswith(".superuser") or normalized.endswith("superuser()"):
+            return "superuser"
+
+        has_superuser = "superuser" in normalized or "superuser()" in normalized
+        has_admin = (
+            "admin_check" in normalized
+            or "plugintype.admin" in normalized
+            or "plugintype.super_and_admin" in normalized
+            or "admin_level" in normalized
+            or "depends(admin" in normalized
+        )
+        if has_superuser and has_admin:
+            return "restricted"
+        if has_superuser:
+            return "superuser"
+        if has_admin:
+            return "admin"
+        return "public"
+
+    @classmethod
+    def _extract_rule_access_level(
+        cls,
+        checker_call: object,
+        symbol_levels: dict[str, str] | None = None,
+    ) -> str:
+        checker_name = type(checker_call).__name__
+        try:
+            text = ast.unparse(checker_call)  # type: ignore[arg-type]
+        except Exception:
+            text = repr(checker_call)
+        level = cls._infer_access_level_from_text(text, symbol_levels)
+        if checker_name == "RegexRule":
+            return "public"
+        return level
+
+    @staticmethod
+    def _merge_access_level(left: str | None, right: str | None) -> str:
+        left_level = str(left or "public").strip().lower() or "public"
+        right_level = str(right or "public").strip().lower() or "public"
+        if left_level == right_level:
+            return left_level
+        if "restricted" in {left_level, right_level}:
+            return "restricted"
+        levels = {left_level, right_level} - {"public"}
+        if not levels:
+            return "public"
+        if levels == {"admin"}:
+            return "admin"
+        if levels == {"superuser"}:
+            return "superuser"
+        return "restricted"
+
+    @classmethod
+    def _resolve_access_level(cls, *levels: object) -> str:
+        resolved = "public"
+        for level in levels:
+            resolved = cls._merge_access_level(resolved, level if level else "public")
+        return resolved
 
     @classmethod
     async def _extract_meme_manager_command_data(
@@ -1042,6 +1247,9 @@ class AutoMetadataBuilder:
             current["target_sources"] = cls._merge_unique_strings(
                 current.get("target_sources"),
                 payload.get("target_sources"),
+            )
+            current["access_level"] = cls._merge_access_level(
+                current.get("access_level"), payload.get("access_level")
             )
             for field in (
                 "text_min",

@@ -208,6 +208,45 @@ class PluginRegistry:
             return False
         return None
 
+    @staticmethod
+    def _normalize_access_level(value: object) -> str:
+        level = str(value or "").strip().lower()
+        if level in {"public", "admin", "superuser", "restricted"}:
+            return level
+        return "public"
+
+    @classmethod
+    def _merge_access_level(
+        cls,
+        left: object = None,
+        right: object = None,
+    ) -> str:
+        left_level = cls._normalize_access_level(left)
+        right_level = cls._normalize_access_level(right)
+        if left_level == right_level:
+            return left_level
+        if "restricted" in {left_level, right_level}:
+            return "restricted"
+        levels = {left_level, right_level} - {"public"}
+        if not levels:
+            return "public"
+        if levels == {"admin"}:
+            return "admin"
+        if levels == {"superuser"}:
+            return "superuser"
+        return "restricted"
+
+    @classmethod
+    def _is_public_command_meta(cls, meta: PluginInfo.PluginCommandMeta) -> bool:
+        return cls._normalize_access_level(getattr(meta, "access_level", None)) == "public"
+
+    @classmethod
+    def _filter_public_command_meta(
+        cls,
+        metas: list[PluginInfo.PluginCommandMeta],
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        return [meta for meta in metas if cls._is_public_command_meta(meta)]
+
     @classmethod
     def _infer_actor_scope(cls, command: str, actor_scope: object) -> str:
         normalize = str(command or "").strip()
@@ -295,6 +334,7 @@ class PluginRegistry:
         target_requirement: object = None,
         target_sources: object = None,
         allow_sticky_arg: object = None,
+        access_level: object = None,
     ) -> PluginInfo.PluginCommandMeta:
         normalized_command = str(command or "").strip()
         resolved_actor_scope = cls._infer_actor_scope(normalized_command, actor_scope)
@@ -314,6 +354,7 @@ class PluginRegistry:
             allow_at=allow_at,
             text_max=text_max,
         )
+        resolved_access_level = cls._normalize_access_level(access_level)
         return PluginInfo.PluginCommandMeta(
             command=normalized_command,
             aliases=cls._merge_unique_strings(aliases, []),
@@ -328,6 +369,7 @@ class PluginRegistry:
             target_requirement=resolved_target_requirement,
             target_sources=resolved_target_sources,
             allow_sticky_arg=resolved_allow_sticky_arg,
+            access_level=resolved_access_level,
         )
 
     @classmethod
@@ -354,6 +396,9 @@ class PluginRegistry:
             or None,
             "target_sources": list(getattr(meta, "target_sources", []) or []),
             "allow_sticky_arg": cls._safe_bool(getattr(meta, "allow_sticky_arg", None)),
+            "access_level": cls._normalize_access_level(
+                getattr(meta, "access_level", None)
+            ),
         }
 
     @staticmethod
@@ -428,6 +473,9 @@ class PluginRegistry:
                     allow_sticky_arg=left.get("allow_sticky_arg")
                     if left.get("allow_sticky_arg") is not None
                     else right.get("allow_sticky_arg"),
+                    access_level=cls._merge_access_level(
+                        left.get("access_level"), right.get("access_level")
+                    ),
                 )
         return sorted(merged.values(), key=lambda item: (len(item.command), item.command))
 
@@ -523,6 +571,9 @@ class PluginRegistry:
                 payload["target_sources"] = cls._merge_unique_strings(
                     payload.get("target_sources"), item_payload.get("target_sources")
                 )
+                payload["access_level"] = cls._merge_access_level(
+                    payload.get("access_level"), item_payload.get("access_level")
+                )
                 for field in (
                     "text_min",
                     "text_max",
@@ -532,6 +583,7 @@ class PluginRegistry:
                     "actor_scope",
                     "target_requirement",
                     "allow_sticky_arg",
+                    "access_level",
                 ):
                     if payload.get(field) is None and item_payload.get(field) is not None:
                         payload[field] = item_payload.get(field)
@@ -602,6 +654,9 @@ class PluginRegistry:
             target_payload["target_sources"] = cls._merge_unique_strings(
                 target_payload.get("target_sources"), item_payload.get("target_sources")
             )
+            target_payload["access_level"] = cls._merge_access_level(
+                target_payload.get("access_level"), item_payload.get("access_level")
+            )
             for field in (
                 "text_min",
                 "text_max",
@@ -611,6 +666,7 @@ class PluginRegistry:
                 "actor_scope",
                 "target_requirement",
                 "allow_sticky_arg",
+                "access_level",
             ):
                 if (
                     target_payload.get(field) is None
@@ -715,6 +771,7 @@ class PluginRegistry:
             allow_sticky_arg=item.get(
                 "allow_sticky_arg", schema.get("allow_sticky_arg")
             ),
+            access_level=item.get("access_level", schema.get("access_level")),
         )
 
     @classmethod
@@ -861,6 +918,7 @@ class PluginRegistry:
             plugin_aliases=extra_data.aliases,
         )
         command_meta = cls._canonicalize_command_meta_groups(command_meta)
+        command_meta = cls._filter_public_command_meta(command_meta)
         commands = cls._extract_commands(extra_data, command_meta)
         if not commands:
             return None

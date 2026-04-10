@@ -47,6 +47,10 @@ class PluginInfo(BaseModel):
             default=False,
             description="是否允许命令头和参数粘连（例如：敲葱葱）",
         )
+        access_level: Literal["public", "admin", "superuser", "restricted"] = Field(
+            default="public",
+            description="命令访问级别：public=普通用户可见；admin/superuser/restricted=导入时过滤",
+        )
 
     module: str = Field(description="插件模块名")
     name: str = Field(description="插件名称")

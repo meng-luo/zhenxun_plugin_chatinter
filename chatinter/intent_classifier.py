@@ -23,6 +23,7 @@ from .skill_registry import (
     SkillSpec,
     get_skill_registry,
     infer_query_families,
+    infer_command_role,
     _extract_explicit_value,
     skill_search,
 )
@@ -178,6 +179,22 @@ _USAGE_CONTEXT_HINTS = (
     "详情",
     "搜索",
     "列表",
+)
+_HELP_HINTS = (
+    "帮助",
+    "怎么用",
+    "如何用",
+    "怎样用",
+    "怎么使用",
+    "如何使用",
+    "怎样使用",
+    "用法",
+    "教程",
+    "参数",
+    "说明",
+    "示例",
+    "例子",
+    "详情",
 )
 
 
@@ -574,7 +591,10 @@ def _should_demote_explicit_command_to_chat(
 ) -> bool:
     if not command_head:
         return True
-    if not query_families or query_families[0] != "general":
+    if not query_families:
+        return False
+    primary_family = query_families[0]
+    if primary_family not in {"general", "utility"}:
         return False
     if _has_structure_route_signal(normalized_message) or _contains_strong_route_action(
         normalized_message
@@ -794,52 +814,66 @@ def classify_message_intent(
             confidence=0.68,
         )
     if is_usage_question(normalized):
+        usage_classification_allowed = True
         if explicit_command is not None:
             plugin_name, plugin_module, command_head = explicit_command
             skill = _find_skill(knowledge_base, plugin_name, plugin_module)
-            fallback_schema = fallback_explicit[3] if fallback_explicit is not None else None
-            return IntentClassification(
-                kind="help",
-                reason="usage_question_with_explicit_command",
-                explicit_command=True,
-                plugin_name=plugin_name,
-                plugin_module=plugin_module,
-                command_head=command_head,
-                schema=_find_schema(skill, command_head) or fallback_schema,
-                confidence=0.96,
-                schema_state="ready",
-                rewrite_command=rewrite_command_with_head(
-                    normalized,
-                    command_head,
-                    allow_sticky=bool(
-                        getattr(_find_schema(skill, command_head) or fallback_schema, "allow_sticky_arg", False)
+            route_role = infer_command_role(
+                command_head,
+                family=getattr(skill, "kind", "general") if skill is not None else "general",
+            )
+            if (
+                route_role in {"query", "catalog"}
+                and not contains_any(normalized, _HELP_HINTS)
+                and not contains_any(normalized, _USAGE_CONTEXT_HINTS)
+            ):
+                usage_classification_allowed = False
+            else:
+                fallback_schema = (
+                    fallback_explicit[3] if fallback_explicit is not None else None
+                )
+                schema = _find_schema(skill, command_head) or fallback_schema
+                return IntentClassification(
+                    kind="help",
+                    reason="usage_question_with_explicit_command",
+                    explicit_command=True,
+                    plugin_name=plugin_name,
+                    plugin_module=plugin_module,
+                    command_head=command_head,
+                    schema=schema,
+                    confidence=0.96,
+                    schema_state="ready",
+                    rewrite_command=rewrite_command_with_head(
+                        normalized,
+                        command_head,
+                        allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
                     ),
-                ),
-            )
-        inferred_usage = _infer_usage_command(knowledge_base, normalized)
-        if inferred_usage is not None:
-            plugin_name, plugin_module, command_head, schema = inferred_usage
+                )
+        if usage_classification_allowed:
+            inferred_usage = _infer_usage_command(knowledge_base, normalized)
+            if inferred_usage is not None:
+                plugin_name, plugin_module, command_head, schema = inferred_usage
+                return IntentClassification(
+                    kind="help",
+                    reason="usage_question_with_prefix_command",
+                    explicit_command=True,
+                    plugin_name=plugin_name,
+                    plugin_module=plugin_module,
+                    command_head=command_head,
+                    schema=schema,
+                    confidence=0.9,
+                    schema_state="ready",
+                    rewrite_command=rewrite_command_with_head(
+                        normalized,
+                        command_head,
+                        allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
+                    ),
+                )
             return IntentClassification(
                 kind="help",
-                reason="usage_question_with_prefix_command",
-                explicit_command=True,
-                plugin_name=plugin_name,
-                plugin_module=plugin_module,
-                command_head=command_head,
-                schema=schema,
-                confidence=0.9,
-                schema_state="ready",
-                rewrite_command=rewrite_command_with_head(
-                    normalized,
-                    command_head,
-                    allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
-                ),
+                reason="usage_question",
+                confidence=0.92,
             )
-        return IntentClassification(
-            kind="help",
-            reason="usage_question",
-            confidence=0.92,
-        )
 
     if explicit_command is not None:
         plugin_name, plugin_module, command_head = explicit_command
