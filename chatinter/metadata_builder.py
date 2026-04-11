@@ -27,6 +27,9 @@ class AutoMetadataBuilder:
     _module_alias_cache: ClassVar[
         dict[str, tuple[int, dict[str, list[str]]]]
     ] = {}
+    _module_prefix_cache: ClassVar[
+        dict[str, tuple[int, dict[str, list[str]]]]
+    ] = {}
     _module_access_cache: ClassVar[dict[str, tuple[int, dict[str, str]]]] = {}
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
     _no_command_log_cache: ClassVar[set[str]] = set()
@@ -90,6 +93,7 @@ class AutoMetadataBuilder:
         loaded_plugin: object,
     ) -> list[dict[str, Any]]:
         alias_map = cls._build_module_alias_map(loaded_plugin)
+        prefix_map = cls._build_module_prefix_map(loaded_plugin)
         result: list[dict[str, Any]] = []
         for matcher in cls._iter_plugin_matchers(loaded_plugin):
             module_obj = getattr(matcher, "module", None)
@@ -121,6 +125,10 @@ class AutoMetadataBuilder:
                     payload.get("aliases"),
                     alias_map.get(command_head.casefold(), []),
                 )
+                payload["prefixes"] = cls._merge_unique_strings(
+                    payload.get("prefixes"),
+                    prefix_map.get(command_head.casefold(), []),
+                )
                 result.append(payload)
 
             if parser is None:
@@ -139,6 +147,10 @@ class AutoMetadataBuilder:
                         cls._extract_parser_aliases(parser, command_head),
                         alias_map.get(command_head.casefold(), []),
                         parser_shortcut_aliases,
+                    ),
+                    "prefixes": cls._merge_unique_strings(
+                        parser_schema["prefixes"],
+                        prefix_map.get(command_head.casefold(), []),
                     ),
                     "params": parser_schema["params"],
                     "text_min": parser_schema["text_min"],
@@ -225,6 +237,7 @@ class AutoMetadataBuilder:
     def _default_parser_schema() -> dict[str, Any]:
         return {
             "params": [],
+            "prefixes": [],
             "text_min": 0,
             "text_max": None,
             "image_min": 0,
@@ -350,6 +363,7 @@ class AutoMetadataBuilder:
             return {}
         return {
             "command": command,
+            "prefixes": parser_schema["prefixes"],
             "params": parser_schema["params"],
             "text_min": parser_schema["text_min"],
             "text_max": parser_schema["text_max"],
@@ -447,6 +461,32 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(aliases, [])
 
     @classmethod
+    def _extract_parser_prefixes(cls, parser: object) -> list[str]:
+        prefixes: list[str] = []
+        seen_ids: set[int] = set()
+        candidates: list[object] = [parser]
+        while candidates:
+            candidate = candidates.pop()
+            if candidate is None or id(candidate) in seen_ids:
+                continue
+            seen_ids.add(id(candidate))
+
+            raw_prefixes = getattr(candidate, "prefixes", None)
+            if isinstance(raw_prefixes, str):
+                raw_prefixes = [raw_prefixes]
+            if isinstance(raw_prefixes, (list, tuple, set, frozenset)):
+                for prefix in raw_prefixes:
+                    prefix_text = cls._normalize_command(str(prefix or ""))
+                    if prefix_text:
+                        prefixes.append(prefix_text)
+
+            for attr_name in ("parser", "meta", "config", "_config", "namespace"):
+                nested = getattr(candidate, attr_name, None)
+                if nested is not None and not isinstance(nested, (str, bytes)):
+                    candidates.append(nested)
+        return cls._merge_unique_strings(prefixes, [])
+
+    @classmethod
     def _extract_parser_shortcut_aliases(cls, parser: object) -> list[str]:
         shortcuts: list[str] = []
         for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
@@ -464,6 +504,7 @@ class AutoMetadataBuilder:
         image_max: int | None = 0
         allow_at: bool | None = None
         target_sources: list[str] = []
+        prefixes = cls._extract_parser_prefixes(parser)
         sample_text = cls._sticky_probe_token
 
         try:
@@ -513,6 +554,7 @@ class AutoMetadataBuilder:
             "image_max": image_max,
             "allow_at": allow_at,
             "target_sources": target_sources,
+            "prefixes": prefixes,
             "sample_text": sample_text,
         }
 
@@ -956,6 +998,23 @@ class AutoMetadataBuilder:
         return merged
 
     @classmethod
+    def _build_module_prefix_map(
+        cls,
+        loaded_plugin: object,
+    ) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+        for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            if module_obj is None:
+                continue
+            for command, prefixes in cls._load_module_prefix_map(module_obj).items():
+                merged[command] = cls._merge_unique_strings(
+                    merged.get(command),
+                    prefixes,
+                )
+        return merged
+
+    @classmethod
     def _load_module_alias_map(cls, module_obj: object) -> dict[str, list[str]]:
         source_file = inspect.getsourcefile(module_obj)
         if not source_file:
@@ -1001,6 +1060,42 @@ class AutoMetadataBuilder:
         return alias_map
 
     @classmethod
+    def _load_module_prefix_map(cls, module_obj: object) -> dict[str, list[str]]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_prefix_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        prefix_map: dict[str, list[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command = cls._extract_command_from_call_node(node)
+            prefixes = cls._extract_prefixes_from_call_node(node)
+            if not command or not prefixes:
+                continue
+            prefix_map[command.casefold()] = cls._merge_unique_strings(
+                prefix_map.get(command.casefold()),
+                prefixes,
+            )
+        cls._module_prefix_cache[cache_key] = (mtime_ns, prefix_map)
+        return prefix_map
+
+    @classmethod
     def _extract_command_from_call_node(cls, node: ast.Call) -> str:
         func_name = cls._get_call_name(node.func)
         if func_name not in {"on_alconna", "on_command", "on_regex"}:
@@ -1020,7 +1115,45 @@ class AutoMetadataBuilder:
             and isinstance(first_arg.args[0].value, str)
         ):
             return cls._normalize_command(first_arg.args[0].value)
+        if (
+            isinstance(first_arg, ast.Call)
+            and cls._get_call_name(first_arg.func) == "Alconna"
+            and len(first_arg.args) >= 2
+        ):
+            command_arg = first_arg.args[1]
+            if isinstance(command_arg, ast.Constant) and isinstance(
+                command_arg.value, str
+            ):
+                prefix_arg = first_arg.args[0]
+                if cls._extract_strings_from_node(prefix_arg):
+                    return cls._normalize_command(command_arg.value)
         return ""
+
+    @classmethod
+    def _extract_prefixes_from_call_node(cls, node: ast.Call) -> list[str]:
+        if cls._get_call_name(node.func) != "on_alconna" or not node.args:
+            return []
+        first_arg = node.args[0]
+        if not isinstance(first_arg, ast.Call):
+            return []
+        if cls._get_call_name(first_arg.func) != "Alconna" or not first_arg.args:
+            return []
+        raw_prefixes = cls._extract_strings_from_node(first_arg.args[0])
+        return raw_prefixes
+
+    @classmethod
+    def _extract_strings_from_node(cls, node: ast.AST) -> list[str]:
+        result: list[str] = []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = cls._normalize_command(node.value)
+            if text:
+                result.append(text)
+            return result
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for item in node.elts:
+                result.extend(cls._extract_strings_from_node(item))
+            return cls._merge_unique_strings(result, [])
+        return []
 
     @staticmethod
     def _get_call_name(node: ast.AST) -> str:
@@ -1058,8 +1191,8 @@ class AutoMetadataBuilder:
         shortcut_key = ""
         first_arg = node.args[0]
         if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
-            shortcut_key = cls._normalize_command(first_arg.value)
-        if not shortcut_key or not cls._looks_like_shortcut_alias(shortcut_key):
+            shortcut_key = cls._coerce_shortcut_alias(first_arg.value)
+        if not shortcut_key:
             return "", []
 
         target_command = ""
@@ -1077,8 +1210,8 @@ class AutoMetadataBuilder:
                     raw_humanized = ast.literal_eval(keyword.value)
                 except Exception:
                     raw_humanized = ""
-                humanized = cls._normalize_command(str(raw_humanized or ""))
-                if humanized and cls._looks_like_shortcut_alias(humanized):
+                humanized = cls._coerce_shortcut_alias(str(raw_humanized or ""))
+                if humanized:
                     humanized_aliases.append(humanized)
         if not target_command:
             return "", []
@@ -1092,6 +1225,18 @@ class AutoMetadataBuilder:
         text = cls._command_placeholder_pattern.sub(" ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return normalize_message_text(text)
+
+    @classmethod
+    def _coerce_shortcut_alias(cls, text: object) -> str:
+        normalized = cls._normalize_command(str(text or ""))
+        if not normalized:
+            return ""
+        if cls._looks_like_shortcut_alias(normalized):
+            return normalized
+        regex_head = cls._extract_regex_head(normalized)
+        if regex_head and cls._looks_like_shortcut_alias(regex_head):
+            return regex_head
+        return ""
 
     @classmethod
     def _looks_like_shortcut_alias(cls, text: str) -> bool:
@@ -1119,8 +1264,8 @@ class AutoMetadataBuilder:
             for attr_name in ("humanized", "origin_key", "key", "pattern"):
                 candidates.append(getattr(shortcut_obj, attr_name, None))
         for candidate in candidates:
-            text = cls._normalize_command(str(candidate or ""))
-            if text and cls._looks_like_shortcut_alias(text):
+            text = cls._coerce_shortcut_alias(candidate)
+            if text:
                 labels.append(text)
         return cls._merge_unique_strings(labels, [])
 
@@ -1130,8 +1275,8 @@ class AutoMetadataBuilder:
         seen: set[tuple[str, int]] = set()
 
         def add_record(key: object, value: object) -> None:
-            key_text = cls._normalize_command(str(key or ""))
-            if not key_text or not cls._looks_like_shortcut_alias(key_text):
+            key_text = cls._coerce_shortcut_alias(key)
+            if not key_text:
                 return
             marker = (key_text.casefold(), id(value))
             if marker in seen:
@@ -1244,6 +1389,10 @@ class AutoMetadataBuilder:
                 current.get("examples"),
                 payload.get("examples"),
             )
+            current["prefixes"] = cls._merge_unique_strings(
+                current.get("prefixes"),
+                payload.get("prefixes"),
+            )
             current["target_sources"] = cls._merge_unique_strings(
                 current.get("target_sources"),
                 payload.get("target_sources"),
@@ -1260,6 +1409,7 @@ class AutoMetadataBuilder:
                 "actor_scope",
                 "target_requirement",
                 "allow_sticky_arg",
+                "prefixes",
             ):
                 if current.get(field) is None and payload.get(field) is not None:
                     current[field] = payload.get(field)

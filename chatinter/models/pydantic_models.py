@@ -22,6 +22,7 @@ class PluginInfo(BaseModel):
 
         command: str = Field(description="命令主干")
         aliases: list[str] = Field(default_factory=list, description="命令别名")
+        prefixes: list[str] = Field(default_factory=list, description="命令前缀")
         params: list[str] = Field(default_factory=list, description="参数提示")
         examples: list[str] = Field(default_factory=list, description="示例命令")
         text_min: int | None = Field(default=None, description="文本参数最小数量")

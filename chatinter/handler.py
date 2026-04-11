@@ -56,9 +56,8 @@ from .route_engine import (
     RouteAttemptReport,
     RouteResolveResult,
     probe_shortlist_route,
-    resolve_shortlist_alignment,
+    resolve_llm_align_route,
 )
-from .route_observer import record_route_observation
 from .route_text import (
     ROUTE_ACTION_WORDS,
     contains_any,
@@ -67,6 +66,7 @@ from .route_text import (
     is_usage_question,
     normalize_action_phrases,
     normalize_message_text,
+    match_command_head_canonical,
     parse_command_with_head,
     should_force_knowledge_refresh,
     strip_invoke_prefix,
@@ -80,10 +80,15 @@ from .skill_registry import SkillRouteDecision
 from .skill_registry import _extract_explicit_value
 from .skill_registry import _extract_schema_argument_tokens
 from .skill_registry import _find_skill_by_identity
+from .skill_registry import _message_has_payload_signals
 from .skill_registry import get_skill_registry
 from .skill_registry import skill_search
 from .trace import StageTrace
-from .turn_metrics import build_turn_metrics_snapshot, emit_turn_metrics
+from .turn_metrics import (
+    build_turn_metrics_snapshot,
+    emit_turn_metrics,
+    record_route_observation,
+)
 from .turn_runtime import TurnBudgetController
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
@@ -397,58 +402,6 @@ def _is_compact_chat_fast_match_message(
             allow_sticky=True,
         ):
             return True
-    return False
-
-
-def _message_matches_known_command_prefix(
-    message_text: str,
-    knowledge_base,
-) -> bool:
-    plugins = getattr(knowledge_base, "plugins", None) or []
-    if not plugins:
-        return False
-
-    normalized = normalize_message_text(message_text or "")
-    stripped = normalize_message_text(strip_invoke_prefix(normalized))
-    if not stripped:
-        return False
-
-    candidates: list[str] = [stripped]
-    soft_stripped = stripped
-    while soft_stripped:
-        matched = next(
-            (
-                prefix
-                for prefix in _SOFT_INVOKE_PREFIXES
-                if soft_stripped.lower().startswith(prefix.lower())
-            ),
-            None,
-        )
-        if matched is None:
-            break
-        soft_stripped = normalize_message_text(soft_stripped[len(matched) :])
-        if soft_stripped and soft_stripped not in candidates:
-            candidates.append(soft_stripped)
-    if stripped.startswith("你") and len(stripped) > 1:
-        trimmed = normalize_message_text(stripped[1:])
-        if trimmed and trimmed not in candidates:
-            candidates.append(trimmed)
-
-    for plugin in plugins:
-        for command in getattr(plugin, "commands", []) or []:
-            command_text = normalize_message_text(str(command or ""))
-            if not command_text:
-                continue
-            command_head = normalize_message_text(command_text.split(" ", 1)[0])
-            if not command_head:
-                continue
-            for candidate in candidates:
-                if parse_command_with_head(
-                    candidate,
-                    command_head,
-                    allow_sticky=True,
-                ):
-                    return True
     return False
 
 
@@ -1334,7 +1287,10 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
             command_head = normalize_message_text(getattr(meta, "command", ""))
             if not command_head:
                 continue
-            if head == command_head or head in _iter_meta_aliases(meta):
+            if match_command_head_canonical(head, command_head) or any(
+                match_command_head_canonical(head, alias)
+                for alias in _iter_meta_aliases(meta)
+            ):
                 return meta
         if head in plugin_aliases and len(plugin.command_meta) == 1:
             return plugin.command_meta[0]
@@ -1365,24 +1321,20 @@ def _is_route_command_executable(
         return False
 
     for plugin in candidate_plugins:
-        allowed_heads: set[str] = set()
         for meta in getattr(plugin, "command_meta", None) or []:
             if not _is_public_command_meta(meta):
                 continue
             command_head = normalize_message_text(getattr(meta, "command", ""))
-            if command_head:
-                allowed_heads.add(command_head.casefold())
+            if command_head and match_command_head_canonical(head, command_head):
+                return True
             for alias in getattr(meta, "aliases", None) or []:
                 alias_head = normalize_message_text(str(alias or ""))
-                if alias_head:
-                    allowed_heads.add(alias_head.casefold())
-        if not allowed_heads:
-            for command in getattr(plugin, "commands", None) or []:
-                command_head = _normalize_head(str(command or ""))
-                if command_head:
-                    allowed_heads.add(command_head.casefold())
-        if head_fold in allowed_heads:
-            return True
+                if alias_head and match_command_head_canonical(head, alias_head):
+                    return True
+        for command in getattr(plugin, "commands", None) or []:
+            command_head = _normalize_head(str(command or ""))
+            if command_head and match_command_head_canonical(head, command_head):
+                return True
     return False
 
 
@@ -2546,6 +2498,32 @@ def _prepare_route_execution_plan(
     for token in schema_tokens:
         if token and token not in payload_tokens and token not in existing_payload_tokens:
             payload_tokens.append(token)
+    if not payload_tokens and (
+        max(int(getattr(schema, "text_min", 0) or 0), 0) > 0
+        or getattr(schema, "params", None)
+        or _message_has_payload_signals(current_message)
+    ):
+        parsed_payload = ""
+        try:
+            parsed = parse_command_with_head(
+                current_message,
+                schema_head or command_head,
+                allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
+                max_prefix_len=16,
+            )
+            parsed_payload = normalize_message_text(
+                (parsed.payload_text if parsed else "") or ""
+            )
+        except Exception:
+            parsed_payload = ""
+        if parsed_payload:
+            for token in parsed_payload.split(" "):
+                if (
+                    token
+                    and token not in payload_tokens
+                    and token not in existing_payload_tokens
+                ):
+                    payload_tokens.append(token)
     if payload_tokens:
         command = _append_unique_tokens(command, payload_tokens)
 
@@ -2594,7 +2572,7 @@ def _prepare_route_execution_plan(
             merged_at.append(f"[@{user_id}]")
         else:
             return RouteExecutionPlan(
-                command=command,
+                command=_apply_route_command_prefixes(command, schema),
                 need_followup=True,
                 followup_message=_build_target_required_message(schema),
                 feedback_reason=_FEEDBACK_REASON_TARGET_REQUIRED,
@@ -2611,7 +2589,7 @@ def _prepare_route_execution_plan(
     text_missing = max(text_min - text_count, 0)
     if image_missing > 0 or text_missing > 0:
         return RouteExecutionPlan(
-            command=command,
+            command=_apply_route_command_prefixes(command, schema),
             need_followup=True,
             followup_message=_build_followup_message(
                 image_missing=image_missing,
@@ -2627,7 +2605,24 @@ def _prepare_route_execution_plan(
     if allow_at and merged_at:
         command = _append_unique_tokens(command, merged_at)
 
-    return RouteExecutionPlan(command=command)
+    return RouteExecutionPlan(command=_apply_route_command_prefixes(command, schema))
+
+
+def _apply_route_command_prefixes(command: str, schema) -> str:
+    normalized = normalize_message_text(command)
+    if not normalized or schema is None:
+        return normalized
+    raw_prefixes = getattr(schema, "prefixes", None) or []
+    prefixes: list[str] = []
+    for prefix in raw_prefixes:
+        prefix_text = normalize_message_text(str(prefix or ""))
+        if prefix_text and prefix_text not in prefixes:
+            prefixes.append(prefix_text)
+    if not prefixes:
+        return normalized
+    if any(normalized.startswith(prefix) for prefix in prefixes):
+        return normalized
+    return normalize_message_text(f"{prefixes[0]}{normalized}")
 
 
 async def _execute_route_decision(
@@ -3260,8 +3255,9 @@ async def handle_fallback(
             f"route_role={route_policy.route_role or '-'}"
         )
         if route_policy.action == "align":
+            # 主链路：direct -> llm_align -> validator -> route
             alignment_decision, alignment_route_result, alignment_report = (
-                await resolve_shortlist_alignment(
+                await resolve_llm_align_route(
                     route_message,
                     route_knowledge_base,
                     session_key=session_key,

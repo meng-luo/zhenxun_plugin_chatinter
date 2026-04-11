@@ -30,7 +30,7 @@ from .lifecycle import ensure_lifecycle_hooks_registered
 from .handler import handle_fallback
 from .memory import _chat_memory
 from .plugin_registry import PluginRegistry
-from .route_observer import render_route_observer_summary
+from .turn_metrics import render_route_observer_summary
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()

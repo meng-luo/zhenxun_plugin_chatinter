@@ -12,8 +12,10 @@ from .route_text import (
     has_template_route_context,
     is_usage_question,
     match_command_head,
+    match_command_head_canonical,
     match_command_head_or_sticky,
     parse_command_with_head,
+    _find_short_noise_head_boundary,
     normalize_action_phrases,
     normalize_message_text,
     sanitize_template_tail,
@@ -167,6 +169,7 @@ _ROUTE_NOISE_WORDS = {
     "帮我",
     "帮他",
     "帮她",
+    "帮忙",
     "替我",
     "替他",
     "替她",
@@ -182,46 +185,30 @@ _ROUTE_NOISE_WORDS = {
     "bot",
     "请",
     "麻烦",
-    "执行",
-    "调用",
-    "使用",
-    "打开",
-    "关闭",
-    "开启",
-    "禁用",
-    "查看",
-    "看看",
-    "看下",
-    "查询",
-    "设置",
-    "生成",
-    "制作",
-    "做个",
-    "做一个",
-    "做一张",
-    "做张",
-    "来个",
-    "来一个",
-    "来一张",
-    "再来个",
-    "再来一个",
-    "再来一张",
-    "点歌",
-    "播放",
-    "签到",
-    "启动",
-    "表情",
-    "表情包",
-    "梗图",
-    "图片",
-    "图",
-    "模板",
     "一个",
     "一张",
     "一首",
     "个",
     "张",
     "的",
+    "一下",
+    "一下子",
+    "一下下",
+    "吧",
+    "嘛",
+    "呀",
+    "啊",
+    "哦",
+    "呢",
+    "啦",
+    "了",
+    "那个",
+    "这个",
+    "什么",
+    "怎么",
+    "如何",
+    "怎样",
+    "可以",
 }
 _TEMPLATE_KIND_HINTS = (
     "表情",
@@ -339,6 +326,7 @@ _TARGET_PARAM_HINTS = ("user", "target", "at", "nickname", "self")
 class SkillCommandSchema:
     command: str
     aliases: tuple[str, ...] = ()
+    prefixes: tuple[str, ...] = ()
     params: tuple[str, ...] = ()
     text_min: int | None = None
     text_max: int | None = None
@@ -432,6 +420,11 @@ def _command_meta_signature(meta: PluginInfo.PluginCommandMeta) -> str:
                 for alias in getattr(meta, "aliases", ()) or ()
                 if str(alias).strip()
             ),
+            ",".join(
+                str(prefix).strip()
+                for prefix in getattr(meta, "prefixes", ()) or ()
+                if str(prefix).strip()
+            ),
             str(getattr(meta, "text_min", "") or ""),
             str(getattr(meta, "text_max", "") or ""),
             str(getattr(meta, "image_min", "") or ""),
@@ -463,7 +456,7 @@ def _normalize_skill_phrase(text: str | None) -> str:
     normalized = _COMMAND_TAIL_PATTERN.sub("", normalized)
     normalized = normalized.replace("`", " ")
     normalized = re.sub(r"\s+", " ", normalized).strip(
-        " ：:，,。.!！?？-[](){}<>【】（）《》「」『』"
+        " ：:，,。.!！?？[](){}<>【】（）《》「」『』"
     )
     return normalized
 
@@ -515,6 +508,14 @@ def _extract_command_schemas(
         metas[command] = SkillCommandSchema(
             command=command,
             aliases=aliases,
+            prefixes=tuple(
+                prefix
+                for prefix in (
+                    _normalize_skill_phrase(str(item or ""))
+                    for item in (getattr(raw, "prefixes", None) or [])
+                )
+                if prefix
+            ),
             params=tuple(
                 param
                 for param in (
@@ -937,6 +938,59 @@ def _command_role_alignment_bonus(message_role: str, command_role: str) -> float
     return 0.0
 
 
+def _is_single_edit_distance_match(left: str, right: str) -> bool:
+    left_text = normalize_message_text(left)
+    right_text = normalize_message_text(right)
+    if not left_text or not right_text:
+        return False
+    if abs(len(left_text) - len(right_text)) > 1:
+        return False
+
+    if len(left_text) < len(right_text):
+        left_text, right_text = right_text, left_text
+
+    i = j = 0
+    edits = 0
+    while i < len(left_text) and j < len(right_text):
+        if left_text[i] == right_text[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left_text) == len(right_text):
+            i += 1
+            j += 1
+        else:
+            i += 1
+
+    if i < len(left_text) or j < len(right_text):
+        edits += 1
+    return edits <= 1
+
+
+def _match_short_noisy_head(
+    text: str,
+    command: str,
+) -> bool:
+    command_text = normalize_message_text(command)
+    if not command_text or len(command_text) > 4:
+        return False
+    compact_command = re.sub(r"\s+", "", normalize_message_text(command_text))
+    if not compact_command:
+        return False
+    compact_text = re.sub(
+        r"\s+",
+        "",
+        normalize_message_text(normalize_action_phrases(text)),
+    )
+    if len(compact_text) < len(compact_command):
+        return False
+    prefix = compact_text[: len(compact_command) + 1]
+    return _is_single_edit_distance_match(prefix, compact_command)
+
+
 def _match_score_for_command(
     command: str,
     *,
@@ -947,10 +1001,18 @@ def _match_score_for_command(
     command_text = command.strip()
     if not command_text:
         return 0.0, False, False
+    if match_command_head_canonical(stripped, command_text) or match_command_head_canonical(
+        normalized, command_text
+    ):
+        return 40.0 + len(command_text) / 50.0, True, False
     if match_command_head(stripped, command_text) or match_command_head(
         normalized, command_text
     ):
         return 32.0 + len(command_text) / 50.0, True, False
+    if _match_short_noisy_head(stripped, command_text) or _match_short_noisy_head(
+        normalized, command_text
+    ):
+        return 38.0 + len(command_text) / 50.0, True, False
     command_lower = command_text.lower()
     if command_lower in lowered:
         return 18.0 + len(command_text) / 100.0, False, True
@@ -1105,11 +1167,11 @@ def _rank_skills(
     ]
     ranked.sort(
         key=lambda item: (
-            item.score,
             item.exact_head_hit,
             item.inline_hit_count,
             item.alias_hit_count,
             item.name_hit,
+            item.score,
             item.token_overlap,
             len(item.skill.plugin_name),
         ),
@@ -1569,6 +1631,15 @@ def _extract_argument_around_head(message_text: str, command_head: str) -> str:
         if sticky_tail:
             return sticky_tail
 
+    fuzzy_boundary = _find_short_noise_head_boundary(normalized, command_head)
+    if fuzzy_boundary is not None and fuzzy_boundary < len(normalized):
+        fuzzy_tail = normalize_message_text(
+            normalized[fuzzy_boundary:].strip(" ：:，,。.!！?？")
+        )
+        fuzzy_tail = _strip_route_noise(fuzzy_tail)
+        if fuzzy_tail:
+            return fuzzy_tail
+
     index = normalized.find(command_head)
     if index < 0:
         return ""
@@ -1860,6 +1931,12 @@ def _compose_skill_command(
         argument_text = normalize_message_text(
             " ".join(part for part in fragments if part)
         )
+        if not argument_text:
+            argument_text = _extract_command_context(
+                message_text,
+                head,
+                schema=schema,
+            )
     else:
         argument_text = _extract_command_context(
             message_text,
@@ -1992,7 +2069,7 @@ def match_skill_command_fast(
 
     is_usage = is_usage_question(normalized)
     query_families = infer_query_families(normalized)
-    best: tuple[float, SkillSpec, str] | None = None
+    best: tuple[int, float, SkillSpec, str] | None = None
     for skill in registry.skills:
         pool = skill.helper_commands if is_usage else skill.action_commands
         if not pool:
@@ -2034,24 +2111,43 @@ def match_skill_command_fast(
                     break
             allow_sticky = bool(schema.allow_sticky_arg) if schema is not None else False
             score = 0.0
-            if match_command_head(stripped, command):
+            head_priority = -1
+            if match_command_head_canonical(stripped, command) or match_command_head_canonical(
+                normalized, command
+            ):
+                head_priority = 3
+                score += 120.0 + len(command)
+            elif match_command_head(stripped, command):
+                head_priority = 2
                 score += 100.0 + len(command)
             elif match_command_head(normalized, command):
+                head_priority = 2
                 score += 85.0 + len(command)
             elif match_command_head_or_sticky(
                 stripped,
                 command,
                 allow_sticky=allow_sticky,
             ):
+                head_priority = 1
                 score += 72.0 + len(command)
             elif match_command_head_or_sticky(
                 normalized,
                 command,
                 allow_sticky=allow_sticky,
             ):
+                head_priority = 1
                 score += 60.0 + len(command)
+            elif _match_short_noisy_head(stripped, command) or _match_short_noisy_head(
+                normalized,
+                command,
+            ):
+                head_priority = 2
+                score += 78.0 + len(command)
             elif len(command) >= 2 and command.lower() in lowered:
+                head_priority = 0
                 score += 30.0 + len(command) * 0.1
+            else:
+                continue
             if command in alias_set:
                 score += 1.0
             command_role = infer_command_role(command, family=skill_family)
@@ -2065,15 +2161,15 @@ def match_skill_command_fast(
             )
             if score <= 0:
                 continue
-            candidate = (score, skill, command)
-            if best is None or candidate[0] > best[0]:
+            candidate = (head_priority, score, skill, command)
+            if best is None or candidate[:2] > best[:2]:
                 best = candidate
 
     if best is None:
         return None
-    if best[0] < 8.0:
+    if best[1] < 8.0:
         return None
-    _, skill, command = best
+    _, _, skill, command = best
     return (skill.plugin_name, skill.plugin_module, command)
 
 

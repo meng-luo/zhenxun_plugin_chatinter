@@ -6,12 +6,20 @@ from .route_text import (
     ROUTE_ACTION_WORDS,
     contains_any,
     has_negative_route_intent,
+    match_command_head,
+    match_command_head_canonical,
     normalize_message_text,
+    normalize_action_phrases,
     strip_invoke_prefix,
 )
 from .skill_registry import infer_command_role
 
-RoutePolicyAction = Literal["direct", "align", "usage", "chat"]
+RoutePolicyAction = Literal[
+    "direct",
+    "align",
+    "usage",
+    "chat",
+]
 
 _CHAT_DIALOGUE_SUBKINDS = {
     "recap",
@@ -121,6 +129,39 @@ def infer_route_action_role(route_command: str) -> str:
     return infer_command_role(command_head, family="general")
 
 
+def _route_command_head(route_command: str) -> str:
+    normalized = normalize_message_text(route_command or "")
+    if not normalized:
+        return ""
+    return normalize_message_text(normalized.split(" ", 1)[0])
+
+
+def is_exact_standard_command_head(
+    message_text: str,
+    route_command: str,
+) -> bool:
+    normalized_message = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    )
+    command_head = _route_command_head(route_command)
+    if not normalized_message or not command_head:
+        return False
+    return match_command_head(normalized_message, command_head)
+
+
+def is_canonical_standard_command_head(
+    message_text: str,
+    route_command: str,
+) -> bool:
+    normalized_message = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    )
+    command_head = _route_command_head(route_command)
+    if not normalized_message or not command_head:
+        return False
+    return match_command_head_canonical(normalized_message, command_head)
+
+
 def is_route_action_compatible(message_text: str, route_command: str) -> bool:
     message_role = infer_message_action_role(message_text)
     route_role = infer_route_action_role(route_command)
@@ -144,7 +185,7 @@ def should_try_shortlist_alignment(
     message_text: str,
     intent_profile: IntentClassification,
 ) -> bool:
-    if intent_profile.kind in {"execute", "execute_need_arg", "help", "ambiguous"}:
+    if intent_profile.kind in {"execute", "execute_need_arg", "help"}:
         return True
     if intent_profile.reason in {
         "weak_route_signal",
@@ -155,9 +196,11 @@ def should_try_shortlist_alignment(
     normalized = normalize_message_text(strip_invoke_prefix(message_text or ""))
     if not normalized:
         return False
-    return contains_any(normalized, ROUTE_ACTION_WORDS) and not has_negative_route_intent(
-        normalized
-    )
+    if has_negative_route_intent(normalized):
+        return False
+    if infer_message_action_role(normalized) != "other":
+        return True
+    return contains_any(normalized, ROUTE_ACTION_WORDS)
 
 
 def decide_route_policy(
@@ -178,6 +221,14 @@ def decide_route_policy(
     if shortlist_route_result is not None:
         route_command = str(shortlist_route_result.decision.command or "")
         route_role = infer_route_action_role(route_command)
+        exact_standard_head = is_exact_standard_command_head(
+            message_text,
+            route_command,
+        )
+        canonical_standard_head = is_canonical_standard_command_head(
+            message_text,
+            route_command,
+        )
         if intent_profile.kind in {"help", "execute_need_arg"} or message_role == "help":
             return RoutePolicyDecision(
                 action="usage",
@@ -185,10 +236,43 @@ def decide_route_policy(
                 message_role=message_role,
                 route_role=route_role,
             )
-        if message_role in {"create", "open", "return", "query"} and route_role == "other":
+        if not exact_standard_head:
+            if canonical_standard_head:
+                if not is_route_action_compatible(message_text, route_command):
+                    return RoutePolicyDecision(
+                        action="align",
+                        reason="shortlist_canonical_action_mismatch",
+                        message_role=message_role,
+                        route_role=route_role,
+                    )
+                if route_role == "create" and not _route_command_has_payload(
+                    route_command
+                ):
+                    return RoutePolicyDecision(
+                        action="usage",
+                        reason="shortlist_create_needs_usage",
+                        message_role=message_role,
+                        route_role=route_role,
+                    )
+                return RoutePolicyDecision(
+                    action="direct",
+                    reason="shortlist_canonical_direct",
+                    message_role=message_role,
+                    route_role=route_role,
+                )
+            if should_try_shortlist_alignment(
+                message_text=message_text,
+                intent_profile=intent_profile,
+            ):
+                return RoutePolicyDecision(
+                    action="align",
+                    reason="shortlist_route_nonstandard_head",
+                    message_role=message_role,
+                    route_role=route_role,
+                )
             return RoutePolicyDecision(
-                action="align",
-                reason="shortlist_route_needs_alignment",
+                action="chat",
+                reason="shortlist_nonstandard_chat",
                 message_role=message_role,
                 route_role=route_role,
             )
@@ -213,12 +297,43 @@ def decide_route_policy(
             route_role=route_role,
         )
 
+    exact_standard_head = bool(
+        intent_profile.explicit_command
+        and intent_profile.command_head
+        and is_exact_standard_command_head(
+            message_text,
+            str(intent_profile.command_head),
+        )
+    )
+    canonical_standard_head = bool(
+        intent_profile.explicit_command
+        and intent_profile.command_head
+        and is_canonical_standard_command_head(
+            message_text,
+            str(intent_profile.command_head),
+        )
+    )
+
     if intent_profile.kind in {"help", "execute_need_arg"} and (
         intent_profile.explicit_command or intent_profile.command_head
     ):
         return RoutePolicyDecision(
             action="usage",
             reason="explicit_usage_no_shortlist",
+            message_role=message_role,
+        )
+
+    if exact_standard_head and intent_profile.kind == "execute":
+        return RoutePolicyDecision(
+            action="direct",
+            reason="explicit_exact_standard_head",
+            message_role=message_role,
+        )
+
+    if canonical_standard_head and intent_profile.kind == "execute":
+        return RoutePolicyDecision(
+            action="direct",
+            reason="explicit_canonical_standard_head",
             message_role=message_role,
         )
 
@@ -245,6 +360,8 @@ __all__ = [
     "decide_route_policy",
     "infer_message_action_role",
     "infer_route_action_role",
+    "is_canonical_standard_command_head",
+    "is_exact_standard_command_head",
     "is_route_action_compatible",
     "should_try_shortlist_alignment",
 ]

@@ -2,23 +2,18 @@ from dataclasses import dataclass, field
 import json
 import re
 import time
-from typing import Any, cast
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from zhenxun.services import chat, generate_structured, logger
-from zhenxun.services.llm.types import LLMToolCall
-
+from zhenxun.services import generate_structured, logger
 from .config import (
-    ROUTE_TOOL_PLANNER_ENABLED,
-    ROUTE_TOOL_PLANNER_MAX_TOOLS,
     get_config_value,
     get_model_name,
 )
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .prompt_guard import guard_prompt_sections
-from .route_tool_planner import RoutePlannerToolSpec, build_route_planner_tools
 from .route_text import (
     collect_placeholders,
     contains_any,
@@ -26,6 +21,7 @@ from .route_text import (
     match_command_head_or_sticky,
     normalize_action_phrases,
     normalize_message_text,
+    parse_command_with_head,
     ROUTE_ACTION_WORDS,
     strip_invoke_prefix,
 )
@@ -35,6 +31,8 @@ from .route_policy import infer_route_action_role
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillRouteDecision,
+    _extract_argument_around_head,
+    _message_has_payload_signals,
     get_skill_registry,
     infer_query_family,
     infer_query_families,
@@ -47,8 +45,6 @@ from .turn_runtime import TurnBudgetController
 
 _ROUTE_NAMESPACE_LIMIT = 12
 _ROUTE_PLUGIN_SHORTLIST_LIMIT = 8
-_ROUTE_TOOLS_PER_SKILL_LIMIT = 2
-_SHORTLIST_ALIGNMENT_TOOLS_PER_SKILL_LIMIT = 4
 _SHORTLIST_ALIGNMENT_INSTRUCTION = """
 你是 ChatInter 的 shortlist 对齐器。
 给你的不是全库，而是当前消息最可能命中的少量插件卡片。
@@ -286,6 +282,33 @@ def _resolve_command_schema(plugin: PluginInfo, command_head: str):
     return None
 
 
+def _strip_supported_command_prefixes(command: str, plugin: PluginInfo) -> str:
+    normalized = normalize_message_text(command)
+    if not normalized:
+        return ""
+
+    prefixes: list[str] = []
+    for meta in plugin.command_meta:
+        if not _is_public_command_meta(meta):
+            continue
+        for prefix in getattr(meta, "prefixes", None) or []:
+            prefix_text = normalize_message_text(str(prefix or ""))
+            if prefix_text and prefix_text not in prefixes:
+                prefixes.append(prefix_text)
+
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        if normalized.startswith(prefix):
+            stripped = normalize_message_text(normalized[len(prefix) :])
+            if stripped:
+                return stripped
+
+    if normalized.startswith("/") and len(normalized) > 1:
+        stripped = normalize_message_text(normalized[1:])
+        if stripped:
+            return stripped
+    return normalized
+
+
 def _collect_placeholder_tokens(command: str) -> set[str]:
     tokens: set[str] = set()
     for token in collect_placeholders(command):
@@ -401,6 +424,67 @@ def _sanitize_command_with_schema(
     return normalize_message_text(" ".join([head, *payload]).strip())
 
 
+def _rehydrate_command_payload_from_message(
+    command: str,
+    *,
+    message_text: str,
+    schema,
+) -> str:
+    normalized = normalize_message_text(command)
+    if not normalized:
+        return normalized
+    if len(normalized.split(" ", 1)) > 1:
+        return normalized
+
+    has_payload_signal = _message_has_payload_signals(message_text)
+    if schema is None and not has_payload_signal:
+        return normalized
+
+    text_min = max(int(getattr(schema, "text_min", 0) or 0), 0) if schema is not None else 0
+    has_params = bool(getattr(schema, "params", None)) if schema is not None else False
+    if text_min <= 0 and not has_params and not has_payload_signal:
+        return normalized
+
+    command_head = normalize_message_text(normalized.split(" ", 1)[0])
+    if not command_head:
+        return normalized
+
+    allow_sticky = bool(getattr(schema, "allow_sticky_arg", False)) if schema is not None else False
+    recovered = parse_command_with_head(
+        message_text,
+        command_head,
+        allow_sticky=allow_sticky,
+        max_prefix_len=16,
+    )
+    payload = normalize_message_text((recovered.payload_text if recovered else "") or "")
+    if not payload:
+        payload = normalize_message_text(
+            _extract_argument_around_head(message_text, command_head)
+        )
+    if not payload:
+        return normalized
+
+    payload_tokens = [token for token in payload.split(" ") if token]
+    if not payload_tokens:
+        return normalized
+
+    text_max = getattr(schema, "text_max", None) if schema is not None else None
+    if text_max is not None:
+        try:
+            text_max_int = max(int(text_max), 0)
+        except Exception:
+            text_max_int = None
+        if text_max_int is not None:
+            if text_max_int == 0:
+                return command_head
+            if text_max_int == 1 and len(payload_tokens) > 1:
+                payload_tokens = [" ".join(payload_tokens)]
+            elif len(payload_tokens) > text_max_int:
+                payload_tokens = payload_tokens[:text_max_int]
+
+    return normalize_message_text(" ".join([command_head, *payload_tokens]).strip())
+
+
 def _to_route_result(
     decision: _LLMRouteDecision,
     message_text: str,
@@ -416,6 +500,7 @@ def _to_route_result(
     command = normalize_message_text(decision.command or "")
     if not command:
         return None
+    command = _strip_supported_command_prefixes(command, plugin)
     command_head = normalize_message_text(command.split(" ", 1)[0]).casefold()
     if not command_head:
         return None
@@ -436,6 +521,19 @@ def _to_route_result(
         return None
 
     command = _sanitize_command_with_schema(plugin, command=command)
+    schema = _resolve_command_schema(plugin, command_head)
+    if schema is not None:
+        command = _rehydrate_command_payload_from_message(
+            command,
+            message_text=message_text,
+            schema=schema,
+        )
+    elif _message_has_payload_signals(message_text):
+        command = _rehydrate_command_payload_from_message(
+            command,
+            message_text=message_text,
+            schema=None,
+        )
     command_head = normalize_message_text(command.split(" ", 1)[0]).casefold()
     if not command_head or command_head not in allowed_heads:
         return None
@@ -527,6 +625,7 @@ def _build_shortlist_alignment_prompt(
         "has_at": bool(_AT_PLACEHOLDER_PATTERN.search(message_text) or _AT_INLINE_PATTERN.search(message_text)),
         "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
         "is_usage_question": is_usage_question(message_text),
+        "message_role": infer_message_action_role(message_text),
         "local_hint": {
             "plugin_module": local_hint.decision.plugin_module,
             "command": local_hint.decision.command,
@@ -911,158 +1010,6 @@ def probe_shortlist_route(
     )
 
 
-def _is_schema_parameter_error(exc: Exception) -> bool:
-    text = normalize_message_text(str(exc or "")).lower()
-    if not text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "invalid_parameter",
-            "invalid_argument",
-            "response_schema",
-            "responsejsonschema",
-            "additionalproperties",
-        )
-    )
-
-
-def _normalize_tool_call_arguments(raw_arguments: str) -> dict[str, Any]:
-    raw_text = str(raw_arguments or "").strip()
-    if not raw_text:
-        return {}
-    try:
-        parsed = json.loads(raw_text)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def _tool_call_to_route_result(
-    tool_call: LLMToolCall,
-    spec_map: dict[str, RoutePlannerToolSpec],
-) -> RouteResolveResult | None:
-    spec = spec_map.get(str(tool_call.function.name or "").strip())
-    if spec is None:
-        return None
-
-    args = _normalize_tool_call_arguments(tool_call.function.arguments)
-    text_value = normalize_message_text(str(args.get("text", "") or ""))
-    command = spec.command_head
-    if text_value and spec.text_allowed:
-        command = normalize_message_text(f"{command} {text_value}")
-
-    decision = SkillRouteDecision(
-        plugin_name=spec.plugin_name,
-        plugin_module=spec.plugin_module,
-        command=command,
-        source="tool",
-        skill_kind="tool",
-    )
-    return RouteResolveResult(decision=decision, stage="tool")
-
-
-async def _request_tool_route_decision(
-    *,
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    timeout_value: float | None,
-    session_key: str,
-    budget_controller: TurnBudgetController | None,
-) -> tuple[RouteResolveResult | None, int, int]:
-    if not ROUTE_TOOL_PLANNER_ENABLED:
-        return None, 0, 0
-
-    max_tools = max(int(ROUTE_TOOL_PLANNER_MAX_TOOLS), 1)
-    planner_tools, spec_map = build_route_planner_tools(
-        message_text=message_text,
-        knowledge_base=knowledge_base,
-        max_tools=max_tools,
-        tools_per_skill=_ROUTE_TOOLS_PER_SKILL_LIMIT,
-        query_family="general",
-        candidate_modules=tuple(
-            normalize_message_text(plugin.module)
-            for plugin in knowledge_base.plugins
-            if normalize_message_text(plugin.module)
-        ),
-    )
-    if not planner_tools or not spec_map:
-        return None, len(planner_tools), 0
-
-    trace_specs = [
-        f"{spec.plugin_name}:{spec.command_head}"
-        for spec in list(spec_map.values())[:_ROUTE_TRACE_SAMPLE_LIMIT]
-    ]
-    logger.debug(
-        "ChatInter tool 路由尝试: "
-        f"tools={len(planner_tools)} "
-        f"choices={trace_specs}"
-    )
-
-    try:
-        if budget_controller is not None and not budget_controller.allow_classifier(
-            "route_tool"
-        ):
-            return None, len(planner_tools), 0
-        started = time.perf_counter()
-        guarded = guard_prompt_sections(
-            session_key=session_key,
-            stage="route_tool",
-            system_prompt=_TOOL_ROUTE_INSTRUCTION,
-            user_text=message_text,
-            controller=budget_controller,
-        )
-        response = await chat(
-            guarded.user_text,
-            model=get_model_name(),
-            instruction=guarded.system_prompt,
-            tools=cast(list[Any], planner_tools),
-            tool_choice="auto",
-            timeout=timeout_value,
-        )
-        if budget_controller is not None:
-            budget_controller.record_classifier(
-                "route_tool",
-                time.perf_counter() - started,
-            )
-    except Exception as exc:
-        logger.debug(f"ChatInter tool 路由失败，回退 JSON 路由: {exc}")
-        return None, len(planner_tools), 0
-
-    raw_tool_calls = response.tool_calls or []
-    if not raw_tool_calls:
-        logger.debug("ChatInter tool 路由未选择任何工具")
-        return None, len(planner_tools), 0
-
-    normalized_calls: list[LLMToolCall] = []
-    for item in raw_tool_calls:
-        if isinstance(item, LLMToolCall):
-            normalized_calls.append(item)
-            continue
-        if isinstance(item, dict):
-            try:
-                normalized_calls.append(LLMToolCall(**item))
-            except Exception:
-                continue
-    if not normalized_calls:
-        logger.debug("ChatInter tool 路由返回的 tool_calls 无法解析")
-        return None, len(planner_tools), 0
-
-    route_result = _tool_call_to_route_result(normalized_calls[0], spec_map)
-    if route_result is None:
-        logger.debug(
-            "ChatInter tool 路由结果未映射到候选工具: "
-            f"name={normalized_calls[0].function.name}"
-        )
-        return None, len(planner_tools), len(normalized_calls)
-    logger.debug(
-        "ChatInter tool 路由命中: "
-        f"module={route_result.decision.plugin_module} "
-        f"command={route_result.decision.command}"
-    )
-    return route_result, len(planner_tools), len(normalized_calls)
-
-
 async def _request_shortlist_alignment_decision(
     *,
     prompt: str,
@@ -1262,9 +1209,30 @@ async def resolve_shortlist_alignment(
     )
 
 
+async def resolve_llm_align_route(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    session_key: str | None = None,
+    budget_controller: TurnBudgetController | None = None,
+) -> tuple[_ShortlistAlignmentDecision | None, RouteResolveResult | None, RouteAttemptReport]:
+    """明确表达 ChatInter 的 LLM 对齐阶段。
+
+    保留旧函数名 `resolve_shortlist_alignment` 作为兼容入口，但主链路使用这个别名更清晰：
+    direct -> llm_align -> validator -> route
+    """
+    return await resolve_shortlist_alignment(
+        message_text,
+        knowledge_base,
+        session_key=session_key,
+        budget_controller=budget_controller,
+    )
+
+
 __all__ = [
     "RouteAttemptReport",
     "RouteResolveResult",
+    "resolve_llm_align_route",
     "probe_shortlist_route",
     "resolve_shortlist_alignment",
 ]

@@ -22,6 +22,7 @@ from zhenxun.utils.enum import PluginType
 
 from .metadata_builder import AutoMetadataBuilder
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .route_text import normalize_message_text
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ class PluginRegistry:
             command_metas.append(
                 cls._with_command_meta_defaults(
                     command=command_text,
+                    prefixes=getattr(raw, "prefixes", None),
                     params=params,
                     examples=examples,
                     text_min=cls._safe_int(getattr(raw, "text_min", None)),
@@ -323,6 +325,7 @@ class PluginRegistry:
         *,
         command: str,
         aliases: list[str] | tuple[str, ...] | None = None,
+        prefixes: list[str] | tuple[str, ...] | None = None,
         params: list[str] | tuple[str, ...] | None = None,
         examples: list[str] | tuple[str, ...] | None = None,
         text_min: int | None = None,
@@ -358,6 +361,7 @@ class PluginRegistry:
         return PluginInfo.PluginCommandMeta(
             command=normalized_command,
             aliases=cls._merge_unique_strings(aliases, []),
+            prefixes=cls._merge_unique_strings(prefixes, []),
             params=cls._merge_unique_strings(params, []),
             examples=cls._merge_unique_strings(examples, []),
             text_min=text_min,
@@ -381,6 +385,7 @@ class PluginRegistry:
         return {
             "command": str(getattr(meta, "command", "") or "").strip(),
             "aliases": list(getattr(meta, "aliases", []) or []),
+            "prefixes": list(getattr(meta, "prefixes", []) or []),
             "params": list(getattr(meta, "params", []) or []),
             "examples": list(getattr(meta, "examples", []) or []),
             "text_min": cls._safe_int(getattr(meta, "text_min", None)),
@@ -443,6 +448,9 @@ class PluginRegistry:
                     aliases=cls._merge_unique_strings(
                         left.get("aliases"), right.get("aliases")
                     ),
+                    prefixes=cls._merge_unique_strings(
+                        left.get("prefixes"), right.get("prefixes")
+                    ),
                     params=cls._merge_unique_strings(
                         left.get("params"), right.get("params")
                     ),
@@ -483,8 +491,9 @@ class PluginRegistry:
     def _command_meta_richness(
         cls,
         meta: PluginInfo.PluginCommandMeta,
-    ) -> tuple[int, int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int]:
         aliases = len(getattr(meta, "aliases", []) or [])
+        prefixes = len(getattr(meta, "prefixes", []) or [])
         params = len(getattr(meta, "params", []) or [])
         examples = len(getattr(meta, "examples", []) or [])
         text_score = sum(
@@ -499,7 +508,7 @@ class PluginRegistry:
         )
         sticky = int(bool(getattr(meta, "allow_sticky_arg", False)))
         allow_at = int(bool(getattr(meta, "allow_at", False)))
-        return (params, text_score, aliases, examples, sticky, allow_at)
+        return (params, text_score, aliases, prefixes, examples, sticky, allow_at)
 
     @classmethod
     def _canonicalize_command_meta_groups(
@@ -567,6 +576,9 @@ class PluginRegistry:
                 )
                 payload["examples"] = cls._merge_unique_strings(
                     payload.get("examples"), item_payload.get("examples")
+                )
+                payload["prefixes"] = cls._merge_unique_strings(
+                    payload.get("prefixes"), item_payload.get("prefixes")
                 )
                 payload["target_sources"] = cls._merge_unique_strings(
                     payload.get("target_sources"), item_payload.get("target_sources")
@@ -651,6 +663,9 @@ class PluginRegistry:
             target_payload["examples"] = cls._merge_unique_strings(
                 target_payload.get("examples"), item_payload.get("examples")
             )
+            target_payload["prefixes"] = cls._merge_unique_strings(
+                target_payload.get("prefixes"), item_payload.get("prefixes")
+            )
             target_payload["target_sources"] = cls._merge_unique_strings(
                 target_payload.get("target_sources"), item_payload.get("target_sources")
             )
@@ -725,10 +740,13 @@ class PluginRegistry:
         if not isinstance(image_schema, dict):
             image_schema = {}
         aliases = item.get("aliases")
+        prefixes = item.get("prefixes")
         params = item.get("params")
         examples = item.get("examples")
         if not isinstance(aliases, list | tuple):
             aliases = []
+        if not isinstance(prefixes, list | tuple):
+            prefixes = []
         if not isinstance(params, list | tuple):
             params = []
         if not isinstance(examples, list | tuple):
@@ -745,6 +763,9 @@ class PluginRegistry:
             command=command_text,
             aliases=[
                 str(alias).strip() for alias in aliases if str(alias or "").strip()
+            ],
+            prefixes=[
+                str(prefix).strip() for prefix in prefixes if str(prefix or "").strip()
             ],
             params=[str(param).strip() for param in params if str(param or "").strip()],
             examples=normalized_examples,
@@ -1156,6 +1177,10 @@ class PluginRegistry:
                 continue
             lookup.add(normalized.casefold())
             lookup.add(normalized.split(" ", 1)[0].casefold())
+            stripped = cls._strip_leading_command_prefix(normalized)
+            if stripped:
+                lookup.add(stripped.casefold())
+                lookup.add(stripped.split(" ", 1)[0].casefold())
         return lookup
 
     @classmethod
@@ -1170,7 +1195,15 @@ class PluginRegistry:
         folded = normalized.casefold()
         if folded in matcher_lookup:
             return True
-        return normalized.split(" ", 1)[0].casefold() in matcher_lookup
+        if normalized.split(" ", 1)[0].casefold() in matcher_lookup:
+            return True
+        stripped = cls._strip_leading_command_prefix(normalized)
+        if not stripped:
+            return False
+        stripped_folded = stripped.casefold()
+        if stripped_folded in matcher_lookup:
+            return True
+        return stripped.split(" ", 1)[0].casefold() in matcher_lookup
 
     @classmethod
     def _filter_to_matcher_executable(
@@ -1238,6 +1271,17 @@ class PluginRegistry:
         if not filtered_commands:
             filtered_commands = matcher_commands[:]
         return filtered_commands, filtered_meta
+
+    @staticmethod
+    def _strip_leading_command_prefix(command: str) -> str:
+        normalized = normalize_message_text(command)
+        if not normalized:
+            return ""
+        if normalized.startswith("/"):
+            return normalize_message_text(normalized[1:])
+        if normalized.startswith("／"):
+            return normalize_message_text(normalized[1:])
+        return normalized
 
     @classmethod
     def _normalize_command(cls, command: str) -> str:

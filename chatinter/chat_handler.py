@@ -223,7 +223,6 @@ async def reroute_to_plugin(
         event_data["message"] = new_message
         event_data["raw_message"] = command_text
         event_data["plain_text"] = command_text
-        event_data["reply"] = None
 
         if hasattr(bot, "self_id"):
             event_data["self_id"] = bot.self_id

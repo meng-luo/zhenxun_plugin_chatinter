@@ -42,7 +42,6 @@ QUESTION_WORDS = (
     "怎样使用",
     "用法",
     "教程",
-    "参数",
     "说明",
     "示例",
     "例子",
@@ -75,7 +74,6 @@ USAGE_WORDS = (
     "怎样使用",
     "用法",
     "教程",
-    "参数",
     "说明",
     "示例",
     "例子",
@@ -98,7 +96,6 @@ _USAGE_CONTEXT_HINTS = (
     "插件",
     "功能",
     "用法",
-    "参数",
     "说明",
     "教程",
     "触发",
@@ -360,6 +357,7 @@ _ROUTE_LEADING_NOISE_WORDS = (
     "向",
     "让",
     "替",
+    "执行",
 )
 
 _ROUTE_INLINE_NOISE_WORDS = (
@@ -367,28 +365,9 @@ _ROUTE_INLINE_NOISE_WORDS = (
     "一下子",
     "一下下",
     "一哈",
-    "一下吧",
-    "一下嘛",
-    "一下呀",
-    "下",
-    "轻轻",
-    "稍微",
-    "顺手",
-    "顺便",
-    "帮忙",
-    "帮我",
-    "给我",
-    "麻烦",
     "请",
+    "那个",
     "把",
-    "对",
-    "向",
-    "让",
-    "替",
-    "去",
-    "先",
-    "再",
-    "的",
     "吧",
     "嘛",
     "呀",
@@ -478,6 +457,189 @@ def match_command_head_or_sticky(
     return len(sticky_key) <= max(max_sticky_len, 1)
 
 
+def _clean_route_command_head_text(text: str, *, compact: bool = False) -> str:
+    cleaned = normalize_message_text(normalize_action_phrases(text))
+    if not cleaned:
+        return ""
+
+    cleaned = normalize_message_text(strip_invoke_prefix(cleaned))
+    cleaned = _strip_route_leading_noise(cleaned)
+    cleaned = _PLACEHOLDER_PATTERN.sub(" ", cleaned)
+    if compact:
+        cleaned = cleaned.replace(" ", "")
+        for token in _ROUTE_INLINE_NOISE_WORDS:
+            if token:
+                cleaned = cleaned.replace(token, "")
+        cleaned = re.sub(r"[^\u4e00-\u9fff0-9A-Za-z]+", "", cleaned)
+        return cleaned.casefold()
+    return normalize_message_text(cleaned)
+
+
+def _compact_ascii_head_text(text: str) -> str:
+    cleaned = _clean_route_command_head_text(text, compact=True)
+    if not cleaned:
+        return ""
+    if not any(char.isascii() and char.isalnum() for char in cleaned):
+        return ""
+    compact = re.sub(r"[^0-9A-Za-z]+", "", cleaned).casefold()
+    return compact
+
+
+def _find_canonical_head_boundary(text: str, command: str) -> int | None:
+    normalized_text = normalize_message_text(normalize_action_phrases(text))
+    normalized_command = normalize_message_text(command)
+    if not normalized_text or not normalized_command:
+        return None
+
+    compact_command = _clean_route_command_head_text(normalized_command, compact=True)
+    ascii_command = _compact_ascii_head_text(normalized_command)
+    if not compact_command and not ascii_command:
+        return None
+
+    for index in range(1, len(normalized_text) + 1):
+        prefix = normalized_text[:index]
+        if compact_command and _clean_route_command_head_text(prefix, compact=True) == compact_command:
+            return index
+        if ascii_command and _compact_ascii_head_text(prefix) == ascii_command:
+            return index
+    return None
+
+
+def _find_canonical_ascii_head_boundary(text: str, command: str) -> int | None:
+    normalized_text = normalize_message_text(normalize_action_phrases(text))
+    normalized_command = normalize_message_text(command)
+    if not normalized_text or not normalized_command:
+        return None
+
+    ascii_command = _compact_ascii_head_text(normalized_command)
+    if not ascii_command:
+        return None
+
+    compact_chars: list[str] = []
+    compact_boundaries: list[int] = []
+    for index, char in enumerate(normalized_text):
+        if not (char.isascii() and char.isalnum()):
+            continue
+        compact_chars.append(char.casefold())
+        compact_boundaries.append(index + 1)
+
+    compact_text = "".join(compact_chars)
+    if not compact_text.startswith(ascii_command):
+        return None
+    if len(compact_boundaries) < len(ascii_command):
+        return None
+    return compact_boundaries[len(ascii_command) - 1]
+
+
+def _find_short_noise_head_boundary(text: str, command: str) -> int | None:
+    normalized_text = normalize_message_text(normalize_action_phrases(text))
+    normalized_command = normalize_message_text(command)
+    if not normalized_text or not normalized_command:
+        return None
+
+    compact_command = _clean_route_command_head_text(normalized_command, compact=True)
+    if not compact_command or len(compact_command) > 4:
+        return None
+
+    compact_text = _clean_route_command_head_text(normalized_text, compact=True)
+    if not compact_text or len(compact_text) < len(compact_command):
+        return None
+
+    prefix_budget = min(len(compact_text), len(compact_command) + 1)
+    prefix_compact = compact_text[:prefix_budget]
+    if not _is_single_edit_distance_match(prefix_compact, compact_command):
+        return None
+
+    seen = 0
+    boundary = 0
+    for index, char in enumerate(normalized_text):
+        if not re.match(r"[\u4e00-\u9fff0-9A-Za-z]", char):
+            continue
+        seen += 1
+        boundary = index + 1
+        if seen >= prefix_budget:
+            return boundary
+    return None
+
+
+def _is_single_edit_distance_match(left: str, right: str) -> bool:
+    left_text = normalize_message_text(left)
+    right_text = normalize_message_text(right)
+    if not left_text or not right_text:
+        return False
+    if abs(len(left_text) - len(right_text)) > 1:
+        return False
+
+    if len(left_text) < len(right_text):
+        left_text, right_text = right_text, left_text
+
+    i = j = 0
+    edits = 0
+    while i < len(left_text) and j < len(right_text):
+        if left_text[i] == right_text[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left_text) == len(right_text):
+            i += 1
+            j += 1
+        else:
+            i += 1
+
+    if i < len(left_text) or j < len(right_text):
+        edits += 1
+    return edits <= 1
+
+
+def match_command_head_canonical(text: str, command: str) -> bool:
+    strict_text = _clean_route_command_head_text(text, compact=False)
+    strict_command = _clean_route_command_head_text(command, compact=False)
+    if strict_text and strict_command and match_command_head(
+        strict_text, strict_command
+    ):
+        return True
+
+    compact_text = _clean_route_command_head_text(text, compact=True)
+    compact_command = _clean_route_command_head_text(command, compact=True)
+    if not compact_text or not compact_command:
+        ascii_text = _compact_ascii_head_text(text)
+        ascii_command = _compact_ascii_head_text(command)
+        if not ascii_text or not ascii_command:
+            return False
+        if ascii_text == ascii_command:
+            return True
+        return match_command_head_or_sticky(
+            ascii_text,
+            ascii_command,
+            allow_sticky=True,
+        )
+    if compact_text == compact_command:
+        return True
+    if match_command_head_or_sticky(
+        compact_text,
+        compact_command,
+        allow_sticky=True,
+    ):
+        return True
+
+    ascii_text = _compact_ascii_head_text(text)
+    ascii_command = _compact_ascii_head_text(command)
+    if not ascii_text or not ascii_command:
+        return _find_short_noise_head_boundary(text, command) is not None
+    if ascii_text == ascii_command:
+        return True
+    if match_command_head_or_sticky(
+        ascii_text,
+        ascii_command,
+        allow_sticky=True,
+    ):
+        return True
+    return _find_short_noise_head_boundary(text, command) is not None
+
+
 def strip_invoke_prefix(text: str) -> str:
     stripped = normalize_message_text(text)
     while stripped:
@@ -531,11 +693,8 @@ def _build_command_match_variants(text: str) -> tuple[str, ...]:
     stripped_route_noise = _strip_route_leading_noise(stripped_invoke)
     _append(stripped_route_noise)
 
-    compact_query = stripped_route_noise
-    for token in _ROUTE_INLINE_NOISE_WORDS:
-        if token:
-            compact_query = compact_query.replace(token, " ")
-    _append(normalize_message_text(compact_query))
+    _append(_clean_route_command_head_text(stripped_route_noise, compact=False))
+    _append(_clean_route_command_head_text(stripped_route_noise, compact=True))
 
     return tuple(variants)
 
@@ -650,6 +809,31 @@ def parse_command_with_head(
                 variant_text=variant,
                 match_mode="prefix_target",
             )
+
+        canonical_boundary = _find_canonical_head_boundary(variant, normalized_command)
+        if canonical_boundary is not None:
+            payload = _strip_route_inline_noise(
+                normalize_message_text(variant[canonical_boundary:])
+            )
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=payload,
+                prefix_text="",
+                variant_text=variant,
+                match_mode="canonical",
+            )
+        ascii_boundary = _find_canonical_ascii_head_boundary(variant, normalized_command)
+        if ascii_boundary is not None:
+            payload = _strip_route_inline_noise(
+                normalize_message_text(variant[ascii_boundary:])
+            )
+            return RouteCommandMatch(
+                command_head=normalized_command,
+                payload_text=payload,
+                prefix_text="",
+                variant_text=variant,
+                match_mode="canonical_ascii",
+            )
     return None
 
 
@@ -694,10 +878,15 @@ def is_usage_question(text: str) -> bool:
         return False
     has_question_hint = contains_any(normalized, QUESTION_WORDS)
     has_explicit_usage_hint = contains_any(normalized, USAGE_WORDS)
-    if not has_question_hint and not has_explicit_usage_hint:
+    has_isolated_param_hint = _contains_isolated_term(normalized, "参数")
+    if not has_question_hint and not has_explicit_usage_hint and not has_isolated_param_hint:
         return False
     if has_explicit_usage_hint:
         return True
+    if has_isolated_param_hint:
+        return contains_any(normalized, _GENERIC_QUESTION_WORDS) or contains_any(
+            normalized, _USAGE_CONTEXT_HINTS
+        )
     # 仅出现“什么/怎么/？”等泛问句，不视为插件帮助请求。
     if contains_any(normalized, _GENERIC_QUESTION_WORDS) and not contains_any(
         normalized, _USAGE_CONTEXT_HINTS
@@ -708,6 +897,14 @@ def is_usage_question(text: str) -> bool:
     if contains_any(normalized, EXECUTE_WORDS):
         return False
     return has_question_hint
+
+
+def _contains_isolated_term(text: str, term: str) -> bool:
+    normalized = normalize_message_text(text)
+    target = normalize_message_text(term)
+    if not normalized or not target:
+        return False
+    return re.search(rf"(?<!\w){re.escape(target)}(?!\w)", normalized) is not None
 
 
 def _is_generic_question_payload(text: str) -> bool:
@@ -916,6 +1113,7 @@ __all__ = [
     "has_negative_route_intent",
     "has_template_route_context",
     "is_usage_question",
+    "match_command_head_canonical",
     "match_command_head",
     "match_command_head_fuzzy",
     "match_command_head_or_sticky",

@@ -10,10 +10,12 @@ from .route_text import (
     has_negative_route_intent,
     is_usage_question,
     match_command_head,
+    match_command_head_canonical,
     match_command_head_fuzzy,
     match_command_head_or_sticky,
     normalize_action_phrases,
     normalize_message_text,
+    parse_command_with_head,
     rewrite_command_with_head,
     strip_invoke_prefix,
 )
@@ -25,6 +27,7 @@ from .skill_registry import (
     infer_query_families,
     infer_command_role,
     _extract_explicit_value,
+    _extract_argument_around_head,
     skill_search,
 )
 
@@ -304,6 +307,18 @@ def _extract_payload_text(
         payload = normalize_message_text(normalized_message[len(normalized_head) :])
 
     if not payload:
+        parsed = parse_command_with_head(
+            normalized_message,
+            normalized_head,
+            allow_sticky=bool(schema.allow_sticky_arg) if schema is not None else False,
+            max_prefix_len=16,
+        )
+        payload = normalize_message_text((parsed.payload_text if parsed else "") or "")
+    if not payload:
+        payload = normalize_message_text(
+            _extract_argument_around_head(normalized_message, normalized_head)
+        )
+    if not payload:
         return ""
 
     placeholder_tokens = {
@@ -431,6 +446,10 @@ def _fallback_explicit_command(
                     allow_sticky=allow_sticky,
                 ):
                     score = 180.0 + len(head)
+                elif match_command_head_canonical(stripped, head):
+                    score = 170.0 + len(head)
+                elif match_command_head_canonical(normalized_message, head):
+                    score = 160.0 + len(head)
                 elif match_command_head_fuzzy(
                     stripped,
                     head,
