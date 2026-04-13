@@ -6,14 +6,16 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .models.pydantic_models import PluginKnowledgeBase
+from .route_text import normalize_action_phrases
+from .route_text import is_usage_question
 from .route_text import normalize_message_text
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillCommandSchema,
-    SkillRankedCandidate,
-    SkillSearchResult,
     SkillSpec,
-    skill_search,
+    get_skill_registry,
+    infer_command_role,
+    infer_message_action_role,
 )
 
 _DEFAULT_TOOLS_PER_SKILL = 2
@@ -78,6 +80,13 @@ def _find_schema(skill: SkillSpec, command_head: str) -> SkillCommandSchema | No
         for alias in schema.aliases:
             if normalize_message_text(alias).casefold() == normalized_head:
                 return schema
+    normalized_aliases = {
+        normalize_message_text(alias).casefold()
+        for alias in (skill.aliases or ())
+        if normalize_message_text(alias)
+    }
+    if normalized_head in normalized_aliases and len(skill.command_schemas) == 1:
+        return skill.command_schemas[0]
     return None
 
 
@@ -141,6 +150,12 @@ def _build_tool_definition(
     description_parts = [
         f"调用插件“{spec.plugin_name}”的命令“{spec.command_head}”。",
     ]
+    command_role = infer_command_role(
+        spec.command_head,
+        family=getattr(skill, "kind", "general") or "general",
+    )
+    if command_role != "other":
+        description_parts.append(f"动作角色: {command_role}")
     if skill.description:
         description_parts.append(_trim_text(skill.description))
     if skill.usage:
@@ -234,37 +249,66 @@ def _iter_candidate_heads(
     skill: SkillSpec,
     *,
     helper_mode: bool,
-    matched_command: str | None,
-    exact_head_hit: bool,
     limit: int,
+    preferred_role: str = "other",
+    query_family: str = "general",
+    query_text: str = "",
 ) -> list[str]:
-    values: list[str] = []
-
-    def _append(items: tuple[str, ...] | list[str]) -> None:
-        for item in items:
-            command_head = normalize_message_text(item)
-            if command_head and command_head not in values:
-                values.append(command_head)
-            if len(values) >= limit:
-                return
-
-    matched = normalize_message_text(matched_command or "")
-    if matched:
-        _append([matched])
-
+    seen: set[str] = set()
+    pools: list[str] = []
     if helper_mode:
-        _append(skill.helper_commands)
-        if not values:
-            _append(skill.commands)
-        return values[:limit]
+        pools.extend(skill.helper_commands)
+        pools.extend(skill.action_commands)
+    else:
+        pools.extend(skill.action_commands)
+        pools.extend(skill.helper_commands)
+    pools.extend(skill.commands)
+    pools.extend(skill.aliases)
 
-    if matched and matched in skill.helper_commands and exact_head_hit:
-        _append([matched])
+    scored: list[tuple[float, str]] = []
+    normalized_query = normalize_message_text(normalize_action_phrases(query_text or "")).lower()
+    query_has_today_hint = any(token in normalized_query for token in ("今天", "今日"))
+    query_has_pig_hint = any(token in normalized_query for token in ("猪", "小猪"))
+    for head in pools:
+        command_head = normalize_message_text(head)
+        if not command_head:
+            continue
+        if command_head in seen:
+            continue
+        seen.add(command_head)
+        score = 0.0
+        command_role = infer_command_role(
+            command_head,
+            family=getattr(skill, "kind", "general") or "general",
+        )
+        if preferred_role and preferred_role != "other":
+            if command_role == preferred_role:
+                score += 12.0
+            elif preferred_role == "query" and command_role in {"query", "catalog"}:
+                score += 10.0
+            elif preferred_role in {"create", "open", "return"} and command_role in {
+                "create",
+                "open",
+                "return",
+            }:
+                score -= 4.0
+        if query_family == "search":
+            if query_has_today_hint:
+                if any(token in command_head for token in ("今天", "今日")):
+                    score += 12.0
+                elif any(token in command_head for token in ("本日", "当日")):
+                    score += 6.0
+            if query_has_pig_hint and any(token in command_head for token in ("猪", "小猪")):
+                score += 4.0
+        if helper_mode and command_role == "help":
+            score += 4.0
+        scored.append((score, command_head))
 
-    _append(skill.action_commands)
-    if len(values) < limit:
-        _append(skill.commands)
-    return values[:limit]
+    scored.sort(key=lambda item: (item[0], -len(item[1]), item[1]), reverse=True)
+    values = [command for _, command in scored]
+    if limit > 0:
+        values = values[:limit]
+    return values
 
 
 def _pick_global_help_head(skill: SkillSpec) -> str | None:
@@ -306,7 +350,7 @@ def _is_global_help_skill(skill: SkillSpec) -> bool:
 
 def _append_global_help_tool(
     *,
-    search_result: SkillSearchResult,
+    skills: tuple[SkillSpec, ...],
     executables: list[ToolExecutable],
     spec_map: dict[str, RoutePlannerToolSpec],
     seen: set[tuple[str, str]],
@@ -317,7 +361,7 @@ def _append_global_help_tool(
     if len(executables) >= max_tools:
         return tool_index_start
 
-    for skill in search_result.registry.skills:
+    for skill in skills:
         if not _is_global_help_skill(skill):
             continue
 
@@ -359,39 +403,46 @@ def build_route_planner_tools(
     max_tools: int,
     tools_per_skill: int = _DEFAULT_TOOLS_PER_SKILL,
     candidate_modules: tuple[str, ...] | list[str] | None = None,
+    query_family: str = "general",
 ) -> tuple[list[ToolExecutable], dict[str, RoutePlannerToolSpec]]:
     if max_tools <= 0 or not knowledge_base.plugins:
         return [], {}
 
-    search_result = skill_search(
-        message_text,
-        knowledge_base,
-        include_usage=True,
-        include_similarity=True,
-    )
-    helper_mode = search_result.is_usage
+    helper_mode = is_usage_question(message_text)
+    registry = get_skill_registry(knowledge_base)
     executables: list[ToolExecutable] = []
     spec_map: dict[str, RoutePlannerToolSpec] = {}
     seen: set[tuple[str, str]] = set()
     tool_index = 1
     message_snapshot = _build_message_snapshot(message_text)
+    per_skill_limit = max(int(tools_per_skill or _DEFAULT_TOOLS_PER_SKILL), 1)
     module_order = [
         normalize_message_text(module)
         for module in (candidate_modules or ())
         if normalize_message_text(module)
     ]
-    ranked_by_module = {
-        normalize_message_text(candidate.skill.plugin_module): candidate
-        for candidate in search_result.ranked_candidates
-    }
     skills_by_module = {
         normalize_message_text(skill.plugin_module): skill
-        for skill in search_result.registry.skills
+        for skill in registry.skills
     }
+    ordered_skills: list[SkillSpec] = []
+    seen_modules: set[str] = set()
+    for module in module_order:
+        skill = skills_by_module.get(module)
+        if skill is None or module in seen_modules:
+            continue
+        seen_modules.add(module)
+        ordered_skills.append(skill)
+    for skill in registry.skills:
+        module = normalize_message_text(skill.plugin_module)
+        if not module or module in seen_modules:
+            continue
+        seen_modules.add(module)
+        ordered_skills.append(skill)
 
     if helper_mode:
         tool_index = _append_global_help_tool(
-            search_result=search_result,
+            skills=tuple(ordered_skills),
             executables=executables,
             spec_map=spec_map,
             seen=seen,
@@ -400,81 +451,17 @@ def build_route_planner_tools(
             message_snapshot=message_snapshot,
         )
 
-    ordered_candidates: list[SkillRankedCandidate | None] = []
-    seen_modules: set[str] = set()
-    for module in module_order:
-        if module in seen_modules:
-            continue
-        seen_modules.add(module)
-        ordered_candidates.append(ranked_by_module.get(module))
-    for candidate in search_result.ranked_candidates:
-        module = candidate.skill.plugin_module
-        if module in seen_modules:
-            continue
-        seen_modules.add(module)
-        ordered_candidates.append(candidate)
-
-    for idx, candidate in enumerate(ordered_candidates):
+    preferred_role = infer_message_action_role(message_text)
+    for skill in ordered_skills:
         if len(executables) >= max_tools:
             break
-        if candidate is None:
-            continue
-        normalized_module = normalize_message_text(candidate.skill.plugin_module)
-        if candidate.score <= 0 and normalized_module not in module_order:
-            continue
-        if idx > 0 and candidate.score < 3.0 and not candidate.exact_head_hit:
-            if normalized_module not in module_order:
-                continue
-
-        skill = candidate.skill
         candidate_heads = _iter_candidate_heads(
             skill,
             helper_mode=helper_mode,
-            matched_command=candidate.matched_command,
-            exact_head_hit=candidate.exact_head_hit,
-            limit=max(tools_per_skill, 1),
-        )
-        for command_head in candidate_heads:
-            if len(executables) >= max_tools:
-                break
-            dedupe_key = (skill.plugin_module, command_head.casefold())
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            schema = _find_schema(skill, command_head)
-            spec = RoutePlannerToolSpec(
-                tool_name=f"route_choice_{tool_index:02d}",
-                plugin_name=skill.plugin_name,
-                plugin_module=skill.plugin_module,
-                command_head=command_head,
-                schema=schema,
-                text_allowed=_is_text_allowed(schema),
-                text_required=_is_text_required(schema),
-            )
-            definition = _build_tool_definition(
-                spec=spec,
-                skill=skill,
-                message_snapshot=message_snapshot,
-            )
-            executables.append(RoutePlannerTool(spec, definition))
-            spec_map[spec.tool_name] = spec
-            tool_index += 1
-
-    if len(executables) >= max_tools:
-        return executables, spec_map
-
-    for module in module_order:
-        if len(executables) >= max_tools:
-            break
-        skill = skills_by_module.get(module)
-        if skill is None:
-            continue
-        candidate_heads = _iter_candidate_heads(
-            skill,
-            helper_mode=helper_mode,
-            matched_command=None,
-            exact_head_hit=False,
-            limit=max(tools_per_skill, 1),
+            limit=per_skill_limit,
+            preferred_role=preferred_role,
+            query_family=query_family,
+            query_text=message_text,
         )
         for command_head in candidate_heads:
             if len(executables) >= max_tools:

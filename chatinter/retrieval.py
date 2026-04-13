@@ -14,6 +14,7 @@ from .route_text import (
     normalize_message_text,
 )
 from .skill_registry import get_skill_registry, select_relevant_skills
+from .skill_registry import infer_query_families
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
 _REQUIRED_TOKEN_PATTERN = re.compile(r"(?<!\w)\+([a-z0-9_]+|[\u4e00-\u9fff]{1,6})")
@@ -39,6 +40,65 @@ _STOPWORDS = {
     "please",
     "help",
 }
+_FAMILY_SEARCH_HINTS = (
+    "找",
+    "搜",
+    "查",
+    "查询",
+    "搜索",
+    "寻找",
+    "列表",
+    "今天",
+    "今日",
+    "本日",
+    "当日",
+)
+_FAMILY_TEMPLATE_HINTS = (
+    "表情",
+    "表情包",
+    "梗图",
+    "模板",
+    "头像",
+    "图片",
+    "文字",
+    "文本",
+    "内容",
+    "标题",
+    "生成",
+    "制作",
+)
+_FAMILY_TRANSACTION_HINTS = (
+    "红包",
+    "金币",
+    "金额",
+    "总额",
+    "总计",
+    "总共",
+    "合计",
+    "转账",
+    "支付",
+    "打赏",
+)
+_FAMILY_SELF_HINTS = (
+    "签到",
+    "自我介绍",
+    "我的信息",
+    "我自己",
+    "本人",
+    "自己",
+)
+_FAMILY_UTILITY_HINTS = (
+    "抠图",
+    "超分",
+    "识图",
+    "词云",
+    "关于",
+    "消息排行",
+    "消息统计",
+    "统计",
+    "管理",
+    "admin",
+)
 
 
 def _normalize_sequence(values: Iterable[str]) -> tuple[str, ...]:
@@ -64,6 +124,7 @@ def _plugin_meta_signature(meta: PluginInfo.PluginCommandMeta) -> tuple[Any, ...
             str(getattr(meta, "target_requirement", "") or "")
         ).lower(),
         _normalize_sequence(getattr(meta, "target_sources", None) or ()),
+        normalize_message_text(str(getattr(meta, "access_level", "") or "")).lower(),
     )
 
 
@@ -77,6 +138,54 @@ def _plugin_cache_key(plugin: PluginInfo) -> tuple[Any, ...]:
         _normalize_sequence(plugin.aliases or ()),
         tuple(_plugin_meta_signature(meta) for meta in plugin.command_meta),
     )
+
+
+def _infer_plugin_family(plugin: PluginInfo) -> str:
+    command_heads = [
+        normalize_message_text(command).lower()
+        for command in plugin.commands or ()
+        if normalize_message_text(command)
+    ]
+    alias_heads = [
+        normalize_message_text(alias).lower()
+        for alias in plugin.aliases or ()
+        if normalize_message_text(alias)
+    ]
+    meta_heads = [
+        normalize_message_text(getattr(meta, "command", "")).lower()
+        for meta in plugin.command_meta or ()
+        if normalize_message_text(getattr(meta, "command", ""))
+    ]
+    meta_aliases = [
+        normalize_message_text(alias).lower()
+        for meta in plugin.command_meta or ()
+        for alias in getattr(meta, "aliases", ()) or ()
+        if normalize_message_text(alias)
+    ]
+    haystack = " ".join(
+        [
+            normalize_message_text(plugin.name),
+            normalize_message_text(plugin.module),
+            normalize_message_text(plugin.description),
+            normalize_message_text(plugin.usage or ""),
+            " ".join(command_heads),
+            " ".join(alias_heads),
+            " ".join(meta_heads),
+            " ".join(meta_aliases),
+        ]
+    ).lower()
+
+    if any(marker in haystack for marker in _FAMILY_TEMPLATE_HINTS):
+        return "template"
+    if any(marker in haystack for marker in _FAMILY_TRANSACTION_HINTS):
+        return "transaction"
+    if any(marker in haystack for marker in _FAMILY_SEARCH_HINTS):
+        return "search"
+    if any(marker in haystack for marker in _FAMILY_SELF_HINTS):
+        return "self"
+    if any(marker in haystack for marker in _FAMILY_UTILITY_HINTS):
+        return "utility"
+    return "general"
 
 
 @lru_cache(maxsize=2048)
@@ -455,8 +564,10 @@ def _build_candidate(
 ) -> _PluginCandidate | None:
     candidate = _PluginCandidate(plugin=plugin)
     normalized_query = normalize_message_text(query).lower()
+    query_families = infer_query_families(normalized_query)
     haystack = _plugin_haystack(plugin, cache_key=plugin_cache_key)
     terms = _plugin_terms(plugin, cache_key=plugin_cache_key)
+    family = _infer_plugin_family(plugin)
 
     if required_tokens and not required_tokens.issubset(terms):
         return None
@@ -511,6 +622,29 @@ def _build_candidate(
         for head, allow_sticky in command_entries
     ):
         candidate.add(0.8, "intent_command_alignment")
+
+    if family == query_families[0]:
+        candidate.add(5.0, f"family:{family}")
+    elif family in query_families[1:]:
+        candidate.add(3.0, f"family:{family}")
+    elif query_families[0] != "general" and family == "general":
+        candidate.add(0.5, "family:general")
+
+    if family == "search":
+        if contains_any(normalized_query, _FAMILY_SEARCH_HINTS):
+            candidate.add(1.8, "family_search_hint")
+        if any(marker in normalized_query for marker in _FAMILY_SEARCH_HINTS) and any(
+            marker in haystack for marker in ("今日", "今天", "本日", "当日", "找", "搜", "查")
+        ):
+            candidate.add(1.6, "family_search_time")
+    elif family == "template" and contains_any(normalized_query, _FAMILY_TEMPLATE_HINTS):
+        candidate.add(2.0, "family_template_hint")
+    elif family == "transaction" and contains_any(normalized_query, _FAMILY_TRANSACTION_HINTS):
+        candidate.add(2.0, "family_transaction_hint")
+    elif family == "self" and contains_any(normalized_query, _FAMILY_SELF_HINTS):
+        candidate.add(1.4, "family_self_hint")
+    elif family == "utility" and contains_any(normalized_query, _FAMILY_UTILITY_HINTS):
+        candidate.add(1.2, "family_utility_hint")
 
     return candidate if candidate.score > 0 else None
 

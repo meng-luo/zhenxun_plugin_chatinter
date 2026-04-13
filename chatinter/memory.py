@@ -50,6 +50,7 @@ from .config import (
     get_config_value,
     get_model_name,
 )
+from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .models.chat_history import ChatInterChatHistory
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
@@ -565,7 +566,7 @@ class ChatMemory:
                 group_id=group_id, user_id=user_id
             ).first()
             if member:
-                nick = member.nickname or member.user_name
+                nick = str(getattr(member, "nickname", "") or member.user_name or "")
                 if nick:
                     self._user_nickname_cache[user_id] = nick
                     self._nickname_cache_time[user_id] = time.time()
@@ -599,7 +600,7 @@ class ChatMemory:
         ).all()
 
         for member in members:
-            nick = member.nickname or member.user_name
+            nick = str(getattr(member, "nickname", "") or member.user_name or "")
             if nick:
                 self._user_nickname_cache[member.user_id] = nick
                 self._nickname_cache_time[member.user_id] = time.time()
@@ -785,6 +786,52 @@ class ChatMemory:
         )
 
         return system_prompt, context_xml, reply_images
+
+    async def build_recent_conversation_recap(
+        self,
+        user_id: str,
+        group_id: str | None,
+        *,
+        limit: int = 4,
+    ) -> str:
+        """生成最近对话的短回顾。
+
+        该路径不调用 LLM，直接从本地历史表抽取最近几轮对话，
+        作为“我们说了些什么”之类问题的固定短回复。
+        """
+        session_id = self.get_session_id(user_id, group_id)
+        recap_limit = max(int(limit or 0), 1)
+        dialogs = await ChatInterChatHistory.get_recent_dialogs(
+            session_id,
+            recap_limit,
+        )
+        if not dialogs:
+            return "最近没有可回顾的聊天记录。"
+
+        lines: list[str] = []
+        for dialog in dialogs[-recap_limit:]:
+            user_text = self._clip_context_line(
+                self._strip_non_final_channel_text(
+                    uni_to_text_with_tags(dialog.user_message)
+                ),
+                36,
+            )
+            ai_text = self._clip_context_line(
+                self._strip_non_final_channel_text(
+                    uni_to_text_with_tags(dialog.ai_response or "")
+                ),
+                36,
+            )
+            if user_text:
+                lines.append(f"你：{user_text}")
+            if ai_text:
+                lines.append(f"我：{ai_text}")
+
+        if not lines:
+            return "最近没有可回顾的聊天记录。"
+
+        lines = lines[-8:]
+        return "最近聊过这些：\n" + "\n".join(lines)
 
     async def _build_current_message_layers(
         self,
@@ -1278,33 +1325,15 @@ class ChatMemory:
         else:
             length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
 
-        if chat_style:
-            base = (
-                f"你是{self._bot_nickname or BotConfig.self_nickname}，"
-                f"一个{chat_style}机器人助手。回复简洁自然，优先使用中文。"
-                "语气偏日式二次元、软萌中带一点傲娇，避免生硬正式。"
-                "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
-                f"{length_rule}"
-                "上下文不足时先追问一个关键澄清问题，不要凭空猜测。"
-                "结构化任务或命令输出时不要加入口癖修饰。"
-            )
-        else:
-            base = (
-                f"你是{self._bot_nickname or BotConfig.self_nickname}，"
-                "一个日式二次元、软萌中带一点傲娇的机器人助手。"
-                "回复简洁自然，优先使用中文，避免生硬正式。"
-                "可适度使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
-                f"{length_rule}"
-                "上下文不足时先追问一个关键澄清问题，不要凭空猜测。"
-                "结构化任务或命令输出时不要加入口癖修饰。"
-            )
-
-        impression_rule = ""
+        base = build_chat_base_prompt(
+            self._bot_nickname or BotConfig.self_nickname,
+            chat_style,
+            length_rule,
+        )
         if USE_SIGN_IN_IMPRESSION:
-            impression_rule = (
-                f"\n用户好感度：{impression:.0f}，态度：{attitude}。"
-                "排斥/警惕→冷淡简短；一般/可以交流→正常友好；好朋友/是个好人→热情；亲密/恋人→亲密关心。回复风格符合用户好感度态度，即使对方好感度很低，你对他态度再差，也要温柔对待他，言语不能含有攻击性"
-            )
+            impression_rule = build_global_attitude_prompt(impression, attitude)
+        else:
+            impression_rule = ""
 
         custom_prompt = get_config_value("CUSTOM_PROMPT", "")
         custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""

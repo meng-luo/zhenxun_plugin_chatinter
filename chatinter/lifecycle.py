@@ -9,7 +9,14 @@ from zhenxun.services.log import logger
 from .config import CONTEXT_TOKEN_BUDGET
 
 LifecycleStage = Literal[
+    "pre_gate",
+    "post_gate",
     "before_intent",
+    "after_intent",
+    "before_route",
+    "after_route",
+    "before_chat",
+    "after_chat",
     "before_agent",
     "after_agent",
     "before_tool",
@@ -295,7 +302,14 @@ LifecycleHook = Callable[[Any], Awaitable[None]]
 class ChatInterLifecycleManager:
     def __init__(self) -> None:
         self._hooks: dict[LifecycleStage, list[LifecycleHook]] = {
+            "pre_gate": [],
+            "post_gate": [],
             "before_intent": [],
+            "after_intent": [],
+            "before_route": [],
+            "after_route": [],
+            "before_chat": [],
+            "after_chat": [],
             "before_agent": [],
             "after_agent": [],
             "before_tool": [],
@@ -419,6 +433,8 @@ async def ensure_lifecycle_hooks_registered() -> None:
         if _startup_registered:
             return
         await _lifecycle_manager.register("before_intent", _context_budget_hook)
+        await _lifecycle_manager.register("before_route", _context_budget_hook)
+        await _lifecycle_manager.register("before_chat", _context_budget_hook)
         await _lifecycle_manager.register("before_agent", _context_budget_hook)
         _startup_registered = True
 

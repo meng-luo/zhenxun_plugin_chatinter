@@ -19,6 +19,7 @@ class AutoMetadataBuilder:
     链路：
     - matcher/parser 反射提取命令头与参数结构
     - matcher 源码 AST 提取 on_xxx(..., aliases={...}) 别名
+    - shortcut(...) / parser.shortcuts / manager.shortcuts 统一提取快捷命令
     - parser dry-run 探针判断是否支持粘连参数
     - meme manager 反射提取模板类命令参数范围
     """
@@ -26,7 +27,15 @@ class AutoMetadataBuilder:
     _module_alias_cache: ClassVar[
         dict[str, tuple[int, dict[str, list[str]]]]
     ] = {}
+    _module_prefix_cache: ClassVar[
+        dict[str, tuple[int, dict[str, list[str]]]]
+    ] = {}
+    _module_context_cache: ClassVar[
+        dict[str, tuple[int, dict[str, dict[str, bool]]]]
+    ] = {}
+    _module_access_cache: ClassVar[dict[str, tuple[int, dict[str, str]]]] = {}
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
+    _no_command_log_cache: ClassVar[set[str]] = set()
     _sticky_probe_token: ClassVar[str] = "测试"
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
@@ -73,9 +82,11 @@ class AutoMetadataBuilder:
             )
         extracted = [*matcher_commands, *manager_commands]
         if not extracted:
-            logger.debug(
-                f"ChatInter 自动元数据构建未从插件提取到命令: {module_name}"
-            )
+            if module_name not in cls._no_command_log_cache:
+                cls._no_command_log_cache.add(module_name)
+                logger.debug(
+                    f"ChatInter 自动元数据构建未从插件提取到命令: {module_name}"
+                )
         return cls._merge_command_dicts(extracted)
 
     @classmethod
@@ -85,8 +96,20 @@ class AutoMetadataBuilder:
         loaded_plugin: object,
     ) -> list[dict[str, Any]]:
         alias_map = cls._build_module_alias_map(loaded_plugin)
+        prefix_map = cls._build_module_prefix_map(loaded_plugin)
         result: list[dict[str, Any]] = []
         for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            access_map = (
+                cls._load_module_access_map(module_obj)
+                if module_obj is not None
+                else {}
+            )
+            context_map = (
+                cls._load_module_context_map(module_obj)
+                if module_obj is not None
+                else {}
+            )
             parser = cls._get_matcher_parser(matcher)
             parser_schema = (
                 cls._extract_parser_schema(parser)
@@ -94,10 +117,17 @@ class AutoMetadataBuilder:
                 else cls._default_parser_schema()
             )
             handler_hint = cls._extract_handler_hint(matcher)
+            context_hint = cls._extract_matcher_context_hint(matcher)
+            parser_shortcut_aliases = (
+                cls._extract_parser_shortcut_aliases(parser) if parser is not None else []
+            )
             for payload in cls._extract_rule_command_data(
                 matcher=matcher,
                 parser_schema=parser_schema,
                 handler_hint=handler_hint,
+                context_hint=context_hint,
+                source_context_map=context_map,
+                access_map=access_map,
             ):
                 command_head = str(payload.get("command") or "").strip()
                 if not command_head:
@@ -106,6 +136,21 @@ class AutoMetadataBuilder:
                     payload.get("aliases"),
                     alias_map.get(command_head.casefold(), []),
                 )
+                payload["prefixes"] = cls._merge_unique_strings(
+                    payload.get("prefixes"),
+                    prefix_map.get(command_head.casefold(), []),
+                )
+                payload["requires_reply"] = bool(payload.get("requires_reply")) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_reply")
+                )
+                payload["requires_private"] = bool(
+                    payload.get("requires_private")
+                ) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_private")
+                )
+                payload["requires_to_me"] = bool(payload.get("requires_to_me")) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_to_me")
+                )
                 result.append(payload)
 
             if parser is None:
@@ -113,12 +158,21 @@ class AutoMetadataBuilder:
             command_head = cls._extract_parser_command_head(parser)
             if not command_head:
                 continue
+            access_level = cls._resolve_access_level(
+                access_map.get(command_head.casefold()),
+                handler_hint.get("requires_superuser"),
+            )
             result.append(
                 {
                     "command": command_head,
                     "aliases": cls._merge_unique_strings(
                         cls._extract_parser_aliases(parser, command_head),
                         alias_map.get(command_head.casefold(), []),
+                        parser_shortcut_aliases,
+                    ),
+                    "prefixes": cls._merge_unique_strings(
+                        parser_schema["prefixes"],
+                        prefix_map.get(command_head.casefold(), []),
                     ),
                     "params": parser_schema["params"],
                     "text_min": parser_schema["text_min"],
@@ -130,11 +184,25 @@ class AutoMetadataBuilder:
                     else parser_schema["allow_at"],
                     "target_sources": handler_hint["target_sources"]
                     or parser_schema["target_sources"],
+                    "requires_reply": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_reply"]
+                    or handler_hint["requires_reply"],
+                    "requires_private": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_private"],
+                    "requires_to_me": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_to_me"],
                     "allow_sticky_arg": cls._probe_sticky_arg(
                         parser=parser,
                         command_head=command_head,
                         sample_text=parser_schema["sample_text"],
                     ),
+                    "access_level": access_level,
                 }
             )
         return result
@@ -204,6 +272,7 @@ class AutoMetadataBuilder:
     def _default_parser_schema() -> dict[str, Any]:
         return {
             "params": [],
+            "prefixes": [],
             "text_min": 0,
             "text_max": None,
             "image_min": 0,
@@ -220,6 +289,9 @@ class AutoMetadataBuilder:
         matcher: object,
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
+        context_hint: dict[str, bool],
+        source_context_map: dict[str, dict[str, bool]],
+        access_map: dict[str, str],
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         rule = getattr(matcher, "rule", None)
@@ -231,45 +303,89 @@ class AutoMetadataBuilder:
             if checker_name in {"CommandRule", "ShellCommandRule"}:
                 allow_sticky_arg = cls._extract_rule_allow_sticky_arg(checker_call)
                 for command_head in cls._iter_command_rule_heads(checker_call):
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
+                    access_level = cls._resolve_access_level(
+                        access_map.get(command_key),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=allow_sticky_arg,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "StartswithRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
+                    access_level = cls._resolve_access_level(
+                        access_map.get(command_key),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "FullmatchRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
+                    access_level = cls._resolve_access_level(
+                        access_map.get(command_key),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=False,
+                            access_level=access_level,
                         )
                     )
                 continue
             if checker_name == "KeywordsRule":
                 for command_head in getattr(checker_call, "keywords", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
+                    access_level = cls._resolve_access_level(
+                        access_map.get(command_key),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
                 continue
@@ -278,12 +394,23 @@ class AutoMetadataBuilder:
                     str(getattr(checker_call, "regex", "") or "")
                 )
                 if command_head:
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
+                    access_level = cls._resolve_access_level(
+                        access_map.get(command_key),
+                        handler_hint.get("requires_superuser"),
+                    )
                     result.append(
                         cls._build_rule_command_payload(
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
+                            access_level=access_level,
                         )
                     )
         return result
@@ -295,13 +422,16 @@ class AutoMetadataBuilder:
         command_head: object,
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
+        context_hint: dict[str, bool],
         allow_sticky_arg: bool | None,
+        access_level: str = "public",
     ) -> dict[str, Any]:
         command = cls._normalize_command(str(command_head or ""))
         if not command:
             return {}
         return {
             "command": command,
+            "prefixes": parser_schema["prefixes"],
             "params": parser_schema["params"],
             "text_min": parser_schema["text_min"],
             "text_max": parser_schema["text_max"],
@@ -312,10 +442,31 @@ class AutoMetadataBuilder:
             else parser_schema["allow_at"],
             "target_sources": handler_hint["target_sources"]
             or parser_schema["target_sources"],
+            "requires_reply": handler_hint["requires_reply"]
+            or context_hint["requires_reply"],
+            "requires_private": context_hint["requires_private"],
+            "requires_to_me": context_hint["requires_to_me"],
             "allow_sticky_arg": allow_sticky_arg
             if allow_sticky_arg is not None
             else True,
+            "access_level": access_level,
         }
+
+    @classmethod
+    def _merge_context_hint(
+        cls,
+        base: dict[str, bool] | None,
+        override: dict[str, bool] | None,
+    ) -> dict[str, bool]:
+        result = {
+            "requires_reply": bool((base or {}).get("requires_reply"))
+            or bool((override or {}).get("requires_reply")),
+            "requires_to_me": bool((base or {}).get("requires_to_me"))
+            or bool((override or {}).get("requires_to_me")),
+            "requires_private": bool((base or {}).get("requires_private"))
+            or bool((override or {}).get("requires_private")),
+        }
+        return result
 
     @classmethod
     def _iter_command_rule_heads(cls, checker_call: object) -> list[str]:
@@ -345,6 +496,75 @@ class AutoMetadataBuilder:
         if checker_name == "ShellCommandRule":
             return True
         return None
+
+    @classmethod
+    def _load_module_context_map(cls, module_obj: object) -> dict[str, dict[str, bool]]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_context_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        context_map: dict[str, dict[str, bool]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command = cls._extract_command_from_call_node(node)
+            if not command:
+                continue
+            context_hint = cls._extract_call_context_hint(node)
+            if not any(context_hint.values()):
+                continue
+            command_key = command.casefold()
+            context_map[command_key] = cls._merge_context_hint(
+                context_map.get(command_key),
+                context_hint,
+            )
+        cls._module_context_cache[cache_key] = (mtime_ns, context_map)
+        return context_map
+
+    @classmethod
+    def _extract_call_context_hint(cls, node: ast.Call) -> dict[str, bool]:
+        requires_reply = False
+        requires_to_me = False
+        requires_private = False
+        for keyword in node.keywords or []:
+            if keyword.arg != "rule":
+                continue
+            rule_text = cls._safe_unparse(keyword.value).lower()
+            if not rule_text:
+                continue
+            if "reply" in rule_text:
+                requires_reply = True
+            if "to_me" in rule_text or "tome" in rule_text:
+                requires_to_me = True
+            if "ensure_private" in rule_text or "private" in rule_text:
+                requires_private = True
+        return {
+            "requires_reply": requires_reply,
+            "requires_to_me": requires_to_me,
+            "requires_private": requires_private,
+        }
+
+    @staticmethod
+    def _safe_unparse(node: ast.AST) -> str:
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
 
     @classmethod
     async def _extract_manager_command_data(
@@ -398,6 +618,41 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(aliases, [])
 
     @classmethod
+    def _extract_parser_prefixes(cls, parser: object) -> list[str]:
+        prefixes: list[str] = []
+        seen_ids: set[int] = set()
+        candidates: list[object] = [parser]
+        while candidates:
+            candidate = candidates.pop()
+            if candidate is None or id(candidate) in seen_ids:
+                continue
+            seen_ids.add(id(candidate))
+
+            raw_prefixes = getattr(candidate, "prefixes", None)
+            if isinstance(raw_prefixes, str):
+                raw_prefixes = [raw_prefixes]
+            if isinstance(raw_prefixes, (list, tuple, set, frozenset)):
+                for prefix in raw_prefixes:
+                    prefix_text = cls._normalize_command(str(prefix or ""))
+                    if prefix_text:
+                        prefixes.append(prefix_text)
+
+            for attr_name in ("parser", "meta", "config", "_config", "namespace"):
+                nested = getattr(candidate, attr_name, None)
+                if nested is not None and not isinstance(nested, (str, bytes)):
+                    candidates.append(nested)
+        return cls._merge_unique_strings(prefixes, [])
+
+    @classmethod
+    def _extract_parser_shortcut_aliases(cls, parser: object) -> list[str]:
+        shortcuts: list[str] = []
+        for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
+            shortcuts.extend(
+                cls._extract_shortcut_labels(shortcut_key=shortcut_key, shortcut_obj=shortcut_obj)
+            )
+        return cls._merge_unique_strings(shortcuts, [])
+
+    @classmethod
     def _extract_parser_schema(cls, parser: object) -> dict[str, Any]:
         params: list[str] = []
         text_min = 0
@@ -406,6 +661,7 @@ class AutoMetadataBuilder:
         image_max: int | None = 0
         allow_at: bool | None = None
         target_sources: list[str] = []
+        prefixes = cls._extract_parser_prefixes(parser)
         sample_text = cls._sticky_probe_token
 
         try:
@@ -455,6 +711,7 @@ class AutoMetadataBuilder:
             "image_max": image_max,
             "allow_at": allow_at,
             "target_sources": target_sources,
+            "prefixes": prefixes,
             "sample_text": sample_text,
         }
 
@@ -507,6 +764,8 @@ class AutoMetadataBuilder:
     def _extract_handler_hint(cls, matcher: object) -> dict[str, Any]:
         allow_at: bool | None = None
         target_sources: list[str] = []
+        requires_reply = False
+        requires_superuser = False
         for handler in getattr(matcher, "handlers", []) or []:
             call = getattr(handler, "call", None)
             if call is None:
@@ -516,13 +775,46 @@ class AutoMetadataBuilder:
                 allow_at = True
             if hint.get("reply_source") and "reply" not in target_sources:
                 target_sources.append("reply")
+            if hint.get("reply_source"):
+                requires_reply = True
             if hint.get("at_source"):
                 for source in ("at", "nickname"):
                     if source not in target_sources:
                         target_sources.append(source)
             if hint.get("self_source") and "self" not in target_sources:
                 target_sources.append("self")
-        return {"allow_at": allow_at, "target_sources": target_sources}
+            if hint.get("requires_superuser"):
+                requires_superuser = True
+        return {
+            "allow_at": allow_at,
+            "target_sources": target_sources,
+            "requires_reply": requires_reply,
+            "requires_superuser": requires_superuser,
+        }
+
+    @classmethod
+    def _extract_matcher_context_hint(cls, matcher: object) -> dict[str, bool]:
+        requires_reply = False
+        requires_to_me = False
+        requires_private = False
+        rule = getattr(matcher, "rule", None)
+        rule_repr = repr(rule).lower() if rule is not None else ""
+        before_rules = getattr(rule, "before_rules", None)
+        before_repr = repr(before_rules).lower() if before_rules is not None else ""
+        combined_repr = " ".join(
+            part for part in (rule_repr, before_repr) if part
+        )
+        if "reply" in combined_repr:
+            requires_reply = True
+        if "tome" in combined_repr or "to_me" in combined_repr:
+            requires_to_me = True
+        if "ensure_private" in combined_repr or "private" in combined_repr:
+            requires_private = True
+        return {
+            "requires_reply": requires_reply,
+            "requires_to_me": requires_to_me,
+            "requires_private": requires_private,
+        }
 
     @classmethod
     def _load_handler_hint(cls, call: object) -> dict[str, bool]:
@@ -555,9 +847,166 @@ class AutoMetadataBuilder:
             or "\"at\"" in lowered
             or "'at'" in lowered,
             "self_source": "自己" in source or "user_id" in lowered,
+            "requires_superuser": "dependssuperuser" in lowered
+            or "depends(superuser" in lowered
+            or "depends(superuser()" in lowered
+            or "is_superuser" in lowered and "depends(" in lowered,
         }
         cls._handler_hint_cache[cache_key] = (mtime_ns, hint)
         return hint
+
+    @classmethod
+    def _load_module_access_map(cls, module_obj: object) -> dict[str, str]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_access_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        symbol_levels: dict[str, str] = {}
+        access_map: dict[str, str] = {}
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                level = cls._infer_access_level_from_expr(node.value, symbol_levels)
+                if level == "public":
+                    continue
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        symbol_levels[target.id.casefold()] = level
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command_head = cls._extract_command_from_call_node(node)
+            if not command_head:
+                continue
+            level = "public"
+            for keyword in node.keywords or []:
+                if keyword.arg == "permission":
+                    level = cls._merge_access_level(
+                        level,
+                        cls._infer_access_level_from_expr(
+                            keyword.value, symbol_levels
+                        ),
+                    )
+                elif keyword.arg == "rule":
+                    level = cls._merge_access_level(
+                        level,
+                        cls._extract_rule_access_level(keyword.value, symbol_levels),
+                    )
+            if level != "public":
+                access_map[command_head.casefold()] = cls._merge_access_level(
+                    access_map.get(command_head.casefold(), "public"),
+                    level,
+                )
+
+        cls._module_access_cache[cache_key] = (mtime_ns, access_map)
+        return access_map
+
+    @classmethod
+    def _infer_access_level_from_expr(
+        cls,
+        expr: object,
+        symbol_levels: dict[str, str],
+    ) -> str:
+        if isinstance(expr, ast.Name):
+            mapped = symbol_levels.get(expr.id.casefold())
+            if mapped:
+                return mapped
+        try:
+            text = ast.unparse(expr)
+        except Exception:
+            text = str(expr or "")
+        return cls._infer_access_level_from_text(text, symbol_levels)
+
+    @classmethod
+    def _infer_access_level_from_text(
+        cls,
+        text: str,
+        symbol_levels: dict[str, str] | None = None,
+    ) -> str:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return "public"
+        symbol_levels = symbol_levels or {}
+        if normalized in symbol_levels:
+            return symbol_levels[normalized]
+        if normalized in {"admin", "superuser", "restricted"}:
+            return normalized
+        if normalized.endswith(".admin") or normalized.endswith("admin()"):
+            return "admin"
+        if normalized.endswith(".superuser") or normalized.endswith("superuser()"):
+            return "superuser"
+
+        has_superuser = "superuser" in normalized or "superuser()" in normalized
+        has_admin = (
+            "admin_check" in normalized
+            or "plugintype.admin" in normalized
+            or "plugintype.super_and_admin" in normalized
+            or "admin_level" in normalized
+            or "depends(admin" in normalized
+        )
+        if has_superuser and has_admin:
+            return "restricted"
+        if has_superuser:
+            return "superuser"
+        if has_admin:
+            return "admin"
+        return "public"
+
+    @classmethod
+    def _extract_rule_access_level(
+        cls,
+        checker_call: object,
+        symbol_levels: dict[str, str] | None = None,
+    ) -> str:
+        checker_name = type(checker_call).__name__
+        try:
+            text = ast.unparse(checker_call)  # type: ignore[arg-type]
+        except Exception:
+            text = repr(checker_call)
+        level = cls._infer_access_level_from_text(text, symbol_levels)
+        if checker_name == "RegexRule":
+            return "public"
+        return level
+
+    @staticmethod
+    def _merge_access_level(left: str | None, right: str | None) -> str:
+        left_level = str(left or "public").strip().lower() or "public"
+        right_level = str(right or "public").strip().lower() or "public"
+        if left_level == right_level:
+            return left_level
+        if "restricted" in {left_level, right_level}:
+            return "restricted"
+        levels = {left_level, right_level} - {"public"}
+        if not levels:
+            return "public"
+        if levels == {"admin"}:
+            return "admin"
+        if levels == {"superuser"}:
+            return "superuser"
+        return "restricted"
+
+    @classmethod
+    def _resolve_access_level(cls, *levels: object) -> str:
+        resolved = "public"
+        for level in levels:
+            resolved = cls._merge_access_level(resolved, level if level else "public")
+        return resolved
 
     @classmethod
     async def _extract_meme_manager_command_data(
@@ -628,19 +1077,28 @@ class AutoMetadataBuilder:
     @staticmethod
     def _iter_meme_heads(meme: object, info: object | None) -> list[str]:
         heads: list[str] = []
+        seen: set[str] = set()
+
+        def add_head(value: object) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            folded = text.casefold()
+            if folded in seen:
+                return
+            seen.add(folded)
+            heads.append(text)
+
         key = str(getattr(meme, "key", "") or "").strip()
         if key:
-            heads.append(key)
+            add_head(key)
         if info is None:
             return heads
         for keyword in getattr(info, "keywords", []) or []:
-            text = str(keyword or "").strip()
-            if text:
-                heads.append(text)
+            add_head(keyword)
         for shortcut in getattr(info, "shortcuts", []) or []:
-            text = str(getattr(shortcut, "humanized", "") or "").strip()
-            if text:
-                heads.append(text)
+            for attr_name in ("humanized", "pattern", "key"):
+                add_head(getattr(shortcut, attr_name, ""))
         return heads
 
     @classmethod
@@ -725,6 +1183,23 @@ class AutoMetadataBuilder:
         return merged
 
     @classmethod
+    def _build_module_prefix_map(
+        cls,
+        loaded_plugin: object,
+    ) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+        for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            if module_obj is None:
+                continue
+            for command, prefixes in cls._load_module_prefix_map(module_obj).items():
+                merged[command] = cls._merge_unique_strings(
+                    merged.get(command),
+                    prefixes,
+                )
+        return merged
+
+    @classmethod
     def _load_module_alias_map(cls, module_obj: object) -> dict[str, list[str]]:
         source_file = inspect.getsourcefile(module_obj)
         if not source_file:
@@ -752,6 +1227,15 @@ class AutoMetadataBuilder:
             command = cls._extract_command_from_call_node(node)
             aliases = cls._extract_aliases_from_call_node(node)
             if not command or not aliases:
+                shortcut_command, shortcut_aliases = cls._extract_shortcut_from_call_node(
+                    node
+                )
+                if not shortcut_command or not shortcut_aliases:
+                    continue
+                alias_map[shortcut_command.casefold()] = cls._merge_unique_strings(
+                    alias_map.get(shortcut_command.casefold()),
+                    shortcut_aliases,
+                )
                 continue
             alias_map[command.casefold()] = cls._merge_unique_strings(
                 alias_map.get(command.casefold()),
@@ -759,6 +1243,42 @@ class AutoMetadataBuilder:
             )
         cls._module_alias_cache[cache_key] = (mtime_ns, alias_map)
         return alias_map
+
+    @classmethod
+    def _load_module_prefix_map(cls, module_obj: object) -> dict[str, list[str]]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_prefix_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        prefix_map: dict[str, list[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command = cls._extract_command_from_call_node(node)
+            prefixes = cls._extract_prefixes_from_call_node(node)
+            if not command or not prefixes:
+                continue
+            prefix_map[command.casefold()] = cls._merge_unique_strings(
+                prefix_map.get(command.casefold()),
+                prefixes,
+            )
+        cls._module_prefix_cache[cache_key] = (mtime_ns, prefix_map)
+        return prefix_map
 
     @classmethod
     def _extract_command_from_call_node(cls, node: ast.Call) -> str:
@@ -780,7 +1300,45 @@ class AutoMetadataBuilder:
             and isinstance(first_arg.args[0].value, str)
         ):
             return cls._normalize_command(first_arg.args[0].value)
+        if (
+            isinstance(first_arg, ast.Call)
+            and cls._get_call_name(first_arg.func) == "Alconna"
+            and len(first_arg.args) >= 2
+        ):
+            command_arg = first_arg.args[1]
+            if isinstance(command_arg, ast.Constant) and isinstance(
+                command_arg.value, str
+            ):
+                prefix_arg = first_arg.args[0]
+                if cls._extract_strings_from_node(prefix_arg):
+                    return cls._normalize_command(command_arg.value)
         return ""
+
+    @classmethod
+    def _extract_prefixes_from_call_node(cls, node: ast.Call) -> list[str]:
+        if cls._get_call_name(node.func) != "on_alconna" or not node.args:
+            return []
+        first_arg = node.args[0]
+        if not isinstance(first_arg, ast.Call):
+            return []
+        if cls._get_call_name(first_arg.func) != "Alconna" or not first_arg.args:
+            return []
+        raw_prefixes = cls._extract_strings_from_node(first_arg.args[0])
+        return raw_prefixes
+
+    @classmethod
+    def _extract_strings_from_node(cls, node: ast.AST) -> list[str]:
+        result: list[str] = []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = cls._normalize_command(node.value)
+            if text:
+                result.append(text)
+            return result
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for item in node.elts:
+                result.extend(cls._extract_strings_from_node(item))
+            return cls._merge_unique_strings(result, [])
+        return []
 
     @staticmethod
     def _get_call_name(node: ast.AST) -> str:
@@ -811,6 +1369,40 @@ class AutoMetadataBuilder:
         return []
 
     @classmethod
+    def _extract_shortcut_from_call_node(cls, node: ast.Call) -> tuple[str, list[str]]:
+        if cls._get_call_name(node.func) != "shortcut" or not node.args:
+            return "", []
+
+        shortcut_key = ""
+        first_arg = node.args[0]
+        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+            shortcut_key = cls._coerce_shortcut_alias(first_arg.value)
+        if not shortcut_key:
+            return "", []
+
+        target_command = ""
+        humanized_aliases: list[str] = [shortcut_key]
+        for keyword in node.keywords or []:
+            if keyword.arg == "command":
+                try:
+                    raw_command = ast.literal_eval(keyword.value)
+                except Exception:
+                    raw_command = ""
+                target_command = cls._normalize_command(str(raw_command or ""))
+                continue
+            if keyword.arg == "humanized":
+                try:
+                    raw_humanized = ast.literal_eval(keyword.value)
+                except Exception:
+                    raw_humanized = ""
+                humanized = cls._coerce_shortcut_alias(str(raw_humanized or ""))
+                if humanized:
+                    humanized_aliases.append(humanized)
+        if not target_command:
+            return "", []
+        return target_command, cls._merge_unique_strings(humanized_aliases, [])
+
+    @classmethod
     def _normalize_command(cls, command: str) -> str:
         text = str(command or "").strip()
         if not text:
@@ -818,6 +1410,108 @@ class AutoMetadataBuilder:
         text = cls._command_placeholder_pattern.sub(" ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return normalize_message_text(text)
+
+    @classmethod
+    def _coerce_shortcut_alias(cls, text: object) -> str:
+        normalized = cls._normalize_command(str(text or ""))
+        if not normalized:
+            return ""
+        if cls._looks_like_shortcut_alias(normalized):
+            return normalized
+        regex_head = cls._extract_regex_head(normalized)
+        if regex_head and cls._looks_like_shortcut_alias(regex_head):
+            return regex_head
+        return ""
+
+    @classmethod
+    def _looks_like_shortcut_alias(cls, text: str) -> bool:
+        normalized = cls._normalize_command(text)
+        if not normalized:
+            return False
+        if normalized.startswith("re:"):
+            return False
+        if any(char in normalized for char in "\\[]()^$|"):
+            return False
+        return True
+
+    @classmethod
+    def _extract_shortcut_labels(
+        cls,
+        *,
+        shortcut_key: object | None,
+        shortcut_obj: object | None,
+    ) -> list[str]:
+        labels: list[str] = []
+        candidates: list[object] = []
+        if shortcut_key is not None:
+            candidates.append(shortcut_key)
+        if shortcut_obj is not None:
+            for attr_name in ("humanized", "origin_key", "key", "pattern"):
+                candidates.append(getattr(shortcut_obj, attr_name, None))
+        for candidate in candidates:
+            text = cls._coerce_shortcut_alias(candidate)
+            if text:
+                labels.append(text)
+        return cls._merge_unique_strings(labels, [])
+
+    @classmethod
+    def _iter_shortcut_records(cls, owner: object) -> list[tuple[str, object]]:
+        records: list[tuple[str, object]] = []
+        seen: set[tuple[str, int]] = set()
+
+        def add_record(key: object, value: object) -> None:
+            key_text = cls._coerce_shortcut_alias(key)
+            if not key_text:
+                return
+            marker = (key_text.casefold(), id(value))
+            if marker in seen:
+                return
+            seen.add(marker)
+            records.append((key_text, value))
+
+        formatter = getattr(owner, "formatter", None)
+        data = getattr(formatter, "data", None)
+        shortcut_hash = getattr(owner, "_hash", None)
+        if isinstance(data, dict) and shortcut_hash in data:
+            trace = data.get(shortcut_hash)
+            shortcuts = getattr(trace, "shortcuts", None)
+            if isinstance(shortcuts, dict):
+                for key, value in shortcuts.items():
+                    add_record(key, value)
+
+        for attr_name in ("_get_shortcuts", "get_shortcuts"):
+            getter = getattr(owner, attr_name, None)
+            if not callable(getter):
+                continue
+            try:
+                raw_shortcuts = getter()
+            except Exception:
+                continue
+            if isinstance(raw_shortcuts, dict):
+                for key, value in raw_shortcuts.items():
+                    add_record(key, value)
+            elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+                for item in raw_shortcuts:
+                    add_record(item, item)
+
+        raw_shortcuts = getattr(owner, "shortcuts", None)
+        if isinstance(raw_shortcuts, dict):
+            for key, value in raw_shortcuts.items():
+                add_record(key, value)
+        elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+            for item in raw_shortcuts:
+                add_record(item, item)
+
+        info = getattr(owner, "info", None)
+        nested_shortcuts = getattr(info, "shortcuts", None) if info is not None else None
+        if isinstance(nested_shortcuts, dict):
+            for key, value in nested_shortcuts.items():
+                add_record(key, value)
+        elif isinstance(nested_shortcuts, (list, tuple, set, frozenset)):
+            for item in nested_shortcuts:
+                add_record(item, item)
+
+        return records
 
     @classmethod
     def _extract_regex_head(cls, pattern: str) -> str | None:
@@ -846,10 +1540,11 @@ class AutoMetadataBuilder:
     def _merge_unique_strings(
         left: list[str] | tuple[str, ...] | None,
         right: list[str] | tuple[str, ...] | None,
+        *extra: list[str] | tuple[str, ...] | None,
     ) -> list[str]:
         result: list[str] = []
-        for collection in (left or [], right or []):
-            for value in collection:
+        for collection in (left, right, *extra):
+            for value in collection or []:
                 text = str(value or "").strip()
                 if text and text not in result:
                     result.append(text)
@@ -879,9 +1574,25 @@ class AutoMetadataBuilder:
                 current.get("examples"),
                 payload.get("examples"),
             )
+            current["prefixes"] = cls._merge_unique_strings(
+                current.get("prefixes"),
+                payload.get("prefixes"),
+            )
             current["target_sources"] = cls._merge_unique_strings(
                 current.get("target_sources"),
                 payload.get("target_sources"),
+            )
+            current["access_level"] = cls._merge_access_level(
+                current.get("access_level"), payload.get("access_level")
+            )
+            current["requires_reply"] = bool(current.get("requires_reply")) or bool(
+                payload.get("requires_reply")
+            )
+            current["requires_private"] = bool(
+                current.get("requires_private")
+            ) or bool(payload.get("requires_private"))
+            current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
+                payload.get("requires_to_me")
             )
             for field in (
                 "text_min",
@@ -892,6 +1603,7 @@ class AutoMetadataBuilder:
                 "actor_scope",
                 "target_requirement",
                 "allow_sticky_arg",
+                "prefixes",
             ):
                 if current.get(field) is None and payload.get(field) is not None:
                     current[field] = payload.get(field)

@@ -26,11 +26,11 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from .data_source import _chat_memory, handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
-from .models.chat_history import ChatInterChatHistory  # noqa: F401
+from .handler import handle_fallback
+from .memory import _chat_memory
 from .plugin_registry import PluginRegistry
-from .route_observer import render_route_observer_summary
+from .turn_metrics import render_route_observer_summary
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()
@@ -45,7 +45,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="Copaan & meng-luo",
-        version="1.2.2",
+        version="1.3.0",
         plugin_type=PluginType.DEPENDANT,
         menu_type="其他",
         ignore_prompt=True,
@@ -304,7 +304,7 @@ async def _rescan_dynamic_matchers_after_startup():
     """等其它插件 startup 动态 matcher 创建完成后，分批重建知识库。"""
     for delay_seconds in _DYNAMIC_MATCHER_RESCAN_DELAYS:
         await asyncio.sleep(delay_seconds)
-        await PluginRegistry.preload_cache()
+        await PluginRegistry.preload_cache(force_refresh=True)
         logger.info(
             "ChatInter 已完成 startup 后动态 matcher 补扫："
             f"delay={delay_seconds}s"
