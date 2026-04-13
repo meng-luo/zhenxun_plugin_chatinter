@@ -795,7 +795,7 @@ async def _get_group_member_profiles_for_fuzzy(
         user_id = str(member.user_id).strip()
         if not user_id.isdigit():
             continue
-        nickname = (member.nickname or "").strip()
+        nickname = str(getattr(member, "nickname", "") or "").strip()
         user_name = (member.user_name or "").strip()
         display_name = (nickname or user_name).strip()
         if not display_name:
@@ -1133,7 +1133,7 @@ async def _build_mention_profiles(
 
     for member in members:
         user_id = str(member.user_id)
-        nickname = (member.nickname or "").strip()
+        nickname = str(getattr(member, "nickname", "") or "").strip()
         user_name = (member.user_name or "").strip()
         display_name = (nickname or user_name).strip()
         uid = str(member.uid).strip() if member.uid is not None else ""

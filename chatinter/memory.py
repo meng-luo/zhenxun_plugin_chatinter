@@ -566,7 +566,7 @@ class ChatMemory:
                 group_id=group_id, user_id=user_id
             ).first()
             if member:
-                nick = member.nickname or member.user_name
+                nick = str(getattr(member, "nickname", "") or member.user_name or "")
                 if nick:
                     self._user_nickname_cache[user_id] = nick
                     self._nickname_cache_time[user_id] = time.time()
@@ -600,7 +600,7 @@ class ChatMemory:
         ).all()
 
         for member in members:
-            nick = member.nickname or member.user_name
+            nick = str(getattr(member, "nickname", "") or member.user_name or "")
             if nick:
                 self._user_nickname_cache[member.user_id] = nick
                 self._nickname_cache_time[member.user_id] = time.time()
