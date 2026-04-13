@@ -6,6 +6,7 @@ from .models.pydantic_models import PluginKnowledgeBase
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
+    collect_weak_route_signals,
     contains_any,
     has_negative_route_intent,
     is_usage_question,
@@ -536,9 +537,16 @@ def _classify_non_explicit_intent(
     has_structure_signal = _has_structure_route_signal(normalized_message)
     has_strong_action = _contains_strong_route_action(normalized_message)
     has_weak_action = contains_any(normalized_message, _WEAK_ROUTE_HINTS)
+    weak_route_signals = collect_weak_route_signals(normalized_message)
+    has_weak_route_signal = bool(weak_route_signals)
     has_technical_hint = contains_any(normalized_message, _TECHNICAL_HINTS)
 
-    if has_technical_hint and not has_structure_signal and not has_strong_action:
+    if (
+        has_technical_hint
+        and not has_structure_signal
+        and not has_strong_action
+        and not has_weak_route_signal
+    ):
         return IntentClassification(
             kind="chat",
             reason="technical_chat_request",
@@ -557,6 +565,14 @@ def _classify_non_explicit_intent(
             confidence=0.95,
             chat_subkind=chat_subkind,
             chat_target_hint=chat_target_hint,
+        )
+
+    if has_weak_route_signal:
+        return IntentClassification(
+            kind="chat",
+            reason="weak_route_signal",
+            confidence=0.72,
+            chat_subkind="general_chat",
         )
 
     if (

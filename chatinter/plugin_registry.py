@@ -336,6 +336,9 @@ class PluginRegistry:
         actor_scope: object = None,
         target_requirement: object = None,
         target_sources: object = None,
+        requires_reply: object = None,
+        requires_private: object = None,
+        requires_to_me: object = None,
         allow_sticky_arg: object = None,
         access_level: object = None,
     ) -> PluginInfo.PluginCommandMeta:
@@ -352,6 +355,9 @@ class PluginRegistry:
             allow_at=allow_at,
             target_sources=target_sources,
         )
+        resolved_requires_reply = bool(cls._safe_bool(requires_reply))
+        resolved_requires_private = bool(cls._safe_bool(requires_private))
+        resolved_requires_to_me = bool(cls._safe_bool(requires_to_me))
         resolved_allow_sticky_arg = cls._infer_allow_sticky_arg(
             allow_sticky_arg=allow_sticky_arg,
             allow_at=allow_at,
@@ -372,6 +378,9 @@ class PluginRegistry:
             actor_scope=resolved_actor_scope,
             target_requirement=resolved_target_requirement,
             target_sources=resolved_target_sources,
+            requires_reply=resolved_requires_reply,
+            requires_private=resolved_requires_private,
+            requires_to_me=resolved_requires_to_me,
             allow_sticky_arg=resolved_allow_sticky_arg,
             access_level=resolved_access_level,
         )
@@ -400,6 +409,9 @@ class PluginRegistry:
             ).strip().lower()
             or None,
             "target_sources": list(getattr(meta, "target_sources", []) or []),
+            "requires_reply": bool(getattr(meta, "requires_reply", False)),
+            "requires_private": bool(getattr(meta, "requires_private", False)),
+            "requires_to_me": bool(getattr(meta, "requires_to_me", False)),
             "allow_sticky_arg": cls._safe_bool(getattr(meta, "allow_sticky_arg", None)),
             "access_level": cls._normalize_access_level(
                 getattr(meta, "access_level", None)
@@ -478,6 +490,12 @@ class PluginRegistry:
                     target_sources=cls._merge_unique_strings(
                         left.get("target_sources"), right.get("target_sources")
                     ),
+                    requires_reply=bool(left.get("requires_reply"))
+                    or bool(right.get("requires_reply")),
+                    requires_private=bool(left.get("requires_private"))
+                    or bool(right.get("requires_private")),
+                    requires_to_me=bool(left.get("requires_to_me"))
+                    or bool(right.get("requires_to_me")),
                     allow_sticky_arg=left.get("allow_sticky_arg")
                     if left.get("allow_sticky_arg") is not None
                     else right.get("allow_sticky_arg"),
@@ -491,7 +509,7 @@ class PluginRegistry:
     def _command_meta_richness(
         cls,
         meta: PluginInfo.PluginCommandMeta,
-    ) -> tuple[int, int, int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int]:
         aliases = len(getattr(meta, "aliases", []) or [])
         prefixes = len(getattr(meta, "prefixes", []) or [])
         params = len(getattr(meta, "params", []) or [])
@@ -508,7 +526,21 @@ class PluginRegistry:
         )
         sticky = int(bool(getattr(meta, "allow_sticky_arg", False)))
         allow_at = int(bool(getattr(meta, "allow_at", False)))
-        return (params, text_score, aliases, prefixes, examples, sticky, allow_at)
+        requires_reply = int(bool(getattr(meta, "requires_reply", False)))
+        requires_private = int(bool(getattr(meta, "requires_private", False)))
+        requires_to_me = int(bool(getattr(meta, "requires_to_me", False)))
+        return (
+            params,
+            text_score,
+            aliases,
+            prefixes,
+            examples,
+            sticky,
+            allow_at,
+            requires_reply,
+            requires_private,
+            requires_to_me,
+        )
 
     @classmethod
     def _canonicalize_command_meta_groups(
@@ -789,6 +821,11 @@ class PluginRegistry:
                 "target_requirement", schema.get("target_requirement")
             ),
             target_sources=item.get("target_sources", schema.get("target_sources")),
+            requires_reply=item.get("requires_reply", schema.get("requires_reply")),
+            requires_private=item.get(
+                "requires_private", schema.get("requires_private")
+            ),
+            requires_to_me=item.get("requires_to_me", schema.get("requires_to_me")),
             allow_sticky_arg=item.get(
                 "allow_sticky_arg", schema.get("allow_sticky_arg")
             ),
@@ -1118,6 +1155,7 @@ class PluginRegistry:
             ),
         )
 
+        # ── 阶段 1：移除完全相同指纹的插件 ──
         deduplicated: list[PluginInfo] = []
         seen_fingerprints: set[tuple[str, tuple[str, ...]]] = set()
         for plugin in ordered:
@@ -1138,6 +1176,55 @@ class PluginRegistry:
                 continue
             seen_fingerprints.add(fingerprint)
             deduplicated.append(plugin)
+
+        # ── 阶段 2：移除命令被子模块完全覆盖的父模块 ──
+        # 当父模块（如 csgo）的所有命令都已出现在子模块（如 csgo.commands）中时，
+        # 父模块只是一个空壳容器，注册它会导致同一命令出现在多个 SkillSpec 中，
+        # 造成交叉路由混淆。此处将这类父模块过滤掉。
+        modules_set = {p.module for p in deduplicated}
+        parent_modules_to_remove: set[str] = set()
+
+        for plugin in deduplicated:
+            parent_module = plugin.module
+            # 收集所有直接子模块
+            children = [
+                p for p in deduplicated
+                if p.module != parent_module
+                and p.module.startswith(parent_module + ".")
+            ]
+            if not children:
+                continue
+
+            # 计算所有子模块命令的并集
+            children_commands: set[str] = set()
+            for child in children:
+                for cmd in child.commands:
+                    normalized_cmd = cmd.strip().lower()
+                    if normalized_cmd:
+                        children_commands.add(normalized_cmd)
+
+            # 计算父模块的命令集
+            parent_commands: set[str] = set()
+            for cmd in plugin.commands:
+                normalized_cmd = cmd.strip().lower()
+                if normalized_cmd:
+                    parent_commands.add(normalized_cmd)
+
+            # 如果父模块的命令全部被子模块覆盖，标记为移除
+            if parent_commands and parent_commands <= children_commands:
+                parent_modules_to_remove.add(parent_module)
+                logger.debug(
+                    f"ChatInter 去重: 移除父模块 {parent_module}，"
+                    f"其 {len(parent_commands)} 个命令已被 "
+                    f"{len(children)} 个子模块完全覆盖"
+                )
+
+        if parent_modules_to_remove:
+            deduplicated = [
+                p for p in deduplicated
+                if p.module not in parent_modules_to_remove
+            ]
+
         return sorted(deduplicated, key=lambda item: item.module)
 
     @classmethod

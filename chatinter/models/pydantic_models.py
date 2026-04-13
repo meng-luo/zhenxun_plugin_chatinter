@@ -44,6 +44,18 @@ class PluginInfo(BaseModel):
             default_factory=list,
             description="可接受的目标来源",
         )
+        requires_reply: bool = Field(
+            default=False,
+            description="是否需要 reply 上下文",
+        )
+        requires_private: bool = Field(
+            default=False,
+            description="是否仅限私聊",
+        )
+        requires_to_me: bool = Field(
+            default=False,
+            description="是否需要 to_me / @机器人 上下文",
+        )
         allow_sticky_arg: bool = Field(
             default=False,
             description="是否允许命令头和参数粘连（例如：敲葱葱）",

@@ -56,12 +56,14 @@ from .route_engine import (
     RouteAttemptReport,
     RouteResolveResult,
     probe_shortlist_route,
+    resolve_weak_signal_intent,
     resolve_llm_align_route,
 )
 from .route_text import (
     ROUTE_ACTION_WORDS,
     contains_any,
     collect_placeholders,
+    collect_weak_route_signals,
     has_negative_route_intent,
     is_usage_question,
     normalize_action_phrases,
@@ -69,6 +71,7 @@ from .route_text import (
     match_command_head_canonical,
     parse_command_with_head,
     should_force_knowledge_refresh,
+    should_try_weak_llm_assist,
     strip_invoke_prefix,
 )
 from .schema_policy import (
@@ -237,13 +240,16 @@ _ROUTE_FEEDBACK_REWARD = {
     _FEEDBACK_REASON_DIRECT_TARGET_REQUIRED: -0.30,
 }
 _GROUP_MEMBER_PROFILE_CACHE_TTL = 90.0
+_GROUP_MEMBER_PROFILE_CACHE_MAX = 256
 _GROUP_MEMBER_PROFILE_CACHE: dict[
     str, tuple[float, list[dict[str, str | tuple[str, ...]]]]
 ] = {}
 _GROUP_ACTIVE_RANK_CACHE_TTL = 30.0
+_GROUP_ACTIVE_RANK_CACHE_MAX = 256
 _GROUP_ACTIVE_RANK_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 _ROUTE_CONTINUATION_FRAMES: dict[str, "RouteContinuationFrame"] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
+_NICKNAME_RESOLUTION_MEMORY_MAX = 2048
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
 _AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD = 10.0
 _ROUTE_CONTINUATION_FRAME_TTL = 10 * 60.0
@@ -812,6 +818,12 @@ async def _get_group_member_profiles_for_fuzzy(
         )
 
     _GROUP_MEMBER_PROFILE_CACHE[cache_key] = (now, profiles)
+    if len(_GROUP_MEMBER_PROFILE_CACHE) > _GROUP_MEMBER_PROFILE_CACHE_MAX:
+        for _evict_key in sorted(
+            _GROUP_MEMBER_PROFILE_CACHE,
+            key=lambda k: _GROUP_MEMBER_PROFILE_CACHE[k][0],
+        )[: len(_GROUP_MEMBER_PROFILE_CACHE) - _GROUP_MEMBER_PROFILE_CACHE_MAX]:
+            _GROUP_MEMBER_PROFILE_CACHE.pop(_evict_key, None)
     return profiles
 
 
@@ -849,6 +861,12 @@ async def _get_group_recent_active_scores(group_id: str | None) -> dict[str, flo
             break
 
     _GROUP_ACTIVE_RANK_CACHE[cache_key] = (now, score_map)
+    if len(_GROUP_ACTIVE_RANK_CACHE) > _GROUP_ACTIVE_RANK_CACHE_MAX:
+        for _evict_key in sorted(
+            _GROUP_ACTIVE_RANK_CACHE,
+            key=lambda k: _GROUP_ACTIVE_RANK_CACHE[k][0],
+        )[: len(_GROUP_ACTIVE_RANK_CACHE) - _GROUP_ACTIVE_RANK_CACHE_MAX]:
+            _GROUP_ACTIVE_RANK_CACHE.pop(_evict_key, None)
     return score_map
 
 
@@ -867,6 +885,12 @@ def _remember_target_resolution(
     _NICKNAME_RESOLUTION_MEMORY[
         _resolution_memory_key(group_id, target_hint)
     ] = (time.monotonic(), str(user_id))
+    if len(_NICKNAME_RESOLUTION_MEMORY) > _NICKNAME_RESOLUTION_MEMORY_MAX:
+        for _evict_key in sorted(
+            _NICKNAME_RESOLUTION_MEMORY,
+            key=lambda k: _NICKNAME_RESOLUTION_MEMORY[k][0],
+        )[: len(_NICKNAME_RESOLUTION_MEMORY) - _NICKNAME_RESOLUTION_MEMORY_MAX]:
+            _NICKNAME_RESOLUTION_MEMORY.pop(_evict_key, None)
 
 
 def _lookup_remembered_target(
@@ -2810,7 +2834,7 @@ async def handle_fallback(
     message=None,
     route_modules: set[str] | None = None,
     cached_plain_text: str | None = None,
-) -> bool:
+) -> None:
     """消息处理器
 
     当消息未被其他插件处理时，使用 AI 分析用户意图并响应。
@@ -2971,6 +2995,7 @@ async def handle_fallback(
         command_heads = _collect_target_capable_command_heads(knowledge_base)
         reply_sender_id = _extract_reply_sender_id(event)
         reply_image_count = len(reply_images_data or [])
+        has_reply = bool(reply_sender_id) or reply_image_count > 0
         if reply_image_count > 0:
             logger.debug(f"Reply 中解析到图片 {reply_image_count} 张，将用于路由重放")
         reply_image_segments_for_reroute = _build_reply_image_segments_for_reroute(
@@ -3168,6 +3193,135 @@ async def handle_fallback(
         context_xml = middleware_state.context_xml
         route_message = middleware_state.route_message or route_message
 
+        weak_signal_decision = None
+        weak_signal_route_result: RouteResolveResult | None = None
+        weak_signal_report: RouteAttemptReport | None = None
+        if (
+            intent_profile.kind == "chat"
+            and getattr(intent_profile, "chat_subkind", "general_chat") == "general_chat"
+        ):
+            route_placeholders = collect_placeholders(route_message)
+            weak_signal_tags = collect_weak_route_signals(route_message)
+            has_at = any(token.startswith("[@") for token in route_placeholders)
+            has_image = any(
+                token.lower().startswith("[image") for token in route_placeholders
+            )
+            if should_try_weak_llm_assist(
+                route_message,
+                has_at=has_at,
+                has_image=has_image,
+                has_reply=has_reply,
+                explicit_command=bool(intent_profile.explicit_command),
+            ):
+                weak_signal_decision, weak_signal_route_result, weak_signal_report = (
+                    await resolve_weak_signal_intent(
+                        route_message,
+                        knowledge_base,
+                        original_message_text=current_message,
+                        has_at=has_at,
+                        has_image=has_image,
+                        has_reply=has_reply,
+                        is_private=group_id is None,
+                        session_key=session_key,
+                        budget_controller=budget_controller,
+                    )
+                )
+                if weak_signal_decision is not None:
+                    trace.update_tags(
+                        weak_signal_tags="|".join(weak_signal_tags[:8]),
+                        weak_signal_action=weak_signal_decision.action,
+                        weak_signal_confidence=(
+                            f"{weak_signal_decision.confidence:.2f}"
+                            if weak_signal_decision.confidence is not None
+                            else ""
+                        ),
+                        weak_signal_reason=weak_signal_decision.reason or "",
+                        weak_signal_plugin=(
+                            weak_signal_route_result.decision.plugin_name
+                            if weak_signal_route_result is not None
+                            else ""
+                        ),
+                        weak_signal_module=(
+                            weak_signal_route_result.decision.plugin_module
+                            if weak_signal_route_result is not None
+                            else ""
+                        ),
+                        weak_signal_command=(
+                            weak_signal_route_result.decision.command
+                            if weak_signal_route_result is not None
+                            else ""
+                        ),
+                    )
+                    logger.debug(
+                        "ChatInter 弱词 LLM 结果: "
+                        f"action={weak_signal_decision.action} "
+                        f"confidence={weak_signal_decision.confidence:.2f} "
+                        f"reason={weak_signal_decision.reason or '-'} "
+                        f"module={weak_signal_route_result.decision.plugin_module if weak_signal_route_result is not None else '-'} "
+                        f"command={weak_signal_route_result.decision.command if weak_signal_route_result is not None else '-'}"
+                    )
+                if (
+                    weak_signal_decision is not None
+                    and weak_signal_decision.action == "usage"
+                    and weak_signal_route_result is not None
+                ):
+                    trace.update_tags(path="clarify", outcome="plugin_usage_redirect")
+                    envelope = TurnChannelEnvelope()
+                    envelope.add(ChannelName.ANALYSIS, "weak signal plugin usage redirect")
+                    envelope.add(
+                        ChannelName.FINAL,
+                        _build_plugin_usage_fallback_message(
+                            route_result=weak_signal_route_result,
+                            knowledge_plugins=knowledge_base.plugins,
+                            current_message=route_message,
+                        ),
+                    )
+                    _log_turn_channels(envelope)
+                    await _persist_final_only_dialog(
+                        envelope=envelope,
+                        user_id=user_id,
+                        group_id=group_id,
+                        nickname=nickname,
+                        user_message=uni_msg or current_message,
+                        bot_id=bot_id,
+                    )
+                    trace.stage("persist")
+                    await MessageUtils.build_message(envelope.final).send()
+                    trace.stage("send")
+                    await _dispatch_post_gate(
+                        response_text=envelope.final,
+                        phase="post_gate:weak_signal_plugin_usage_redirect",
+                    )
+                    _finish_trace(
+                        trace=trace,
+                        user_id=str(user_id),
+                        group_id=group_id,
+                        message_preview=current_message,
+                        route_report=weak_signal_report,
+                        budget_controller=budget_controller,
+                    )
+                    return
+                if weak_signal_route_result is not None:
+                    if await _execute_route_decision(
+                        bot=bot,
+                        event=event,
+                        trace=trace,
+                        route_result=weak_signal_route_result,
+                        knowledge_plugins=knowledge_base.plugins,
+                        user_id=user_id,
+                        group_id=group_id,
+                        nickname=nickname,
+                        user_message=uni_msg or raw_message,
+                        bot_id=bot_id,
+                        current_message=route_message,
+                        session_id=session_key,
+                        extra_image_segments=reply_image_segments_for_reroute,
+                        route_report=weak_signal_report,
+                        budget_controller=budget_controller,
+                        finalize_callback=_dispatch_post_gate,
+                    ):
+                        return
+
         if intent_profile.kind == "chat":
             dialogue_reply = await _build_dialogue_fast_reply(
                 intent_profile=intent_profile,
@@ -3262,6 +3416,7 @@ async def handle_fallback(
                     route_knowledge_base,
                     session_key=session_key,
                     budget_controller=budget_controller,
+                    has_reply=has_reply,
                 )
             )
             if alignment_decision is not None:
@@ -3769,6 +3924,14 @@ async def handle_fallback(
             f"ChatInter 当前会话任务被中断: user={user_id}, group={group_name}"
         )
         await _dispatch_post_gate(phase="post_gate:cancelled")
+        _finish_trace(
+            trace=trace,
+            user_id=str(user_id),
+            group_id=group_id,
+            message_preview=current_message,
+            route_report=route_report,
+            budget_controller=budget_controller,
+        )
         return
     except Exception as e:
         trace.update_tags(path="error", outcome="error")

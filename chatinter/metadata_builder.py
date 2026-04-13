@@ -30,6 +30,9 @@ class AutoMetadataBuilder:
     _module_prefix_cache: ClassVar[
         dict[str, tuple[int, dict[str, list[str]]]]
     ] = {}
+    _module_context_cache: ClassVar[
+        dict[str, tuple[int, dict[str, dict[str, bool]]]]
+    ] = {}
     _module_access_cache: ClassVar[dict[str, tuple[int, dict[str, str]]]] = {}
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
     _no_command_log_cache: ClassVar[set[str]] = set()
@@ -102,6 +105,11 @@ class AutoMetadataBuilder:
                 if module_obj is not None
                 else {}
             )
+            context_map = (
+                cls._load_module_context_map(module_obj)
+                if module_obj is not None
+                else {}
+            )
             parser = cls._get_matcher_parser(matcher)
             parser_schema = (
                 cls._extract_parser_schema(parser)
@@ -109,6 +117,7 @@ class AutoMetadataBuilder:
                 else cls._default_parser_schema()
             )
             handler_hint = cls._extract_handler_hint(matcher)
+            context_hint = cls._extract_matcher_context_hint(matcher)
             parser_shortcut_aliases = (
                 cls._extract_parser_shortcut_aliases(parser) if parser is not None else []
             )
@@ -116,6 +125,8 @@ class AutoMetadataBuilder:
                 matcher=matcher,
                 parser_schema=parser_schema,
                 handler_hint=handler_hint,
+                context_hint=context_hint,
+                source_context_map=context_map,
                 access_map=access_map,
             ):
                 command_head = str(payload.get("command") or "").strip()
@@ -128,6 +139,17 @@ class AutoMetadataBuilder:
                 payload["prefixes"] = cls._merge_unique_strings(
                     payload.get("prefixes"),
                     prefix_map.get(command_head.casefold(), []),
+                )
+                payload["requires_reply"] = bool(payload.get("requires_reply")) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_reply")
+                )
+                payload["requires_private"] = bool(
+                    payload.get("requires_private")
+                ) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_private")
+                )
+                payload["requires_to_me"] = bool(payload.get("requires_to_me")) or bool(
+                    context_map.get(command_head.casefold(), {}).get("requires_to_me")
                 )
                 result.append(payload)
 
@@ -162,6 +184,19 @@ class AutoMetadataBuilder:
                     else parser_schema["allow_at"],
                     "target_sources": handler_hint["target_sources"]
                     or parser_schema["target_sources"],
+                    "requires_reply": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_reply"]
+                    or handler_hint["requires_reply"],
+                    "requires_private": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_private"],
+                    "requires_to_me": cls._merge_context_hint(
+                        context_hint,
+                        context_map.get(command_head.casefold(), {}),
+                    )["requires_to_me"],
                     "allow_sticky_arg": cls._probe_sticky_arg(
                         parser=parser,
                         command_head=command_head,
@@ -254,6 +289,8 @@ class AutoMetadataBuilder:
         matcher: object,
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
+        context_hint: dict[str, bool],
+        source_context_map: dict[str, dict[str, bool]],
         access_map: dict[str, str],
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -266,8 +303,13 @@ class AutoMetadataBuilder:
             if checker_name in {"CommandRule", "ShellCommandRule"}:
                 allow_sticky_arg = cls._extract_rule_allow_sticky_arg(checker_call)
                 for command_head in cls._iter_command_rule_heads(checker_call):
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
                     access_level = cls._resolve_access_level(
-                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        access_map.get(command_key),
                         handler_hint.get("requires_superuser"),
                     )
                     result.append(
@@ -275,6 +317,7 @@ class AutoMetadataBuilder:
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=allow_sticky_arg,
                             access_level=access_level,
                         )
@@ -282,8 +325,13 @@ class AutoMetadataBuilder:
                 continue
             if checker_name == "StartswithRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
                     access_level = cls._resolve_access_level(
-                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        access_map.get(command_key),
                         handler_hint.get("requires_superuser"),
                     )
                     result.append(
@@ -291,6 +339,7 @@ class AutoMetadataBuilder:
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
                             access_level=access_level,
                         )
@@ -298,8 +347,13 @@ class AutoMetadataBuilder:
                 continue
             if checker_name == "FullmatchRule":
                 for command_head in getattr(checker_call, "msg", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
                     access_level = cls._resolve_access_level(
-                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        access_map.get(command_key),
                         handler_hint.get("requires_superuser"),
                     )
                     result.append(
@@ -307,6 +361,7 @@ class AutoMetadataBuilder:
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=False,
                             access_level=access_level,
                         )
@@ -314,8 +369,13 @@ class AutoMetadataBuilder:
                 continue
             if checker_name == "KeywordsRule":
                 for command_head in getattr(checker_call, "keywords", ()) or ():
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
                     access_level = cls._resolve_access_level(
-                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        access_map.get(command_key),
                         handler_hint.get("requires_superuser"),
                     )
                     result.append(
@@ -323,6 +383,7 @@ class AutoMetadataBuilder:
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
                             access_level=access_level,
                         )
@@ -333,8 +394,13 @@ class AutoMetadataBuilder:
                     str(getattr(checker_call, "regex", "") or "")
                 )
                 if command_head:
+                    command_key = cls._normalize_command(command_head).casefold()
+                    merged_context_hint = cls._merge_context_hint(
+                        context_hint,
+                        source_context_map.get(command_key, {}),
+                    )
                     access_level = cls._resolve_access_level(
-                        access_map.get(cls._normalize_command(command_head).casefold()),
+                        access_map.get(command_key),
                         handler_hint.get("requires_superuser"),
                     )
                     result.append(
@@ -342,6 +408,7 @@ class AutoMetadataBuilder:
                             command_head=command_head,
                             parser_schema=parser_schema,
                             handler_hint=handler_hint,
+                            context_hint=merged_context_hint,
                             allow_sticky_arg=True,
                             access_level=access_level,
                         )
@@ -355,6 +422,7 @@ class AutoMetadataBuilder:
         command_head: object,
         parser_schema: dict[str, Any],
         handler_hint: dict[str, Any],
+        context_hint: dict[str, bool],
         allow_sticky_arg: bool | None,
         access_level: str = "public",
     ) -> dict[str, Any]:
@@ -374,11 +442,31 @@ class AutoMetadataBuilder:
             else parser_schema["allow_at"],
             "target_sources": handler_hint["target_sources"]
             or parser_schema["target_sources"],
+            "requires_reply": handler_hint["requires_reply"]
+            or context_hint["requires_reply"],
+            "requires_private": context_hint["requires_private"],
+            "requires_to_me": context_hint["requires_to_me"],
             "allow_sticky_arg": allow_sticky_arg
             if allow_sticky_arg is not None
             else True,
             "access_level": access_level,
         }
+
+    @classmethod
+    def _merge_context_hint(
+        cls,
+        base: dict[str, bool] | None,
+        override: dict[str, bool] | None,
+    ) -> dict[str, bool]:
+        result = {
+            "requires_reply": bool((base or {}).get("requires_reply"))
+            or bool((override or {}).get("requires_reply")),
+            "requires_to_me": bool((base or {}).get("requires_to_me"))
+            or bool((override or {}).get("requires_to_me")),
+            "requires_private": bool((base or {}).get("requires_private"))
+            or bool((override or {}).get("requires_private")),
+        }
+        return result
 
     @classmethod
     def _iter_command_rule_heads(cls, checker_call: object) -> list[str]:
@@ -408,6 +496,75 @@ class AutoMetadataBuilder:
         if checker_name == "ShellCommandRule":
             return True
         return None
+
+    @classmethod
+    def _load_module_context_map(cls, module_obj: object) -> dict[str, dict[str, bool]]:
+        source_file = inspect.getsourcefile(module_obj)
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = str(path)
+        cached = cls._module_context_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        context_map: dict[str, dict[str, bool]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            command = cls._extract_command_from_call_node(node)
+            if not command:
+                continue
+            context_hint = cls._extract_call_context_hint(node)
+            if not any(context_hint.values()):
+                continue
+            command_key = command.casefold()
+            context_map[command_key] = cls._merge_context_hint(
+                context_map.get(command_key),
+                context_hint,
+            )
+        cls._module_context_cache[cache_key] = (mtime_ns, context_map)
+        return context_map
+
+    @classmethod
+    def _extract_call_context_hint(cls, node: ast.Call) -> dict[str, bool]:
+        requires_reply = False
+        requires_to_me = False
+        requires_private = False
+        for keyword in node.keywords or []:
+            if keyword.arg != "rule":
+                continue
+            rule_text = cls._safe_unparse(keyword.value).lower()
+            if not rule_text:
+                continue
+            if "reply" in rule_text:
+                requires_reply = True
+            if "to_me" in rule_text or "tome" in rule_text:
+                requires_to_me = True
+            if "ensure_private" in rule_text or "private" in rule_text:
+                requires_private = True
+        return {
+            "requires_reply": requires_reply,
+            "requires_to_me": requires_to_me,
+            "requires_private": requires_private,
+        }
+
+    @staticmethod
+    def _safe_unparse(node: ast.AST) -> str:
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
 
     @classmethod
     async def _extract_manager_command_data(
@@ -607,6 +764,7 @@ class AutoMetadataBuilder:
     def _extract_handler_hint(cls, matcher: object) -> dict[str, Any]:
         allow_at: bool | None = None
         target_sources: list[str] = []
+        requires_reply = False
         requires_superuser = False
         for handler in getattr(matcher, "handlers", []) or []:
             call = getattr(handler, "call", None)
@@ -617,6 +775,8 @@ class AutoMetadataBuilder:
                 allow_at = True
             if hint.get("reply_source") and "reply" not in target_sources:
                 target_sources.append("reply")
+            if hint.get("reply_source"):
+                requires_reply = True
             if hint.get("at_source"):
                 for source in ("at", "nickname"):
                     if source not in target_sources:
@@ -628,7 +788,32 @@ class AutoMetadataBuilder:
         return {
             "allow_at": allow_at,
             "target_sources": target_sources,
+            "requires_reply": requires_reply,
             "requires_superuser": requires_superuser,
+        }
+
+    @classmethod
+    def _extract_matcher_context_hint(cls, matcher: object) -> dict[str, bool]:
+        requires_reply = False
+        requires_to_me = False
+        requires_private = False
+        rule = getattr(matcher, "rule", None)
+        rule_repr = repr(rule).lower() if rule is not None else ""
+        before_rules = getattr(rule, "before_rules", None)
+        before_repr = repr(before_rules).lower() if before_rules is not None else ""
+        combined_repr = " ".join(
+            part for part in (rule_repr, before_repr) if part
+        )
+        if "reply" in combined_repr:
+            requires_reply = True
+        if "tome" in combined_repr or "to_me" in combined_repr:
+            requires_to_me = True
+        if "ensure_private" in combined_repr or "private" in combined_repr:
+            requires_private = True
+        return {
+            "requires_reply": requires_reply,
+            "requires_to_me": requires_to_me,
+            "requires_private": requires_private,
         }
 
     @classmethod
@@ -1399,6 +1584,15 @@ class AutoMetadataBuilder:
             )
             current["access_level"] = cls._merge_access_level(
                 current.get("access_level"), payload.get("access_level")
+            )
+            current["requires_reply"] = bool(current.get("requires_reply")) or bool(
+                payload.get("requires_reply")
+            )
+            current["requires_private"] = bool(
+                current.get("requires_private")
+            ) or bool(payload.get("requires_private"))
+            current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
+                payload.get("requires_to_me")
             )
             for field in (
                 "text_min",

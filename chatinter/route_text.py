@@ -19,6 +19,7 @@ INVOKE_PREFIXES = (
     "帮忙",
     "麻烦",
     "给我",
+    "我要",
     "请",
     "制作一个",
     "制作一张",
@@ -33,7 +34,7 @@ INVOKE_PREFIXES = (
     "再来个",
 )
 
-QUESTION_WORDS = (
+STRONG_USAGE_WORDS = (
     "怎么用",
     "如何用",
     "怎样用",
@@ -42,7 +43,7 @@ QUESTION_WORDS = (
     "怎样使用",
     "用法",
     "教程",
-    "说明",
+    "帮助",
     "示例",
     "例子",
     "怎么触发",
@@ -54,42 +55,35 @@ QUESTION_WORDS = (
     "怎么做",
     "如何做",
     "怎样做",
-    "是什么",
-    "是啥",
-    "什么意思",
-    "?",
-    "？",
 )
 
-USAGE_WORDS = (
+WEAK_USAGE_HINTS = (
     "配置",
     "怎么配置",
     "如何配置",
     "怎样配置",
-    "怎么用",
-    "如何用",
-    "怎样用",
-    "怎么使用",
-    "如何使用",
-    "怎样使用",
-    "用法",
-    "教程",
+    "参数",
     "说明",
-    "示例",
-    "例子",
-    "怎么触发",
-    "如何触发",
-    "怎样触发",
-    "怎么调用",
-    "如何调用",
-    "怎样调用",
-    "怎么做",
-    "如何做",
-    "怎样做",
+    "详情",
+    "列表",
+    "功能",
+    "插件",
+    "命令",
+    "调用",
+    "搜索",
+    "查询",
+    "查看",
+    "看看",
+    "看下",
+    "怎么",
+    "什么",
     "是什么",
     "是啥",
     "什么意思",
 )
+
+QUESTION_WORDS = STRONG_USAGE_WORDS
+USAGE_WORDS = STRONG_USAGE_WORDS
 
 _USAGE_CONTEXT_HINTS = (
     "命令",
@@ -104,6 +98,13 @@ _USAGE_CONTEXT_HINTS = (
     "详情",
     "搜索",
     "列表",
+)
+
+_CONFIGURATION_USAGE_HINTS = (
+    "配置",
+    "怎么配置",
+    "如何配置",
+    "怎样配置",
 )
 
 _GENERIC_QUESTION_WORDS = (
@@ -414,6 +415,13 @@ def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword.lower() in normalized for keyword in keywords)
 
 
+def _has_ascii_alnum(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    return any(char.isascii() and char.isalnum() for char in normalized)
+
+
 def match_command_head(text: str, command: str) -> bool:
     normalized_text = normalize_message_text(text)
     normalized_command = normalize_message_text(command)
@@ -541,6 +549,11 @@ def _find_short_noise_head_boundary(text: str, command: str) -> int | None:
     if not compact_command or len(compact_command) > 4:
         return None
 
+    # 对于 1-2 字符的命令，编辑距离 ≤1 的模糊匹配没有意义
+    # （任意两个单字符之间编辑距离都是 1），必须要求精确前缀匹配
+    if len(compact_command) <= 2:
+        return None
+
     compact_text = _clean_route_command_head_text(normalized_text, compact=True)
     if not compact_text or len(compact_text) < len(compact_command):
         return None
@@ -618,26 +631,19 @@ def match_command_head_canonical(text: str, command: str) -> bool:
         )
     if compact_text == compact_command:
         return True
-    if match_command_head_or_sticky(
-        compact_text,
-        compact_command,
-        allow_sticky=True,
-    ):
-        return True
-
-    ascii_text = _compact_ascii_head_text(text)
-    ascii_command = _compact_ascii_head_text(command)
-    if not ascii_text or not ascii_command:
+    if not _has_ascii_alnum(strict_command):
+        if match_command_head_or_sticky(
+            compact_text,
+            compact_command,
+            allow_sticky=True,
+        ):
+            return True
+        ascii_text = _compact_ascii_head_text(text)
+        ascii_command = _compact_ascii_head_text(command)
+        if ascii_text and ascii_command and ascii_text == ascii_command:
+            return True
         return _find_short_noise_head_boundary(text, command) is not None
-    if ascii_text == ascii_command:
-        return True
-    if match_command_head_or_sticky(
-        ascii_text,
-        ascii_command,
-        allow_sticky=True,
-    ):
-        return True
-    return _find_short_noise_head_boundary(text, command) is not None
+    return False
 
 
 def strip_invoke_prefix(text: str) -> str:
@@ -872,31 +878,48 @@ def normalize_action_phrases(text: str) -> str:
     return normalize_message_text(normalized)
 
 
+def _has_strong_usage_anchor(normalized: str) -> bool:
+    return contains_any(normalized, STRONG_USAGE_WORDS)
+
+
 def is_usage_question(text: str) -> bool:
     normalized = normalize_message_text(text)
     if not normalized:
         return False
-    has_question_hint = contains_any(normalized, QUESTION_WORDS)
-    has_explicit_usage_hint = contains_any(normalized, USAGE_WORDS)
-    has_isolated_param_hint = _contains_isolated_term(normalized, "参数")
-    if not has_question_hint and not has_explicit_usage_hint and not has_isolated_param_hint:
+    return contains_any(normalized, STRONG_USAGE_WORDS)
+
+
+def collect_weak_route_signals(text: str) -> tuple[str, ...]:
+    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    if not normalized:
+        return ()
+    signals: list[str] = []
+    for word in WEAK_USAGE_HINTS:
+        if not word:
+            continue
+        if word in normalized and word not in signals:
+            signals.append(word)
+    return tuple(signals)
+
+
+def should_try_weak_llm_assist(
+    text: str,
+    *,
+    has_at: bool = False,
+    has_image: bool = False,
+    has_reply: bool = False,
+    explicit_command: bool = False,
+) -> bool:
+    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    if not normalized:
         return False
-    if has_explicit_usage_hint:
-        return True
-    if has_isolated_param_hint:
-        return contains_any(normalized, _GENERIC_QUESTION_WORDS) or contains_any(
-            normalized, _USAGE_CONTEXT_HINTS
-        )
-    # 仅出现“什么/怎么/？”等泛问句，不视为插件帮助请求。
-    if contains_any(normalized, _GENERIC_QUESTION_WORDS) and not contains_any(
-        normalized, _USAGE_CONTEXT_HINTS
-    ):
+    if explicit_command or has_at or has_image or has_reply:
         return False
-    if contains_any(normalized, STRONG_EXECUTE_WORDS):
+    if is_usage_question(normalized):
         return False
-    if contains_any(normalized, EXECUTE_WORDS):
+    if has_negative_route_intent(normalized):
         return False
-    return has_question_hint
+    return bool(collect_weak_route_signals(normalized))
 
 
 def _contains_isolated_term(text: str, term: str) -> bool:
@@ -1109,6 +1132,7 @@ __all__ = [
     "ROUTE_ACTION_WORDS",
     "RouteCommandMatch",
     "collect_placeholders",
+    "collect_weak_route_signals",
     "contains_any",
     "has_negative_route_intent",
     "has_template_route_context",
@@ -1123,5 +1147,6 @@ __all__ = [
     "rewrite_command_with_head",
     "sanitize_template_tail",
     "should_force_knowledge_refresh",
+    "should_try_weak_llm_assist",
     "strip_invoke_prefix",
 ]

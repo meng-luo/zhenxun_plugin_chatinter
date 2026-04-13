@@ -7,13 +7,13 @@ from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
+    collect_weak_route_signals,
     contains_any,
     has_negative_route_intent,
     has_template_route_context,
     is_usage_question,
     match_command_head,
     match_command_head_canonical,
-    match_command_head_or_sticky,
     parse_command_with_head,
     _find_short_noise_head_boundary,
     normalize_action_phrases,
@@ -336,6 +336,9 @@ class SkillCommandSchema:
     actor_scope: str = "allow_other"
     target_requirement: str = "none"
     target_sources: tuple[str, ...] = ()
+    requires_reply: bool = False
+    requires_private: bool = False
+    requires_to_me: bool = False
     allow_sticky_arg: bool = False
 
 
@@ -443,6 +446,9 @@ def _command_meta_signature(meta: PluginInfo.PluginCommandMeta) -> str:
                     str(getattr(meta, "access_level", "") or "")
                 ).lower()
             ),
+            str(int(bool(getattr(meta, "requires_reply", False)))),
+            str(int(bool(getattr(meta, "requires_private", False)))),
+            str(int(bool(getattr(meta, "requires_to_me", False)))),
         ]
     )
 
@@ -545,6 +551,9 @@ def _extract_command_schemas(
                 )
                 if source in {"at", "reply", "nickname", "self"}
             ),
+            requires_reply=bool(getattr(raw, "requires_reply", False)),
+            requires_private=bool(getattr(raw, "requires_private", False)),
+            requires_to_me=bool(getattr(raw, "requires_to_me", False)),
             allow_sticky_arg=bool(getattr(raw, "allow_sticky_arg", False)),
         )
     for command in commands:
@@ -977,6 +986,12 @@ def _match_short_noisy_head(
     command_text = normalize_message_text(command)
     if not command_text or len(command_text) > 4:
         return False
+    # 对于 1-2 字符的命令，编辑距离 ≤1 的模糊匹配不可靠
+    # （任意两个单字符之间编辑距离都是 1，两个双字符命令 50% 不同也能匹配）
+    if len(command_text) <= 2:
+        return False
+    if any(char.isascii() and char.isalnum() for char in command_text):
+        return False
     compact_command = re.sub(r"\s+", "", normalize_message_text(command_text))
     if not compact_command:
         return False
@@ -1001,9 +1016,40 @@ def _match_score_for_command(
     command_text = command.strip()
     if not command_text:
         return 0.0, False, False
+    # 单字符命令（如"我"、"开"、"抢"）在中文语境中太常见，
+    # 会导致大量假阳性（"我好累啊"→"我"、"开心就好"→"开"）。
+    # 仅当消息本身就是该单字符（精确匹配）时才允许匹配。
+    compact_command = re.sub(r"\s+", "", command_text)
+    if len(compact_command) <= 1:
+        compact_normalized = re.sub(r"\s+", "", normalize_message_text(normalized))
+        compact_stripped = re.sub(r"\s+", "", normalize_message_text(stripped))
+        if compact_normalized == compact_command or compact_stripped == compact_command:
+            return 40.0 + len(command_text) / 50.0, True, False
+        return 0.0, False, False
+    def _has_sticky_tail(text: str, head: str) -> bool:
+        normalized_text = normalize_message_text(text)
+        normalized_head = normalize_message_text(head)
+        if not normalized_text or not normalized_head:
+            return False
+        text_fold = normalized_text.casefold()
+        head_fold = normalized_head.casefold()
+        if not text_fold.startswith(head_fold):
+            return False
+        if len(text_fold) <= len(head_fold):
+            return False
+        tail = normalized_text[len(normalized_head) :].lstrip()
+        if not tail:
+            return False
+        lead = tail[0]
+        return bool(lead.isascii() and lead.isalnum()) or ("\u4e00" <= lead <= "\u9fff")
+
     if match_command_head_canonical(stripped, command_text) or match_command_head_canonical(
         normalized, command_text
     ):
+        if _has_sticky_tail(stripped, command_text) or _has_sticky_tail(
+            normalized, command_text
+        ):
+            return 24.0 + len(command_text) / 100.0, True, False
         return 40.0 + len(command_text) / 50.0, True, False
     if match_command_head(stripped, command_text) or match_command_head(
         normalized, command_text
@@ -1012,7 +1058,9 @@ def _match_score_for_command(
     if _match_short_noisy_head(stripped, command_text) or _match_short_noisy_head(
         normalized, command_text
     ):
-        return 38.0 + len(command_text) / 50.0, True, False
+        # 模糊匹配的分数应远低于精确匹配，且不应设置 head_hit
+        # 避免模糊匹配在排序中与精确匹配竞争
+        return 15.0 + len(command_text) / 50.0, False, False
     command_lower = command_text.lower()
     if command_lower in lowered:
         return 18.0 + len(command_text) / 100.0, False, True
@@ -1047,6 +1095,8 @@ def _build_ranked_candidate(
     exact_head_hit = False
     inline_hit_count = 0
     alias_hit_count = 0
+    best_command_score = 0.0
+    matched_command_hits = 0
 
     skill_family = infer_skill_family(
         skill,
@@ -1062,12 +1112,16 @@ def _build_ranked_candidate(
             stripped=stripped,
             lowered=lowered,
         )
-        command_role = infer_command_role(command, family=skill_family)
-        command_score += _command_role_alignment_bonus(message_role, command_role)
+        # 角色对齐加分只在已有文本匹配时才生效，
+        # 避免凭空创造匹配（如 "今天天气怎么样" → "赛事查看" 因 query 角色对齐得 10 分）
+        if command_score > 0:
+            command_role = infer_command_role(command, family=skill_family)
+            command_score += _command_role_alignment_bonus(message_role, command_role)
         if command_score <= 0:
             continue
-        score += command_score
-        if matched_command is None or command_score > 30:
+        matched_command_hits += 1
+        if command_score > best_command_score or matched_command is None:
+            best_command_score = command_score
             matched_command = command
         exact_head_hit = exact_head_hit or head_hit
         if inline_hit:
@@ -1080,12 +1134,16 @@ def _build_ranked_candidate(
             stripped=stripped,
             lowered=lowered,
         )
-        alias_role = infer_command_role(alias, family=skill_family)
-        alias_score += _command_role_alignment_bonus(message_role, alias_role)
+        # 同上：角色对齐加分只在已有文本匹配时才生效
+        if alias_score > 0:
+            alias_role = infer_command_role(alias, family=skill_family)
+            alias_score += _command_role_alignment_bonus(message_role, alias_role)
         if alias_score <= 0:
             continue
-        score += alias_score * 0.75
-        if alias_head_hit and matched_command is None:
+        matched_command_hits += 1
+        alias_score *= 0.75
+        if alias_score > best_command_score or matched_command is None:
+            best_command_score = alias_score
             matched_command = alias
         exact_head_hit = exact_head_hit or alias_head_hit
         if alias_inline_hit:
@@ -1110,6 +1168,38 @@ def _build_ranked_candidate(
 
     if include_usage and is_usage_question(normalized) and skill.helper_commands:
         score += 6.0
+
+    weak_signals = collect_weak_route_signals(normalized)
+    if weak_signals and skill.helper_commands:
+        score += min(1.8 + len(weak_signals) * 0.25, 3.0)
+
+    if best_command_score > 0:
+        score += best_command_score
+    if matched_command_hits > 1:
+        score += min((matched_command_hits - 1) * 0.5, 1.5)
+
+    module_depth = skill.plugin_module.count(".")
+    if exact_head_hit:
+        score += min(1.5 + module_depth * 0.75, 4.5)
+    elif inline_hit_count or alias_hit_count:
+        score += min(module_depth * 0.25, 1.5)
+
+    if exact_head_hit and matched_command:
+        module_tail = skill.plugin_module.rsplit(".", 1)[-1].lower()
+        module_tail_compact = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", module_tail)
+        command_compact = re.sub(
+            r"\s+",
+            "",
+            normalize_message_text(matched_command).lower(),
+        )
+        if module_tail_compact and command_compact:
+            if module_tail_compact == command_compact:
+                score += 2.5
+            elif (
+                module_tail_compact.startswith(command_compact)
+                or command_compact.startswith(module_tail_compact)
+            ):
+                score += 1.0
 
     if skill.supports_placeholders and ("[@" in normalized or "[image" in normalized):
         score += 1.8
@@ -1171,6 +1261,7 @@ def _rank_skills(
             item.inline_hit_count,
             item.alias_hit_count,
             item.name_hit,
+            item.skill.plugin_module.count("."),
             item.score,
             item.token_overlap,
             len(item.skill.plugin_name),
@@ -1302,8 +1393,6 @@ def _pick_command_by_evidence(
             score += min(len(overlap) * 2.0, 8.0)
             has_command_evidence = True
         if command_score > 0:
-            has_command_evidence = True
-        if role_bonus > 0:
             has_command_evidence = True
 
         family_bonus = _family_alignment_bonus(
@@ -1651,6 +1740,23 @@ def _extract_argument_around_head(message_text: str, command_head: str) -> str:
     before_cleaned = _strip_route_noise(before)
     after_cleaned = _strip_route_noise(after)
 
+    def _is_usable_argument_fragment(fragment: str) -> bool:
+        cleaned = normalize_message_text(fragment)
+        if not cleaned:
+            return False
+        if _message_has_payload_signals(cleaned):
+            return True
+        if contains_any(cleaned, ROUTE_ACTION_WORDS):
+            return False
+        if cleaned in _ROUTE_NOISE_WORDS:
+            return False
+        return len(cleaned) > 2
+
+    if before_cleaned and not _is_usable_argument_fragment(before_cleaned):
+        before_cleaned = ""
+    if after_cleaned and not _is_usable_argument_fragment(after_cleaned):
+        after_cleaned = ""
+
     if before_cleaned and after_cleaned:
         combined = normalize_message_text(f"{before_cleaned} {after_cleaned}")
         if _message_has_payload_signals(combined):
@@ -1827,6 +1933,15 @@ def _normalize_at_placeholder(token: str) -> str:
     return f"[{text}]"
 
 
+def _strip_context_only_at_tokens(text: str) -> str:
+    cleaned = normalize_message_text(text)
+    if not cleaned:
+        return ""
+    cleaned = _INLINE_AT_TOKEN_PATTERN.sub(" ", cleaned)
+    cleaned = normalize_message_text(cleaned)
+    return cleaned
+
+
 def _sanitize_usage_argument(argument_text: str) -> str:
     argument = normalize_message_text(argument_text)
     if not argument:
@@ -1874,8 +1989,15 @@ def _apply_command_schema(
     image_tokens = [token for token in placeholders if token.startswith("[image")]
 
     if schema is not None:
+        if schema.requires_to_me and schema.allow_at is not True:
+            argument_text = _strip_context_only_at_tokens(argument_text)
+            text_tokens = (
+                _extract_schema_argument_tokens(argument_text, schema)
+                if argument_text
+                else []
+            ) or _parse_argument_tokens(argument_text)
         allow_at = schema.allow_at
-        if allow_at is False:
+        if allow_at is False or (schema.requires_to_me and allow_at is not True):
             at_tokens = []
 
         if schema.image_max is not None:
@@ -1951,6 +2073,8 @@ def _compose_skill_command(
             schema=schema,
         )
     argument_text = _strip_skill_terms(argument_text, skill)
+    if schema is not None and schema.requires_to_me and schema.allow_at is not True:
+        argument_text = _strip_context_only_at_tokens(argument_text)
 
     best_schema = _select_payload_schema(
         skill,
@@ -2063,114 +2187,31 @@ def match_skill_command_fast(
 ) -> tuple[str, str, str] | None:
     registry = get_skill_registry(knowledge_base)
     normalized, stripped, lowered, _ = _prepare_query(query)
-    message_role = infer_message_action_role(normalized)
     if not normalized:
         return None
 
     is_usage = is_usage_question(normalized)
-    query_families = infer_query_families(normalized)
-    best: tuple[int, float, SkillSpec, str] | None = None
-    for skill in registry.skills:
-        pool = skill.helper_commands if is_usage else skill.action_commands
-        if not pool:
-            pool = skill.commands
-        pool_values: list[str] = []
-        for command in pool:
-            normalized_command = normalize_message_text(command)
-            if normalized_command and normalized_command not in pool_values:
-                pool_values.append(normalized_command)
-        for alias in skill.aliases:
-            normalized_alias = normalize_message_text(alias)
-            if normalized_alias and normalized_alias not in pool_values:
-                pool_values.append(normalized_alias)
-        alias_set = {
-            normalize_message_text(alias)
-            for alias in skill.aliases
-            if normalize_message_text(alias)
-        }
+    ranked = _rank_skills(
+        registry,
+        normalized,
+        include_usage=True,
+        include_similarity=True,
+    )
+    for candidate in ranked:
+        if candidate.score <= 0:
+            continue
+        if not candidate.exact_head_hit and candidate.score < 8.0:
+            continue
+        skill = candidate.skill
+        command = candidate.matched_command
+        # 快速路径必须有直接的命令匹配结果，不应通过 _pick_command_by_evidence
+        # 凭借弱信号（token 重叠、family 对齐等）凭空构造命令匹配
+        # 弱信号匹配应留给 skill_execute 的 ranked candidates 路径处理
+        if command is None:
+            continue
+        return (skill.plugin_name, skill.plugin_module, command)
 
-        skill_family = infer_skill_family(
-            skill,
-            skill.commands,
-            skill.helper_commands,
-            skill.examples,
-        )
-
-        for command in pool_values:
-            normalized_command = command
-            schema = None
-            for current_schema in skill.command_schemas:
-                if normalize_message_text(current_schema.command) == normalized_command:
-                    schema = current_schema
-                    break
-                if any(
-                    normalize_message_text(alias) == normalized_command
-                    for alias in current_schema.aliases
-                ):
-                    schema = current_schema
-                    break
-            allow_sticky = bool(schema.allow_sticky_arg) if schema is not None else False
-            score = 0.0
-            head_priority = -1
-            if match_command_head_canonical(stripped, command) or match_command_head_canonical(
-                normalized, command
-            ):
-                head_priority = 3
-                score += 120.0 + len(command)
-            elif match_command_head(stripped, command):
-                head_priority = 2
-                score += 100.0 + len(command)
-            elif match_command_head(normalized, command):
-                head_priority = 2
-                score += 85.0 + len(command)
-            elif match_command_head_or_sticky(
-                stripped,
-                command,
-                allow_sticky=allow_sticky,
-            ):
-                head_priority = 1
-                score += 72.0 + len(command)
-            elif match_command_head_or_sticky(
-                normalized,
-                command,
-                allow_sticky=allow_sticky,
-            ):
-                head_priority = 1
-                score += 60.0 + len(command)
-            elif _match_short_noisy_head(stripped, command) or _match_short_noisy_head(
-                normalized,
-                command,
-            ):
-                head_priority = 2
-                score += 78.0 + len(command)
-            elif len(command) >= 2 and command.lower() in lowered:
-                head_priority = 0
-                score += 30.0 + len(command) * 0.1
-            else:
-                continue
-            if command in alias_set:
-                score += 1.0
-            command_role = infer_command_role(command, family=skill_family)
-            score += _command_role_alignment_bonus(message_role, command_role)
-            score += _family_alignment_bonus(
-                skill_family,
-                query_families,
-                normalized_query=normalized,
-                commands=skill.commands,
-                aliases=skill.aliases,
-            )
-            if score <= 0:
-                continue
-            candidate = (head_priority, score, skill, command)
-            if best is None or candidate[:2] > best[:2]:
-                best = candidate
-
-    if best is None:
-        return None
-    if best[1] < 8.0:
-        return None
-    _, _, skill, command = best
-    return (skill.plugin_name, skill.plugin_module, command)
+    return None
 
 
 def skill_search(
@@ -2277,12 +2318,23 @@ def skill_execute(
         if template_keyword and template_keyword in skill.commands:
             command_head = template_keyword
         if command_head is None:
-            command_head = _pick_command_by_evidence(
-                skill,
-                message_text=message_text,
-                prefer_helper=is_usage,
-                allow_fallback=index == 0,
+            # 当没有直接的命令文本匹配时，通过 _pick_command_by_evidence 推测命令。
+            # 但要求候选项至少有一个强信号（名称命中、精确头部匹配、或行内命中），
+            # 否则纯粹靠 token 重叠 / 弱信号推测出的命令会导致
+            # 会话式消息（如"你好呀"）被错误路由到不相关的插件。
+            has_direct_evidence = (
+                candidate.exact_head_hit
+                or candidate.name_hit
+                or candidate.inline_hit_count > 0
+                or candidate.alias_hit_count > 0
             )
+            if has_direct_evidence:
+                command_head = _pick_command_by_evidence(
+                    skill,
+                    message_text=message_text,
+                    prefer_helper=is_usage,
+                    allow_fallback=index == 0,
+                )
             if template_keyword and template_keyword in skill.commands:
                 command_head = template_keyword
 
@@ -2372,6 +2424,12 @@ def _render_command_schema(schema: SkillCommandSchema) -> dict:
         result["target_requirement"] = schema.target_requirement
     if schema.target_sources:
         result["target_sources"] = list(schema.target_sources)
+    if schema.requires_reply:
+        result["requires_reply"] = True
+    if schema.requires_private:
+        result["requires_private"] = True
+    if schema.requires_to_me:
+        result["requires_to_me"] = True
     if schema.allow_sticky_arg:
         result["allow_sticky_arg"] = True
     return result

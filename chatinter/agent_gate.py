@@ -63,10 +63,9 @@ def decide_agent_gate(
         return AgentGateDecision(False, "config_disabled")
 
     if intent.kind == "chat":
+        if intent.chat_subkind in _AGENT_BLOCK_CHAT_SUBKINDS:
+            return AgentGateDecision(False, f"chat_subkind:{intent.chat_subkind}")
         return AgentGateDecision(False, "chat_fast_path")
-
-    if intent.chat_subkind in _AGENT_BLOCK_CHAT_SUBKINDS:
-        return AgentGateDecision(False, f"chat_subkind:{intent.chat_subkind}")
 
     if intent.explicit_command or intent.command_head or intent.plugin_module:
         return AgentGateDecision(False, "plugin_routing_preferred")

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from .config import LLM_VERIFY_ALL_ROUTES
 from .intent_classifier import IntentClassification
 from .route_text import (
     ROUTE_ACTION_WORDS,
@@ -162,6 +163,21 @@ def is_canonical_standard_command_head(
     return match_command_head_canonical(normalized_message, command_head)
 
 
+def _is_pure_command_message(message_text: str, route_command: str) -> bool:
+    """Check if the message is exactly the command head with no trailing text.
+
+    Returns True when the user typed just the command word (e.g. "签到"),
+    meaning there is zero ambiguity and LLM verification can be skipped.
+    """
+    stripped = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    )
+    cmd_head = _route_command_head(route_command)
+    if not stripped or not cmd_head:
+        return False
+    return stripped.casefold() == cmd_head.casefold()
+
+
 def is_route_action_compatible(message_text: str, route_command: str) -> bool:
     message_role = infer_message_action_role(message_text)
     route_role = infer_route_action_role(route_command)
@@ -218,6 +234,13 @@ def decide_route_policy(
             message_role=message_role,
         )
 
+    if intent_profile.reason == "weak_route_signal":
+        return RoutePolicyDecision(
+            action="chat",
+            reason="weak_route_signal_chat",
+            message_role=message_role,
+        )
+
     if shortlist_route_result is not None:
         route_command = str(shortlist_route_result.decision.command or "")
         route_role = infer_route_action_role(route_command)
@@ -254,6 +277,15 @@ def decide_route_policy(
                         message_role=message_role,
                         route_role=route_role,
                     )
+                if LLM_VERIFY_ALL_ROUTES and not _is_pure_command_message(
+                    message_text, route_command
+                ):
+                    return RoutePolicyDecision(
+                        action="align",
+                        reason="llm_verify_canonical_route",
+                        message_role=message_role,
+                        route_role=route_role,
+                    )
                 return RoutePolicyDecision(
                     action="direct",
                     reason="shortlist_canonical_direct",
@@ -287,6 +319,15 @@ def decide_route_policy(
             return RoutePolicyDecision(
                 action="usage",
                 reason="shortlist_create_needs_usage",
+                message_role=message_role,
+                route_role=route_role,
+            )
+        if LLM_VERIFY_ALL_ROUTES and not _is_pure_command_message(
+            message_text, route_command
+        ):
+            return RoutePolicyDecision(
+                action="align",
+                reason="llm_verify_shortlist_route",
                 message_role=message_role,
                 route_role=route_role,
             )

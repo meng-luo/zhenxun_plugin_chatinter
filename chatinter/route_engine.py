@@ -16,6 +16,7 @@ from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .prompt_guard import guard_prompt_sections
 from .route_text import (
     collect_placeholders,
+    collect_weak_route_signals,
     contains_any,
     is_usage_question,
     match_command_head_or_sticky,
@@ -35,7 +36,6 @@ from .skill_registry import (
     _message_has_payload_signals,
     get_skill_registry,
     infer_query_family,
-    infer_query_families,
     render_skill_namespace,
     select_relevant_skills,
     skill_execute,
@@ -45,21 +45,50 @@ from .turn_runtime import TurnBudgetController
 
 _ROUTE_NAMESPACE_LIMIT = 12
 _ROUTE_PLUGIN_SHORTLIST_LIMIT = 8
-_SHORTLIST_ALIGNMENT_INSTRUCTION = """
+_WEAK_SIGNAL_SHORTLIST_LIMIT = 5
+_SHORTLIST_ALIGNMENT_INSTRUCTION = """\
 你是 ChatInter 的 shortlist 对齐器。
 给你的不是全库，而是当前消息最可能命中的少量插件卡片。
 你的任务只有三种：
-1. route：明显是在调用插件，并且已经能确定插件与插件内命令。
+1. route：用户明确想要调用插件功能（发命令、请求操作、生成内容等）。
 2. usage：明显有插件调用意图，但参数、图片、目标或上下文不够，适合返回插件用法。
-3. skip：更像普通聊天，或者仍然无法可靠判断。
+3. skip：更像普通聊天、讨论、吐槽、闲聊，或者仍然无法可靠判断。
+
+假阳性防护（最重要）：
+很多插件命令名是日常汉语词汇（如 无语、需要、震惊、禁止、控制、翻译、签到、垃圾、一起、远离 等）。
+当这些词出现在自然对话语境中时，绝对不能路由到插件。
+
+判断标准：
+- 用户是在"使用"功能（想让 bot 执行操作），还是只是"提到/谈论"了这个词？
+- 命令词后面跟着自然语句（聊天、讨论、吐槽、陈述）-> skip
+- 命令词后面跟着该命令的合理参数/目标（如"翻译 hello"）-> route
+- 用户在讨论某功能/工具但不是要求执行（如"签到功能好用吗""翻译软件用哪个好"）-> skip
+- 命令词嵌在更长的句子中间、不在句首控制位 -> skip
 
 严格遵守：
 1. 只能从 skills_json 里选择 plugin_module 与 command。
 2. command 只能填命令头，不要把数字、文本、[@...]、[image] 拼进去；本地会绑定显式参数。
 3. 不要臆造当前消息里不存在的参数、目标或图片。
-4. “怎么用/帮助/用法/参数/说明”优先 usage。
+4. "怎么用/帮助/用法/参数/说明"优先 usage。
 5. 对红包、查询、搜索、今日类命令，优先依据动作词和时间词选择插件内正确动作。
 6. 无法可靠判断时返回 skip。
+7. 宁可 skip 也不要误路由——假阳性比漏路由更严重。""".strip()
+_WEAK_SIGNAL_ALIGNMENT_INSTRUCTION = """
+你是 ChatInter 的弱词歧义判别器。
+输入里只有少量弱词，没有明确命令头时，才使用你。
+你的任务只有四类：
+1. chat：普通聊天、解释、讨论、反问，或者不应进入插件。
+2. usage：明显是在问某个插件或功能怎么用，但当前输入还缺上下文、参数、reply、图片或目标。
+3. execute：在给定 shortlist 中已经能确定插件与命令，并且输入足够执行。
+4. ambiguous：介于 usage 和 execute 之间，或者锚点还不稳。
+
+严格遵守：
+1. 只能从 cards_json 里选择 plugin_module 与 command。
+2. 不要发明插件、命令或参数。
+3. 如果没有明确插件锚点，优先 chat。
+4. 如果只是弱词泛问，没有足够插件锚点，也优先 chat。
+5. usage 只在明显是在问插件用法时返回。
+6. execute 只能在 shortlist 内且语义足够明确时返回。
 """.strip()
 _TOOL_ROUTE_INSTRUCTION = """
 你是 ChatInter 的工具式路由规划器。
@@ -69,7 +98,7 @@ _TOOL_ROUTE_INSTRUCTION = """
 2. text 只填额外纯文本，不要重复命令头、[@...]、[image]、reply。
 3. 命令不需要文本参数时不要传 text。
 4. 像普通对话、闲聊、澄清或把握不足时，直接回复 SKIP。
-5. “怎么用/用法/帮助/参数”类问题优先帮助型命令，不要误调用业务动作命令。
+5. "怎么用/用法/帮助/参数"类问题优先帮助型命令，不要误调用业务动作命令。
 """.strip()
 _JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _AT_PLACEHOLDER_PATTERN = re.compile(r"\[@\d{5,20}\]")
@@ -186,6 +215,28 @@ class _ShortlistAlignmentDecision(BaseModel):
     command: str | None = Field(
         default=None,
         description="命令头，不要带参数、[@...]、[image]",
+    )
+
+
+class _WeakSignalDecision(BaseModel):
+    action: Literal["chat", "usage", "execute", "ambiguous"] = Field(
+        default="chat",
+        description="chat=普通聊天；usage=插件用法；execute=直接执行；ambiguous=介于两者之间",
+    )
+    plugin_module: str | None = Field(
+        default=None,
+        description="目标插件模块，必须来自 cards_json",
+    )
+    plugin_name: str | None = Field(default=None, description="目标插件名称，可选")
+    command: str | None = Field(
+        default=None,
+        description="命令头，不要带参数、[@...]、[image]",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str | None = Field(default=None, description="简短原因")
+    missing_context: list[str] = Field(
+        default_factory=list,
+        description="缺失的上下文，例如 at/image/reply/target/参数",
     )
 
 
@@ -603,6 +654,7 @@ def _build_shortlist_alignment_prompt(
     knowledge_base: PluginKnowledgeBase,
     local_hint: RouteResolveResult | None,
     entity_hint: RouteResolveResult | None,
+    has_reply: bool,
 ) -> str:
     skills_json = render_skill_namespace(
         knowledge_base,
@@ -624,6 +676,7 @@ def _build_shortlist_alignment_prompt(
         "numbers": _extract_alignment_numbers(message_text),
         "has_at": bool(_AT_PLACEHOLDER_PATTERN.search(message_text) or _AT_INLINE_PATTERN.search(message_text)),
         "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
+        "has_reply": has_reply,
         "is_usage_question": is_usage_question(message_text),
         "message_role": infer_message_action_role(message_text),
         "local_hint": {
@@ -650,6 +703,65 @@ def _build_shortlist_alignment_prompt(
     )
 
 
+def _build_weak_signal_alignment_prompt(
+    *,
+    message_text: str,
+    original_message_text: str | None,
+    knowledge_base: PluginKnowledgeBase,
+    has_at: bool,
+    has_image: bool,
+    has_reply: bool,
+    is_private: bool,
+) -> str:
+    normalized_message = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    )
+    weak_tags = list(collect_weak_route_signals(normalized_message))
+    shortlist_limit = max(_WEAK_SIGNAL_SHORTLIST_LIMIT, 1)
+    registry = get_skill_registry(knowledge_base)
+    selected_skills = list(
+        select_relevant_skills(
+            registry,
+            normalized_message,
+            limit=shortlist_limit,
+        )
+    )
+    preferred_modules = [
+        normalize_message_text(skill.plugin_module)
+        for skill in selected_skills
+        if normalize_message_text(skill.plugin_module)
+    ]
+    cards_json = render_skill_namespace(
+        knowledge_base,
+        query=normalized_message,
+        limit=shortlist_limit,
+        preferred_modules=preferred_modules,
+        include_helpers=True,
+        mask_module=False,
+    )
+    signal_payload = {
+        "original_text": original_message_text or message_text,
+        "normalized_text": normalized_message,
+        "weak_tags": weak_tags,
+        "context": {
+            "has_at": has_at,
+            "has_image": has_image,
+            "has_reply": has_reply,
+            "is_private": is_private,
+            "message_role": infer_message_action_role(normalized_message),
+        },
+        "shortlist_modules": preferred_modules,
+    }
+    return (
+        f"用户原文:\n{original_message_text or message_text}\n\n"
+        f"归一化文本:\n{normalized_message}\n\n"
+        f"弱词标签 JSON:\n{json.dumps(signal_payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "候选插件卡片 JSON:\n"
+        f"{cards_json}\n\n"
+        "只基于上述 cards_json 判定 chat / usage / execute / ambiguous。"
+    )
+
+
 def _subset_knowledge_base_by_modules(
     knowledge_base: PluginKnowledgeBase,
     modules: list[str],
@@ -671,6 +783,19 @@ def _subset_knowledge_base_by_modules(
     if not plugins:
         return knowledge_base
     return PluginKnowledgeBase(plugins=plugins, user_role=knowledge_base.user_role)
+
+
+def _has_strong_shortlist_entity_signal(entity_tokens: tuple[str, ...]) -> bool:
+    if not entity_tokens:
+        return False
+    if len(entity_tokens) >= 2:
+        return True
+    token = entity_tokens[0].strip()
+    if not token:
+        return False
+    if any(char.isascii() for char in token):
+        return len(token) >= 5
+    return len(token) >= 4
 
 
 def _extract_shortlist_entity_tokens(message_text: str) -> tuple[str, ...]:
@@ -746,11 +871,8 @@ def _build_shortlist_knowledge_base(
             limit=shortlist_limit,
         )
     )
-    query_families = infer_query_families(message_text)
     entity_tokens = _extract_shortlist_entity_tokens(message_text)
-    enable_entity_enrichment = any(family != "general" for family in query_families) or (
-        entity_tokens and _looks_like_compact_route_query(message_text)
-    )
+    enable_entity_enrichment = _has_strong_shortlist_entity_signal(entity_tokens)
     if enable_entity_enrichment and entity_tokens:
         entity_skills = [
             skill
@@ -805,7 +927,7 @@ def _resolve_shortlist_entity_route(
     knowledge_base: PluginKnowledgeBase,
 ) -> RouteResolveResult | None:
     entity_tokens = _extract_shortlist_entity_tokens(message_text)
-    if not entity_tokens:
+    if not _has_strong_shortlist_entity_signal(entity_tokens):
         return None
 
     query_family = infer_query_family(message_text)
@@ -813,71 +935,54 @@ def _resolve_shortlist_entity_route(
     registry = get_skill_registry(knowledge_base)
 
     best_skill: Any | None = None
+    best_command: str | None = None
     best_score = 0.0
     for skill in registry.skills:
-        haystack = normalize_message_text(
-            " ".join(
-                [
-                    skill.plugin_name,
-                    skill.plugin_module,
-                    " ".join(skill.commands),
-                    " ".join(skill.aliases),
-                    " ".join(skill.examples),
-                    skill.usage or "",
-                ]
-            )
-        ).lower()
-        if not haystack:
+        command_pool: list[str] = []
+        for command in [*skill.commands, *skill.aliases]:
+            normalized_command = normalize_message_text(command)
+            if normalized_command and normalized_command not in command_pool:
+                command_pool.append(normalized_command)
+        if not command_pool:
             continue
-        matched = [token for token in entity_tokens if token in haystack]
-        if not matched:
+
+        skill_best_score = 0.0
+        skill_best_command: str | None = None
+        for candidate in command_pool:
+            candidate_lower = candidate.lower()
+            matched = [token for token in entity_tokens if token and token in candidate_lower]
+            if not matched:
+                continue
+            score = len(matched) * 10.0 + max(len(token) for token in matched)
+            if candidate_lower == normalized:
+                score += 24.0
+            elif candidate_lower.startswith(normalized) or normalized.startswith(candidate_lower):
+                score += 10.0
+            if len(candidate_lower) <= len(normalized):
+                score += 2.0
+            if query_family == "search":
+                score += 2.0
+            if score > skill_best_score:
+                skill_best_score = score
+                skill_best_command = candidate
+
+        if skill_best_command is None:
             continue
-        score = max(len(token) for token in matched) * 10.0 + len(matched)
-        if query_family == "search":
-            score += 4.0
-        if score > best_score:
-            best_score = score
+        if skill_best_score > best_score:
+            best_score = skill_best_score
             best_skill = skill
+            best_command = skill_best_command
 
     if best_skill is None:
         return None
-
-    command_pool: list[str] = []
-    for command in [*best_skill.commands, *best_skill.aliases]:
-        normalized_command = normalize_message_text(command)
-        if normalized_command and normalized_command not in command_pool:
-            command_pool.append(normalized_command)
-
-    if not command_pool:
+    if best_command is None:
         return None
-
-    chosen_command: str | None = None
-    if query_family == "search":
-        if "抽" in normalized:
-            for candidate in command_pool:
-                if any(token in candidate for token in ("今天", "今日", "本日", "当日")):
-                    chosen_command = candidate
-                    break
-        if chosen_command is None and any(token in normalized for token in ("找", "搜", "查", "查询")):
-            for candidate in command_pool:
-                if any(token in candidate for token in ("找", "搜", "查")):
-                    chosen_command = candidate
-                    break
-
-    if chosen_command is None:
-        for candidate in command_pool:
-            if any(token in candidate for token in entity_tokens):
-                chosen_command = candidate
-                break
-
-    if chosen_command is None:
-        chosen_command = command_pool[0]
 
     return RouteResolveResult(
         decision=SkillRouteDecision(
             plugin_name=best_skill.plugin_name,
             plugin_module=best_skill.plugin_module,
-            command=chosen_command,
+            command=best_command,
             source="shortlist_entity",
             skill_kind=best_skill.kind,
         ),
@@ -1048,12 +1153,51 @@ async def _request_shortlist_alignment_decision(
         return None
 
 
+async def _request_weak_signal_decision(
+    *,
+    prompt: str,
+    timeout_value: float | None,
+    session_key: str,
+    budget_controller: TurnBudgetController | None,
+) -> _WeakSignalDecision | None:
+    try:
+        if budget_controller is not None and not budget_controller.allow_classifier(
+            "weak_signal_align"
+        ):
+            return None
+        started = time.perf_counter()
+        guarded = guard_prompt_sections(
+            session_key=session_key,
+            stage="weak_signal_align",
+            system_prompt=_WEAK_SIGNAL_ALIGNMENT_INSTRUCTION,
+            user_text=prompt,
+            controller=budget_controller,
+        )
+        decision = await generate_structured(
+            guarded.user_text,
+            _WeakSignalDecision,
+            model=get_model_name(),
+            instruction=guarded.system_prompt,
+            timeout=timeout_value,
+        )
+        if budget_controller is not None:
+            budget_controller.record_classifier(
+                "weak_signal_align",
+                time.perf_counter() - started,
+            )
+        return decision
+    except Exception as exc:
+        logger.debug(f"ChatInter 弱词对齐失败: {exc}")
+        return None
+
+
 async def resolve_shortlist_alignment(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
     *,
     session_key: str | None = None,
     budget_controller: TurnBudgetController | None = None,
+    has_reply: bool = False,
 ) -> tuple[_ShortlistAlignmentDecision | None, RouteResolveResult | None, RouteAttemptReport]:
     normalized_message = normalize_message_text(message_text)
     report = RouteAttemptReport(helper_mode=is_usage_question(normalized_message))
@@ -1101,6 +1245,7 @@ async def resolve_shortlist_alignment(
         knowledge_base=attempt_kb,
         local_hint=local_hint,
         entity_hint=entity_hint,
+        has_reply=has_reply,
     )
     decision = await _request_shortlist_alignment_decision(
         prompt=prompt,
@@ -1209,12 +1354,126 @@ async def resolve_shortlist_alignment(
     )
 
 
+async def resolve_weak_signal_intent(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    original_message_text: str | None = None,
+    has_at: bool = False,
+    has_image: bool = False,
+    has_reply: bool = False,
+    is_private: bool = False,
+    session_key: str | None = None,
+    budget_controller: TurnBudgetController | None = None,
+) -> tuple[_WeakSignalDecision | None, RouteResolveResult | None, RouteAttemptReport]:
+    normalized_message = normalize_message_text(message_text)
+    weak_tags = collect_weak_route_signals(normalized_message)
+    report = RouteAttemptReport(helper_mode=bool(weak_tags))
+    if not normalized_message or not knowledge_base.plugins or not weak_tags:
+        report.finalize(reason="weak_signal_empty")
+        return None, None, report
+
+    timeout = get_config_value("INTENT_TIMEOUT", 20)
+    try:
+        timeout_value = float(timeout) if timeout else None
+    except (TypeError, ValueError):
+        timeout_value = None
+
+    shortlist_limit = max(_WEAK_SIGNAL_SHORTLIST_LIMIT, 1)
+    attempt_kb, shortlisted_modules = _build_shortlist_knowledge_base(
+        normalized_message,
+        knowledge_base,
+        limit=shortlist_limit,
+    )
+    report.candidate_total = len(knowledge_base.plugins)
+    report.lexical_candidates = len(attempt_kb.plugins)
+    report.direct_candidates = len(attempt_kb.plugins)
+    report.vector_candidates = 0
+    attempt_modules = shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT]
+    if not attempt_modules:
+        attempt_modules = [
+            normalize_message_text(plugin.module)
+            for plugin in attempt_kb.plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
+        ]
+    report.note_attempt(attempt_modules)
+
+    prompt = _build_weak_signal_alignment_prompt(
+        message_text=normalized_message,
+        original_message_text=original_message_text,
+        knowledge_base=attempt_kb,
+        has_at=has_at,
+        has_image=has_image,
+        has_reply=has_reply,
+        is_private=is_private,
+    )
+    decision = await _request_weak_signal_decision(
+        prompt=prompt,
+        timeout_value=timeout_value,
+        session_key=session_key or "global",
+        budget_controller=budget_controller,
+    )
+    if decision is None:
+        report.finalize(reason="weak_signal_miss")
+        return None, None, report
+
+    if decision.action in {"chat", "ambiguous"}:
+        report.finalize(
+            reason=f"weak_signal_{decision.action}",
+            stage="weak_signal_chat",
+        )
+        return decision, None, report
+
+    route_result = _to_route_result(
+        _LLMRouteDecision(
+            action="route",
+            plugin_module=decision.plugin_module,
+            plugin_name=decision.plugin_name,
+            command=decision.command,
+        ),
+        normalized_message,
+        attempt_kb,
+    )
+    if route_result is None:
+        report.finalize(reason="weak_signal_invalid")
+        return decision, None, report
+    if not is_route_action_compatible(
+        normalized_message,
+        route_result.decision.command,
+    ):
+        report.finalize(reason="weak_signal_incompatible")
+        return decision, None, report
+
+    stage_name = "weak_signal_usage" if decision.action == "usage" else "weak_signal_route"
+    report.finalize(
+        reason=f"weak_signal_{decision.action}",
+        stage=stage_name,
+        plugin_name=route_result.decision.plugin_name,
+        plugin_module=route_result.decision.plugin_module,
+        command=route_result.decision.command,
+    )
+    return (
+        decision,
+        RouteResolveResult(
+            decision=SkillRouteDecision(
+                plugin_name=route_result.decision.plugin_name,
+                plugin_module=route_result.decision.plugin_module,
+                command=route_result.decision.command,
+                source="weak_signal_llm",
+                skill_kind="weak_signal_llm",
+            ),
+            stage=stage_name,
+        ),
+        report,
+    )
+
+
 async def resolve_llm_align_route(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
     *,
     session_key: str | None = None,
     budget_controller: TurnBudgetController | None = None,
+    has_reply: bool = False,
 ) -> tuple[_ShortlistAlignmentDecision | None, RouteResolveResult | None, RouteAttemptReport]:
     """明确表达 ChatInter 的 LLM 对齐阶段。
 
@@ -1226,6 +1485,7 @@ async def resolve_llm_align_route(
         knowledge_base,
         session_key=session_key,
         budget_controller=budget_controller,
+        has_reply=has_reply,
     )
 
 
@@ -1233,6 +1493,7 @@ __all__ = [
     "RouteAttemptReport",
     "RouteResolveResult",
     "resolve_llm_align_route",
+    "resolve_weak_signal_intent",
     "probe_shortlist_route",
     "resolve_shortlist_alignment",
 ]

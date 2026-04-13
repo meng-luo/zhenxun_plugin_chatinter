@@ -45,9 +45,11 @@ def guard_prompt_sections(
         fingerprint=fingerprint,
     )
 
-    token_budget = (
-        controller.prompt_budget_remaining() if controller is not None else 0
-    ) or (controller.prompt_budget_tokens if controller is not None else 0) or 4000
+    if controller is not None:
+        remaining = controller.prompt_budget_remaining()
+        token_budget = remaining if remaining > 0 else max(int(controller.prompt_budget_tokens * 0.1), 200)
+    else:
+        token_budget = 4000
     soft_budget = max(int(token_budget * _SOFT_PROMPT_RATIO), 48)
     estimated = estimate_text_tokens(f"{system_text}\n{context_value}\n{user_value}")
     compacted = False
@@ -98,9 +100,11 @@ def compact_agent_messages(
             )
         return messages, False
 
-    token_budget = (
-        controller.prompt_budget_remaining() if controller is not None else 0
-    ) or (controller.prompt_budget_tokens if controller is not None else 0) or 4000
+    if controller is not None:
+        remaining = controller.prompt_budget_remaining()
+        token_budget = remaining if remaining > 0 else max(int(controller.prompt_budget_tokens * 0.1), 200)
+    else:
+        token_budget = 4000
     total_tokens = sum(_message_tokens(message) for message in messages)
     if total_tokens <= token_budget:
         if controller is not None:

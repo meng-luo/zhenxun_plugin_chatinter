@@ -220,9 +220,12 @@ async def reroute_to_plugin(
             )
             return False
 
+        rendered_plain_text = new_message.extract_plain_text()
         event_data["message"] = new_message
-        event_data["raw_message"] = command_text
-        event_data["plain_text"] = command_text
+        event_data["raw_message"] = rendered_plain_text
+        event_data["plain_text"] = rendered_plain_text
+        if getattr(event, "reply", None) is not None:
+            event_data["reply"] = getattr(event, "reply")
 
         if hasattr(bot, "self_id"):
             event_data["self_id"] = bot.self_id
@@ -375,7 +378,6 @@ def _build_reroute_message(
     has_explicit_at_token = False
     result = Message()
     cursor = 0
-
     for match in _REROUTE_TOKEN_PATTERN.finditer(command_text):
         if match.start() > cursor:
             result += MessageSegment.text(command_text[cursor : match.start()])
