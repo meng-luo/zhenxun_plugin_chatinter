@@ -23,34 +23,35 @@
 
 ## 📦 插件结构
 
-```
+```text
 chatinter/
-├── __init__.py              # 插件入口，定义响应器和元数据
-├── config.py                # 配置项定义和获取
-├── memory.py                # 聊天记忆管理（ChatMemory 类）
-├── agent_runner.py          # Agent 运行器（Tool Calling 循环）
-├── agent_tools.py           # Agent 工具集（安全执行、插件查询）
-├── chat_handler.py          # 聊天响应处理
-├── handler.py               # 主处理器（handle_fallback）
-├── plugin_registry.py       # 插件信息注册表
-├── tool_registry.py         # 工具注册表
-├── skill_registry.py        # 技能注册表
+├── __init__.py              # 插件入口、matcher 与超级用户命令
+├── config.py                # 配置读取与推理配置构建
+├── handler.py               # 主处理流程与意图分发
+├── chat_handler.py          # 对话回复生成
+├── memory.py                # 会话记忆与上下文构建
+├── intent_classifier.py     # 意图分类
 ├── route_engine.py          # 路由引擎
-├── knowledge_rag.py         # 知识库 RAG 检索
-├── retrieval.py             # 向量检索
-├── sandbox.py               # 沙箱执行环境
-├── runtime.py               # 运行时调度
+├── route_tool_planner.py    # 工具/命令规划
+├── route_policy.py          # 路由策略约束
+├── skill_registry.py        # 技能注册与命令归一化
+├── plugin_registry.py       # 插件发现与缓存
+├── agent_gate.py            # Agent 启用判定
+├── agent_runner.py          # Agent 工具调用循环
+├── tool_registry.py         # Tool 注册与暴露
+├── tool_orchestration.py    # 工具编排
+├── subagent_handoff.py      # 子代理交接逻辑
+├── knowledge_rag.py         # 知识检索服务
+├── retrieval.py             # 历史召回与检索辅助
+├── prompt_guard.py          # Prompt 安全护栏
 ├── lifecycle.py             # 生命周期钩子
-├── trace.py                 # 追踪模块
-├── data_source.py           # 导出模块（整合各子模块）
+├── trace.py                 # 追踪与调试
+├── turn_metrics.py          # 路由统计输出
 ├── models/
-│   ├── __init__.py          # 模型导出
-│   ├── chat_history.py      # 数据库模型
-│   └── pydantic_models.py   # Pydantic 结构化模型
+│   ├── chat_history.py      # 对话历史表
+│   └── pydantic_models.py   # 结构化数据模型
 └── utils/
-    ├── __init__.py          # 工具函数导出
-    ├── cache.py             # 缓存工具
-    ├── multimodal.py        # 多模态处理（图片提取）
+    ├── multimodal.py        # 多模态输入处理
     └── unimsg_utils.py      # UniMessage 工具函数
 ```
 
@@ -62,30 +63,16 @@ chatinter/
 |--------|------|--------|------|
 | `ENABLE_FALLBACK` | 是否启用 ChatInter 兜底对话能力 | `True` | bool |
 | `ENABLE_AGENT_MODE` | 是否启用 ChatInter Agent（工具调用）模式 | `True` | bool |
-| `INTENT_MODEL` | ChatInter 使用的模型名称 (格式: ProviderName/ModelName)，留空时复用 AI.DEFAULT_MODEL_NAME | `""` | str |
 | `INTENT_TIMEOUT` | ChatInter 推理超时时间（秒），<=0 时复用 AI.CLIENT_SETTINGS.timeout | `20` | int |
-| `AGENT_MAX_TOOL_STEPS` | Agent 工具调用最大迭代步数 | `4` | int |
-| `AGENT_TOTAL_TIMEOUT` | Agent 全链路预算秒数（0=自动跟随 INTENT_TIMEOUT） | `0` | int |
-| `AGENT_EXPAND_TOOLS_STEP` | Agent 第 N 轮后扩展到完整工具池 | `2` | int |
+| `AGENT_MAX_TOOL_STEPS` | Agent 工具调用最大迭代步数（复杂请求会自动小幅上调） | `4` | int |
 | `AGENT_TOOL_FAILURE_LIMIT` | 单工具连续失败达到阈值后自动熔断 | `2` | int |
 | `AGENT_FAILED_ROUND_LIMIT` | 连续失败回合阈值，达到后直接总结 | `2` | int |
-| `AGENT_STRICT_TOOL_SELECT` | 严格工具选择（无匹配时不回退全量工具） | `True` | bool |
-| `CONFIDENCE_THRESHOLD` | 插件意图置信度阈值，低于该值时降级为普通聊天 | `0.72` | float |
 | `CHAT_STYLE` | ChatInter 对话风格补充设定，留空使用默认风格 | `""` | str |
-| `CUSTOM_PROMPT` | ChatInter 自定义系统提示词补充 | `""` | str |
+| `CUSTOM_PROMPT` | ChatInter 自定义系统提示词补充，会追加到系统提示词末尾 | `""` | str |
 | `MCP_ENDPOINTS` | MCP 工具服务地址列表，使用英文逗号分隔 | `""` | str |
-| `REASONING_EFFORT` | 强制推理强度，可选 MEDIUM 或 HIGH | `"MEDIUM"` | str |
-| `HISTORY_RECALL_LIMIT` | 上下文中额外召回的历史相关对话片段数量 | `4` | int |
-| `HISTORY_RECALL_MIN_SCORE` | 历史片段召回最低相关度阈值（0-1） | `0.18` | float |
-| `HISTORY_RECALL_CANDIDATE_LIMIT` | 历史片段召回候选池大小 | `60` | int |
-| `GROUP_BACKGROUND_FETCH_MULTIPLIER` | 群聊背景候选抓取倍数 | `3` | int |
-| `GROUP_BACKGROUND_RELEVANT_LIMIT` | 群聊背景中按相关度补充的消息上限 | `3` | int |
-| `GROUP_BACKGROUND_MIN_SCORE` | 群聊背景相关补充的最低相关度阈值 | `0.16` | float |
-| `CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX` | 复杂问题自动放宽对话长度限制 | `True` | bool |
-| `ENABLE_CONTEXT_RELEVANCE_GATE` | 新话题与历史低关联时按单轮对话处理 | `True` | bool |
-| `CONTEXT_RELEVANCE_THRESHOLD` | 上下文关联阈值（0-1） | `0.11` | float |
-| `CONTEXT_RELEVANCE_SAMPLE_LIMIT` | 上下文关联评估采样条数 | `18` | int |
-| `CONTEXT_RELEVANCE_MIN_QUERY_TOKENS` | 触发上下文关联评估所需的最少查询关键词数量 | `1` | int |
+| `REASONING_EFFORT` | 强制推理强度，可选 `MEDIUM` 或 `HIGH`，留空表示不强制设置 | `"MEDIUM"` | str |
+
+> 说明：其余路由、上下文和历史召回阈值目前为插件内固定策略参数，不作为外部配置项暴露。
 
 ### 配置示例
 
@@ -93,9 +80,11 @@ chatinter/
 # configs.yml
 chatinter:
   ENABLE_FALLBACK: true
-  INTENT_MODEL: "Gemini/gemini-2.0-flash"
+  ENABLE_AGENT_MODE: true
   INTENT_TIMEOUT: 20
-  CONFIDENCE_THRESHOLD: 0.72
+  AGENT_MAX_TOOL_STEPS: 4
+  AGENT_TOOL_FAILURE_LIMIT: 2
+  AGENT_FAILED_ROUND_LIMIT: 2
   CHAT_STYLE: "活泼可爱"
   CUSTOM_PROMPT: ""
   MCP_ENDPOINTS: "http://127.0.0.1:9001,http://127.0.0.1:9002"
@@ -110,29 +99,35 @@ chatinter:
 
 1. 消息 `@` 了机器人
 2. 消息未被其他高优先级插件处理
+3. 私聊场景下当前消息为纯文本（回复消息允许，图片等非文本内容会被跳过）
 
 ### 超级用户命令
 
-```
-重置会话    # 重置当前会话历史（仅超级用户可用）
+```text
+重置会话        # 重置当前会话历史
+chatinter统计   # 查看最近路由统计
 ```
 
 ## 🏗️ 工作流程
 
-```
-用户消息 → 意图分析 → 判断意图类型
-                     ├── 插件调用 → 重路由到对应插件 → 执行命令 → 保存记忆 → 返回结果
-                     └── 普通聊天 → 构建上下文 → Agent 对话 → Tool Calling → 保存记忆 → 返回回复
+```text
+用户消息
+  → ChatInter 接管兜底消息
+  → 意图分析与路由候选筛选
+  → 按策略决定：插件命令 / 帮助 / 普通对话
+      ├── 插件命令：重写消息并交还给目标插件执行
+      └── 普通对话：构建上下文 → Agent / 普通聊天生成 → 保存记忆 → 返回回复
 ```
 
 ### Agent 能力
 
-ChatInter 1.1.0 引入了 Agent 框架，支持：
+ChatInter 当前支持：
 
 - **Tool Calling** - LLM 可调用工具获取实时信息
 - **插件查询** - 动态检索可用插件和命令
-- **安全执行** - 在沙箱中执行数学表达式和只读 Shell 命令
 - **MCP 集成** - 支持外部 MCP 工具服务
+- **失败熔断** - 工具连续失败后自动停用并总结
+- **子代理分流** - 针对复杂任务自动切换到子代理工作流
 
 ### 多模态支持
 
@@ -142,7 +137,7 @@ ChatInter 1.1.0 引入了 Agent 框架，支持：
 
 ### 待补全机制
 
-当用户发送的消息缺少必要信息时（如需要图片但未提供），ChatInter 会提示用户补充并等待后续消息。
+当用户发送的消息缺少必要信息时（如需要图片但未提供，或执行命令缺少关键参数），ChatInter 会提示用户补充并等待后续消息。
 
 ## 🗄️ 数据库
 
@@ -150,15 +145,16 @@ ChatInter 使用 `ChatInterChatHistory` 模型持久化存储对话历史：
 
 ```python
 class ChatInterChatHistory(Model):
-    id: int = Field(pk=True, auto_increment=True)
-    user_id: str
-    group_id: str | None
-    nickname: str
-    user_message: str
-    ai_response: str
-    timestamp: datetime
-    bot_id: str | None
-    session_reset: bool = False
+    id = fields.IntField(pk=True, generated=True, auto_increment=True)
+    session_id = fields.CharField(255, index=True)
+    user_id = fields.CharField(255)
+    group_id = fields.CharField(255, null=True)
+    nickname = fields.CharField(255)
+    user_message = fields.TextField()
+    ai_response = fields.TextField(null=True)
+    bot_id = fields.CharField(255, null=True)
+    create_time = fields.DatetimeField(auto_now_add=True, index=True)
+    reset = fields.BooleanField(default=False, index=True)
 ```
 
 ## 🎨 效果图
@@ -166,6 +162,13 @@ class ChatInterChatHistory(Model):
 ![example](docs_image/1.png)
 
 ## 🚀 更新日志
+
+### v1.3.0
+
+- 重构插件路由与命令抽取逻辑，增强意图识别稳定性
+- 新增插件调用对齐层，统一工具暴露与路由行为
+- 优化对话场景下的工具接入策略，减少幻觉与误触发
+- 兼容新版本体移除 `GroupInfoUser.nickname` 字段，避免运行时报错
 
 ### v1.2.1
 
