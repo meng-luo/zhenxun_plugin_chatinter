@@ -16,7 +16,7 @@ from zhenxun.utils.http_utils import AsyncHttpx
 
 
 async def extract_images_from_message(
-    raw_message: str | UniMessage,
+    raw_message: str | UniMessage | AdapterMessage,
 ) -> list[LLMContentPart]:
     """从消息中提取图片，转换为 LLM 可识别的 Base64 格式
 
@@ -69,7 +69,9 @@ def _safe_to_unimessage(raw_message) -> UniMessage | None:
     of_method = getattr(UniMessage, "of", None)
     if callable(of_method):
         try:
-            return of_method(raw_message)
+            value = of_method(raw_message)
+            if isinstance(value, UniMessage):
+                return value
         except Exception:
             pass
 
@@ -128,7 +130,7 @@ async def _process_image_segment(seg: Image) -> LLMContentPart | None:
 
     if getattr(seg, "path", None):
         try:
-            path = Path(seg.path)
+            path = Path(str(seg.path))
             if path.exists():
                 async with aiofiles.open(path, "rb") as f:
                     content = await f.read()

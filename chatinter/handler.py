@@ -32,46 +32,50 @@ from .chat_handler import (
 from .config import get_config_value, get_mcp_endpoints, get_model_name
 from .feedback_keys import (
     FEEDBACK_REASON_DIRECT_TARGET_REQUIRED as _FEEDBACK_REASON_DIRECT_TARGET_REQUIRED,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_FUZZY_CLARIFY as _FEEDBACK_REASON_FUZZY_CLARIFY,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_REROUTE_FAILED as _FEEDBACK_REASON_REROUTE_FAILED,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_ROUTE_SUCCESS as _FEEDBACK_REASON_ROUTE_SUCCESS,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_SELF_ONLY_BLOCKED as _FEEDBACK_REASON_SELF_ONLY_BLOCKED,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
 )
 from .intent_classifier import IntentClassification, classify_message_intent
+from .knowledge_rag import PluginRAGService
 from .memory import _chat_memory
 from .middleware import TurnMiddlewareState, get_middleware_manager
-from .knowledge_rag import PluginRAGService
 from .plugin_registry import (
     PluginRegistry,
     PluginSelectionContext,
     get_user_plugin_knowledge,
 )
-from .route_policy import (
-    decide_route_policy,
-    infer_message_action_role,
-)
 from .route_engine import (
     RouteAttemptReport,
     RouteResolveResult,
-    probe_shortlist_route,
-    resolve_weak_signal_intent,
-    resolve_llm_align_route,
+    resolve_llm_router,
 )
 from .route_text import (
     ROUTE_ACTION_WORDS,
-    contains_any,
     collect_placeholders,
-    collect_weak_route_signals,
+    contains_any,
     has_negative_route_intent,
     is_usage_question,
+    match_command_head_canonical,
     normalize_action_phrases,
     normalize_message_text,
-    match_command_head_canonical,
     parse_command_with_head,
     should_force_knowledge_refresh,
-    should_try_weak_llm_assist,
     strip_invoke_prefix,
 )
 from .schema_policy import (
@@ -79,13 +83,12 @@ from .schema_policy import (
     schema_allows_at,
     schema_is_self_only,
 )
-from .skill_registry import SkillRouteDecision
-from .skill_registry import _extract_explicit_value
-from .skill_registry import _extract_schema_argument_tokens
-from .skill_registry import _find_skill_by_identity
-from .skill_registry import _message_has_payload_signals
-from .skill_registry import get_skill_registry
-from .skill_registry import skill_search
+from .skill_registry import (
+    SkillRouteDecision,
+    _extract_explicit_value,
+    _extract_schema_argument_tokens,
+    _message_has_payload_signals,
+)
 from .trace import StageTrace
 from .turn_metrics import (
     build_turn_metrics_snapshot,
@@ -251,7 +254,6 @@ _ROUTE_CONTINUATION_FRAMES: dict[str, "RouteContinuationFrame"] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
 _NICKNAME_RESOLUTION_MEMORY_MAX = 2048
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
-_AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD = 10.0
 _ROUTE_CONTINUATION_FRAME_TTL = 10 * 60.0
 _ROUTE_CONTINUATION_FRAME_CACHE_MAX = 512
 _FOLLOWUP_REUSE_HINTS = (
@@ -290,18 +292,6 @@ _ALIGNMENT_NOISE_PREFIXES = {
     "bot",
     "机器人",
 }
-_CHAT_FAST_MATCH_QUESTION_HINTS = (
-    "什么",
-    "怎么",
-    "如何",
-    "怎样",
-    "为什么",
-    "多少",
-    "吗",
-    "嘛",
-    "呢",
-)
-_CHAT_FAST_MATCH_MAX_CHARS = 12
 
 
 @dataclass(frozen=True)
@@ -313,14 +303,6 @@ class RouteExecutionPlan:
     image_missing: int = 0
     text_missing: int = 0
     allow_at: bool | None = None
-
-
-@dataclass(frozen=True)
-class RouteGateDecision:
-    allowed: bool
-    reason: str
-    top_score: float = 0.0
-    fast_match: tuple[str, str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -371,46 +353,6 @@ def _log_turn_channels(envelope: TurnChannelEnvelope) -> None:
         logger.debug("[ChatInter][commentary] " + " | ".join(envelope.commentary))
 
 
-def _is_compact_chat_fast_match_message(
-    message_text: str,
-    knowledge_base,
-    fast_match: tuple[str, str, str] | None,
-) -> bool:
-    if fast_match is None:
-        return False
-    normalized = normalize_message_text(strip_invoke_prefix(message_text or ""))
-    if not normalized:
-        return False
-    compact = normalized.replace(" ", "")
-    if not compact or len(compact) > _CHAT_FAST_MATCH_MAX_CHARS:
-        return False
-    if contains_any(normalized, _CHAT_FAST_MATCH_QUESTION_HINTS):
-        return False
-    registry = get_skill_registry(knowledge_base)
-    skill = _find_skill_by_identity(
-        registry,
-        fast_match[0],
-        fast_match[1],
-    )
-    if skill is None:
-        return False
-    candidate_heads = [fast_match[2], *skill.commands, *skill.aliases]
-    compact_casefold = compact.casefold()
-    for candidate in candidate_heads:
-        candidate_compact = normalize_message_text(candidate).replace(" ", "").casefold()
-        if candidate_compact and compact_casefold == candidate_compact:
-            return True
-    for candidate in candidate_heads:
-        candidate_text = normalize_message_text(candidate)
-        if candidate_text and parse_command_with_head(
-            normalized,
-            candidate_text,
-            allow_sticky=True,
-        ):
-            return True
-    return False
-
-
 async def _persist_final_only_dialog(
     *,
     envelope: TurnChannelEnvelope,
@@ -452,122 +394,21 @@ def _build_route_notify_text(
     if not target:
         return _render(_CUTE_NOTIFY_TEMPLATES, target="处理一下", seed=seed_base)
 
-    is_meme_like = "meme" in (plugin_module or "").lower() or "表情" in (plugin_name or "")
+    is_meme_like = "meme" in (plugin_module or "").lower() or "表情" in (
+        plugin_name or ""
+    )
     if is_meme_like and "表情" not in target:
         if target in _MEME_HELPER_COMMANDS:
-            return _render(_CUTE_MEME_HELPER_TEMPLATES, target=target, seed=f"{seed_base}|helper")
-        return _render(_CUTE_MEME_NOTIFY_TEMPLATES, target=f"{target}表情", seed=f"{seed_base}|meme")
+            return _render(
+                _CUTE_MEME_HELPER_TEMPLATES, target=target, seed=f"{seed_base}|helper"
+            )
+        return _render(
+            _CUTE_MEME_NOTIFY_TEMPLATES,
+            target=f"{target}表情",
+            seed=f"{seed_base}|meme",
+        )
 
     return _render(_CUTE_NOTIFY_TEMPLATES, target=target, seed=f"{seed_base}|default")
-
-
-async def _build_dialogue_fast_reply(
-    *,
-    intent_profile: IntentClassification,
-    current_message: str,
-    group_id: str | None,
-    user_id: str,
-) -> str | None:
-    chat_subkind = str(getattr(intent_profile, "chat_subkind", "") or "general_chat")
-    target_hint = normalize_message_text(
-        getattr(intent_profile, "chat_target_hint", "") or ""
-    )
-    normalized_message = normalize_message_text(current_message or "")
-
-    if chat_subkind == "recap":
-        return await _chat_memory.build_recent_conversation_recap(
-            user_id=str(user_id),
-            group_id=group_id,
-            limit=4,
-        )
-
-    if chat_subkind == "identity_query":
-        if not target_hint:
-            return "你说的是谁呀？给我一点线索，或者直接@目标成员。"
-        if not group_id:
-            return f"你说的是 {target_hint} 吗？给我一点线索，我再帮你确认。"
-
-        remembered_user_id = _lookup_remembered_target(group_id, target_hint)
-        if remembered_user_id:
-            profiles = await _get_group_member_profiles_for_fuzzy(group_id)
-            remembered_profile = next(
-                (
-                    profile
-                    for profile in profiles
-                    if str(profile.get("user_id") or "").strip() == remembered_user_id
-                ),
-                None,
-            )
-            if remembered_profile is not None:
-                display_name = str(remembered_profile.get("display_name") or "").strip()
-                if display_name:
-                    _remember_target_resolution(group_id, target_hint, remembered_user_id)
-                    return f"你说的是 {display_name}(@{remembered_user_id}) 吧。"
-
-        profiles = await _get_group_member_profiles_for_fuzzy(group_id)
-        if not profiles:
-            return f"我暂时没找到 {target_hint}，你再给我一点线索，或者直接@他。"
-
-        active_scores = await _get_group_recent_active_scores(group_id)
-        matched, ambiguous_candidates, top_score = _pick_fuzzy_target_profile(
-            target_hint,
-            profiles,
-            active_scores,
-            trigger_strength="strong",
-        )
-        if ambiguous_candidates:
-            return _build_member_ambiguity_message(ambiguous_candidates)
-        if matched is None:
-            return f"我暂时没找到 {target_hint}，你再给我一点线索，或者直接@他。"
-
-        resolved_user_id = str(matched.get("user_id") or "").strip()
-        display_name = str(matched.get("display_name") or "").strip()
-        if not resolved_user_id.isdigit() or not display_name:
-            return None
-        if top_score >= 0.90:
-            _remember_target_resolution(group_id, target_hint, resolved_user_id)
-        return f"你说的是 {display_name}(@{resolved_user_id}) 吧。"
-
-    if chat_subkind == "memory_confirm":
-        mention_ids = sorted(_extract_mentioned_user_ids(normalized_message))
-        if group_id and target_hint and mention_ids:
-            resolved_user_id = mention_ids[0]
-            _remember_target_resolution(group_id, target_hint, resolved_user_id)
-            return f"好，我记住啦，以后就把{target_hint}认作这位。"
-
-        if group_id and target_hint:
-            profiles = await _get_group_member_profiles_for_fuzzy(group_id)
-            if profiles:
-                active_scores = await _get_group_recent_active_scores(group_id)
-                matched, ambiguous_candidates, _ = _pick_fuzzy_target_profile(
-                    target_hint,
-                    profiles,
-                    active_scores,
-                    trigger_strength="strong",
-                )
-                if ambiguous_candidates:
-                    return _build_member_ambiguity_message(ambiguous_candidates)
-                if matched is not None:
-                    resolved_user_id = str(matched.get("user_id") or "").strip()
-                    display_name = str(matched.get("display_name") or "").strip()
-                    if resolved_user_id.isdigit() and display_name:
-                        _remember_target_resolution(
-                            group_id,
-                            target_hint,
-                            resolved_user_id,
-                        )
-                        return f"好，我记住啦，以后就把{target_hint}认作{display_name}。"
-
-        if target_hint:
-            return f"好，我记住啦，以后我会记住{target_hint}。"
-        if mention_ids:
-            return "好，我记住啦。"
-        return "好，我记住啦。"
-
-    if chat_subkind == "explain_context":
-        return None
-
-    return None
 
 
 def _is_already_handled(event: Event) -> bool:
@@ -590,14 +431,12 @@ def _mark_as_handled(event: Event):
 
 def _get_nickname(session: Uninfo) -> str:
     """获取用户昵称"""
-    if (
-        session.user
-        and hasattr(session.user, "display_name")
-        and session.user.display_name
-    ):
-        return session.user.display_name
-    if session.user and hasattr(session.user, "name") and session.user.name:
-        return session.user.name
+    display_name = str(getattr(session.user, "display_name", "") or "").strip()
+    if display_name:
+        return display_name
+    name = str(getattr(session.user, "name", "") or "").strip()
+    if name:
+        return name
     return "用户"
 
 
@@ -662,9 +501,9 @@ def _build_mention_name_map(
 ) -> dict[str, str]:
     mention_name_map: dict[str, str] = {}
     for user_id, profile in mention_profiles.items():
-        nickname = (
-            str(profile.get("display_name") or profile.get("nickname") or "").strip()
-        )
+        nickname = str(
+            profile.get("display_name") or profile.get("nickname") or ""
+        ).strip()
         if nickname:
             mention_name_map[user_id] = nickname
     return mention_name_map
@@ -882,9 +721,10 @@ def _remember_target_resolution(
     normalized_hint = _normalize_alias_key(target_hint)
     if not normalized_hint or not str(user_id).isdigit():
         return
-    _NICKNAME_RESOLUTION_MEMORY[
-        _resolution_memory_key(group_id, target_hint)
-    ] = (time.monotonic(), str(user_id))
+    _NICKNAME_RESOLUTION_MEMORY[_resolution_memory_key(group_id, target_hint)] = (
+        time.monotonic(),
+        str(user_id),
+    )
     if len(_NICKNAME_RESOLUTION_MEMORY) > _NICKNAME_RESOLUTION_MEMORY_MAX:
         for _evict_key in sorted(
             _NICKNAME_RESOLUTION_MEMORY,
@@ -967,7 +807,9 @@ def _pick_fuzzy_target_profile(
             if (hint in alias_text or alias_text in hint) and min(
                 len(hint), len(alias_text)
             ) >= 4:
-                overlap = min(len(hint), len(alias_text)) / max(len(hint), len(alias_text))
+                overlap = min(len(hint), len(alias_text)) / max(
+                    len(hint), len(alias_text)
+                )
                 best_score = max(best_score, 0.85 + overlap * 0.12)
                 continue
             ratio = SequenceMatcher(None, hint, alias_text).ratio()
@@ -993,9 +835,10 @@ def _pick_fuzzy_target_profile(
         return top_profile, [], top_score
 
     second_score = ranked[1][0]
-    if top_score < ambiguous_top_threshold or (
-        top_score - second_score
-    ) < ambiguous_gap_threshold:
+    if (
+        top_score < ambiguous_top_threshold
+        or (top_score - second_score) < ambiguous_gap_threshold
+    ):
         candidates: list[dict[str, str | tuple[str, ...]]] = []
         for _, profile in ranked[:5]:
             display_name = str(profile.get("display_name") or "").strip()
@@ -1200,9 +1043,12 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
             policy = resolve_command_target_policy(meta)
             allow_at = policy.allow_at
             image_min = int(getattr(meta, "image_min", 0) or 0)
-            target_requirement = normalize_message_text(
-                str(getattr(meta, "target_requirement", "") or "")
-            ).lower() or "none"
+            target_requirement = (
+                normalize_message_text(
+                    str(getattr(meta, "target_requirement", "") or "")
+                ).lower()
+                or "none"
+            )
             allow_sticky_arg = bool(getattr(meta, "allow_sticky_arg", False))
             if (
                 not allow_at
@@ -1211,7 +1057,9 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
                 and not allow_sticky_arg
             ):
                 continue
-            command_text = normalize_message_text(str(getattr(meta, "command", "") or ""))
+            command_text = normalize_message_text(
+                str(getattr(meta, "command", "") or "")
+            )
             if command_text:
                 heads.add(normalize_message_text(command_text.split(" ", 1)[0]))
             for alias in getattr(meta, "aliases", None) or []:
@@ -1278,8 +1126,9 @@ def _iter_meta_aliases(meta) -> set[str]:
 
 def _is_public_command_meta(meta) -> bool:
     return (
-        normalize_message_text(str(getattr(meta, "access_level", "public") or "public"))
-        .lower()
+        normalize_message_text(
+            str(getattr(meta, "access_level", "public") or "public")
+        ).lower()
         == "public"
     )
 
@@ -1295,9 +1144,7 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
         if plugin.module == decision.plugin_module
     ]
     candidate_plugins = exact_module_plugins or [
-        plugin
-        for plugin in knowledge_plugins
-        if plugin.name == decision.plugin_name
+        plugin for plugin in knowledge_plugins if plugin.name == decision.plugin_name
     ]
     for plugin in candidate_plugins:
         plugin_aliases = {
@@ -1329,7 +1176,6 @@ def _is_route_command_executable(
     head = _normalize_head(decision.command)
     if not head:
         return False
-    head_fold = head.casefold()
 
     exact_module_plugins = [
         plugin
@@ -1337,9 +1183,7 @@ def _is_route_command_executable(
         if plugin.module == decision.plugin_module
     ]
     candidate_plugins = exact_module_plugins or [
-        plugin
-        for plugin in knowledge_plugins
-        if plugin.name == decision.plugin_name
+        plugin for plugin in knowledge_plugins if plugin.name == decision.plugin_name
     ]
     if not candidate_plugins:
         return False
@@ -1682,15 +1526,12 @@ def _build_route_message_with_explicit_context(
     if not normalized:
         return normalized
 
-    should_enrich = (
-        not is_usage_question(normalized)
-        and (
-            contains_any(normalized, ROUTE_ACTION_WORDS)
-            or contains_any(normalized, _FOLLOWUP_MEME_HINTS)
-            or "[image" in normalized
-            or "[@" in normalized
-            or _contains_reply_reference_hint(normalized)
-        )
+    should_enrich = not is_usage_question(normalized) and (
+        contains_any(normalized, ROUTE_ACTION_WORDS)
+        or contains_any(normalized, _FOLLOWUP_MEME_HINTS)
+        or "[image" in normalized
+        or "[@" in normalized
+        or _contains_reply_reference_hint(normalized)
     )
     if not should_enrich:
         return normalized
@@ -1732,7 +1573,11 @@ def _should_retry_intent_with_refreshed_knowledge(
         return False
 
     normalized = normalize_message_text(message_text or "")
-    if not normalized or is_usage_question(normalized) or has_negative_route_intent(normalized):
+    if (
+        not normalized
+        or is_usage_question(normalized)
+        or has_negative_route_intent(normalized)
+    ):
         return False
     if len(normalized) > 24:
         return False
@@ -1793,16 +1638,20 @@ async def _enrich_route_message_with_fuzzy_target(
             enriched_message = normalize_message_text(f"{route_message} [@{user_id}]")
             mention_profiles = dict(mention_profiles)
             mention_profiles[user_id] = {
-                "display_name": str(remembered_profile.get("display_name") or "").strip(),
+                "display_name": str(
+                    remembered_profile.get("display_name") or ""
+                ).strip(),
                 "nickname": str(remembered_profile.get("nickname") or "").strip(),
                 "user_name": str(remembered_profile.get("user_name") or "").strip(),
                 "uid": str(remembered_profile.get("uid") or "").strip(),
-                "platform": str(remembered_profile.get("platform") or "qq").strip() or "qq",
+                "platform": str(remembered_profile.get("platform") or "qq").strip()
+                or "qq",
                 "alias_key": str(remembered_profile.get("alias_key") or "").strip(),
             }
             logger.debug(
                 "ChatInter 昵称记忆命中: "
-                f"hint='{target_hint}' -> {mention_profiles[user_id].get('display_name')}(@{user_id})"
+                f"hint='{target_hint}' -> "
+                f"{mention_profiles[user_id].get('display_name')}(@{user_id})"
             )
             return enriched_message, mention_profiles, None
 
@@ -1844,7 +1693,8 @@ async def _enrich_route_message_with_fuzzy_target(
     }
     logger.debug(
         "ChatInter 昵称模糊映射命中: "
-        f"hint='{target_hint}' -> {mention_profiles[user_id].get('display_name')}(@{user_id})"
+        f"hint='{target_hint}' -> "
+        f"{mention_profiles[user_id].get('display_name')}(@{user_id})"
     )
     if top_score >= 0.90:
         _remember_target_resolution(group_id, target_hint, user_id)
@@ -1876,8 +1726,7 @@ def _build_reply_image_segments_for_reroute(
                 path = seg_data.get("file")
         preferred_file_id = (
             file_id
-            if file_id
-            and not file_id.startswith(("http://", "https://", "base64://"))
+            if file_id and not file_id.startswith(("http://", "https://", "base64://"))
             else ""
         )
         if preferred_file_id:
@@ -2148,7 +1997,7 @@ def _build_intent_clarification_message(intent: IntentClassification) -> str:
         return (
             "这句更像是在发起功能调用，但我还不能确定具体命令。"
             "请补齐命令、图片或@目标后重新发送完整命令。"
-    )
+        )
     return "这个请求还缺少关键信息，请补齐参数后重新发送完整命令。"
 
 
@@ -2219,7 +2068,10 @@ def _build_plugin_usage_fallback_message(
     intent_hint = "如果你是想调用这个插件，可以这样用："
     if is_usage_question(current_message):
         intent_hint = "这个插件的用法大致是："
-    lines = [intent_hint, f"{plugin_name}：{command_head or route_result.decision.command}"]
+    lines = [
+        intent_hint,
+        f"{plugin_name}：{command_head or route_result.decision.command}",
+    ]
     if usage_line:
         lines.append(f"用法：{usage_line}")
     if hints:
@@ -2227,151 +2079,6 @@ def _build_plugin_usage_fallback_message(
     if example_lines:
         lines.append("示例：" + " | ".join(example_lines[:2]))
     return "\n".join(line for line in lines if line)
-
-
-def _decide_route_gate(
-    *,
-    message_text: str,
-    knowledge_base,
-    intent_profile: IntentClassification,
-    shortlist_route_result: RouteResolveResult | None = None,
-) -> RouteGateDecision:
-    plugins = getattr(knowledge_base, "plugins", None) or []
-    if not plugins:
-        return RouteGateDecision(allowed=False, reason="empty_knowledge")
-
-    search_result = skill_search(
-        message_text,
-        knowledge_base,
-        include_usage=True,
-        include_similarity=True,
-    )
-    message_role = infer_message_action_role(message_text)
-    fast_match = search_result.fast_match
-    top_score = (
-        float(search_result.ranked_candidates[0].score)
-        if search_result.ranked_candidates
-        else 0.0
-    )
-
-    if shortlist_route_result is not None and intent_profile.kind == "ambiguous":
-        if message_role in {"create", "open", "return"}:
-            return RouteGateDecision(
-                allowed=True,
-                reason="shortlist_pre_gate",
-                top_score=0.0,
-                fast_match=shortlist_route_result.decision.command,
-            )
-        return RouteGateDecision(
-            allowed=False,
-            reason="ambiguous_low_score",
-            top_score=top_score,
-            fast_match=fast_match,
-        )
-
-    if intent_profile.kind in {"execute", "execute_need_arg", "help"}:
-        return RouteGateDecision(
-            allowed=True,
-            reason="strong_intent",
-            top_score=top_score,
-            fast_match=fast_match,
-        )
-
-    if intent_profile.kind == "ambiguous":
-        if message_role in {"create", "open", "return"} and top_score >= _AMBIGUOUS_ROUTE_GATE_SCORE_THRESHOLD:
-            return RouteGateDecision(
-                allowed=True,
-                reason="ambiguous_high_score",
-                top_score=top_score,
-                fast_match=fast_match,
-            )
-        return RouteGateDecision(
-            allowed=False,
-            reason="ambiguous_low_score",
-            top_score=top_score,
-            fast_match=fast_match,
-        )
-
-    if intent_profile.kind == "chat":
-        if fast_match is not None and _is_compact_chat_fast_match_message(
-            message_text,
-            knowledge_base,
-            fast_match,
-        ):
-            return RouteGateDecision(
-                allowed=True,
-                reason="chat_fast_match",
-                top_score=top_score,
-                fast_match=fast_match,
-            )
-        return RouteGateDecision(
-            allowed=False,
-            reason="chat_blocked",
-            top_score=top_score,
-            fast_match=fast_match,
-        )
-
-    return RouteGateDecision(
-        allowed=False,
-        reason="unsupported_intent",
-        top_score=top_score,
-        fast_match=fast_match,
-    )
-
-
-def _probe_route_before_gate(
-    *,
-    message_text: str,
-    knowledge_base,
-    intent_profile: IntentClassification,
-) -> tuple[RouteResolveResult | None, RouteAttemptReport | None, RouteGateDecision]:
-    """Keep shortlist/local parse ahead of the gate.
-
-    The gate may still block weak chat-like messages, but ambiguous plugin-looking
-    requests should first get one chance to resolve via shortlist/local parse.
-    """
-    pre_gate_route_result, pre_gate_route_report = probe_shortlist_route(
-        message_text,
-        knowledge_base,
-    )
-    route_gate = _decide_route_gate(
-        message_text=message_text,
-        knowledge_base=knowledge_base,
-        intent_profile=intent_profile,
-        shortlist_route_result=pre_gate_route_result,
-    )
-    return pre_gate_route_result, pre_gate_route_report, route_gate
-
-
-def _should_force_chat_by_intent_gate(
-    *,
-    route_result: RouteResolveResult,
-    intent_profile: IntentClassification,
-    knowledge_plugins,
-) -> bool:
-    if intent_profile.explicit_command:
-        return False
-    if intent_profile.kind != "chat":
-        return False
-    if intent_profile.confidence < 0.85:
-        return False
-    schema = _find_route_command_schema(route_result, knowledge_plugins)
-    if schema is None:
-        return intent_profile.reason in {
-            "no_route_signal",
-            "weak_route_signal",
-            "sticky_payload_looks_chat",
-            "negative_route_intent",
-            "technical_chat_request",
-        }
-    policy = resolve_command_target_policy(schema)
-    image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
-    text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
-    return (
-        policy.target_requirement == "required"
-        or image_min > 0
-        or text_min > 0
-    )
 
 
 def _is_image_related_route(route_result: RouteResolveResult) -> bool:
@@ -2507,20 +2214,33 @@ def _prepare_route_execution_plan(
     command_head = _normalize_head(command)
     if schema_head and command_head and schema_head != command_head:
         tail = normalize_message_text(command[len(command_head) :].strip())
-        command = normalize_message_text(f"{schema_head} {tail}".strip()) if tail else schema_head
+        command = (
+            normalize_message_text(f"{schema_head} {tail}".strip())
+            if tail
+            else schema_head
+        )
 
     existing_payload_tokens = set(_extract_command_payload_tokens(command))
     payload_tokens: list[str] = []
     explicit_value = normalize_message_text(_extract_explicit_value(current_message))
-    if explicit_value and (max(int(getattr(schema, "text_min", 0) or 0), 0) > 0 or getattr(schema, "params", None)):
+    if explicit_value and (
+        max(int(getattr(schema, "text_min", 0) or 0), 0) > 0
+        or getattr(schema, "params", None)
+    ):
         payload_tokens.extend(
             token
             for token in explicit_value.split(" ")
-            if token and token not in payload_tokens and token not in existing_payload_tokens
+            if token
+            and token not in payload_tokens
+            and token not in existing_payload_tokens
         )
     schema_tokens = _extract_schema_argument_tokens(current_message, schema)
     for token in schema_tokens:
-        if token and token not in payload_tokens and token not in existing_payload_tokens:
+        if (
+            token
+            and token not in payload_tokens
+            and token not in existing_payload_tokens
+        ):
             payload_tokens.append(token)
     if not payload_tokens and (
         max(int(getattr(schema, "text_min", 0) or 0), 0) > 0
@@ -2557,7 +2277,9 @@ def _prepare_route_execution_plan(
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
     target_requirement = (
-        normalize_message_text(str(getattr(schema, "target_requirement", "") or "")).lower()
+        normalize_message_text(
+            str(getattr(schema, "target_requirement", "") or "")
+        ).lower()
         or "none"
     )
     allow_at = schema_allows_at(schema)
@@ -2585,8 +2307,11 @@ def _prepare_route_execution_plan(
         if token not in merged_images:
             merged_images.append(token)
 
-    if image_min > 0 and allow_at and not merged_at and _contains_self_reference(
-        current_message
+    if (
+        image_min > 0
+        and allow_at
+        and not merged_at
+        and _contains_self_reference(current_message)
     ):
         self_at = f"[@{user_id}]"
         merged_at.append(self_at)
@@ -2669,9 +2394,7 @@ async def _execute_route_decision(
     finalize_callback=None,
 ) -> bool:
     decision = route_result.decision
-    route_head = normalize_message_text(
-        str(decision.command or "").split(" ", 1)[0]
-    )
+    route_head = normalize_message_text(str(decision.command or "").split(" ", 1)[0])
     trace.update_tags(
         path="plugin",
         route_stage=route_result.stage,
@@ -2701,7 +2424,9 @@ async def _execute_route_decision(
             knowledge_plugins=knowledge_plugins,
             current_message=current_message,
         )
-        envelope.add(ChannelName.COMMENTARY, "route downgraded to plugin usage guidance")
+        envelope.add(
+            ChannelName.COMMENTARY, "route downgraded to plugin usage guidance"
+        )
         envelope.add(ChannelName.FINAL, usage_text)
         _log_turn_channels(envelope)
         logger.info(
@@ -2751,7 +2476,9 @@ async def _execute_route_decision(
         return True
 
     route_command = execution_plan.command or decision.command
-    trace.set_tag("route_head", normalize_message_text(str(route_command).split(" ", 1)[0]))
+    trace.set_tag(
+        "route_head", normalize_message_text(str(route_command).split(" ", 1)[0])
+    )
     logger.info(
         "触发技能路由："
         f"stage={route_result.stage}, "
@@ -2849,6 +2576,8 @@ async def handle_fallback(
     返回:
         bool: 是否处理成功
     """
+    global _last_knowledge_refresh_ts
+
     if not get_config_value("ENABLE_FALLBACK", True):
         logger.debug("ChatInter 功能已禁用")
         return
@@ -2887,6 +2616,7 @@ async def handle_fallback(
     enriched_context_xml = ""
     route_report: RouteAttemptReport | None = None
     intent_profile: IntentClassification | None = None
+    router_force_pure_chat = False
     mention_name_map: dict[str, str] = {}
     mention_profiles: dict[str, dict[str, str]] = {}
     middleware_state = TurnMiddlewareState(
@@ -3007,7 +2737,11 @@ async def handle_fallback(
             reply_image_count=reply_image_count,
             reply_sender_id=reply_sender_id,
         )
-        route_message, mention_profiles, fuzzy_prompt = await _enrich_route_message_with_fuzzy_target(
+        (
+            route_message,
+            mention_profiles,
+            fuzzy_prompt,
+        ) = await _enrich_route_message_with_fuzzy_target(
             group_id=str(group_id) if group_id else None,
             original_message=current_message,
             route_message=route_message_base,
@@ -3026,11 +2760,7 @@ async def handle_fallback(
                 + ", ".join(
                     (
                         f"{mapped_user_id}->{profile.get('display_name')}"
-                        + (
-                            f"(uid:{profile.get('uid')})"
-                            if profile.get("uid")
-                            else ""
-                        )
+                        + (f"(uid:{profile.get('uid')})" if profile.get("uid") else "")
                     )
                     for mapped_user_id, profile in mention_profiles.items()
                 )
@@ -3122,7 +2852,6 @@ async def handle_fallback(
             selection_context=selection_context,
         )
 
-        global _last_knowledge_refresh_ts
         if should_force_knowledge_refresh(route_message, knowledge_base):
             now = time.monotonic()
             if now - _last_knowledge_refresh_ts >= _KNOWLEDGE_REFRESH_COOLDOWN:
@@ -3130,56 +2859,30 @@ async def handle_fallback(
                 refreshed_knowledge = await get_user_plugin_knowledge(
                     force_refresh=True
                 )
-                if len(refreshed_knowledge.plugins) > len(knowledge_base.plugins):
-                    knowledge_base = PluginRegistry.filter_knowledge_base(
-                        refreshed_knowledge,
-                        selection_context=selection_context,
-                    )
+                filtered_knowledge = PluginRegistry.filter_knowledge_base(
+                    refreshed_knowledge,
+                    selection_context=selection_context,
+                )
+                if len(filtered_knowledge.plugins) > len(knowledge_base.plugins):
+                    knowledge_base = filtered_knowledge
                     logger.info(
                         "检测到插件知识可能不完整，已执行一次自愈刷新："
                         f"{len(knowledge_base.plugins)} 个插件"
                     )
 
         intent_profile = classify_message_intent(route_message, knowledge_base)
-        if _should_retry_intent_with_refreshed_knowledge(route_message, intent_profile):
-            now = time.monotonic()
-            if now - _last_knowledge_refresh_ts >= _KNOWLEDGE_REFRESH_COOLDOWN:
-                _last_knowledge_refresh_ts = now
-                refreshed_knowledge = await get_user_plugin_knowledge(force_refresh=True)
-                filtered_knowledge = PluginRegistry.filter_knowledge_base(
-                    refreshed_knowledge,
-                    selection_context=selection_context,
-                )
-                refreshed_intent = classify_message_intent(
-                    route_message,
-                    filtered_knowledge,
-                )
-                if (
-                    refreshed_intent.kind != intent_profile.kind
-                    or refreshed_intent.reason != intent_profile.reason
-                    or refreshed_intent.explicit_command
-                    != intent_profile.explicit_command
-                    or refreshed_intent.command_head != intent_profile.command_head
-                ):
-                    knowledge_base = filtered_knowledge
-                    intent_profile = refreshed_intent
-                    logger.info(
-                        "ChatInter 意图自愈刷新命中："
-                        f"kind={intent_profile.kind} "
-                        f"reason={intent_profile.reason} "
-                        f"command={intent_profile.command_head or '-'}"
-                    )
-        trace.update_tags(intent_kind=intent_profile.kind, intent_reason=intent_profile.reason)
+        trace.update_tags(
+            intent_kind=intent_profile.kind,
+            intent_reason=intent_profile.reason,
+        )
         logger.debug(
             "ChatInter intent classify: "
             f"kind={intent_profile.kind} "
             f"reason={intent_profile.reason} "
             f"explicit={intent_profile.explicit_command} "
             f"command={intent_profile.command_head or '-'} "
-            f"schema_state={intent_profile.schema_state} "
             f"chat_subkind={getattr(intent_profile, 'chat_subkind', 'general_chat')} "
-            f"confidence={intent_profile.confidence:.2f} "
-            f"rewrite='{intent_profile.rewrite_command or '-'}'"
+            f"confidence={intent_profile.confidence:.2f}"
         )
         middleware_state.intent = intent_profile
         middleware_state.route_message = route_message
@@ -3193,591 +2896,151 @@ async def handle_fallback(
         context_xml = middleware_state.context_xml
         route_message = middleware_state.route_message or route_message
 
-        weak_signal_decision = None
-        weak_signal_route_result: RouteResolveResult | None = None
-        weak_signal_report: RouteAttemptReport | None = None
-        if (
-            intent_profile.kind == "chat"
-            and getattr(intent_profile, "chat_subkind", "general_chat") == "general_chat"
-        ):
-            route_placeholders = collect_placeholders(route_message)
-            weak_signal_tags = collect_weak_route_signals(route_message)
-            has_at = any(token.startswith("[@") for token in route_placeholders)
-            has_image = any(
-                token.lower().startswith("[image") for token in route_placeholders
-            )
-            if should_try_weak_llm_assist(
-                route_message,
-                has_at=has_at,
-                has_image=has_image,
-                has_reply=has_reply,
-                explicit_command=bool(intent_profile.explicit_command),
-            ):
-                weak_signal_decision, weak_signal_route_result, weak_signal_report = (
-                    await resolve_weak_signal_intent(
-                        route_message,
-                        knowledge_base,
-                        original_message_text=current_message,
-                        has_at=has_at,
-                        has_image=has_image,
-                        has_reply=has_reply,
-                        is_private=group_id is None,
-                        session_key=session_key,
-                        budget_controller=budget_controller,
-                    )
-                )
-                if weak_signal_decision is not None:
-                    trace.update_tags(
-                        weak_signal_tags="|".join(weak_signal_tags[:8]),
-                        weak_signal_action=weak_signal_decision.action,
-                        weak_signal_confidence=(
-                            f"{weak_signal_decision.confidence:.2f}"
-                            if weak_signal_decision.confidence is not None
-                            else ""
-                        ),
-                        weak_signal_reason=weak_signal_decision.reason or "",
-                        weak_signal_plugin=(
-                            weak_signal_route_result.decision.plugin_name
-                            if weak_signal_route_result is not None
-                            else ""
-                        ),
-                        weak_signal_module=(
-                            weak_signal_route_result.decision.plugin_module
-                            if weak_signal_route_result is not None
-                            else ""
-                        ),
-                        weak_signal_command=(
-                            weak_signal_route_result.decision.command
-                            if weak_signal_route_result is not None
-                            else ""
-                        ),
-                    )
-                    logger.debug(
-                        "ChatInter 弱词 LLM 结果: "
-                        f"action={weak_signal_decision.action} "
-                        f"confidence={weak_signal_decision.confidence:.2f} "
-                        f"reason={weak_signal_decision.reason or '-'} "
-                        f"module={weak_signal_route_result.decision.plugin_module if weak_signal_route_result is not None else '-'} "
-                        f"command={weak_signal_route_result.decision.command if weak_signal_route_result is not None else '-'}"
-                    )
-                if (
-                    weak_signal_decision is not None
-                    and weak_signal_decision.action == "usage"
-                    and weak_signal_route_result is not None
-                ):
-                    trace.update_tags(path="clarify", outcome="plugin_usage_redirect")
-                    envelope = TurnChannelEnvelope()
-                    envelope.add(ChannelName.ANALYSIS, "weak signal plugin usage redirect")
-                    envelope.add(
-                        ChannelName.FINAL,
-                        _build_plugin_usage_fallback_message(
-                            route_result=weak_signal_route_result,
-                            knowledge_plugins=knowledge_base.plugins,
-                            current_message=route_message,
-                        ),
-                    )
-                    _log_turn_channels(envelope)
-                    await _persist_final_only_dialog(
-                        envelope=envelope,
-                        user_id=user_id,
-                        group_id=group_id,
-                        nickname=nickname,
-                        user_message=uni_msg or current_message,
-                        bot_id=bot_id,
-                    )
-                    trace.stage("persist")
-                    await MessageUtils.build_message(envelope.final).send()
-                    trace.stage("send")
-                    await _dispatch_post_gate(
-                        response_text=envelope.final,
-                        phase="post_gate:weak_signal_plugin_usage_redirect",
-                    )
-                    _finish_trace(
-                        trace=trace,
-                        user_id=str(user_id),
-                        group_id=group_id,
-                        message_preview=current_message,
-                        route_report=weak_signal_report,
-                        budget_controller=budget_controller,
-                    )
-                    return
-                if weak_signal_route_result is not None:
-                    if await _execute_route_decision(
-                        bot=bot,
-                        event=event,
-                        trace=trace,
-                        route_result=weak_signal_route_result,
-                        knowledge_plugins=knowledge_base.plugins,
-                        user_id=user_id,
-                        group_id=group_id,
-                        nickname=nickname,
-                        user_message=uni_msg or raw_message,
-                        bot_id=bot_id,
-                        current_message=route_message,
-                        session_id=session_key,
-                        extra_image_segments=reply_image_segments_for_reroute,
-                        route_report=weak_signal_report,
-                        budget_controller=budget_controller,
-                        finalize_callback=_dispatch_post_gate,
-                    ):
-                        return
-
-        if intent_profile.kind == "chat":
-            dialogue_reply = await _build_dialogue_fast_reply(
-                intent_profile=intent_profile,
-                current_message=current_message,
-                group_id=group_id,
-                user_id=str(user_id),
-            )
-            if dialogue_reply is not None:
-                reply_text = normalize_ai_reply_text(dialogue_reply)
-                reply_text = replace_mention_ids_with_names(
-                    reply_text, mention_name_map
-                )
-                envelope = TurnChannelEnvelope()
-                trace.update_tags(path="chat", outcome=f"dialogue_{intent_profile.chat_subkind}")
-                envelope.add(
-                    ChannelName.ANALYSIS,
-                    f"dialogue fast path kind={intent_profile.chat_subkind}",
-                )
-                envelope.add(ChannelName.FINAL, reply_text)
-                _log_turn_channels(envelope)
-                await _persist_final_only_dialog(
-                    envelope=envelope,
-                    user_id=user_id,
-                    group_id=group_id,
-                    nickname=nickname,
-                    user_message=uni_msg or current_message,
-                    bot_id=bot_id,
-                )
-                trace.stage("persist")
-                await MessageUtils.build_message(envelope.final).send()
-                trace.stage("send")
-                await _dispatch_post_gate(
-                    response_text=envelope.final,
-                    phase="post_gate:dialogue_fast_path",
-                )
-                _finish_trace(
-                    trace=trace,
-                    user_id=str(user_id),
-                    group_id=group_id,
-                    message_preview=current_message,
-                    route_report=route_report,
-                    budget_controller=budget_controller,
-                )
-                return
-
-        route_result: RouteResolveResult | None = None
-        route_report: RouteAttemptReport | None = None
-        route_knowledge_base = knowledge_base
-        (
-            pre_gate_route_result,
-            pre_gate_route_report,
-            route_gate,
-        ) = _probe_route_before_gate(
-            message_text=route_message,
-            knowledge_base=route_knowledge_base,
-            intent_profile=intent_profile,
-        )
-        trace.update_tags(
-            route_gate=route_gate.reason,
-            route_gate_allowed=int(route_gate.allowed),
-        )
-        logger.debug(
-            "ChatInter route gate: "
-            f"allowed={route_gate.allowed} "
-            f"reason={route_gate.reason} "
-            f"top_score={route_gate.top_score:.2f} "
-            f"fast_match={route_gate.fast_match or '-'}"
-        )
-        route_policy = decide_route_policy(
-            message_text=route_message,
-            intent_profile=intent_profile,
-            shortlist_route_result=pre_gate_route_result,
-        )
-        trace.update_tags(
-            route_policy=route_policy.action,
-            route_policy_reason=route_policy.reason,
-            route_policy_message_role=route_policy.message_role,
-            route_policy_route_role=route_policy.route_role,
-        )
-        logger.debug(
-            "ChatInter route policy: "
-            f"action={route_policy.action} "
-            f"reason={route_policy.reason} "
-            f"message_role={route_policy.message_role} "
-            f"route_role={route_policy.route_role or '-'}"
-        )
-        if route_policy.action == "align":
-            # 主链路：direct -> llm_align -> validator -> route
-            alignment_decision, alignment_route_result, alignment_report = (
-                await resolve_llm_align_route(
-                    route_message,
-                    route_knowledge_base,
-                    session_key=session_key,
-                    budget_controller=budget_controller,
-                    has_reply=has_reply,
-                )
-            )
-            if alignment_decision is not None:
-                trace.update_tags(
-                    shortlist_alignment=alignment_decision.action,
-                    shortlist_alignment_plugin=(
-                        alignment_route_result.decision.plugin_module
-                        if alignment_route_result is not None
-                        else ""
-                    ),
-                )
-            if alignment_decision is not None and alignment_report is not None:
-                logger.debug(
-                    "ChatInter shortlist 对齐结果: "
-                    f"action={alignment_decision.action} "
-                    f"reason={alignment_report.final_reason} "
-                    f"module={alignment_route_result.decision.plugin_module if alignment_route_result is not None else '-'} "
-                    f"command={alignment_route_result.decision.command if alignment_route_result is not None else '-'}"
-                )
-            if (
-                alignment_decision is not None
-                and alignment_decision.action == "usage"
-                and alignment_route_result is not None
-            ):
-                trace.update_tags(path="clarify", outcome="plugin_usage_redirect")
-                envelope = TurnChannelEnvelope()
-                envelope.add(ChannelName.ANALYSIS, "plugin usage redirect")
-                envelope.add(
-                    ChannelName.FINAL,
-                    _build_plugin_usage_fallback_message(
-                        route_result=alignment_route_result,
-                        knowledge_plugins=knowledge_base.plugins,
-                        current_message=route_message,
-                    ),
-                )
-                _log_turn_channels(envelope)
-                await _persist_final_only_dialog(
-                    envelope=envelope,
-                    user_id=user_id,
-                    group_id=group_id,
-                    nickname=nickname,
-                    user_message=uni_msg or current_message,
-                    bot_id=bot_id,
-                )
-                trace.stage("persist")
-                await MessageUtils.build_message(envelope.final).send()
-                trace.stage("send")
-                await _dispatch_post_gate(
-                    response_text=envelope.final,
-                    phase="post_gate:plugin_usage_redirect",
-                )
-                _finish_trace(
-                    trace=trace,
-                    user_id=str(user_id),
-                    group_id=group_id,
-                    message_preview=current_message,
-                    route_report=alignment_report,
-                    budget_controller=budget_controller,
-                )
-                return
-            if alignment_route_result is not None:
-                route_result = alignment_route_result
-                route_report = alignment_report
-                middleware_state.metadata = {
-                    "phase": "route_completed",
-                    "route_reason": route_report.final_reason if route_report else "",
-                }
-                await middleware.dispatch("after_route", middleware_state)
-                if route_report is not None:
-                    trace.update_tags(
-                        route_reason=route_report.final_reason,
-                        route_candidates=route_report.candidate_total,
-                        route_attempts=route_report.attempts,
-                        route_tool_candidates=route_report.tool_candidates,
-                    )
-                logger.debug(
-                    "ChatInter route shortlist alignment hit: "
-                    f"reason={route_report.final_reason if route_report else 'shortlist_alignment_route'} "
-                    f"module={route_result.decision.plugin_module} "
-                    f"command={route_result.decision.command}"
-                )
-        if (
-            route_result is None
-            and pre_gate_route_result is not None
-            and route_policy.action in {"direct", "usage"}
-        ):
-            route_result = pre_gate_route_result
-            route_report = pre_gate_route_report
-            middleware_state.metadata = {
-                "phase": "route_completed",
-                "route_reason": route_report.final_reason if route_report else "",
-            }
-            await middleware.dispatch("after_route", middleware_state)
-            if route_report is not None:
-                trace.update_tags(
-                    route_reason=route_report.final_reason,
-                    route_candidates=route_report.candidate_total,
-                    route_attempts=route_report.attempts,
-                    route_tool_candidates=route_report.tool_candidates,
-                )
-            logger.debug(
-                "ChatInter route pre-gate shortlist hit: "
-                f"reason={route_report.final_reason if route_report else 'shortlist_route'} "
-                f"module={route_result.decision.plugin_module} "
-                f"command={route_result.decision.command}"
-            )
-        if route_result is not None:
-            if not _is_route_command_executable(route_result, knowledge_base.plugins):
-                logger.debug(
-                    "ChatInter 路由结果命令不可执行，降级为对话："
-                    f"stage={route_result.stage}, "
-                    f"module={route_result.decision.plugin_module}, "
-                    f"command={route_result.decision.command}"
-                )
-                route_result = None
-            elif _should_force_chat_by_intent_gate(
-                route_result=route_result,
-                intent_profile=intent_profile,
-                knowledge_plugins=knowledge_base.plugins,
-            ):
-                logger.debug(
-                    "ChatInter schema闸门判定该路由更像对话，降级为聊天："
-                    f"intent_reason={intent_profile.reason}, "
-                    f"confidence={intent_profile.confidence:.2f}, "
-                    f"stage={route_result.stage}, "
-                    f"module={route_result.decision.plugin_module}, "
-                    f"command={route_result.decision.command}"
-                )
-                route_result = None
-        if route_policy.action != "chat" and route_result is None:
-            if (
-                route_policy.action in {"direct", "usage"}
-                and intent_profile is not None
-                and intent_profile.explicit_command
-                and intent_profile.kind in {"execute", "execute_need_arg", "ambiguous"}
-            ):
-                repaired_route_result = _build_route_result_from_intent(intent_profile)
-                if (
-                    repaired_route_result is not None
-                    and _is_route_command_executable(
-                        repaired_route_result,
-                        knowledge_base.plugins,
-                    )
-                ):
-                    route_result = repaired_route_result
-                    logger.debug(
-                        "ChatInter 显式命令修复重试命中："
-                        f"module={route_result.decision.plugin_module}, "
-                        f"command={route_result.decision.command}"
-                    )
-            if route_result is None:
-                aligned_route_result, aligned_route_message, aligned_reason = (
-                    _resolve_route_continuation_alignment(
-                        session_id=session_key,
-                        current_message=route_message,
-                    )
-                )
-                if (
-                    aligned_route_result is not None
-                    and _is_route_command_executable(
-                        aligned_route_result,
-                        knowledge_base.plugins,
-                    )
-                ):
-                    route_result = aligned_route_result
-                    route_message = aligned_route_message or route_message
-                    middleware_state.route_message = route_message
-                    middleware_state.metadata = {
-                        "phase": "route_aligned",
-                        "route_reason": "alignment_followup",
-                        "alignment_reason": aligned_reason,
-                    }
-                    await middleware.dispatch("after_route", middleware_state)
-                    trace.update_tags(route_reason="alignment_followup")
-                    logger.debug(
-                        "ChatInter 续接对齐命中："
-                        f"reason={aligned_reason} "
-                        f"module={route_result.decision.plugin_module} "
-                        f"command={route_result.decision.command}"
-                    )
-            if route_result is not None:
-                route_schema = _find_route_command_schema(route_result, knowledge_base.plugins)
-                block_self_only = False
-                if route_schema is not None:
-                    block_self_only = _should_block_self_only_action(
-                        schema=route_schema,
-                        route_command=route_result.decision.command,
-                        original_message=current_message,
-                        requester_user_id=str(user_id),
-                    )
-                elif _is_self_only_action_message(route_result.decision.command):
-                    route_targets = {
-                        extracted_id
-                        for token in _extract_at_tokens(route_result.decision.command)
-                        if (extracted_id := _extract_user_id_from_at_token(token))
-                    }
-                    block_self_only = any(target != str(user_id) for target in route_targets)
-                    if not block_self_only and not _contains_self_reference(current_message):
-                        block_self_only = (
-                            _contains_non_self_target_phrase(current_message)
-                            or _contains_third_person_reference(current_message)
-                        )
-                if block_self_only:
-                    trace.update_tags(
-                        path="plugin",
-                        outcome="self_only_blocked",
-                        route_stage=route_result.stage,
-                        route_plugin=route_result.decision.plugin_name,
-                        route_module=route_result.decision.plugin_module,
-                        route_head=normalize_message_text(
-                            str(route_result.decision.command or "").split(" ", 1)[0]
-                        )
-                        or "unknown",
-                    )
-                    target_modules = _build_target_modules(route_result, knowledge_base.plugins)
-                    envelope = TurnChannelEnvelope()
-                    envelope.add(ChannelName.ANALYSIS, "blocked self-only action for others")
-                    envelope.add(
-                        ChannelName.FINAL,
-                        "这类功能只能本人触发，不能代他人执行。请让对方自己发送命令。",
-                    )
-                    _log_turn_channels(envelope)
-                    await _persist_final_only_dialog(
-                        envelope=envelope,
-                        user_id=user_id,
-                        group_id=group_id,
-                        nickname=nickname,
-                        user_message=uni_msg or current_message,
-                        bot_id=bot_id,
-                    )
-                    trace.stage("persist")
-                    await MessageUtils.build_message(envelope.final).send()
-                    trace.stage("send")
-                    await _record_route_feedback(
-                        session_id=session_key,
-                        modules=target_modules,
-                        reason=_FEEDBACK_REASON_SELF_ONLY_BLOCKED,
-                        route_message=route_message,
-                        route_command=route_result.decision.command,
-                    )
-                    await _dispatch_post_gate(
-                        response_text=envelope.final,
-                        phase="post_gate:self_only_blocked",
-                    )
-                    _finish_trace(
-                        trace=trace,
-                        user_id=str(user_id),
-                        group_id=group_id,
-                        message_preview=current_message,
-                        route_report=route_report,
-                        budget_controller=budget_controller,
-                    )
-                    return
-        if route_result is not None and await _execute_route_decision(
-            bot=bot,
-            event=event,
-            trace=trace,
-            route_result=route_result,
-            knowledge_plugins=knowledge_base.plugins,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            user_message=uni_msg or raw_message,
-            bot_id=bot_id,
-            current_message=route_message,
-            session_id=session_key,
-            extra_image_segments=reply_image_segments_for_reroute,
-            route_report=route_report,
+        router_decision, route_result, route_report = await resolve_llm_router(
+            route_message,
+            knowledge_base,
+            session_key=session_key,
             budget_controller=budget_controller,
-            finalize_callback=_dispatch_post_gate,
-        ):
+            has_reply=has_reply,
+        )
+        trace.update_tags(
+            router_action=router_decision.action,
+            router_confidence=f"{router_decision.confidence:.2f}",
+            router_reason=router_decision.reason or "",
+            router_plugin=route_result.decision.plugin_module if route_result else "",
+            router_command=route_result.decision.command if route_result else "",
+        )
+        if route_report is not None:
+            trace.update_tags(
+                route_reason=route_report.final_reason,
+                route_candidates=route_report.candidate_total,
+                route_attempts=route_report.attempts,
+                route_tool_candidates=route_report.tool_candidates,
+            )
+        logger.debug(
+            "ChatInter router result: "
+            f"action={router_decision.action} "
+            f"confidence={router_decision.confidence:.2f} "
+            f"reason={router_decision.reason or '-'} "
+            f"module={route_result.decision.plugin_module if route_result else '-'} "
+            f"command={route_result.decision.command if route_result else '-'}"
+        )
+        middleware_state.metadata = {
+            "phase": "route_completed",
+            "router_action": router_decision.action,
+            "route_reason": route_report.final_reason if route_report else "",
+        }
+        await middleware.dispatch("after_route", middleware_state)
+
+        if router_decision.action == "usage" and route_result is not None:
+            trace.update_tags(path="clarify", outcome="plugin_usage_redirect")
+            envelope = TurnChannelEnvelope()
+            envelope.add(ChannelName.ANALYSIS, "router plugin usage")
+            envelope.add(
+                ChannelName.FINAL,
+                _build_plugin_usage_fallback_message(
+                    route_result=route_result,
+                    knowledge_plugins=knowledge_base.plugins,
+                    current_message=route_message,
+                ),
+            )
+            _log_turn_channels(envelope)
+            await _persist_final_only_dialog(
+                envelope=envelope,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                user_message=uni_msg or current_message,
+                bot_id=bot_id,
+            )
+            trace.stage("persist")
+            await MessageUtils.build_message(envelope.final).send()
+            trace.stage("send")
+            await _dispatch_post_gate(
+                response_text=envelope.final,
+                phase="post_gate:router_usage",
+            )
+            _finish_trace(
+                trace=trace,
+                user_id=str(user_id),
+                group_id=group_id,
+                message_preview=current_message,
+                route_report=route_report,
+                budget_controller=budget_controller,
+            )
             return
-        if route_result is not None:
+
+        if router_decision.action == "clarify":
+            trace.update_tags(path="clarify", outcome="router_clarify")
+            missing_text = "、".join(router_decision.missing)
+            clarify_text = (
+                f"还差一点信息：{missing_text}。请补充后我再帮你执行。"
+                if missing_text
+                else "我还不太确定要执行哪个功能，可以再补充一下目标或参数吗？"
+            )
+            if route_result is not None:
+                _remember_route_continuation_frame(
+                    session_id=session_key,
+                    route_result=route_result,
+                    route_command=route_result.decision.command,
+                    current_message=route_message,
+                )
+            envelope = TurnChannelEnvelope()
+            envelope.add(ChannelName.ANALYSIS, "router clarify")
+            envelope.add(ChannelName.FINAL, clarify_text)
+            _log_turn_channels(envelope)
+            await _persist_final_only_dialog(
+                envelope=envelope,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                user_message=uni_msg or current_message,
+                bot_id=bot_id,
+            )
+            trace.stage("persist")
+            await MessageUtils.build_message(envelope.final).send()
+            trace.stage("send")
+            await _dispatch_post_gate(
+                response_text=envelope.final,
+                phase="post_gate:router_clarify",
+            )
+            _finish_trace(
+                trace=trace,
+                user_id=str(user_id),
+                group_id=group_id,
+                message_preview=current_message,
+                route_report=route_report,
+                budget_controller=budget_controller,
+            )
+            return
+
+        if router_decision.action == "execute" and route_result is not None:
+            if await _execute_route_decision(
+                bot=bot,
+                event=event,
+                trace=trace,
+                route_result=route_result,
+                knowledge_plugins=knowledge_base.plugins,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                user_message=uni_msg or raw_message,
+                bot_id=bot_id,
+                current_message=route_message,
+                session_id=session_key,
+                extra_image_segments=reply_image_segments_for_reroute,
+                route_report=route_report,
+                budget_controller=budget_controller,
+                finalize_callback=_dispatch_post_gate,
+            ):
+                return
             logger.warning(
-                "技能路由重路由失败，降级为聊天处理："
-                f"stage={route_result.stage}, "
+                "Router 技能路由重路由失败，降级为纯会话处理："
                 f"plugin={route_result.decision.plugin_name}, "
                 f"command={route_result.decision.command}"
             )
-        if route_policy.action != "chat" and route_result is None and intent_profile is not None:
-            if intent_profile.kind in {"execute_need_arg", "ambiguous"}:
-                trace.update_tags(path="clarify", outcome="clarify_once")
-                envelope = TurnChannelEnvelope()
-                envelope.add(
-                    ChannelName.ANALYSIS,
-                    f"intent clarification kind={intent_profile.kind}",
-                )
-                clarify_message = _build_intent_clarification_message(intent_profile)
-                if intent_profile.kind == "execute_need_arg" and intent_profile.explicit_command:
-                    command_result = _build_route_result_from_intent(intent_profile)
-                    if command_result is not None:
-                        clarify_message = _build_plugin_usage_fallback_message(
-                            route_result=command_result,
-                            knowledge_plugins=knowledge_base.plugins,
-                            current_message=route_message,
-                        )
-                        _remember_route_continuation_frame(
-                            session_id=session_key,
-                            route_result=command_result,
-                            route_command=command_result.decision.command,
-                            current_message=route_message,
-                        )
-                envelope.add(ChannelName.FINAL, clarify_message)
-                _log_turn_channels(envelope)
-                await _persist_final_only_dialog(
-                    envelope=envelope,
-                    user_id=user_id,
-                    group_id=group_id,
-                    nickname=nickname,
-                    user_message=uni_msg or current_message,
-                    bot_id=bot_id,
-                )
-                trace.stage("persist")
-                await MessageUtils.build_message(envelope.final).send()
-                trace.stage("send")
-                await _dispatch_post_gate(
-                    response_text=envelope.final,
-                    phase="post_gate:clarify_once",
-                )
-                _finish_trace(
-                    trace=trace,
-                    user_id=str(user_id),
-                    group_id=group_id,
-                    message_preview=current_message,
-                    route_report=route_report,
-                    budget_controller=budget_controller,
-                )
-                return
-            if intent_profile.kind == "help" and intent_profile.command_head:
-                trace.update_tags(path="clarify", outcome="help_redirect")
-                envelope = TurnChannelEnvelope()
-                envelope.add(ChannelName.ANALYSIS, "help redirect")
-                envelope.add(
-                    ChannelName.FINAL,
-                    f"如果你是想问用法，直接说“真寻帮助{intent_profile.command_head}”就行。",
-                )
-                _log_turn_channels(envelope)
-                await _persist_final_only_dialog(
-                    envelope=envelope,
-                    user_id=user_id,
-                    group_id=group_id,
-                    nickname=nickname,
-                    user_message=uni_msg or current_message,
-                    bot_id=bot_id,
-                )
-                trace.stage("persist")
-                await MessageUtils.build_message(envelope.final).send()
-                trace.stage("send")
-                await _dispatch_post_gate(
-                    response_text=envelope.final,
-                    phase="post_gate:help_redirect",
-                )
-                _finish_trace(
-                    trace=trace,
-                    user_id=str(user_id),
-                    group_id=group_id,
-                    message_preview=current_message,
-                    route_report=route_report,
-                    budget_controller=budget_controller,
-                )
-                return
+
+        router_force_pure_chat = True
 
         # 提取图片（多模态处理）
         source_for_media = event_message or uni_msg or message or raw_message
@@ -3822,9 +3085,13 @@ async def handle_fallback(
             has_images=bool(image_parts),
             has_mcp_endpoints=bool(get_mcp_endpoints()),
         )
-        agent_enabled = agent_gate.enabled
-        trace.update_tags(agent_gate=agent_gate.reason, agent_enabled=int(agent_enabled))
-        logger.debug(f"ChatInter agent gate: enabled={agent_enabled} reason={agent_gate.reason}")
+        agent_enabled = False if router_force_pure_chat else agent_gate.enabled
+        trace.update_tags(
+            agent_gate=agent_gate.reason, agent_enabled=int(agent_enabled)
+        )
+        logger.debug(
+            f"ChatInter agent gate: enabled={agent_enabled} reason={agent_gate.reason}"
+        )
         reply: str | UniMessage | None = None
         if agent_enabled:
             middleware_state.metadata = {"phase": "agent_fallback"}
@@ -3884,9 +3151,7 @@ async def handle_fallback(
             else reply_text
         )
         reply_text = normalize_ai_reply_text(reply_text or "")
-        reply_text = replace_mention_ids_with_names(
-            reply_text, mention_name_map
-        )
+        reply_text = replace_mention_ids_with_names(reply_text, mention_name_map)
         envelope = TurnChannelEnvelope()
         trace.update_tags(path="chat", outcome="chat_fallback")
         envelope.add(ChannelName.ANALYSIS, "chat fallback")
