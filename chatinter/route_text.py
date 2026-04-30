@@ -5,7 +5,7 @@ from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _PLACEHOLDER_PATTERN = re.compile(
-    r"\[@(?:\d{5,20}|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
+    r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
 )
 _STICKY_TOKEN_PATTERN = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
@@ -49,6 +49,9 @@ STRONG_USAGE_WORDS = (
     "怎么触发",
     "如何触发",
     "怎样触发",
+    "怎么发",
+    "如何发",
+    "怎样发",
     "怎么调用",
     "如何调用",
     "怎样调用",
@@ -379,17 +382,21 @@ _ROUTE_INLINE_NOISE_WORDS = (
     "了",
 )
 
-_ROUTE_CONTEXT_HINT_WORDS = ROUTE_ACTION_WORDS + MEME_TRIGGER_WORDS + (
-    "给",
-    "对",
-    "向",
-    "让",
-    "替",
-    "去",
-    "发送",
-    "先",
-    "再",
-    "一下",
+_ROUTE_CONTEXT_HINT_WORDS = (
+    ROUTE_ACTION_WORDS
+    + MEME_TRIGGER_WORDS
+    + (
+        "给",
+        "对",
+        "向",
+        "让",
+        "替",
+        "去",
+        "发送",
+        "先",
+        "再",
+        "一下",
+    )
 )
 
 
@@ -506,7 +513,10 @@ def _find_canonical_head_boundary(text: str, command: str) -> int | None:
 
     for index in range(1, len(normalized_text) + 1):
         prefix = normalized_text[:index]
-        if compact_command and _clean_route_command_head_text(prefix, compact=True) == compact_command:
+        if (
+            compact_command
+            and _clean_route_command_head_text(prefix, compact=True) == compact_command
+        ):
             return index
         if ascii_command and _compact_ascii_head_text(prefix) == ascii_command:
             return index
@@ -610,8 +620,10 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
 def match_command_head_canonical(text: str, command: str) -> bool:
     strict_text = _clean_route_command_head_text(text, compact=False)
     strict_command = _clean_route_command_head_text(command, compact=False)
-    if strict_text and strict_command and match_command_head(
-        strict_text, strict_command
+    if (
+        strict_text
+        and strict_command
+        and match_command_head(strict_text, strict_command)
     ):
         return True
 
@@ -778,14 +790,14 @@ def parse_command_with_head(
         prefix_payload = _strip_route_inline_noise(
             _PLACEHOLDER_PATTERN.sub(" ", prefix)
         )
-        if has_prefix_hint and not has_argument_hint and _is_generic_question_payload(
-            compact_suffix
+        if (
+            has_prefix_hint
+            and not has_argument_hint
+            and _is_generic_question_payload(compact_suffix)
         ):
             continue
         if has_prefix_hint and (
-            has_argument_hint
-            or not allow_sticky
-            or not normalize_message_text(suffix)
+            has_argument_hint or not allow_sticky or not normalize_message_text(suffix)
         ):
             return RouteCommandMatch(
                 command_head=normalized_command,
@@ -828,7 +840,9 @@ def parse_command_with_head(
                 variant_text=variant,
                 match_mode="canonical",
             )
-        ascii_boundary = _find_canonical_ascii_head_boundary(variant, normalized_command)
+        ascii_boundary = _find_canonical_ascii_head_boundary(
+            variant, normalized_command
+        )
         if ascii_boundary is not None:
             payload = _strip_route_inline_noise(
                 normalize_message_text(variant[ascii_boundary:])
@@ -890,7 +904,9 @@ def is_usage_question(text: str) -> bool:
 
 
 def collect_weak_route_signals(text: str) -> tuple[str, ...]:
-    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    normalized = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(text or ""))
+    )
     if not normalized:
         return ()
     signals: list[str] = []
@@ -910,7 +926,9 @@ def should_try_weak_llm_assist(
     has_reply: bool = False,
     explicit_command: bool = False,
 ) -> bool:
-    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    normalized = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(text or ""))
+    )
     if not normalized:
         return False
     if explicit_command or has_at or has_image or has_reply:
@@ -971,9 +989,13 @@ def _is_meme_plugin(plugin: PluginInfo) -> bool:
 def _is_template_like_plugin(plugin: PluginInfo) -> bool:
     if _is_meme_plugin(plugin):
         return True
-    command_text = " ".join(normalize_message_text(command) for command in plugin.commands)
+    command_text = " ".join(
+        normalize_message_text(command) for command in plugin.commands
+    )
     usage_text = normalize_message_text(plugin.usage or "")
-    hint_text = f"{plugin.name} {plugin.description} {command_text} {usage_text}".lower()
+    hint_text = (
+        f"{plugin.name} {plugin.description} {command_text} {usage_text}".lower()
+    )
     has_catalog_hint = any(word in hint_text for word in ("搜索", "详情", "列表"))
     has_template_hint = any(
         word in hint_text
@@ -1030,9 +1052,13 @@ def has_template_route_context(
                 else:
                     matched_non_template = True
 
-    if not (has_template_hint or has_placeholder or has_meme_trigger or matched_template):
+    if not (
+        has_template_hint or has_placeholder or has_meme_trigger or matched_template
+    ):
         return False
-    if matched_non_template and not (has_template_hint or has_placeholder or has_meme_trigger):
+    if matched_non_template and not (
+        has_template_hint or has_placeholder or has_meme_trigger
+    ):
         return False
 
     if has_template_hint or has_placeholder or has_meme_trigger:
@@ -1137,8 +1163,8 @@ __all__ = [
     "has_negative_route_intent",
     "has_template_route_context",
     "is_usage_question",
-    "match_command_head_canonical",
     "match_command_head",
+    "match_command_head_canonical",
     "match_command_head_fuzzy",
     "match_command_head_or_sticky",
     "normalize_action_phrases",

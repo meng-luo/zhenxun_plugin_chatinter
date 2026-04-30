@@ -6,6 +6,7 @@ ChatInter - 聊天响应处理
 
 import asyncio
 import re
+from typing import Any, cast
 
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.onebot.v11 import (
@@ -35,7 +36,7 @@ from .turn_runtime import TurnBudgetController
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
-    r"\[@(?:\d+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
+    r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
 )
 _IMAGE_INDEX_PATTERN = re.compile(r"\[image#(\d+)\]", re.IGNORECASE)
@@ -52,7 +53,7 @@ _MD_BOLD_PATTERN = re.compile(r"(\*\*|__)(.+?)\1", re.DOTALL)
 _MD_STRIKE_PATTERN = re.compile(r"~~(.+?)~~", re.DOTALL)
 _MD_EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
 _AT_ID_TOKEN_PATTERN = re.compile(
-    r"\[@(\d{5,20})\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[的，,。.!！？?]))"
+    r"\[@([^\]\s]+)\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[的，,。.!！？?]))"
 )
 _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN = re.compile(
     r"\[image(?:#\d+)?\]",
@@ -101,7 +102,7 @@ async def handle_chat_message(
     session_key: str | None = None,
     budget_controller: TurnBudgetController | None = None,
 ) -> str | UniMessage:
-    chat_style = get_config_value("CHAT_STYLE", "")
+    chat_style = str(get_config_value("CHAT_STYLE", "") or "")
 
     system_prompt = await build_chat_system_prompt(
         user_id=user_id,
@@ -256,9 +257,10 @@ async def reroute_to_plugin(
         if route_heads:
             setattr(new_event, "_ai_route_heads", frozenset(route_heads))
 
-        task = asyncio.create_task(bot.handle_event(new_event))
+        handle_event = cast(Any, bot.handle_event)
+        task = asyncio.create_task(handle_event(new_event))
         _REROUTE_TASKS.add(task)
-        task.add_done_callback(_REROUTE_TASKS.discard)
+        task.add_done_callback(lambda done_task: _REROUTE_TASKS.discard(done_task))
         logger.info(f"消息重路由成功：{command_text}")
         return True
 
@@ -279,9 +281,7 @@ def _parse_at_target(token: str) -> str | None:
         return None
     if target in {"所有人", "all"}:
         return "all"
-    if target.isdigit():
-        return target
-    return None
+    return target
 
 
 def _expand_reroute_target_modules(target_modules: set[str] | None) -> set[str]:
@@ -401,9 +401,9 @@ def _build_reroute_message(
             if target == "all":
                 has_explicit_at_token = True
                 result += MessageSegment.at("all")
-            elif target and target.isdigit():
+            elif target:
                 has_explicit_at_token = True
-                result += MessageSegment.at(int(target))
+                result += MessageSegment.at(target)
             else:
                 result += MessageSegment.text(token)
         cursor = match.end()

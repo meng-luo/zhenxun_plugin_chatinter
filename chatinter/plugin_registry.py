@@ -11,7 +11,7 @@ from datetime import datetime
 import importlib
 import inspect
 import re
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, cast
 
 import nonebot
 
@@ -20,8 +20,18 @@ from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 
+from .capability_graph import build_capability_graph_snapshot
 from .metadata_builder import AutoMetadataBuilder
-from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .models.pydantic_models import (
+    CapabilityGraphSnapshot,
+    PluginInfo,
+    PluginKnowledgeBase,
+    PluginReference,
+)
+from .plugin_reference import (
+    build_plugin_references,
+    build_router_cards_from_graph,
+)
 from .route_text import normalize_message_text
 
 
@@ -55,6 +65,56 @@ class PluginRegistry:
     _self_only_command_keywords: ClassVar[tuple[str, ...]] = ("签到", "打卡", "补签")
     _session_plugin_overrides: ClassVar[dict[str, dict[str, bool]]] = {}
     _group_plugin_overrides: ClassVar[dict[str, dict[str, bool]]] = {}
+    _restricted_plugin_types: ClassVar[set[PluginType]] = {
+        PluginType.SUPERUSER,
+        PluginType.ADMIN,
+        PluginType.SUPER_AND_ADMIN,
+        PluginType.HIDDEN,
+        PluginType.DEPENDANT,
+        PluginType.PARENT,
+    }
+    _infra_module_tails: ClassVar[set[str]] = {
+        "admin_help",
+        "auto_backup",
+        "auto_update",
+        "bot_manage",
+        "broadcast",
+        "check",
+        "chkdsk_hook",
+        "clear_data",
+        "exec_sql",
+        "fg_manage",
+        "group_manage",
+        "group_member_update",
+        "group_update",
+        "hooks",
+        "init",
+        "init_config",
+        "init_plugin",
+        "init_task",
+        "limiter_hook",
+        "llm_manager",
+        "plugin_config_manager",
+        "plugin_store",
+        "plugin_switch",
+        "restart",
+        "scheduler",
+        "scheduler_admin",
+        "scheduler_adm",
+        "set_admin",
+        "super_help",
+        "update_fg_info",
+        "web_ui",
+        "withdraw_hook",
+    }
+    _infra_module_markers: ClassVar[tuple[str, ...]] = (
+        ".builtin_plugins.hooks",
+        ".builtin_plugins.init",
+        ".builtin_plugins.scheduler",
+        ".services.",
+        ".webui",
+        ".web_ui",
+    )
 
     @classmethod
     async def get_plugin_knowledge_base(
@@ -124,8 +184,7 @@ class PluginRegistry:
             if not command_text:
                 continue
             params = [
-                str(param).strip()
-                for param in (getattr(raw, "params", []) or [])
+                str(param).strip() for param in (getattr(raw, "params", []) or [])
             ]
             params = [param for param in params if param]
             params = cls._merge_unique_strings(
@@ -240,7 +299,9 @@ class PluginRegistry:
 
     @classmethod
     def _is_public_command_meta(cls, meta: PluginInfo.PluginCommandMeta) -> bool:
-        return cls._normalize_access_level(getattr(meta, "access_level", None)) == "public"
+        return (
+            cls._normalize_access_level(getattr(meta, "access_level", None)) == "public"
+        )
 
     @classmethod
     def _filter_public_command_meta(
@@ -285,7 +346,7 @@ class PluginRegistry:
         allow_at: bool | None,
         target_sources: object,
     ) -> list[str]:
-        if isinstance(target_sources, (list, tuple)):
+        if isinstance(target_sources, list | tuple):
             parsed = [
                 str(item).strip().lower()
                 for item in target_sources
@@ -375,14 +436,23 @@ class PluginRegistry:
             image_min=image_min,
             image_max=image_max,
             allow_at=allow_at,
-            actor_scope=resolved_actor_scope,
-            target_requirement=resolved_target_requirement,
-            target_sources=resolved_target_sources,
+            actor_scope=cast(Literal["self_only", "allow_other"], resolved_actor_scope),
+            target_requirement=cast(
+                Literal["none", "optional", "required"],
+                resolved_target_requirement,
+            ),
+            target_sources=cast(
+                list[Literal["at", "reply", "nickname", "self"]],
+                resolved_target_sources,
+            ),
             requires_reply=resolved_requires_reply,
             requires_private=resolved_requires_private,
             requires_to_me=resolved_requires_to_me,
             allow_sticky_arg=resolved_allow_sticky_arg,
-            access_level=resolved_access_level,
+            access_level=cast(
+                Literal["public", "admin", "superuser", "restricted"],
+                resolved_access_level,
+            ),
         )
 
     @classmethod
@@ -404,9 +474,9 @@ class PluginRegistry:
             "allow_at": cls._safe_bool(getattr(meta, "allow_at", None)),
             "actor_scope": str(getattr(meta, "actor_scope", "") or "").strip().lower()
             or None,
-            "target_requirement": str(
-                getattr(meta, "target_requirement", "") or ""
-            ).strip().lower()
+            "target_requirement": str(getattr(meta, "target_requirement", "") or "")
+            .strip()
+            .lower()
             or None,
             "target_sources": list(getattr(meta, "target_sources", []) or []),
             "requires_reply": bool(getattr(meta, "requires_reply", False)),
@@ -425,7 +495,7 @@ class PluginRegistry:
     ) -> list[str]:
         result: list[str] = []
         for collection in (left or [], right or []):
-            if isinstance(collection, (list, tuple)):
+            if isinstance(collection, list | tuple):
                 iterable = collection
             else:
                 iterable = [collection]
@@ -503,7 +573,9 @@ class PluginRegistry:
                         left.get("access_level"), right.get("access_level")
                     ),
                 )
-        return sorted(merged.values(), key=lambda item: (len(item.command), item.command))
+        return sorted(
+            merged.values(), key=lambda item: (len(item.command), item.command)
+        )
 
     @classmethod
     def _command_meta_richness(
@@ -629,7 +701,10 @@ class PluginRegistry:
                     "allow_sticky_arg",
                     "access_level",
                 ):
-                    if payload.get(field) is None and item_payload.get(field) is not None:
+                    if (
+                        payload.get(field) is None
+                        and item_payload.get(field) is not None
+                    ):
                         payload[field] = item_payload.get(field)
             canonicalized.append(cls._with_command_meta_defaults(**payload))
 
@@ -728,7 +803,9 @@ class PluginRegistry:
         for item in metas:
             if item is target:
                 continue
-            command_fold = cls._normalize_command(getattr(item, "command", "")).casefold()
+            command_fold = cls._normalize_command(
+                getattr(item, "command", "")
+            ).casefold()
             if command_fold in alias_heads:
                 continue
             folded.append(item)
@@ -930,7 +1007,49 @@ class PluginRegistry:
 
     @classmethod
     def _is_runtime_plugin_allowed(cls, module_name: str, loaded_plugin=None) -> bool:
-        return bool(module_name and loaded_plugin is not None)
+        return bool(
+            module_name
+            and loaded_plugin is not None
+            and not cls._is_infrastructure_module(module_name)
+        )
+
+    @classmethod
+    def _is_infrastructure_module(
+        cls,
+        module_name: str,
+        plugin_name: str | None = None,
+    ) -> bool:
+        normalized = str(module_name or "").strip().lower()
+        if not normalized:
+            return True
+        tail = normalized.rsplit(".", 1)[-1]
+        if tail in cls._infra_module_tails:
+            return True
+        if any(marker in normalized for marker in cls._infra_module_markers):
+            return True
+
+        name_text = normalize_message_text(plugin_name or "").lower()
+        return bool(
+            name_text
+            and name_text
+            in {
+                "webui",
+                "webui管理",
+                "ui管理",
+                "重启",
+                "广播",
+                "数据库操作",
+                "插件商店",
+                "插件配置管理",
+                "功能开关",
+                "llm模型管理",
+                "bot管理",
+                "好友群组列表",
+                "管理群操作",
+                "超级用户帮助",
+                "群组管理员帮助",
+            }
+        )
 
     @classmethod
     async def _build_plugin_info(
@@ -973,7 +1092,7 @@ class PluginRegistry:
                 )
         command_meta = cls._fold_plugin_alias_command_meta(
             command_meta,
-            plugin_aliases=extra_data.aliases,
+            plugin_aliases=list(extra_data.aliases or []),
         )
         command_meta = cls._canonicalize_command_meta_groups(command_meta)
         command_meta = cls._filter_public_command_meta(command_meta)
@@ -991,8 +1110,7 @@ class PluginRegistry:
             admin_level if admin_level is not None else extra_data.admin_level
         )
         resolved_description = (
-            str(getattr(metadata, "description", "") or "").strip()
-            or "暂无描述"
+            str(getattr(metadata, "description", "") or "").strip() or "暂无描述"
         )
         resolved_usage = (
             str(getattr(metadata, "usage", "") or "").strip()
@@ -1024,12 +1142,7 @@ class PluginRegistry:
         if bool(getattr(extra_data, "limit_superuser", False)):
             return False
         plugin_type = getattr(extra_data, "plugin_type", PluginType.NORMAL)
-        if plugin_type in {
-            PluginType.SUPERUSER,
-            PluginType.ADMIN,
-            PluginType.SUPER_AND_ADMIN,
-            PluginType.HIDDEN,
-        }:
+        if plugin_type in cls._restricted_plugin_types:
             return False
         setting = extra_data.setting
         if isinstance(setting, dict):
@@ -1070,18 +1183,12 @@ class PluginRegistry:
             db_plugins = await cls._load_db_plugins()
         except Exception as exc:
             logger.debug(
-                "ChatInter 插件知识库数据库增强失败，已回退到运行时插件: "
-                f"{exc}"
+                "ChatInter 插件知识库数据库增强失败，已回退到运行时插件: " f"{exc}"
             )
             return
 
         for db_plugin in db_plugins.values():
-            if db_plugin.plugin_type in {
-                PluginType.SUPERUSER,
-                PluginType.ADMIN,
-                PluginType.SUPER_AND_ADMIN,
-                PluginType.HIDDEN,
-            }:
+            if db_plugin.plugin_type in cls._restricted_plugin_types:
                 continue
             if int(db_plugin.admin_level or 0) > 0:
                 continue
@@ -1094,6 +1201,8 @@ class PluginRegistry:
             ]
             module_name = next((item for item in module_candidates if item), "")
             if not module_name:
+                continue
+            if cls._is_infrastructure_module(module_name, str(db_plugin.name or "")):
                 continue
 
             runtime_plugin = plugins_by_module.get(module_name)
@@ -1160,13 +1269,7 @@ class PluginRegistry:
         seen_fingerprints: set[tuple[str, tuple[str, ...]]] = set()
         for plugin in ordered:
             command_fingerprint = tuple(
-                sorted(
-                    {
-                        cmd.strip().lower()
-                        for cmd in plugin.commands
-                        if cmd.strip()
-                    }
-                )
+                sorted({cmd.strip().lower() for cmd in plugin.commands if cmd.strip()})
             )
             fingerprint = (
                 plugin.name.strip().lower(),
@@ -1181,14 +1284,14 @@ class PluginRegistry:
         # 当父模块（如 csgo）的所有命令都已出现在子模块（如 csgo.commands）中时，
         # 父模块只是一个空壳容器，注册它会导致同一命令出现在多个 SkillSpec 中，
         # 造成交叉路由混淆。此处将这类父模块过滤掉。
-        modules_set = {p.module for p in deduplicated}
         parent_modules_to_remove: set[str] = set()
 
         for plugin in deduplicated:
             parent_module = plugin.module
             # 收集所有直接子模块
             children = [
-                p for p in deduplicated
+                p
+                for p in deduplicated
                 if p.module != parent_module
                 and p.module.startswith(parent_module + ".")
             ]
@@ -1221,8 +1324,7 @@ class PluginRegistry:
 
         if parent_modules_to_remove:
             deduplicated = [
-                p for p in deduplicated
-                if p.module not in parent_modules_to_remove
+                p for p in deduplicated if p.module not in parent_modules_to_remove
             ]
 
         return sorted(deduplicated, key=lambda item: item.module)
@@ -1237,7 +1339,7 @@ class PluginRegistry:
         for payload in matcher_meta:
             candidates = [str(payload.get("command") or "").strip()]
             raw_aliases = payload.get("aliases") or []
-            if isinstance(raw_aliases, (set, list, tuple, frozenset)):
+            if isinstance(raw_aliases, set | list | tuple | frozenset):
                 candidates.extend(
                     str(alias).strip() for alias in raw_aliases if str(alias).strip()
                 )
@@ -1341,7 +1443,9 @@ class PluginRegistry:
             ]
             filtered_meta.append(cls._with_command_meta_defaults(**payload))
 
-        filtered_commands = cls._merge_unique_strings(filtered_commands, matcher_commands)
+        filtered_commands = cls._merge_unique_strings(
+            filtered_commands, matcher_commands
+        )
 
         if not filtered_meta:
             filtered_meta = cls._build_command_meta_from_commands(filtered_commands)
@@ -1464,6 +1568,19 @@ class PluginRegistry:
         return True
 
     @classmethod
+    def _is_allowed_plugin_info(cls, plugin: PluginInfo) -> bool:
+        if not plugin.commands:
+            return False
+        if cls._is_infrastructure_module(plugin.module, plugin.name):
+            return False
+        if bool(plugin.limit_superuser):
+            return False
+        if int(plugin.admin_level or 0) > 0:
+            return False
+        public_meta = cls._filter_public_command_meta(plugin.command_meta)
+        return bool(public_meta or not plugin.command_meta)
+
+    @classmethod
     def filter_knowledge_base(
         cls,
         knowledge_base: PluginKnowledgeBase,
@@ -1473,6 +1590,8 @@ class PluginRegistry:
             return knowledge_base
         selected: list[PluginInfo] = []
         for plugin in knowledge_base.plugins:
+            if not cls._is_allowed_plugin_info(plugin):
+                continue
             if not cls._is_plugin_enabled(plugin, selection_context):
                 continue
             if not cls._is_plugin_authorized(plugin, selection_context):
@@ -1482,6 +1601,138 @@ class PluginRegistry:
             plugins=selected,
             user_role=knowledge_base.user_role,
         )
+
+    @classmethod
+    def build_capability_graph(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+    ) -> CapabilityGraphSnapshot:
+        """构建安全过滤后的插件能力图。"""
+        if selection_context is not None:
+            source = cls.filter_knowledge_base(
+                knowledge_base,
+                selection_context=selection_context,
+            )
+        else:
+            selected: list[PluginInfo] = []
+            for plugin in knowledge_base.plugins:
+                if cls._is_allowed_plugin_info(plugin):
+                    selected.append(plugin)
+            source = PluginKnowledgeBase(
+                plugins=selected,
+                user_role=knowledge_base.user_role,
+            )
+        return build_capability_graph_snapshot(source, limit=limit)
+
+    @classmethod
+    def build_plugin_references(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+    ) -> list[PluginReference]:
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=limit,
+        )
+        return build_plugin_references(graph, limit=limit)
+
+    @classmethod
+    def build_router_cards(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+        query: str = "",
+    ) -> list[dict[str, object]]:
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=limit,
+        )
+        return build_router_cards_from_graph(graph, limit=limit, query=query)
+
+    @classmethod
+    def build_compact_cards(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        """兼容旧调用：返回 Router 使用的紧凑插件卡片。"""
+        return cls.build_router_cards(knowledge_base, limit=limit)
+
+    @classmethod
+    def _build_compact_cards_legacy(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        """旧版卡片渲染逻辑，保留作对照与快速回退。"""
+        plugins = knowledge_base.plugins
+        if limit is not None:
+            plugins = plugins[: max(int(limit), 0)]
+
+        cards: list[dict[str, object]] = []
+        for plugin in plugins:
+            if not cls._is_allowed_plugin_info(plugin):
+                continue
+            commands: list[str] = []
+            aliases: list[str] = []
+            examples: list[str] = []
+            requires = {
+                "text": False,
+                "image": False,
+                "reply": False,
+                "at": False,
+            }
+            for meta in plugin.command_meta:
+                cls._append_command(commands, meta.command)
+                for alias in meta.aliases:
+                    cls._append_command(aliases, alias)
+                for example in meta.examples:
+                    text = cls._normalize_command(example)
+                    if text and text not in examples:
+                        examples.append(text)
+                requires["text"] = requires["text"] or bool(
+                    (meta.text_min or 0) > 0 or meta.params
+                )
+                requires["image"] = requires["image"] or bool((meta.image_min or 0) > 0)
+                requires["reply"] = requires["reply"] or bool(meta.requires_reply)
+                requires["at"] = requires["at"] or bool(
+                    meta.allow_at or "at" in meta.target_sources
+                )
+
+            for command in plugin.commands:
+                cls._append_command(commands, command)
+            for alias in plugin.aliases:
+                cls._append_command(aliases, alias)
+
+            does = normalize_message_text(plugin.description or "")
+            if does == "暂无描述" and plugin.usage:
+                does = normalize_message_text(plugin.usage)
+            if len(does) > 96:
+                does = does[:96].rstrip() + "..."
+
+            cards.append(
+                {
+                    "module": plugin.module,
+                    "name": plugin.name,
+                    "commands": commands[:10],
+                    "aliases": aliases[:6],
+                    "does": does,
+                    "examples": examples[:4],
+                    "requires": requires,
+                }
+            )
+        return cards
 
     @classmethod
     async def set_plugin_enabled(

@@ -26,8 +26,9 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from .lifecycle import ensure_lifecycle_hooks_registered
+from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
+from .lifecycle import ensure_lifecycle_hooks_registered
 from .memory import _chat_memory
 from .plugin_registry import PluginRegistry
 from .turn_metrics import render_route_observer_summary
@@ -35,6 +36,7 @@ from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()
 _DYNAMIC_MATCHER_RESCAN_DELAYS = (2, 8, 20)
+_dynamic_rescan_task: asyncio.Task | None = None
 
 
 __plugin_meta__ = PluginMetadata(
@@ -165,7 +167,7 @@ _fallback_matcher = on_message(
 
 def _is_private_text_only_message(
     event: Event,
-    event_message: Message | None,
+    event_message: object,
 ) -> bool:
     if not isinstance(event, PrivateMessageEvent):
         return True
@@ -183,7 +185,6 @@ def _is_private_text_only_message(
             continue
         return False
     return has_text
-
 
 
 @_fallback_matcher.handle()
@@ -285,19 +286,23 @@ async def _handle_reset_by_alconna(
 
 @_stats_matcher.handle()
 async def _handle_stats_by_alconna():
-    await MessageUtils.build_message(render_route_observer_summary()).send()
+    await MessageUtils.build_message(
+        render_route_observer_summary() + "\n\n" + render_execution_observer_summary()
+    ).send()
 
 
 @driver.on_startup
 async def _on_startup():
     """插件启动初始化"""
+    global _dynamic_rescan_task
+
     from zhenxun.configs.config import BotConfig
 
     logger.info("ChatInter 插件已加载")
     await ensure_lifecycle_hooks_registered()
     _chat_memory.set_bot_nickname(BotConfig.self_nickname)
     await PluginRegistry.preload_cache()
-    asyncio.create_task(_rescan_dynamic_matchers_after_startup())
+    _dynamic_rescan_task = asyncio.create_task(_rescan_dynamic_matchers_after_startup())
 
 
 async def _rescan_dynamic_matchers_after_startup():
@@ -306,6 +311,5 @@ async def _rescan_dynamic_matchers_after_startup():
         await asyncio.sleep(delay_seconds)
         await PluginRegistry.preload_cache(force_refresh=True)
         logger.info(
-            "ChatInter 已完成 startup 后动态 matcher 补扫："
-            f"delay={delay_seconds}s"
+            "ChatInter 已完成 startup 后动态 matcher 补扫：" f"delay={delay_seconds}s"
         )
