@@ -8,6 +8,18 @@ from pydantic import BaseModel, Field
 
 from zhenxun.services import generate_structured, logger
 
+from .capability_graph import capability_from_plugin
+from .command_index import (
+    CommandCandidate,
+    build_command_candidates,
+    dump_schema_for_prompt,
+)
+from .command_schema import (
+    build_command_schemas,
+    complete_slots,
+    render_command,
+    select_command_schema,
+)
 from .config import (
     get_config_value,
     get_model_name,
@@ -32,6 +44,7 @@ from .route_text import (
     parse_command_with_head,
     strip_invoke_prefix,
 )
+from .route_tool_planner import build_command_choice_tools
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillRouteDecision,
@@ -44,6 +57,7 @@ from .skill_registry import (
     skill_execute,
     skill_search,
 )
+from .speech_act import classify_speech_act
 from .turn_runtime import TurnBudgetController
 
 _ROUTE_NAMESPACE_LIMIT = 12
@@ -51,7 +65,11 @@ _ROUTE_PLUGIN_SHORTLIST_LIMIT = 30
 _WEAK_SIGNAL_SHORTLIST_LIMIT = 5
 _ROUTER_INSTRUCTION = """
 判断用户消息是普通对话、插件执行、插件用法查询、还是需要澄清。
-只能选择 plugin_cards 中存在的插件和命令。
+优先选择 plugin_cards.command_schemas 中存在的 command_id，并填写 slots。
+不要自由发明命令；需要执行时给出 command_id 或合法命令头。
+列表/有哪些/搜索类 helper 命令属于 execute，只有“怎么用/用法/教程/示例”才 usage。
+图片模板命令只需要图片时不要把自然语言描述当作 text 参数。
+只有必填槽位缺失时才 clarify；无必填槽位的命令可以直接 execute。
 输出 JSON，不要输出额外文本。
 """.strip()
 _SHORTLIST_ALIGNMENT_INSTRUCTION = _ROUTER_INSTRUCTION
@@ -67,7 +85,7 @@ _TOOL_ROUTE_INSTRUCTION = """
 5. "怎么用/用法/帮助/参数"类问题优先帮助型命令，不要误调用业务动作命令。
 """.strip()
 _JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-_AT_PLACEHOLDER_PATTERN = re.compile(r"\[@\d{5,20}\]")
+_AT_PLACEHOLDER_PATTERN = re.compile(r"\[@[^\]\s]+\]")
 _AT_INLINE_PATTERN = re.compile(r"@\d{5,20}")
 _IMAGE_PLACEHOLDER_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _ROUTE_TRACE_SAMPLE_LIMIT = 12
@@ -110,6 +128,9 @@ class RouteResolveResult:
     decision: SkillRouteDecision
     stage: str
     report: "RouteAttemptReport | None" = None
+    command_id: str | None = None
+    slots: dict[str, Any] = field(default_factory=dict)
+    missing: tuple[str, ...] = ()
 
 
 @dataclass
@@ -216,10 +237,33 @@ class LLMRouterDecision(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     plugin_module: str | None = Field(default=None, description="必须来自 plugin_cards")
     plugin_name: str | None = Field(default=None, description="插件名称，可选")
+    command_id: str | None = Field(default=None, description="优先使用的命令 schema ID")
     command: str | None = Field(default=None, description="插件命令头")
+    slots: dict[str, Any] = Field(default_factory=dict, description="命令槽位")
     arguments_text: str = Field(default="", description="命令后的自然语言参数")
     missing: list[str] = Field(default_factory=list, description="缺失信息")
     reason: str | None = Field(default=None, description="简短原因")
+
+
+class LLMCommandSelection(BaseModel):
+    action: Literal["chat", "execute", "usage", "clarify"] = Field(
+        default="chat",
+        description="chat=普通对话；execute=执行候选命令；usage=查询候选命令用法；clarify=需要补充信息",
+    )
+    command_id: str | None = Field(
+        default=None,
+        description="必须来自 candidates.command_id；chat 时为空",
+    )
+    slots: dict[str, Any] = Field(
+        default_factory=dict,
+        description="按候选 schema 填写的槽位，不要臆造 schema 之外的槽位",
+    )
+    missing: list[str] = Field(
+        default_factory=list,
+        description="缺失的必填槽位或上下文，例如 text/image/reply/target",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = Field(default="", description="简短选择理由")
 
 
 def _resolve_target_plugin(
@@ -280,6 +324,16 @@ def _collect_allowed_heads(plugin: PluginInfo) -> set[str]:
             normalized = normalize_message_text(command)
             if normalized:
                 allowed.add(normalized.casefold())
+    capability = capability_from_plugin(plugin)
+    if capability is not None:
+        for schema in build_command_schemas(plugin.module, capability.commands):
+            head = normalize_message_text(schema.head)
+            if head:
+                allowed.add(head.casefold())
+            for alias in schema.aliases:
+                alias_text = normalize_message_text(alias)
+                if alias_text:
+                    allowed.add(alias_text.casefold())
     return allowed
 
 
@@ -321,6 +375,12 @@ def _strip_supported_command_prefixes(command: str, plugin: PluginInfo) -> str:
     if not normalized:
         return ""
 
+    allowed_heads = _collect_allowed_heads(plugin)
+    normalized_fold = normalized.casefold()
+    command_head = normalize_message_text(normalized.split(" ", 1)[0]).casefold()
+    if command_head in allowed_heads:
+        return normalized
+
     prefixes: list[str] = []
     for meta in plugin.command_meta:
         if not _is_public_command_meta(meta):
@@ -333,12 +393,21 @@ def _strip_supported_command_prefixes(command: str, plugin: PluginInfo) -> str:
     for prefix in sorted(prefixes, key=len, reverse=True):
         if normalized.startswith(prefix):
             stripped = normalize_message_text(normalized[len(prefix) :])
-            if stripped:
+            stripped_head = normalize_message_text(
+                stripped.split(" ", 1)[0] if stripped else ""
+            ).casefold()
+            if stripped_head in allowed_heads:
                 return stripped
+            for candidate_head in sorted(allowed_heads, key=len, reverse=True):
+                if candidate_head and stripped.casefold().startswith(candidate_head):
+                    return stripped
 
-    if normalized.startswith("/") and len(normalized) > 1:
+    if normalized_fold.startswith("/") and len(normalized) > 1:
         stripped = normalize_message_text(normalized[1:])
-        if stripped:
+        stripped_head = normalize_message_text(
+            stripped.split(" ", 1)[0] if stripped else ""
+        ).casefold()
+        if stripped_head in allowed_heads:
             return stripped
     return normalized
 
@@ -458,6 +527,21 @@ def _sanitize_command_with_schema(
     return normalize_message_text(" ".join([head, *payload]).strip())
 
 
+def _schema_accepts_text_payload(schema: Any | None) -> bool:
+    if schema is None:
+        return False
+    text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
+    if text_min > 0:
+        return True
+    text_max = getattr(schema, "text_max", None)
+    if text_max is not None:
+        try:
+            return int(text_max) > 0
+        except Exception:
+            return False
+    return bool(getattr(schema, "params", None))
+
+
 def _rehydrate_command_payload_from_message(
     command: str,
     *,
@@ -471,14 +555,13 @@ def _rehydrate_command_payload_from_message(
         return normalized
 
     has_payload_signal = _message_has_payload_signals(message_text)
+    accepts_text_payload = _schema_accepts_text_payload(schema)
     if schema is None and not has_payload_signal:
         return normalized
 
-    text_min = (
-        max(int(getattr(schema, "text_min", 0) or 0), 0) if schema is not None else 0
-    )
-    has_params = bool(getattr(schema, "params", None)) if schema is not None else False
-    if text_min <= 0 and not has_params and not has_payload_signal:
+    if not accepts_text_payload and schema is not None:
+        return normalized
+    if not accepts_text_payload and not has_payload_signal:
         return normalized
 
     command_head = normalize_message_text(normalized.split(" ", 1)[0])
@@ -531,6 +614,10 @@ def _to_route_result(
     decision: _LLMRouteDecision,
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
+    *,
+    command_id: str | None = None,
+    slots: dict[str, Any] | None = None,
+    missing: list[str] | tuple[str, ...] = (),
 ) -> RouteResolveResult | None:
     if decision.action != "route":
         return None
@@ -584,6 +671,7 @@ def _to_route_result(
     if (
         helper_heads
         and command_head in helper_heads
+        and not command_id
         and not is_usage_question(message_text)
         and not _is_explicit_helper_command_request(message_text, command_head)
     ):
@@ -596,7 +684,39 @@ def _to_route_result(
         source="llm",
         skill_kind="llm",
     )
-    return RouteResolveResult(decision=route_decision, stage="llm")
+    return RouteResolveResult(
+        decision=route_decision,
+        stage="llm",
+        command_id=normalize_message_text(command_id or "") or None,
+        slots=dict(slots or {}),
+        missing=tuple(item for item in missing if item),
+    )
+
+
+def _to_plugin_route_result(
+    *,
+    plugin: PluginInfo,
+    stage: str,
+    source: str,
+    skill_kind: str,
+    command: str = "",
+    command_id: str | None = None,
+    slots: dict[str, Any] | None = None,
+    missing: list[str] | tuple[str, ...] = (),
+) -> RouteResolveResult:
+    return RouteResolveResult(
+        decision=SkillRouteDecision(
+            plugin_name=plugin.name,
+            plugin_module=plugin.module,
+            command=normalize_message_text(command),
+            source=source,
+            skill_kind=skill_kind,
+        ),
+        stage=stage,
+        command_id=normalize_message_text(command_id or "") or None,
+        slots=dict(slots or {}),
+        missing=tuple(item for item in missing if item),
+    )
 
 
 def _validate_existing_route_result(
@@ -613,6 +733,9 @@ def _validate_existing_route_result(
         ),
         message_text,
         knowledge_base,
+        command_id=route_result.command_id,
+        slots=route_result.slots,
+        missing=route_result.missing,
     )
     if validated is None:
         return None
@@ -625,6 +748,9 @@ def _validate_existing_route_result(
             skill_kind=route_result.decision.skill_kind,
         ),
         stage=route_result.stage,
+        command_id=validated.command_id or route_result.command_id,
+        slots=dict(validated.slots or route_result.slots),
+        missing=validated.missing or route_result.missing,
     )
 
 
@@ -918,6 +1044,496 @@ def _build_router_prompt(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def _message_context_flags(
+    message_text: str, *, has_reply: bool = False
+) -> dict[str, bool]:
+    return {
+        "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
+        "has_at": bool(
+            _AT_PLACEHOLDER_PATTERN.search(message_text)
+            or _AT_INLINE_PATTERN.search(message_text)
+        ),
+        "has_reply": has_reply,
+    }
+
+
+def _resolve_command_index_route(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    has_reply: bool = False,
+    session_key: str | None = None,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    flags = _message_context_flags(message_text, has_reply=has_reply)
+    speech_act = classify_speech_act(message_text, **flags)
+    if speech_act == "discuss_command":
+        return LLMRouterDecision(
+            action="chat",
+            confidence=0.82,
+            reason=f"speech_act:{speech_act}",
+        ), None
+
+    candidates = build_command_candidates(
+        knowledge_base,
+        message_text,
+        limit=8,
+        session_id=session_key,
+    )
+    if not candidates:
+        return None
+
+    top = candidates[0]
+    second_score = candidates[1].score if len(candidates) > 1 else 0.0
+    margin = top.score - second_score
+    if top.score < 190.0:
+        return None
+    if margin < 24.0 and top.schema.command_role not in {"catalog", "helper", "random"}:
+        return None
+
+    schema = top.schema
+    route_slots, schema_missing = complete_slots(
+        schema,
+        slots={},
+        message_text=message_text,
+        arguments_text="",
+    )
+    rendered, schema_missing = render_command(
+        schema,
+        slots=route_slots,
+        message_text=message_text,
+        arguments_text="",
+    )
+    action: Literal["chat", "execute", "usage", "clarify"]
+    if speech_act == "ask_usage":
+        action = "usage"
+    elif schema_missing:
+        action = "clarify"
+    else:
+        action = "execute"
+    decision_command = schema.head if action == "usage" else rendered or schema.head
+    decision_slots = {} if action == "usage" else route_slots
+    decision_missing = [] if action == "usage" else list(schema_missing)
+
+    decision = LLMRouterDecision(
+        action=action,
+        confidence=min(max(top.score / 360.0, 0.0), 0.98),
+        plugin_module=top.plugin_module,
+        plugin_name=top.plugin_name,
+        command_id=schema.command_id,
+        command=decision_command,
+        slots=decision_slots,
+        missing=decision_missing,
+        reason=f"command_index:{top.reason};score={top.score:.1f};margin={margin:.1f}",
+    )
+    if action == "usage":
+        return decision, _to_plugin_route_result(
+            plugin=_resolve_target_plugin(
+                _LLMRouteDecision(
+                    action="route",
+                    plugin_module=top.plugin_module,
+                    plugin_name=top.plugin_name,
+                    command=schema.head,
+                ),
+                knowledge_base,
+            )
+            or PluginInfo(
+                module=top.plugin_module,
+                name=top.plugin_name,
+                description="",
+            ),
+            stage="command_index_usage",
+            source="command_index",
+            skill_kind="command_index",
+            command=decision_command,
+            command_id=schema.command_id,
+            slots=decision_slots,
+            missing=decision_missing,
+        )
+
+    route_result = _to_route_result(
+        _LLMRouteDecision(
+            action="route",
+            plugin_module=top.plugin_module,
+            plugin_name=top.plugin_name,
+            command=rendered or schema.head,
+        ),
+        message_text,
+        knowledge_base,
+        command_id=schema.command_id,
+        slots=route_slots,
+        missing=schema_missing,
+    )
+    if route_result is None:
+        return None
+    return decision, RouteResolveResult(
+        decision=SkillRouteDecision(
+            plugin_name=route_result.decision.plugin_name,
+            plugin_module=route_result.decision.plugin_module,
+            command=route_result.decision.command,
+            source="command_index",
+            skill_kind="command_index",
+        ),
+        stage="command_index",
+        report=route_result.report,
+        command_id=route_result.command_id,
+        slots=route_result.slots,
+        missing=route_result.missing,
+    )
+
+
+def _build_candidate_selection_prompt(
+    *,
+    message_text: str,
+    candidates: list[CommandCandidate],
+    has_reply: bool,
+) -> str:
+    _, tool_specs = build_command_choice_tools(
+        candidates,
+        max_tools=len(candidates),
+    )
+    tool_by_command_id = {
+        spec.command_id: {
+            "tool_name": spec.tool_name,
+            "candidate_index": spec.candidate_index,
+        }
+        for spec in tool_specs.values()
+    }
+    payload = {
+        "message": message_text,
+        "has_reply": has_reply,
+        "task": (
+            "只在 candidates 中选择一个 command_id，或判断为 chat/clarify/usage。"
+            "需要执行时同时填写 slots。不要自由发明命令。"
+        ),
+        "candidates": [
+            {
+                "rank": index,
+                "score": round(candidate.score, 2),
+                "family": candidate.family,
+                "reason": candidate.reason,
+                "plugin_module": candidate.plugin_module,
+                "plugin_name": candidate.plugin_name,
+                "tool": tool_by_command_id.get(candidate.schema.command_id, {}),
+                **dump_schema_for_prompt(candidate.schema),
+            }
+            for index, candidate in enumerate(candidates, 1)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _fallback_candidate_selection(
+    *,
+    message_text: str,
+    candidates: list[CommandCandidate],
+    has_reply: bool,
+) -> LLMCommandSelection | None:
+    if not candidates:
+        return None
+    flags = _message_context_flags(message_text, has_reply=has_reply)
+    speech_act = classify_speech_act(message_text, **flags)
+    if speech_act in {"casual_chat", "discuss_command"}:
+        return None
+    top = candidates[0]
+    second_score = candidates[1].score if len(candidates) > 1 else 0.0
+    margin = top.score - second_score
+    strong_enough = top.score >= 150.0 and (
+        margin >= 18.0 or top.schema.command_role in {"catalog", "helper", "random"}
+    )
+    if not strong_enough:
+        return None
+    if speech_act == "ask_usage":
+        return LLMCommandSelection(
+            action="usage",
+            command_id=top.schema.command_id,
+            confidence=min(max(top.score / 360.0, 0.0), 0.9),
+            reason=f"local_fallback_usage:{top.reason}",
+        )
+    slots, missing = complete_slots(
+        top.schema,
+        slots={},
+        message_text=message_text,
+        arguments_text="",
+    )
+    return LLMCommandSelection(
+        action="clarify" if missing else "execute",
+        command_id=top.schema.command_id,
+        slots=slots,
+        missing=list(missing),
+        confidence=min(max(top.score / 360.0, 0.0), 0.9),
+        reason=f"local_fallback:{top.reason};score={top.score:.1f};margin={margin:.1f}",
+    )
+
+
+def _is_generic_meme_creation_request(
+    message_text: str,
+    candidates: list[CommandCandidate],
+) -> bool:
+    normalized = normalize_message_text(message_text).casefold()
+    if not normalized:
+        return False
+    meme_candidates = [item for item in candidates if item.family == "meme"]
+    if not meme_candidates:
+        return False
+    if "随机" in normalized:
+        return False
+    if not any(token in normalized for token in ("表情", "表情包", "梗图", "头像")):
+        return False
+    if not any(
+        token in normalized
+        for token in ("做", "制作", "生成", "整", "来个", "来一个", "来张", "来一张")
+    ):
+        return False
+    for candidate in meme_candidates:
+        schema = candidate.schema
+        if schema.command_role not in {"template", "random"}:
+            continue
+        phrases = [schema.head, *schema.aliases]
+        if any(
+            normalize_message_text(phrase).casefold()
+            and normalize_message_text(phrase).casefold() in normalized
+            for phrase in phrases
+        ):
+            return False
+    return True
+
+
+def _pick_meme_clarify_candidate(
+    candidates: list[CommandCandidate],
+) -> CommandCandidate | None:
+    meme_candidates = [item for item in candidates if item.family == "meme"]
+    for candidate in meme_candidates:
+        if candidate.schema.command_id == "memes.list":
+            return candidate
+    for candidate in meme_candidates:
+        if candidate.schema.command_role in {"catalog", "helper"}:
+            return candidate
+    return meme_candidates[0] if meme_candidates else None
+
+
+def _candidate_selection_to_route_result(
+    *,
+    selection: LLMCommandSelection,
+    candidates: list[CommandCandidate],
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    stage: str,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    if selection.action == "chat":
+        return (
+            LLMRouterDecision(
+                action="chat",
+                confidence=selection.confidence,
+                reason=selection.reason or f"{stage}:chat",
+            ),
+            None,
+        )
+
+    command_id = normalize_message_text(selection.command_id or "")
+    if not command_id:
+        return None
+    candidate = next(
+        (
+            item
+            for item in candidates
+            if normalize_message_text(item.schema.command_id) == command_id
+        ),
+        None,
+    )
+    if candidate is None:
+        return None
+
+    schema = candidate.schema
+    route_slots = dict(selection.slots or {})
+    if selection.action == "usage":
+        rendered = schema.head
+        schema_missing: list[str] | tuple[str, ...] = ()
+        route_slots = {}
+    else:
+        route_slots, schema_missing = complete_slots(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+        rendered, schema_missing = render_command(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+    missing = [*selection.missing, *list(schema_missing)]
+    action: Literal["chat", "execute", "usage", "clarify"] = selection.action
+    if action == "execute" and missing:
+        action = "clarify"
+
+    command = schema.head if action == "usage" else rendered or schema.head
+    decision = LLMRouterDecision(
+        action=action,
+        confidence=selection.confidence,
+        plugin_module=candidate.plugin_module,
+        plugin_name=candidate.plugin_name,
+        command_id=schema.command_id,
+        command=command,
+        slots={} if action == "usage" else route_slots,
+        missing=[] if action == "usage" else missing,
+        reason=selection.reason or f"{stage}:{candidate.reason}",
+    )
+    route_result = _to_route_result(
+        _LLMRouteDecision(
+            action="route",
+            plugin_module=candidate.plugin_module,
+            plugin_name=candidate.plugin_name,
+            command=command,
+        ),
+        message_text,
+        knowledge_base,
+        command_id=schema.command_id,
+        slots=decision.slots,
+        missing=decision.missing,
+    )
+    if route_result is None:
+        return None
+
+    route_result = RouteResolveResult(
+        decision=SkillRouteDecision(
+            plugin_name=route_result.decision.plugin_name,
+            plugin_module=route_result.decision.plugin_module,
+            command=route_result.decision.command,
+            source=stage,
+            skill_kind=stage,
+        ),
+        stage=stage,
+        report=route_result.report,
+        command_id=route_result.command_id,
+        slots=route_result.slots,
+        missing=route_result.missing,
+    )
+    return decision, route_result
+
+
+async def _resolve_candidate_selection_route(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    session_key: str | None,
+    budget_controller: TurnBudgetController | None,
+    has_reply: bool,
+    report: RouteAttemptReport,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    candidates = build_command_candidates(
+        knowledge_base,
+        message_text,
+        limit=max(
+            int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
+            8,
+        ),
+        session_id=session_key,
+    )
+    if not candidates:
+        return None
+    # Very weak candidates are better left to the existing chat fallback path.
+    if candidates[0].score < 80.0:
+        return None
+
+    report.note_tool_pool(len(candidates))
+    if _is_generic_meme_creation_request(message_text, candidates):
+        clarify_candidate = _pick_meme_clarify_candidate(candidates)
+        if clarify_candidate is not None:
+            return _candidate_selection_to_route_result(
+                selection=LLMCommandSelection(
+                    action="clarify",
+                    command_id=clarify_candidate.schema.command_id,
+                    missing=["具体表情模板"],
+                    confidence=0.86,
+                    reason="generic_meme_template_missing",
+                ),
+                candidates=candidates,
+                message_text=message_text,
+                knowledge_base=knowledge_base,
+                stage="command_selector",
+            )
+    prompt = _build_candidate_selection_prompt(
+        message_text=message_text,
+        candidates=candidates,
+        has_reply=has_reply,
+    )
+    timeout = get_config_value("INTENT_TIMEOUT", 20)
+    try:
+        timeout_value = float(timeout) if timeout else None
+    except (TypeError, ValueError):
+        timeout_value = None
+
+    candidate_ids = {
+        normalize_message_text(candidate.schema.command_id) for candidate in candidates
+    }
+
+    async def _validate_selection(selection: LLMCommandSelection) -> None:
+        if selection.action in {"execute", "usage", "clarify"}:
+            selected_id = normalize_message_text(selection.command_id or "")
+            if selected_id not in candidate_ids:
+                raise ValueError(f"unknown command_id: {selected_id}")
+
+    selection: LLMCommandSelection | None = None
+    try:
+        if budget_controller is not None and not budget_controller.allow_classifier(
+            "command_selector"
+        ):
+            selection = _fallback_candidate_selection(
+                message_text=message_text,
+                candidates=candidates,
+                has_reply=has_reply,
+            )
+        else:
+            started = time.perf_counter()
+            guarded = guard_prompt_sections(
+                session_key=session_key or "global",
+                stage="command_selector",
+                system_prompt=(
+                    "你是命令分类器。只能从 candidates 里选 command_id；"
+                    "如果用户是在聊天、讨论概念、或请求不属于候选命令，返回 chat；"
+                    "如果用户询问怎么用/用法，返回 usage；"
+                    "如果命令明确但缺少必填参数，返回 clarify 并列出 missing；"
+                    "如果执行意图明确，返回 execute 并填写 slots。"
+                ),
+                user_text=prompt,
+                controller=budget_controller,
+            )
+            selection = await generate_structured(
+                guarded.user_text,
+                LLMCommandSelection,
+                model=get_model_name(),
+                instruction=guarded.system_prompt,
+                timeout=timeout_value,
+                validation_callback=_validate_selection,
+            )
+            if budget_controller is not None:
+                budget_controller.record_classifier(
+                    "command_selector",
+                    time.perf_counter() - started,
+                )
+    except Exception as exc:
+        logger.debug(f"ChatInter command selector 失败，尝试本地兜底: {exc}")
+        selection = _fallback_candidate_selection(
+            message_text=message_text,
+            candidates=candidates,
+            has_reply=has_reply,
+        )
+
+    if selection is None:
+        return None
+    result = _candidate_selection_to_route_result(
+        selection=selection,
+        candidates=candidates,
+        message_text=message_text,
+        knowledge_base=knowledge_base,
+        stage="command_selector",
+    )
+    if result is not None:
+        report.tool_choice_count += 1
+    return result
+
+
 def _pick_default_command(plugin: PluginInfo) -> str:
     for meta in plugin.command_meta:
         command = normalize_message_text(meta.command)
@@ -950,13 +1566,65 @@ def _router_decision_to_route_result(
         return None
 
     command = normalize_message_text(decision.command or "")
+    route_command_id = normalize_message_text(decision.command_id or "") or None
+    route_slots = dict(decision.slots or {})
+    schemas = []
+    capability = capability_from_plugin(plugin)
+    if capability is not None:
+        schemas = build_command_schemas(plugin.module, capability.commands)
+    selection = None
+    if not (decision.action == "usage" and not decision.command_id and not command):
+        selection = select_command_schema(
+            schemas,
+            command_id=decision.command_id,
+            command=command,
+            message_text=message_text,
+            arguments_text=decision.arguments_text,
+            slots=route_slots,
+            action=decision.action,
+        )
+    schema = selection.schema if selection is not None else None
+    if schema is not None:
+        route_command_id = schema.command_id
+        route_slots, schema_missing = complete_slots(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text=decision.arguments_text,
+        )
+        rendered, schema_missing = render_command(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text=decision.arguments_text,
+        )
+        command = rendered or schema.head
+        if schema_missing and decision.action == "execute":
+            decision.action = "clarify"
+            decision.missing = [*decision.missing, *schema_missing]
+
     if not command and allow_default_command:
-        command = _pick_default_command(plugin)
+        command = schemas[0].head if schemas else _pick_default_command(plugin)
     if not command:
+        if decision.action == "usage":
+            return _to_plugin_route_result(
+                plugin=plugin,
+                stage="llm",
+                source="llm",
+                skill_kind="llm",
+                command_id=route_command_id,
+                slots=route_slots,
+                missing=decision.missing,
+            )
         return None
 
     arguments = normalize_message_text(decision.arguments_text or "")
-    if arguments and arguments not in command:
+    if (
+        decision.action == "execute"
+        and schema is None
+        and arguments
+        and arguments not in command
+    ):
         command = normalize_message_text(f"{command} {arguments}")
 
     return _to_route_result(
@@ -968,6 +1636,9 @@ def _router_decision_to_route_result(
         ),
         message_text,
         knowledge_base,
+        command_id=route_command_id,
+        slots=route_slots,
+        missing=decision.missing,
     )
 
 
@@ -984,6 +1655,46 @@ async def resolve_llm_router(
     if not normalized_message:
         report.finalize(reason="router_empty")
         return LLMRouterDecision(action="chat", reason="empty"), None, report
+
+    indexed = _resolve_command_index_route(
+        normalized_message,
+        knowledge_base,
+        has_reply=has_reply,
+        session_key=session_key,
+    )
+    if indexed is not None:
+        decision, route_result = indexed
+        report.finalize(
+            reason=decision.reason or f"command_index_{decision.action}",
+            stage=route_result.stage if route_result is not None else "speech_act",
+            plugin_name=route_result.decision.plugin_name if route_result else None,
+            plugin_module=route_result.decision.plugin_module if route_result else None,
+            command=route_result.decision.command if route_result else None,
+        )
+        return decision, route_result, report
+
+    candidate_route = await _resolve_candidate_selection_route(
+        normalized_message,
+        knowledge_base,
+        session_key=session_key,
+        budget_controller=budget_controller,
+        has_reply=has_reply,
+        report=report,
+    )
+    if candidate_route is not None:
+        decision, route_result = candidate_route
+        report.finalize(
+            reason=decision.reason or f"command_selector_{decision.action}",
+            stage=(
+                route_result.stage
+                if route_result is not None
+                else "command_selector"
+            ),
+            plugin_name=route_result.decision.plugin_name if route_result else None,
+            plugin_module=route_result.decision.plugin_module if route_result else None,
+            command=route_result.decision.command if route_result else None,
+        )
+        return decision, route_result, report
 
     shortlist_limit = max(
         int(
@@ -1005,7 +1716,11 @@ async def resolve_llm_router(
     report.direct_candidates = len(attempt_kb.plugins)
     report.note_attempt(shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT])
 
-    cards = PluginRegistry.build_compact_cards(attempt_kb, limit=shortlist_limit)
+    cards = PluginRegistry.build_router_cards(
+        attempt_kb,
+        limit=shortlist_limit,
+        query=normalized_message,
+    )
     prompt = _build_router_prompt(
         message_text=normalized_message,
         cards=cards,
@@ -1058,7 +1773,7 @@ async def resolve_llm_router(
             decision,
             normalized_message,
             attempt_kb,
-            allow_default_command=decision.action in {"usage", "clarify"},
+            allow_default_command=decision.action == "clarify",
         )
         if route_result is None:
             report.finalize(reason="router_invalid_selection")
@@ -1294,6 +2009,9 @@ def probe_shortlist_route(
             decision=validated_shortlist_result.decision,
             stage=validated_shortlist_result.stage,
             report=report,
+            command_id=validated_shortlist_result.command_id,
+            slots=dict(validated_shortlist_result.slots),
+            missing=validated_shortlist_result.missing,
         ),
         report,
     )
@@ -1537,6 +2255,9 @@ async def resolve_shortlist_alignment(
                 skill_kind="shortlist_align",
             ),
             stage=stage_name,
+            command_id=route_result.command_id,
+            slots=dict(route_result.slots),
+            missing=route_result.missing,
         ),
         report,
     )
@@ -1652,6 +2373,9 @@ async def resolve_weak_signal_intent(
                 skill_kind="weak_signal_llm",
             ),
             stage=stage_name,
+            command_id=route_result.command_id,
+            slots=dict(route_result.slots),
+            missing=route_result.missing,
         ),
         report,
     )
@@ -1682,6 +2406,7 @@ async def resolve_llm_align_route(
 
 
 __all__ = [
+    "LLMCommandSelection",
     "LLMRouterDecision",
     "RouteAttemptReport",
     "RouteResolveResult",

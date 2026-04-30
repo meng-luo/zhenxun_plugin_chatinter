@@ -6,6 +6,7 @@ from typing import Any
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import (
     ROUTE_ACTION_WORDS,
+    _find_short_noise_head_boundary,
     collect_placeholders,
     collect_weak_route_signals,
     contains_any,
@@ -14,10 +15,9 @@ from .route_text import (
     is_usage_question,
     match_command_head,
     match_command_head_canonical,
-    parse_command_with_head,
-    _find_short_noise_head_boundary,
     normalize_action_phrases,
     normalize_message_text,
+    parse_command_with_head,
     sanitize_template_tail,
     strip_invoke_prefix,
 )
@@ -287,7 +287,7 @@ _UTILITY_QUERY_HINTS = (
     "admin",
 )
 _INLINE_AT_TOKEN_PATTERN = re.compile(
-    r"\[@\d{5,20}\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))"
+    r"\[@[^\]\s]+\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))"
 )
 _NUMERIC_TOKEN_PATTERN = re.compile(r"\d+(?:\.\d+)?")
 _AMOUNT_HINT_PATTERN = re.compile(
@@ -698,20 +698,50 @@ def infer_command_role(command: str, *, family: str = "general") -> str:
     normalized = normalize_message_text(command).lower()
     if not normalized:
         return "other"
-    if any(token in normalized for token in ("帮助", "help", "用法", "说明", "详情", "参数")):
+    if any(
+        token in normalized
+        for token in ("帮助", "help", "用法", "说明", "详情", "参数")
+    ):
         return "help"
     if any(
         token in normalized
-        for token in ("发", "塞", "创建", "新增", "生成", "制作", "上传", "设置", "绑定", "添加", "开启")
+        for token in (
+            "发",
+            "塞",
+            "创建",
+            "新增",
+            "生成",
+            "制作",
+            "上传",
+            "设置",
+            "绑定",
+            "添加",
+            "开启",
+        )
     ):
         return "create"
     if any(token in normalized for token in ("开", "抢", "领取", "领", "抽签")):
         return "open"
-    if any(token in normalized for token in ("退回", "退还", "删除", "取消", "解绑", "关闭")):
+    if any(
+        token in normalized
+        for token in ("退回", "退还", "删除", "取消", "解绑", "关闭")
+    ):
         return "return"
     if any(
         token in normalized
-        for token in ("查", "搜", "搜索", "查询", "查看", "识别", "是什么", "今天", "今日", "本日", "当日")
+        for token in (
+            "查",
+            "搜",
+            "搜索",
+            "查询",
+            "查看",
+            "识别",
+            "是什么",
+            "今天",
+            "今日",
+            "本日",
+            "当日",
+        )
     ):
         return "query"
     if any(token in normalized for token in ("排行", "统计", "列表", "菜单")):
@@ -1041,11 +1071,14 @@ def _match_score_for_command(
         if not tail:
             return False
         lead = tail[0]
-        return bool(lead.isascii() and lead.isalnum()) or ("\u4e00" <= lead <= "\u9fff")
+        return bool(lead.isascii() and lead.isalnum()) or (
+            "\u4e00" <= lead <= "\u9fff"
+        )
 
-    if match_command_head_canonical(stripped, command_text) or match_command_head_canonical(
-        normalized, command_text
-    ):
+    if match_command_head_canonical(
+        stripped,
+        command_text,
+    ) or match_command_head_canonical(normalized, command_text):
         if _has_sticky_tail(stripped, command_text) or _has_sticky_tail(
             normalized, command_text
         ):
@@ -1502,12 +1535,35 @@ def _score_schema_payload_fit(
         score += 12.0
     if "红包" in normalized_head and "红包" in schema_blob:
         score += 8.0
-    if any(token in normalized_head for token in ("amount", "money", "gold", "金额", "总额", "总金", "总计", "总共", "合计")) and any(
-        token in schema_blob for token in ("amount", "money", "gold", "金币数", "金币", "金额", "总额", "总金", "总计", "总共", "合计")
+    amount_hints = (
+        "amount",
+        "money",
+        "gold",
+        "金额",
+        "总额",
+        "总金",
+        "总计",
+        "总共",
+        "合计",
+    )
+    amount_schema_hints = (*amount_hints, "金币数", "金币")
+    count_hints = (
+        "num",
+        "count",
+        "quantity",
+        "number",
+        "红包数",
+        "数量",
+        "个数",
+        "份数",
+        "数目",
+    )
+    if any(token in normalized_head for token in amount_hints) and any(
+        token in schema_blob for token in amount_schema_hints
     ):
         score += 10.0
-    if any(token in normalized_head for token in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")) and any(
-        token in schema_blob for token in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")
+    if any(token in normalized_head for token in count_hints) and any(
+        token in schema_blob for token in count_hints
     ):
         score += 10.0
 
@@ -1679,7 +1735,18 @@ def _extract_schema_argument_tokens(
         ):
             value = amount_value
         elif count_value and any(
-            hint in param_l for hint in ("num", "count", "quantity", "number", "红包数", "数量", "个数", "份数", "数目")
+            hint in param_l
+            for hint in (
+                "num",
+                "count",
+                "quantity",
+                "number",
+                "红包数",
+                "数量",
+                "个数",
+                "份数",
+                "数目",
+            )
         ):
             value = count_value
         if not value:
@@ -2190,7 +2257,6 @@ def match_skill_command_fast(
     if not normalized:
         return None
 
-    is_usage = is_usage_question(normalized)
     ranked = _rank_skills(
         registry,
         normalized,
@@ -2448,7 +2514,9 @@ def _select_prompt_commands(
     stripped = normalize_message_text(strip_invoke_prefix(normalized))
     query_tokens = tuple(_tokenize(normalized))
     message_role = infer_message_action_role(normalized)
-    query_has_today_hint = any(token in normalized for token in _SEARCH_QUERY_TIME_HINTS)
+    query_has_today_hint = any(
+        token in normalized for token in _SEARCH_QUERY_TIME_HINTS
+    )
     query_has_pig_hint = any(token in normalized for token in ("猪", "小猪"))
 
     scored: list[tuple[float, str]] = []
@@ -2477,7 +2545,9 @@ def _select_prompt_commands(
                     score += 12.0
                 elif any(token in command_text for token in ("本日", "当日")):
                     score += 6.0
-            if query_has_pig_hint and any(token in command_text for token in ("猪", "小猪")):
+            if query_has_pig_hint and any(
+                token in command_text for token in ("猪", "小猪")
+            ):
                 score += 4.0
 
         scored.append((score, command_text))
@@ -2618,12 +2688,12 @@ __all__ = [
     "SkillRouteDecision",
     "SkillSearchResult",
     "SkillSpec",
+    "get_skill_registry",
     "infer_command_role",
     "infer_message_action_role",
-    "infer_query_family",
     "infer_query_families",
+    "infer_query_family",
     "infer_skill_family",
-    "get_skill_registry",
     "match_skill_command_fast",
     "render_skill_namespace",
     "select_relevant_skills",

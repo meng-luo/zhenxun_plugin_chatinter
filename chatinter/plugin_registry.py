@@ -20,8 +20,18 @@ from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 
+from .capability_graph import build_capability_graph_snapshot
 from .metadata_builder import AutoMetadataBuilder
-from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .models.pydantic_models import (
+    CapabilityGraphSnapshot,
+    PluginInfo,
+    PluginKnowledgeBase,
+    PluginReference,
+)
+from .plugin_reference import (
+    build_plugin_references,
+    build_router_cards_from_graph,
+)
 from .route_text import normalize_message_text
 
 
@@ -1593,12 +1603,79 @@ class PluginRegistry:
         )
 
     @classmethod
+    def build_capability_graph(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+    ) -> CapabilityGraphSnapshot:
+        """构建安全过滤后的插件能力图。"""
+        if selection_context is not None:
+            source = cls.filter_knowledge_base(
+                knowledge_base,
+                selection_context=selection_context,
+            )
+        else:
+            selected: list[PluginInfo] = []
+            for plugin in knowledge_base.plugins:
+                if cls._is_allowed_plugin_info(plugin):
+                    selected.append(plugin)
+            source = PluginKnowledgeBase(
+                plugins=selected,
+                user_role=knowledge_base.user_role,
+            )
+        return build_capability_graph_snapshot(source, limit=limit)
+
+    @classmethod
+    def build_plugin_references(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+    ) -> list[PluginReference]:
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=limit,
+        )
+        return build_plugin_references(graph, limit=limit)
+
+    @classmethod
+    def build_router_cards(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+        query: str = "",
+    ) -> list[dict[str, object]]:
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=limit,
+        )
+        return build_router_cards_from_graph(graph, limit=limit, query=query)
+
+    @classmethod
     def build_compact_cards(
         cls,
         knowledge_base: PluginKnowledgeBase,
         *,
         limit: int | None = None,
     ) -> list[dict[str, object]]:
+        """兼容旧调用：返回 Router 使用的紧凑插件卡片。"""
+        return cls.build_router_cards(knowledge_base, limit=limit)
+
+    @classmethod
+    def _build_compact_cards_legacy(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        """旧版卡片渲染逻辑，保留作对照与快速回退。"""
         plugins = knowledge_base.plugins
         if limit is not None:
             plugins = plugins[: max(int(limit), 0)]

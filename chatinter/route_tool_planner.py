@@ -5,10 +5,13 @@ from typing import Any
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
+from .command_index import CommandCandidate, dump_schema_for_prompt
 from .models.pydantic_models import PluginKnowledgeBase
-from .route_text import normalize_action_phrases
-from .route_text import is_usage_question
-from .route_text import normalize_message_text
+from .route_text import (
+    is_usage_question,
+    normalize_action_phrases,
+    normalize_message_text,
+)
 from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillCommandSchema,
@@ -21,7 +24,10 @@ from .skill_registry import (
 _DEFAULT_TOOLS_PER_SKILL = 2
 _DESCRIPTION_TRIM = 120
 _GLOBAL_HELP_HEAD_PRIORITY = ("功能", "帮助", "help")
-_AT_TOKEN_PATTERN = re.compile(r"\[@\d{5,20}\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))")
+_AT_TOKEN_PATTERN = re.compile(
+    r"\[@[^\]\s]+\]|(?<![0-9A-Za-z_])@\d{5,20}"
+    r"(?=(?:\s|$|[的，,。.!！？?]))"
+)
 _IMAGE_TOKEN_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _SELF_REF_HINTS = ("我", "自己", "本人", "我自己", "自己的")
 
@@ -35,6 +41,19 @@ class RoutePlannerToolSpec:
     schema: SkillCommandSchema | None
     text_allowed: bool
     text_required: bool
+
+
+@dataclass(frozen=True)
+class RouteCommandChoiceSpec:
+    tool_name: str
+    candidate_index: int
+    command_id: str
+    plugin_name: str
+    plugin_module: str
+    command_head: str
+    score: float
+    family: str
+    schema_payload: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -59,6 +78,33 @@ class RoutePlannerTool(ToolExecutable):
             "plugin_module": self.spec.plugin_module,
             "command_head": self.spec.command_head,
             "text": normalize_message_text(str(kwargs.get("text", "") or "")),
+        }
+        return ToolResult(output=payload, display_content=str(payload))
+
+
+class RouteCommandChoiceTool(ToolExecutable):
+    """LLM-facing candidate command.
+
+    The tool itself is side-effect free: calling it only selects a command
+    candidate and returns normalized slots. Real execution still goes through
+    NoneBot reroute.
+    """
+
+    def __init__(self, spec: RouteCommandChoiceSpec, definition: ToolDefinition):
+        self.spec = spec
+        self._definition = definition
+
+    async def get_definition(self) -> ToolDefinition:
+        return self._definition
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        _ = context
+        payload = {
+            "command_id": self.spec.command_id,
+            "plugin_name": self.spec.plugin_name,
+            "plugin_module": self.spec.plugin_module,
+            "command_head": self.spec.command_head,
+            "slots": dict(kwargs),
         }
         return ToolResult(output=payload, display_content=str(payload))
 
@@ -140,6 +186,103 @@ def _build_text_property(schema: SkillCommandSchema | None) -> dict[str, Any]:
     return property_payload
 
 
+def _slot_json_type(slot_type: str) -> str:
+    if slot_type == "int":
+        return "integer"
+    if slot_type == "float":
+        return "number"
+    if slot_type == "bool":
+        return "boolean"
+    return "string"
+
+
+def _build_candidate_choice_definition(
+    spec: RouteCommandChoiceSpec,
+    schema: Any,
+) -> ToolDefinition:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for slot in getattr(schema, "slots", []) or []:
+        slot_name = normalize_message_text(getattr(slot, "name", "") or "")
+        if not slot_name:
+            continue
+        description_bits = [
+            normalize_message_text(getattr(slot, "description", "") or ""),
+        ]
+        aliases = [
+            normalize_message_text(alias)
+            for alias in (getattr(slot, "aliases", None) or [])
+            if normalize_message_text(alias)
+        ]
+        if aliases:
+            description_bits.append("别名: " + "、".join(aliases[:6]))
+        default = getattr(slot, "default", None)
+        if default is not None:
+            description_bits.append(f"默认值: {default}")
+        properties[slot_name] = {
+            "type": _slot_json_type(str(getattr(slot, "type", "text") or "text")),
+            "description": "；".join(bit for bit in description_bits if bit)
+            or slot_name,
+        }
+        if bool(getattr(slot, "required", False)):
+            required.append(slot_name)
+
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+    schema_payload = spec.schema_payload
+    description = (
+        f"选择插件“{spec.plugin_name}”的命令“{spec.command_head}”。"
+        f"command_id={spec.command_id}；family={spec.family}；"
+        f"召回分={spec.score:.1f}。"
+    )
+    if schema_payload.get("description"):
+        description += f"\n用途: {schema_payload['description']}"
+    if schema_payload.get("aliases"):
+        description += f"\n别名: {schema_payload['aliases']}"
+    if schema_payload.get("requires"):
+        description += f"\n上下文需求: {schema_payload['requires']}"
+    if schema_payload.get("render"):
+        description += f"\n渲染模板: {schema_payload['render']}"
+    return ToolDefinition(
+        name=spec.tool_name,
+        description=description,
+        parameters=parameters,
+    )
+
+
+def build_command_choice_tools(
+    candidates: list[CommandCandidate],
+    *,
+    max_tools: int,
+) -> tuple[list[ToolExecutable], dict[str, RouteCommandChoiceSpec]]:
+    """Build side-effect-free candidate tools from command-level candidates."""
+
+    tools: list[ToolExecutable] = []
+    spec_map: dict[str, RouteCommandChoiceSpec] = {}
+    for index, candidate in enumerate(candidates[: max(int(max_tools or 0), 0)], 1):
+        schema = candidate.schema
+        schema_payload = dump_schema_for_prompt(schema)
+        spec = RouteCommandChoiceSpec(
+            tool_name=f"route_command_{index:02d}",
+            candidate_index=index,
+            command_id=schema.command_id,
+            plugin_name=candidate.plugin_name,
+            plugin_module=candidate.plugin_module,
+            command_head=schema.head,
+            score=candidate.score,
+            family=candidate.family,
+            schema_payload=schema_payload,
+        )
+        definition = _build_candidate_choice_definition(spec, schema)
+        tools.append(RouteCommandChoiceTool(spec, definition))
+        spec_map[spec.tool_name] = spec
+    return tools, spec_map
+
+
 def _build_tool_definition(
     *,
     spec: RoutePlannerToolSpec,
@@ -190,7 +333,8 @@ def _build_tool_definition(
         )
 
     description_parts.append(
-        "仅当当前用户消息明显对应这个命令时调用；不要在 text 中重复填写 [@...] 或 [image]。"
+        "仅当当前用户消息明显对应这个命令时调用；"
+        "不要在 text 中重复填写 [@...] 或 [image]。"
     )
 
     parameters: dict[str, Any] = {
@@ -266,7 +410,9 @@ def _iter_candidate_heads(
     pools.extend(skill.aliases)
 
     scored: list[tuple[float, str]] = []
-    normalized_query = normalize_message_text(normalize_action_phrases(query_text or "")).lower()
+    normalized_query = normalize_message_text(
+        normalize_action_phrases(query_text or "")
+    ).lower()
     query_has_today_hint = any(token in normalized_query for token in ("今天", "今日"))
     query_has_pig_hint = any(token in normalized_query for token in ("猪", "小猪"))
     for head in pools:
@@ -298,7 +444,9 @@ def _iter_candidate_heads(
                     score += 12.0
                 elif any(token in command_head for token in ("本日", "当日")):
                     score += 6.0
-            if query_has_pig_hint and any(token in command_head for token in ("猪", "小猪")):
+            if query_has_pig_hint and any(
+                token in command_head for token in ("猪", "小猪")
+            ):
                 score += 4.0
         if helper_mode and command_role == "help":
             score += 4.0
