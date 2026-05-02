@@ -17,8 +17,9 @@ from collections import Counter
 import json
 import re
 import time
+from typing import Protocol, cast
 
-from nonebot.adapters import Bot, Event
+from nonebot.adapters import Bot, Event, Message
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 from nonebot_plugin_alconna.uniseg.tools import reply_fetch
 from pydantic import BaseModel, Field
@@ -97,6 +98,12 @@ _COMPLEX_QUERY_HINTS = (
     "python",
     "api",
 )
+
+
+class DialogueContextPack(Protocol):
+    def to_context_xml(self) -> str: ...
+
+
 _FOLLOWUP_QUERY_HINTS = (
     "然后",
     "接着",
@@ -659,6 +666,7 @@ class ChatMemory:
         bot: Bot | None = None,
         bot_id: str | None = None,
         event: Event | None = None,
+        dialogue_context: DialogueContextPack | None = None,
     ) -> tuple[str, str, list[Image]]:
         """构建完整的上下文（System + Context + Current）
 
@@ -701,7 +709,7 @@ class ChatMemory:
             group_name = group_id
             if bot:
                 try:
-                    group_info = await bot.get_group_info(group_id=int(group_id))
+                    group_info = await bot.get_group_info(group_id=group_id)
                     if group_info and group_info.get("group_name"):
                         group_name = group_info.get("group_name")
                 except Exception as e:
@@ -721,6 +729,10 @@ class ChatMemory:
             ]
         )
         lines.extend(qq_context_lines)
+        if dialogue_context is not None:
+            packed_context = dialogue_context.to_context_xml()
+            if packed_context:
+                lines.append(packed_context)
         lines.extend(self._build_conversation_focus(current_message_text))
 
         session_id = self.get_session_id(user_id, group_id)
@@ -883,7 +895,7 @@ class ChatMemory:
             if isinstance(raw_message, UniMessage):
                 uni_msg = raw_message
             else:
-                uni_msg = UniMessage.of(raw_message)
+                uni_msg = UniMessage.of(cast(Message, raw_message))
         except Exception:
             uni_msg = None
 
@@ -913,13 +925,6 @@ class ChatMemory:
                 except Exception as e:
                     logger.debug(f"从 reply_fetch 获取回复 ID 失败：{e}")
 
-            if not reply_id:
-                reply_id = (
-                    extract_reply_from_message(raw_message)
-                    if isinstance(raw_message, str)
-                    else None
-                )
-
             if reply_id:
                 seen_ids: set[str] = set()
                 current_reply_id = reply_id
@@ -930,7 +935,7 @@ class ChatMemory:
                     seen_ids.add(current_reply_id)
 
                     try:
-                        msg_data = await bot.get_msg(message_id=int(current_reply_id))
+                        msg_data = await bot.get_msg(message_id=current_reply_id)
                         if not msg_data:
                             break
 
@@ -1054,9 +1059,10 @@ class ChatMemory:
                                     break
 
                         if not next_reply_id:
-                            next_reply_id = extract_reply_from_message(
-                                uni_msg_layer or plain_text
-                            )
+                            if uni_msg_layer is not None:
+                                next_reply_id = extract_reply_from_message(
+                                    uni_msg_layer
+                                )
 
                         if not next_reply_id:
                             break
@@ -1334,7 +1340,7 @@ class ChatMemory:
         current_message_text: str = "",
     ) -> str:
         """构建系统提示词"""
-        chat_style = get_config_value("CHAT_STYLE", "")
+        chat_style = str(get_config_value("CHAT_STYLE", "") or "")
         if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and self._is_complex_query(
             current_message_text
         ):

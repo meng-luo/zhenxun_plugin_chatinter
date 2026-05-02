@@ -316,3 +316,28 @@ class ChatInterMemory(Model):
             reverse=True,
         )
         return scoped[: max(int(limit or 0), 0)]
+
+
+class ChatInterPersonProfile(Model):
+    """ChatInter 群友身份档案表
+
+    用于把群聊里的昵称、别名和稳定 user_id 对齐，避免把“认识人”
+    依赖在一次性 prompt 里。
+    """
+
+    id = fields.IntField(pk=True, generated=True, auto_increment=True)
+    user_id = fields.CharField(255, index=True)
+    group_id = fields.CharField(255, null=True, index=True)
+    nickname = fields.CharField(255, default="")
+    group_card = fields.CharField(255, default="")
+    aliases = fields.TextField(default="")
+    known_facts = fields.TextField(default="")
+    relationship = fields.CharField(255, default="")
+    confidence = fields.FloatField(default=0.0)
+    last_seen = fields.DatetimeField(auto_now=True)
+    create_time = fields.DatetimeField(auto_now_add=True, index=True)
+    update_time = fields.DatetimeField(auto_now=True)
+
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
+        table = "chatinter_person_profile"
+        table_description = "ChatInter 群友身份档案表"

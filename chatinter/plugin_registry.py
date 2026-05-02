@@ -53,6 +53,10 @@ class PluginSelectionContext:
     supports_image: bool = True
     supports_at: bool = True
     supports_reply: bool = True
+    addressee_user_id: str | None = None
+    addressee_source: str = ""
+    thread_id: str = ""
+    intervention_action: str = ""
 
 
 class PluginRegistry:

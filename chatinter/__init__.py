@@ -26,6 +26,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
+from . import models as _models  # noqa: F401
 from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
@@ -47,7 +48,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="Copaan & meng-luo",
-        version="1.4.0",
+        version="1.3.0",
         plugin_type=PluginType.DEPENDANT,
         menu_type="其他",
         ignore_prompt=True,
