@@ -141,11 +141,7 @@ def build_reasoning_generation_config() -> LLMGenerationConfig | None:
     effort_text = get_config_value("REASONING_EFFORT", "")
     if not effort_text:
         return None
-    effort = (
-        ReasoningEffort.MEDIUM
-        if effort_text == "MEDIUM"
-        else ReasoningEffort.HIGH
-    )
+    effort = ReasoningEffort.MEDIUM if effort_text == "MEDIUM" else ReasoningEffort.HIGH
     return LLMGenerationConfig(
         reasoning=ReasoningConfig(
             effort=effort,

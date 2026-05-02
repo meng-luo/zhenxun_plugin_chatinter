@@ -27,6 +27,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.services import generate_structured, logger
 
+from .chat_memory_store import ChatMemoryStore
 from .config import (
     CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
     CONTEXT_PREFIX_SIZE,
@@ -50,8 +51,8 @@ from .config import (
     get_config_value,
     get_model_name,
 )
-from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .models.chat_history import ChatInterChatHistory
+from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
     extract_reply_from_message,
@@ -204,9 +205,10 @@ class ChatMemory:
             return True
         if normalized.startswith(_COMMAND_LIKE_PREFIX):
             return True
-        if normalized.lower().startswith(("http://", "https://")) and len(
-            normalized
-        ) <= 64:
+        if (
+            normalized.lower().startswith(("http://", "https://"))
+            and len(normalized) <= 64
+        ):
             return True
         if _LOW_VALUE_ONLY_SYMBOLS.fullmatch(normalized):
             return True
@@ -304,7 +306,7 @@ class ChatMemory:
             f"当前问题:\n{self._normalize_context_text(query_text)}\n\n"
             "候选历史记忆:\n"
             f"{chr(10).join(manifest_lines)}\n\n"
-            "返回格式：{\"selected_ids\": [id...]}"
+            '返回格式：{"selected_ids": [id...]}'
         )
         timeout = max(int(HISTORY_SELECTOR_TIMEOUT), 2)
         model_name = get_model_name()
@@ -498,8 +500,10 @@ class ChatMemory:
         url_text = str(url_value or "").strip()
         path_text = str(path_value or "").strip()
 
-        if not url_text and file_text and not file_text.startswith(
-            ("http://", "https://", "base64://")
+        if (
+            not url_text
+            and file_text
+            and not file_text.startswith(("http://", "https://", "base64://"))
         ):
             url_text = await self._resolve_onebot_image_url(bot, file_text)
 
@@ -629,7 +633,7 @@ class ChatMemory:
         formatted_ai_response = uni_to_text_with_tags(ai_response)
 
         async with self._lock:
-            await ChatInterChatHistory.add_dialog(
+            dialog = await ChatInterChatHistory.add_dialog(
                 session_id=session_id,
                 user_id=user_id,
                 group_id=group_id,
@@ -638,6 +642,13 @@ class ChatMemory:
                 ai_response=formatted_ai_response,
                 bot_id=bot_id,
             )
+        await ChatMemoryStore.record_from_dialog(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            message_text=formatted_user_message,
+            source_dialog_id=getattr(dialog, "id", None),
+        )
 
     async def build_full_context(
         self,
@@ -755,6 +766,18 @@ class ChatMemory:
                 lines.append("<history>")
                 lines.extend(group_background_lines)
                 lines.append("</history>")
+
+        if not isolate_context:
+            memory_lines = await ChatMemoryStore.recall(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                query=current_message_text,
+            )
+            if memory_lines:
+                lines.append("<long_term_memory>")
+                lines.extend(memory_lines)
+                lines.append("</long_term_memory>")
 
         # 4. 当前消息层（Layer 0 + 回复链追溯）
         (
@@ -916,6 +939,7 @@ class ChatMemory:
 
                         try:
                             from nonebot.adapters.onebot.v11 import Message as OBMessage
+
                             if isinstance(raw_msg, list):
                                 from nonebot_plugin_alconna.uniseg import At, Text
 
@@ -1144,9 +1168,7 @@ class ChatMemory:
                 if group_id:
                     cached_nick = self._user_nickname_cache.get(dlg.user_id)
                     sender = (
-                        f"[{cached_nick}]"
-                        if cached_nick
-                        else f"[QQ:{dlg.user_id}]"
+                        f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
                     )
                 else:
                     sender = f"[{dlg.nickname}]"
@@ -1257,9 +1279,7 @@ class ChatMemory:
             if self._is_low_value_background_message(content):
                 continue
             score = (
-                self._similarity_score(query_tokens, content)
-                if query_tokens
-                else 0.0
+                self._similarity_score(query_tokens, content) if query_tokens else 0.0
             )
             scored_msgs.append((msg, content, score))
 

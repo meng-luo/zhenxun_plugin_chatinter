@@ -10,32 +10,18 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
-from .command_alias import derive_semantic_aliases, is_shadowed_meme_head
 from .models.pydantic_models import (
     CommandCapability,
     CommandSlotSpec,
     PluginCommandSchema,
 )
+from .plugin_adapters import (
+    build_adapter_schemas,
+    derive_adapter_semantic_aliases,
+    extract_adapter_slots,
+)
 from .route_text import normalize_message_text, parse_command_with_head
-from .slot_extractors import extract_builtin_slots
 
-_CN_DIGITS = {
-    "零": 0,
-    "〇": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "俩": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-}
-_CN_UNITS = {"十": 10, "百": 100, "千": 1000}
-_NUMBER_TEXT = r"\d+|[零〇一二两俩三四五六七八九十百千]+"
 _TEXT_PLACEHOLDER_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][0-9A-Za-z_]*)\}")
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
 _URL_PAYLOAD_PATTERN = re.compile(
@@ -140,224 +126,6 @@ def _schema(
         matcher_key=matcher_key,
         retrieval_phrases=phrases,
     )
-
-
-_SCHEMA_OVERRIDES: dict[str, list[PluginCommandSchema]] = {
-    "zhenxun.plugins.gold_redbag": [
-        _schema(
-            "gold_redbag.send",
-            "塞红包",
-            aliases=[
-                "金币红包",
-                "发红包",
-                "塞金币红包",
-                "给群里发红包",
-                "发金币红包",
-                "给大家发红包",
-            ],
-            description=("发送金币红包；用于发/塞红包，amount=总金币，num=红包个数"),
-            slots=[
-                _slot(
-                    "amount",
-                    "int",
-                    required=True,
-                    aliases=["金额", "金币", "总额"],
-                    description="红包总金币数",
-                ),
-                _slot(
-                    "num",
-                    "int",
-                    default=5,
-                    aliases=["数量", "红包数", "个", "份"],
-                    description="红包个数，默认 5",
-                ),
-            ],
-            render="塞红包 {amount} {num}",
-            requires={"text": True},
-            payload_policy="slots",
-            extra_text_policy="slot_only",
-        ),
-        _schema(
-            "gold_redbag.open",
-            "开",
-            aliases=["抢", "开红包", "抢红包", "我想抢红包", "领红包"],
-            description="打开/抢/领取当前群可领取的红包；不发送新红包",
-            render="开",
-            extra_text_policy="discard",
-        ),
-        _schema(
-            "gold_redbag.return",
-            "退回红包",
-            aliases=["退还红包", "红包退回", "没领完的红包退回", "退回没领完红包"],
-            description="退回自己发出且未领取完的红包；不是抢红包",
-            render="退回红包",
-            extra_text_policy="discard",
-        ),
-    ],
-    "zhenxun.plugins.roll": [
-        _schema(
-            "roll.choose",
-            "roll",
-            aliases=[
-                "随机选",
-                "帮我选",
-                "从里面选",
-                "选择困难",
-                "二选一",
-                "选一个",
-                "挑一个",
-                "做个选择",
-                "帮我决定",
-            ],
-            description="从给定多个候选项中随机选择一个；需要 options",
-            slots=[
-                _slot(
-                    "options",
-                    "text",
-                    required=True,
-                    aliases=["选项", "候选"],
-                    description="用空格分隔的候选项",
-                )
-            ],
-            render="roll {options}",
-            requires={"text": True},
-            payload_policy="slots",
-            extra_text_policy="slot_only",
-        ),
-        _schema(
-            "roll.number",
-            "roll",
-            aliases=["随机数字", "掷骰子", "roll点", "随机一个数字", "投个随机数字"],
-            description="随机生成数字/骰子点数；不需要候选项文本",
-            render="roll",
-            extra_text_policy="discard",
-        ),
-    ],
-    "zhenxun.plugins.poetry": [
-        _schema(
-            "poetry.random",
-            "古诗",
-            aliases=[
-                "念诗",
-                "来首诗",
-                "念首诗",
-                "给我念一首诗",
-                "来一首古诗",
-                "来首古诗",
-                "诗词",
-            ],
-            description="随机发送一首古诗词",
-            render="念诗",
-        )
-    ],
-    "zhenxun.plugins.cover": [
-        _schema(
-            "cover.bilibili",
-            "b封面",
-            aliases=["B站封面", "视频封面", "查视频封面"],
-            description="获取 B 站视频或直播封面",
-            slots=[
-                _slot(
-                    "target",
-                    "text",
-                    required=True,
-                    aliases=["链接", "BV号", "av号", "直播id"],
-                )
-            ],
-            render="b封面 {target}",
-            requires={"text": True},
-            payload_policy="slots",
-            extra_text_policy="slot_only",
-        )
-    ],
-    "zhenxun.plugins.translate": [
-        _schema(
-            "translate.text",
-            "翻译",
-            aliases=["翻译一下", "翻成中文", "翻译成中文", "帮我翻译", "用中文说一下"],
-            description="翻译给定文本；需要 text，不用于查看支持语种",
-            slots=[_slot("text", "text", required=True, aliases=["文本", "内容"])],
-            render="翻译 {text}",
-            requires={"text": True},
-            payload_policy="text",
-            extra_text_policy="slot_only",
-        ),
-        _schema(
-            "translate.langs",
-            "翻译语种",
-            aliases=["翻译语种", "支持哪些语言", "翻译支持什么语言"],
-            description="查看翻译插件支持的语言列表；不是执行翻译",
-            render="翻译语种",
-            command_role="helper",
-            extra_text_policy="discard",
-        ),
-    ],
-    "zhenxun.plugins.luxun": [
-        _schema(
-            "luxun.say",
-            "鲁迅说",
-            aliases=["鲁迅风格", "来张鲁迅说", "让鲁迅说"],
-            description="生成鲁迅说图片",
-            slots=[_slot("text", "text", required=True, aliases=["内容", "文本"])],
-            render="鲁迅说 {text}",
-            requires={"text": True},
-            payload_policy="text",
-            extra_text_policy="slot_only",
-        )
-    ],
-    "zhenxun.plugins.nbnhhsh": [
-        _schema(
-            "nbnhhsh.expand",
-            "能不能好好说话",
-            aliases=["nbnhhsh", "解释缩写", "缩写是什么意思"],
-            description="解释网络缩写",
-            slots=[_slot("text", "text", required=True, aliases=["缩写", "文本"])],
-            render="能不能好好说话 {text}",
-            requires={"text": True},
-            payload_policy="text",
-            extra_text_policy="slot_only",
-        )
-    ],
-    "zhenxun.plugins.quotations": [
-        _schema(
-            "quotations.hitokoto",
-            "语录",
-            aliases=["来一句语录", "一言"],
-            description="随机发送一句语录",
-            render="语录",
-        ),
-        _schema(
-            "quotations.acg",
-            "二次元",
-            aliases=["二次元语录", "来一句二次元语录"],
-            description="随机发送一句二次元语录",
-            render="二次元",
-        ),
-    ],
-    "zhenxun.builtin_plugins.about": [
-        _schema(
-            "about.info",
-            "关于",
-            aliases=[
-                "about",
-                "真寻信息",
-                "小真寻信息",
-                "小真寻的信息",
-                "了解小真寻",
-                "想了解小真寻",
-                "机器人信息",
-                "bot信息",
-                "项目介绍",
-                "项目说明",
-                "介绍真寻",
-            ],
-            description="查看真寻项目、版本和帮助入口",
-            render="关于",
-            command_role="helper",
-            extra_text_policy="discard",
-        )
-    ],
-}
 
 
 def _command_id(module: str, head: str) -> str:
@@ -503,7 +271,7 @@ def _command_description(command: CommandCapability, head: str) -> str:
     return description[:120].rstrip()
 
 
-def _schema_from_capability(
+def schema_from_capability(
     module: str,
     command: CommandCapability,
 ) -> PluginCommandSchema | None:
@@ -541,7 +309,7 @@ def _schema_from_capability(
     payload_policy, extra_text_policy = _payload_policy_from_capability(command)
     aliases = [
         *command.aliases,
-        *derive_semantic_aliases(
+        *derive_adapter_semantic_aliases(
             head,
             module=module,
             image_required=requirement.image_min > 0,
@@ -564,107 +332,19 @@ def _schema_from_capability(
     )
 
 
-def _build_meme_schemas(
-    module: str,
-    commands: list[CommandCapability],
-) -> list[PluginCommandSchema]:
-    schemas: list[PluginCommandSchema] = [
-        _schema(
-            "memes.list",
-            "表情包制作",
-            aliases=[
-                "表情列表",
-                "表情包列表",
-                "头像表情包",
-                "文字表情包",
-                "有哪些表情包",
-            ],
-            description="查看可制作的表情包列表；列表/有哪些/打开表情包时执行",
-            render="表情包制作",
-            command_role="catalog",
-            payload_policy="none",
-            extra_text_policy="discard",
-        ),
-        _schema(
-            "memes.search",
-            "表情搜索",
-            aliases=["搜索表情", "找表情", "查找表情", "找相关表情"],
-            description="按关键词搜索相关表情包模板",
-            slots=[
-                _slot(
-                    "keyword",
-                    "text",
-                    required=True,
-                    aliases=["关键词", "表情名"],
-                    description="要搜索的表情关键词",
-                )
-            ],
-            render="表情搜索 {keyword}",
-            requires={"text": True},
-            command_role="helper",
-            payload_policy="slots",
-            extra_text_policy="slot_only",
-        ),
-        _schema(
-            "memes.info",
-            "表情详情",
-            aliases=["表情用法", "表情参数", "这个表情怎么用"],
-            description="查看某个表情的参数、预览和用法",
-            slots=[
-                _slot(
-                    "keyword",
-                    "text",
-                    required=True,
-                    aliases=["关键词", "表情名"],
-                    description="要查看详情的表情关键词",
-                )
-            ],
-            render="表情详情 {keyword}",
-            requires={"text": True},
-            command_role="usage",
-            payload_policy="slots",
-            extra_text_policy="slot_only",
-        ),
-        _schema(
-            "memes.random",
-            "随机表情",
-            aliases=["随机做个表情", "随机表情包", "随便做个表情"],
-            description="使用当前图片/文字随机制作一个表情包",
-            render="随机表情",
-            requires={"image": False, "text": False},
-            command_role="random",
-            payload_policy="text_or_image",
-            extra_text_policy="discard",
-        ),
-    ]
-    seen = {schema.command_id for schema in schemas}
-    for command in commands:
-        head = normalize_message_text(command.command)
-        if not head or is_shadowed_meme_head(head):
-            continue
-        schema = _schema_from_capability(module, command)
-        if schema is None or schema.command_id in seen:
-            continue
-        seen.add(schema.command_id)
-        schemas.append(schema)
-    return schemas
-
-
 def build_command_schemas(
     module: str,
     commands: list[CommandCapability],
 ) -> list[PluginCommandSchema]:
     module_key = normalize_message_text(module)
-    overrides = _SCHEMA_OVERRIDES.get(module_key)
-    if overrides:
-        return [schema.model_copy(deep=True) for schema in overrides]
-    if module_key.endswith("nonebot_plugin_memes"):
-        return _build_meme_schemas(module_key, commands)
+    adapter_schemas = build_adapter_schemas(module_key, commands)
+    if adapter_schemas is not None:
+        return adapter_schemas
 
     schemas: list[PluginCommandSchema] = []
     seen: set[str] = set()
     for command in commands:
-        schema = _schema_from_capability(module_key, command)
+        schema = schema_from_capability(module_key, command)
         if schema is None or schema.command_id in seen:
             continue
         seen.add(schema.command_id)
@@ -910,207 +590,14 @@ def find_command_schema(
     return selection.schema if selection is not None else None
 
 
-def _parse_int_token(value: str) -> int | None:
-    text = normalize_message_text(value)
-    if not text:
-        return None
-    if text.isdigit():
-        return int(text)
-    total = 0
-    current = 0
-    for char in text:
-        if char in _CN_DIGITS:
-            current = _CN_DIGITS[char]
-            continue
-        unit = _CN_UNITS.get(char)
-        if unit is None:
-            return None
-        if current == 0:
-            current = 1
-        total += current * unit
-        current = 0
-    return total + current if total or current else None
-
-
-def _extract_number(pattern: str, text: str, group: str) -> int | None:
-    match = re.search(pattern, text, re.IGNORECASE)
-    if not match:
-        return None
-    return _parse_int_token(match.group(group))
-
-
-def _extract_redbag_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    slots: dict[str, Any] = {}
-    amount = _extract_number(
-        rf"总额\s*(?P<amount>{_NUMBER_TEXT})",
-        text,
-        "amount",
-    )
-    num = _extract_number(
-        rf"分\s*(?P<num>{_NUMBER_TEXT})\s*[份个]",
-        text,
-        "num",
-    )
-    if amount is not None:
-        slots["amount"] = amount
-    if num is not None:
-        slots["num"] = num
-
-    pair = re.search(
-        rf"(?P<num>{_NUMBER_TEXT})\s*[个份]\s*(?P<amount>{_NUMBER_TEXT})\s*金币",
-        text,
-        re.IGNORECASE,
-    )
-    if pair:
-        parsed_num = _parse_int_token(pair.group("num"))
-        parsed_amount = _parse_int_token(pair.group("amount"))
-        if parsed_num is not None:
-            slots["num"] = parsed_num
-        if parsed_amount is not None:
-            slots["amount"] = parsed_amount
-
-    separated_pair = re.search(
-        rf"(?P<num>{_NUMBER_TEXT})\s*[个份]\s*红包.*?(?P<amount>{_NUMBER_TEXT})\s*金币",
-        text,
-        re.IGNORECASE,
-    )
-    if separated_pair:
-        parsed_num = _parse_int_token(separated_pair.group("num"))
-        parsed_amount = _parse_int_token(separated_pair.group("amount"))
-        if parsed_num is not None:
-            slots["num"] = parsed_num
-        if parsed_amount is not None:
-            slots["amount"] = parsed_amount
-
-    amount_first_pair = re.search(
-        rf"(?P<amount>{_NUMBER_TEXT})\s*金币.*?(?P<num>{_NUMBER_TEXT})\s*[个份]\s*红包",
-        text,
-        re.IGNORECASE,
-    )
-    if amount_first_pair:
-        parsed_num = _parse_int_token(amount_first_pair.group("num"))
-        parsed_amount = _parse_int_token(amount_first_pair.group("amount"))
-        if parsed_num is not None:
-            slots["num"] = parsed_num
-        if parsed_amount is not None:
-            slots["amount"] = parsed_amount
-
-    if "num" not in slots:
-        num_only = _extract_number(
-            rf"(?P<num>{_NUMBER_TEXT})\s*[个份]\s*红包",
-            text,
-            "num",
-        )
-        if num_only is not None:
-            slots["num"] = num_only
-
-    if "amount" not in slots:
-        amount = _extract_number(rf"(?P<amount>{_NUMBER_TEXT})\s*金币", text, "amount")
-        if amount is not None:
-            slots["amount"] = amount
-    return slots
-
-
-def _extract_translate_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    for pattern in (
-        r"把\s*(?P<text>.+?)\s*翻(?:译)?成(?:中文|英文|日文|韩文)",
-        r"翻译一下\s*(?P<text>.+)",
-        r"翻译\s*(?P<text>.+)",
-    ):
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = normalize_message_text(match.group("text"))
-            if value:
-                return {"text": value}
-    return {}
-
-
-def _extract_roll_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    match = re.search(r"从\s*(?P<options>.+?)\s*(?:里|中)?\s*选", text)
-    if not match:
-        return {}
-    options = normalize_message_text(match.group("options"))
-    if not options:
-        return {}
-    if " " not in options and len(options) <= 6:
-        options = " ".join(options)
-    return {"options": options}
-
-
-def _extract_luxun_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    match = re.search(r"鲁迅风格(?:写一句|写一段|说)?\s*(?P<text>.+)", text)
-    if match:
-        value = normalize_message_text(match.group("text"))
-        return {"text": value} if value else {}
-    match = re.search(r"文字是\s*(?P<text>.+)", text)
-    if match:
-        value = normalize_message_text(match.group("text"))
-        return {"text": value} if value else {}
-    match = re.search(r"内容是\s*(?P<text>.+)", text)
-    if match:
-        value = normalize_message_text(match.group("text"))
-        return {"text": value} if value else {}
-    match = re.search(r"说\s*(?P<text>.+)", text)
-    if not match:
-        return {}
-    value = normalize_message_text(match.group("text"))
-    return {"text": value} if value else {}
-
-
-def _extract_cover_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    match = re.search(r"(https?://\S+|BV[0-9A-Za-z]+|av\d+|cv\d+)", text)
-    return {"target": match.group(1)} if match else {}
-
-
-def _extract_nbnhhsh_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    patterns = (
-        r"(?P<text>[0-9A-Za-z_]{2,16})\s*(?:是)?(?:什么|啥|哪个)?缩写",
-        r"(?:缩写|解释一下缩写|解释)\s*(?P<text>[0-9A-Za-z_]{2,16})",
-        r"(?P<text>[0-9A-Za-z_]{2,16}).{0,4}(?:展开|啥意思|什么意思|是什么意思)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return {"text": match.group("text")}
-    return {}
-
-
-def _infer_builtin_slots(
+def _infer_adapter_slots(
     schema: PluginCommandSchema,
     message_text: str,
 ) -> dict[str, Any]:
     command_id = normalize_message_text(schema.command_id)
-    normalized = normalize_message_text(message_text)
     if not command_id:
         return {}
-    if command_id == "translate.text" and normalized in {"帮我翻译一下", "翻译一下"}:
-        return {}
-    if command_id != "translate.text" and not (
-        command_id == "gold_redbag.send"
-        or command_id == "nbnhhsh.expand"
-        or command_id.startswith("nonebot_plugin_memes.")
-        or command_id in {"memes.search", "memes.info"}
-        or any(char.isdigit() for char in normalized)
-        or any(char in normalized for char in _CN_DIGITS)
-        or any(char in normalized for char in _CN_UNITS)
-    ):
-        return {}
-    extracted = extract_builtin_slots(command_id, message_text)
-    if extracted:
-        return extracted
-    if command_id == "luxun.say":
-        return _extract_luxun_slots(message_text)
-    if command_id == "cover.bilibili":
-        return _extract_cover_slots(message_text)
-    if command_id == "nbnhhsh.expand":
-        return _extract_nbnhhsh_slots(message_text)
-    return {}
+    return extract_adapter_slots(command_id, message_text)
 
 
 def _clean_text_payload(value: str) -> str:
@@ -1151,8 +638,7 @@ def _slot_accepts_url(slot: CommandSlotSpec) -> bool:
         " ".join([slot.name, slot.description, *slot.aliases])
     ).casefold()
     return any(
-        token in text
-        for token in ("链接", "地址", "url", "bv", "av", "视频", "link")
+        token in text for token in ("链接", "地址", "url", "bv", "av", "视频", "link")
     )
 
 
@@ -1179,7 +665,9 @@ def _fill_slots_from_payload(
         value: Any = payload_tokens[token_index]
         token_index += 1
         if slot.type == "int":
-            parsed_value = _parse_int_token(value)
+            from .slot_extractors import parse_int_token
+
+            parsed_value = parse_int_token(value)
             if parsed_value is None:
                 continue
             value = parsed_value
@@ -1222,11 +710,11 @@ def complete_slots(
         if isinstance(value, str) and not normalize_message_text(value):
             continue
         merged[key] = value
-    # 手写 extractor 只覆盖少量高频命令，语义更贴近实际 matcher 参数顺序；
-    # 它作为确定性修正层，避免模型把“4个20金币红包”误当成总额 80。
-    inferred = _infer_builtin_slots(schema, normalize_message_text(message_text))
+    # Adapter extractors provide optional plugin-specific slot correction without
+    # leaking those rules into the generic renderer.
+    inferred = _infer_adapter_slots(schema, normalize_message_text(message_text))
     if not inferred and arguments_text:
-        inferred = _infer_builtin_slots(schema, normalize_message_text(arguments_text))
+        inferred = _infer_adapter_slots(schema, normalize_message_text(arguments_text))
     merged.update(
         inferred,
     )

@@ -720,7 +720,7 @@ class ChatInterToolRegistry:
 
         if not query_tokens and not context_tokens:
             if allow_fallback:
-                return dict(list(base_tools.items())[:max(max_tools, 1)])
+                return dict(list(base_tools.items())[: max(max_tools, 1)])
             return {}
 
         scored: list[tuple[str, float]] = []
@@ -745,7 +745,7 @@ class ChatInterToolRegistry:
 
         if not scored:
             if allow_fallback:
-                return dict(list(base_tools.items())[:max(max_tools, 1)])
+                return dict(list(base_tools.items())[: max(max_tools, 1)])
             return {}
 
         scored.sort(key=lambda item: item[1], reverse=True)

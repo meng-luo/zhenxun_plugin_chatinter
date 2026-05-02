@@ -22,6 +22,8 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import chat, logger
 from zhenxun.utils.message import MessageUtils
 
+from .chat_dialogue_planner import ChatDialoguePlan
+from .chat_strategy import build_chat_strategy_prompt
 from .config import (
     CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
     USE_SIGN_IN_IMPRESSION,
@@ -101,6 +103,8 @@ async def handle_chat_message(
     mention_name_map: dict[str, str] | None = None,
     session_key: str | None = None,
     budget_controller: TurnBudgetController | None = None,
+    dialogue_plan: ChatDialoguePlan | None = None,
+    context_xml: str = "",
 ) -> str | UniMessage:
     chat_style = str(get_config_value("CHAT_STYLE", "") or "")
 
@@ -110,6 +114,7 @@ async def handle_chat_message(
         group_id=group_id,
         chat_style=chat_style,
         message_text=message,
+        dialogue_plan=dialogue_plan,
     )
 
     logger.debug(f"系统提示词：{system_prompt[:500]}...")
@@ -119,11 +124,18 @@ async def handle_chat_message(
             session_key=session_key or str(group_id or user_id),
             stage="chat_reply",
             system_prompt=system_prompt,
+            context_text=context_xml,
             user_text=message,
             controller=budget_controller,
         )
+        user_text = guarded.user_text
+        if guarded.context_text:
+            user_text = (
+                f"{guarded.context_text}\n\n"
+                f"<current_user_message>{guarded.user_text}</current_user_message>"
+            )
         response = await chat(
-            message=guarded.user_text,
+            message=user_text,
             instruction=guarded.system_prompt,
             model=get_model_name(),
             config=build_reasoning_generation_config(),
@@ -146,13 +158,16 @@ async def build_chat_system_prompt(
     group_id: str | None = None,
     chat_style: str = "",
     message_text: str = "",
+    dialogue_plan: ChatDialoguePlan | None = None,
 ) -> str:
     if USE_SIGN_IN_IMPRESSION:
         impression, attitude = await _chat_memory.get_user_impression(user_id)
     else:
         impression, attitude = 0.0, "一般"
 
-    is_complex_query = _is_complex_query(message_text)
+    is_complex_query = _is_complex_query(message_text) or bool(
+        dialogue_plan and dialogue_plan.is_complex
+    )
     if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and is_complex_query:
         length_rule = (
             "当前问题偏复杂（如代码/排错/实现类），允许使用分点和步骤化说明，"
@@ -165,6 +180,7 @@ async def build_chat_system_prompt(
         BotConfig.self_nickname,
         chat_style,
         length_rule,
+        strategy_prompt=build_chat_strategy_prompt(dialogue_plan),
     )
     group_prompt = f"\n群组 ID：{group_id}" if group_id else ""
     impression_prompt = (
@@ -176,12 +192,7 @@ async def build_chat_system_prompt(
     custom_prompt = get_config_value("CUSTOM_PROMPT", "")
     custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
 
-    return (
-        base_prompt
-        + impression_prompt
-        + group_prompt
-        + custom_prompt_text
-    )
+    return base_prompt + impression_prompt + group_prompt + custom_prompt_text
 
 
 async def reroute_to_plugin(
@@ -211,9 +222,8 @@ async def reroute_to_plugin(
                 continue
             if segment.type == "text":
                 unresolved_plain_text += str(segment.data.get("text", ""))
-        if (
-            image_segment_count <= 0
-            and _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN.search(unresolved_plain_text)
+        if image_segment_count <= 0 and _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN.search(
+            unresolved_plain_text
         ):
             logger.warning(
                 "重路由消息仍包含未解析的 [image] 占位符，"

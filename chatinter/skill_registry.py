@@ -1042,7 +1042,7 @@ def _match_score_for_command(
     normalized: str,
     stripped: str,
     lowered: str,
-    ) -> tuple[float, bool, bool]:
+) -> tuple[float, bool, bool]:
     command_text = command.strip()
     if not command_text:
         return 0.0, False, False
@@ -1056,6 +1056,7 @@ def _match_score_for_command(
         if compact_normalized == compact_command or compact_stripped == compact_command:
             return 40.0 + len(command_text) / 50.0, True, False
         return 0.0, False, False
+
     def _has_sticky_tail(text: str, head: str) -> bool:
         normalized_text = normalize_message_text(text)
         normalized_head = normalize_message_text(head)
@@ -1071,9 +1072,7 @@ def _match_score_for_command(
         if not tail:
             return False
         lead = tail[0]
-        return bool(lead.isascii() and lead.isalnum()) or (
-            "\u4e00" <= lead <= "\u9fff"
-        )
+        return bool(lead.isascii() and lead.isalnum()) or ("\u4e00" <= lead <= "\u9fff")
 
     if match_command_head_canonical(
         stripped,
@@ -1228,10 +1227,9 @@ def _build_ranked_candidate(
         if module_tail_compact and command_compact:
             if module_tail_compact == command_compact:
                 score += 2.5
-            elif (
-                module_tail_compact.startswith(command_compact)
-                or command_compact.startswith(module_tail_compact)
-            ):
+            elif module_tail_compact.startswith(
+                command_compact
+            ) or command_compact.startswith(module_tail_compact):
                 score += 1.0
 
     if skill.supports_placeholders and ("[@" in normalized or "[image" in normalized):
@@ -1405,8 +1403,7 @@ def _pick_command_by_evidence(
         score = 0.0
         has_command_evidence = False
         if suggested and (
-            match_command_head(suggested, command)
-            or command.lower() in suggested_lower
+            match_command_head(suggested, command) or command.lower() in suggested_lower
         ):
             score += 30.0
             has_command_evidence = True
@@ -2184,9 +2181,8 @@ def _compose_skill_command(
         placeholders=placeholders,
         schema=schema,
     )
-    if (
-        normalize_message_text(command) == head
-        and _message_has_payload_signals(message_text)
+    if normalize_message_text(command) == head and _message_has_payload_signals(
+        message_text
     ):
         rescued_argument = _strip_skill_terms(
             _extract_argument_around_head(message_text, head),
@@ -2674,8 +2670,7 @@ def render_skill_namespace(
                 "helper_commands": selected_helpers,
                 "aliases": list(skill.aliases[:3]),
                 "schemas": [
-                    _render_command_schema(schema)
-                    for schema in schema_selection
+                    _render_command_schema(schema) for schema in schema_selection
                 ],
             }
         )

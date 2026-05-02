@@ -13,6 +13,7 @@ from zhenxun.services.llm import embed_documents, embed_query, list_embedding_mo
 from zhenxun.services.log import logger
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
+from .plugin_adapters import get_adapter_target_policy
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy
 
@@ -156,8 +157,15 @@ def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
     target_capable = False
     image_capable = False
     self_only = False
+    adapter_policy = get_adapter_target_policy(
+        plugin_module=plugin.module,
+        plugin_name=plugin.name,
+    )
     for meta in plugin.command_meta:
-        policy = resolve_command_target_policy(meta)
+        policy = resolve_command_target_policy(
+            meta,
+            adapter_policy=adapter_policy,
+        )
         if policy.allow_at or bool(policy.target_sources & {"at", "reply", "nickname"}):
             target_capable = True
         image_min = getattr(meta, "image_min", None)
@@ -196,15 +204,11 @@ def _parse_retrieve_options(
 ) -> _RetrieveOptions:
     resolved_top_k = max(int(top_k or 1), 1)
     resolved_fetch_k = (
-        fetch_k
-        if fetch_k is not None
-        else max(resolved_top_k * 4, _DEFAULT_FETCH_K)
+        fetch_k if fetch_k is not None else max(resolved_top_k * 4, _DEFAULT_FETCH_K)
     )
     resolved_fetch_k = max(resolved_top_k, min(int(resolved_fetch_k), _MAX_FETCH_K))
     resolved_min_score = (
-        _DEFAULT_MIN_SCORE
-        if min_score is None
-        else max(float(min_score), 0.0)
+        _DEFAULT_MIN_SCORE if min_score is None else max(float(min_score), 0.0)
     )
     resolved_max_k = max_k if max_k is not None else max(resolved_top_k, _DEFAULT_MAX_K)
     resolved_max_k = max(resolved_top_k, min(int(resolved_max_k), resolved_fetch_k))
@@ -309,6 +313,26 @@ class PluginRAGRetrievalMixin:
     _index_meta: ClassVar[dict[str, str]] = {}
     _cache_version: ClassVar[int] = 0
     _query_cache: ClassVar[dict[str, tuple[float, list[str]]]] = {}
+
+    @classmethod
+    def _session_pref_scores(cls, session_id: str | None) -> dict[str, float]:
+        return {}
+
+    @classmethod
+    def _session_reason_penalty_scores(
+        cls,
+        session_id: str | None,
+    ) -> dict[str, float]:
+        return {}
+
+    @classmethod
+    def _session_slot_scores(
+        cls,
+        session_id: str | None,
+        query: str,
+        context_text: str = "",
+    ) -> dict[str, float]:
+        return {}
 
     @classmethod
     def _query_cache_key(
@@ -515,10 +539,7 @@ class PluginRAGRetrievalMixin:
                     )
                     metadata_raw = persisted.get("metadata")
                     metadata = (
-                        {
-                            str(key): bool(value)
-                            for key, value in metadata_raw.items()
-                        }
+                        {str(key): bool(value) for key, value in metadata_raw.items()}
                         if isinstance(metadata_raw, dict)
                         else _build_doc_metadata(plugin)
                     )

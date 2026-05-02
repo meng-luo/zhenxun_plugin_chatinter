@@ -5,11 +5,11 @@ def build_chat_base_prompt(
     bot_name: str,
     chat_style: str,
     length_rule: str,
+    strategy_prompt: str = "",
+    memory_prompt: str = "",
 ) -> str:
     style_text = (
-        f"{chat_style}风格的"
-        if chat_style
-        else "日式二次元、软萌中带一点傲娇的"
+        f"{chat_style}风格的" if chat_style else "日式二次元、软萌中带一点傲娇的"
     )
     return (
         f"你是{bot_name}，一个{style_text}机器人助手。"
@@ -18,6 +18,8 @@ def build_chat_base_prompt(
         f"{length_rule}"
         "信息不足先问最关键的问题，不要凭空猜测。"
         "结构化输出或插件命令不要加入口癖修饰。"
+        f"{strategy_prompt}"
+        f"{memory_prompt}"
     )
 
 

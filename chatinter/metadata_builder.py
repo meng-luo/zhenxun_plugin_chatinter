@@ -24,12 +24,8 @@ class AutoMetadataBuilder:
     - meme manager 反射提取模板类命令参数范围
     """
 
-    _module_alias_cache: ClassVar[
-        dict[str, tuple[int, dict[str, list[str]]]]
-    ] = {}
-    _module_prefix_cache: ClassVar[
-        dict[str, tuple[int, dict[str, list[str]]]]
-    ] = {}
+    _module_alias_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
+    _module_prefix_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
     _module_context_cache: ClassVar[
         dict[str, tuple[int, dict[str, dict[str, bool]]]]
     ] = {}
@@ -40,9 +36,7 @@ class AutoMetadataBuilder:
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
-    _regex_head_pattern: ClassVar[re.Pattern[str]] = re.compile(
-        r"[\[\(\.\*\+\?\|\$\\]"
-    )
+    _regex_head_pattern: ClassVar[re.Pattern[str]] = re.compile(r"[\[\(\.\*\+\?\|\$\\]")
     _image_type_hints: ClassVar[tuple[str, ...]] = (
         "image",
         "uniimg",
@@ -595,9 +589,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _extract_parser_command_head(cls, parser: object) -> str:
-        command_head = cls._normalize_command(
-            str(getattr(parser, "command", "") or "")
-        )
+        command_head = cls._normalize_command(str(getattr(parser, "command", "") or ""))
         if not command_head:
             return ""
         if command_head.startswith("re:"):
@@ -803,9 +795,7 @@ class AutoMetadataBuilder:
         rule_repr = repr(rule).lower() if rule is not None else ""
         before_rules = getattr(rule, "before_rules", None)
         before_repr = repr(before_rules).lower() if before_rules is not None else ""
-        combined_repr = " ".join(
-            part for part in (rule_repr, before_repr) if part
-        )
+        combined_repr = " ".join(part for part in (rule_repr, before_repr) if part)
         if "reply" in combined_repr:
             requires_reply = True
         if "tome" in combined_repr or "to_me" in combined_repr:
@@ -915,9 +905,7 @@ class AutoMetadataBuilder:
                 if keyword.arg == "permission":
                     level = cls._merge_access_level(
                         level,
-                        cls._infer_access_level_from_expr(
-                            keyword.value, symbol_levels
-                        ),
+                        cls._infer_access_level_from_expr(keyword.value, symbol_levels),
                     )
                 elif keyword.arg == "rule":
                     level = cls._merge_access_level(
@@ -1068,12 +1056,8 @@ class AutoMetadataBuilder:
                         "command": normalized,
                         "text_min": cls._safe_int(getattr(params, "min_texts", None)),
                         "text_max": cls._safe_int(getattr(params, "max_texts", None)),
-                        "image_min": cls._safe_int(
-                            getattr(params, "min_images", None)
-                        ),
-                        "image_max": cls._safe_int(
-                            getattr(params, "max_images", None)
-                        ),
+                        "image_min": cls._safe_int(getattr(params, "min_images", None)),
+                        "image_max": cls._safe_int(getattr(params, "max_images", None)),
                         "allow_at": True,
                         "target_requirement": "optional",
                         "target_sources": ["at", "reply", "nickname", "self"],
@@ -1612,9 +1596,9 @@ class AutoMetadataBuilder:
             current["requires_reply"] = bool(current.get("requires_reply")) or bool(
                 payload.get("requires_reply")
             )
-            current["requires_private"] = bool(
-                current.get("requires_private")
-            ) or bool(payload.get("requires_private"))
+            current["requires_private"] = bool(current.get("requires_private")) or bool(
+                payload.get("requires_private")
+            )
             current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
                 payload.get("requires_to_me")
             )

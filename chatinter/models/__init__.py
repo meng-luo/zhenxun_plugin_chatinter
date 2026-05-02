@@ -7,6 +7,7 @@ ChatInter - 数据模型
 """
 
 # Pydantic 模型（结构化输出）
+from .chat_history import ChatInterChatHistory, ChatInterMemory
 from .pydantic_models import (
     CapabilityGraphSnapshot,
     CommandCandidateFeatures,
@@ -24,6 +25,8 @@ from .pydantic_models import (
 
 __all__ = [
     "CapabilityGraphSnapshot",
+    "ChatInterChatHistory",
+    "ChatInterMemory",
     "CommandCandidateFeatures",
     "CommandCandidateSnapshot",
     "CommandCapability",

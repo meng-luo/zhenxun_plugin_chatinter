@@ -3,6 +3,7 @@ import re
 from typing import Literal
 
 from .models.pydantic_models import PluginKnowledgeBase
+from .plugin_adapters import get_adapter_target_policy_for_schema
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
@@ -114,9 +115,7 @@ _CHAT_IDENTITY_TARGET_PATTERNS = (
         r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
         r"(?:是谁|是啥|什么人|哪位|是谁呀|是谁吗|是谁嘛|是谁啊)"
     ),
-    re.compile(
-        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})(?:是谁|是啥|什么人|哪位)"
-    ),
+    re.compile(r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})(?:是谁|是啥|什么人|哪位)"),
 )
 _CHAT_MEMORY_TARGET_PATTERNS = (
     re.compile(
@@ -251,10 +250,7 @@ def _find_schema(
         for alias in (skill.aliases or ())
         if normalize_message_text(alias)
     }
-    if (
-        normalized_head in normalized_aliases
-        and len(skill.command_schemas) == 1
-    ):
+    if normalized_head in normalized_aliases and len(skill.command_schemas) == 1:
         return skill.command_schemas[0]
     return None
 
@@ -401,12 +397,16 @@ def _classify_chat_dialogue(
         has_context_hint = contains_any(compact, _CHAT_EXPLAIN_CONTEXT_HINTS)
         if has_context_hint and contains_any(compact, _CHAT_EXPLAIN_HINTS):
             return "explain_context", "", "context_explain_request"
-        if has_context_hint and contains_any(
-            compact,
-            ("知道", "了解", "想问", "问一下", "请问"),
-        ) and contains_any(
-            compact,
-            ("是什么", "是啥", "什么意思", "什么含义", "怎么回事"),
+        if (
+            has_context_hint
+            and contains_any(
+                compact,
+                ("知道", "了解", "想问", "问一下", "请问"),
+            )
+            and contains_any(
+                compact,
+                ("是什么", "是啥", "什么意思", "什么含义", "怎么回事"),
+            )
         ):
             return "explain_context", "", "context_explain_request"
 
@@ -510,8 +510,7 @@ def _fallback_explicit_command(
                         image_max=getattr(meta, "image_max", None),
                         allow_at=bool(getattr(meta, "allow_at", False)),
                         actor_scope=str(
-                            getattr(meta, "actor_scope", "allow_other")
-                            or "allow_other"
+                            getattr(meta, "actor_scope", "allow_other") or "allow_other"
                         ),
                         target_requirement=str(
                             getattr(meta, "target_requirement", "none") or "none"
@@ -742,7 +741,14 @@ def _classify_explicit_command(
             rewrite_command=rewrite_command,
         )
 
-    policy = resolve_command_target_policy(schema)
+    policy = resolve_command_target_policy(
+        schema,
+        adapter_policy=get_adapter_target_policy_for_schema(
+            schema,
+            plugin_module=plugin_module,
+            plugin_name=plugin_name,
+        ),
+    )
     available_target_units = image_count
     if has_at and policy.allow_at:
         available_target_units += 1
@@ -964,9 +970,8 @@ def classify_message_intent(
         normalized,
         query_families=query_families,
     )
-    if (
-        fallback_intent.kind == "ambiguous"
-        and contains_any(normalized, _EXECUTE_NEED_ARG_HINTS)
+    if fallback_intent.kind == "ambiguous" and contains_any(
+        normalized, _EXECUTE_NEED_ARG_HINTS
     ):
         return fallback_intent
     return fallback_intent

@@ -13,8 +13,11 @@ from .route_text import (
     match_command_head_or_sticky,
     normalize_message_text,
 )
-from .skill_registry import get_skill_registry, select_relevant_skills
-from .skill_registry import infer_query_families
+from .skill_registry import (
+    get_skill_registry,
+    infer_query_families,
+    select_relevant_skills,
+)
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
 _REQUIRED_TOKEN_PATTERN = re.compile(r"(?<!\w)\+([a-z0-9_]+|[\u4e00-\u9fff]{1,6})")
@@ -242,10 +245,8 @@ def _cached_plugin_haystack(cache_key: tuple[Any, ...]) -> str:
         for command, meta_aliases, params, examples, *_ in meta_signatures
     )
     return normalize_message_text(
-        (
-            f"{name} {module} {description} "
-            f"{' '.join(commands)} {' '.join(aliases)} {command_meta_text} {usage}"
-        )
+        f"{name} {module} {description} "
+        f"{' '.join(commands)} {' '.join(aliases)} {command_meta_text} {usage}"
     ).lower()
 
 
@@ -634,12 +635,17 @@ def _build_candidate(
         if contains_any(normalized_query, _FAMILY_SEARCH_HINTS):
             candidate.add(1.8, "family_search_hint")
         if any(marker in normalized_query for marker in _FAMILY_SEARCH_HINTS) and any(
-            marker in haystack for marker in ("今日", "今天", "本日", "当日", "找", "搜", "查")
+            marker in haystack
+            for marker in ("今日", "今天", "本日", "当日", "找", "搜", "查")
         ):
             candidate.add(1.6, "family_search_time")
-    elif family == "template" and contains_any(normalized_query, _FAMILY_TEMPLATE_HINTS):
+    elif family == "template" and contains_any(
+        normalized_query, _FAMILY_TEMPLATE_HINTS
+    ):
         candidate.add(2.0, "family_template_hint")
-    elif family == "transaction" and contains_any(normalized_query, _FAMILY_TRANSACTION_HINTS):
+    elif family == "transaction" and contains_any(
+        normalized_query, _FAMILY_TRANSACTION_HINTS
+    ):
         candidate.add(2.0, "family_transaction_hint")
     elif family == "self" and contains_any(normalized_query, _FAMILY_SELF_HINTS):
         candidate.add(1.4, "family_self_hint")
@@ -780,9 +786,7 @@ def _rank_route_candidates_internal(
                 for plugin in filtered_plugins
             ]
 
-        pref_order = {
-            module: idx for idx, module in enumerate(normalized_pref)
-        }
+        pref_order = {module: idx for idx, module in enumerate(normalized_pref)}
         fallback_index = len(pref_order)
         filtered_plugins.sort(
             key=lambda plugin: pref_order.get(
@@ -861,16 +865,12 @@ def _rank_route_candidates_internal(
         reverse=True,
     )
     ranked_plugins = [
-        item.plugin
-        for item in scored
-        if item.score >= max(min_score, 0.0)
+        item.plugin for item in scored if item.score >= max(min_score, 0.0)
     ]
 
     if select_key:
         direct = [
-            plugin
-            for plugin in ranked_plugins
-            if _match_select_key(plugin, select_key)
+            plugin for plugin in ranked_plugins if _match_select_key(plugin, select_key)
         ]
         if direct:
             remain = [plugin for plugin in ranked_plugins if plugin not in direct]

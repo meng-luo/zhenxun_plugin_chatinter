@@ -58,8 +58,7 @@ def build_turn_metrics_snapshot(
         trace_name=trace.name,
         total_ms=round(total_seconds * 1000, 2),
         stage_ms={
-            name: round(cost * 1000, 2)
-            for name, cost in getattr(trace, "_stages", ())
+            name: round(cost * 1000, 2) for name, cost in getattr(trace, "_stages", ())
         },
         tags=dict(trace.tags),
         route_reason=(route_report.final_reason if route_report else None),
@@ -91,9 +90,7 @@ def build_turn_metrics_snapshot(
         ),
         rerank_attempts=(route_report.rerank_attempts if route_report else 0),
         rerank_success=(route_report.rerank_success if route_report else 0),
-        rerank_no_available=(
-            route_report.rerank_no_available if route_report else 0
-        ),
+        rerank_no_available=(route_report.rerank_no_available if route_report else 0),
         rerank_stage=(route_report.rerank_stage if route_report else ""),
         rerank_reason=(route_report.rerank_reason if route_report else ""),
         runtime_budget=runtime_budget,
@@ -183,15 +180,15 @@ class _RouteObserver:
         )
         avg_candidate_total = sum(row.candidate_total for row in rows) / len(rows)
         avg_tool_candidates = sum(row.tool_candidates for row in rows) / len(rows)
-        avg_prompt_full_candidates = (
-            sum(row.prompt_full_candidates for row in rows) / len(rows)
-        )
-        avg_prompt_compact_candidates = (
-            sum(row.prompt_compact_candidates for row in rows) / len(rows)
-        )
-        avg_prompt_name_only_candidates = (
-            sum(row.prompt_name_only_candidates for row in rows) / len(rows)
-        )
+        avg_prompt_full_candidates = sum(
+            row.prompt_full_candidates for row in rows
+        ) / len(rows)
+        avg_prompt_compact_candidates = sum(
+            row.prompt_compact_candidates for row in rows
+        ) / len(rows)
+        avg_prompt_name_only_candidates = sum(
+            row.prompt_name_only_candidates for row in rows
+        ) / len(rows)
         recent_failures = [
             asdict(row)
             for row in rows
@@ -215,9 +212,7 @@ class _RouteObserver:
             "no_hit_recovery_attempts": sum(
                 row.no_hit_recovery_attempts for row in rows
             ),
-            "no_hit_recovery_success": sum(
-                row.no_hit_recovery_success for row in rows
-            ),
+            "no_hit_recovery_success": sum(row.no_hit_recovery_success for row in rows),
             "rerank_attempts": sum(row.rerank_attempts for row in rows),
             "rerank_success": sum(row.rerank_success for row in rows),
             "rerank_no_available": sum(row.rerank_no_available for row in rows),
@@ -309,9 +304,7 @@ def record_route_observation(
         )
         rerank_attempts = int(getattr(route_report, "rerank_attempts", 0) or 0)
         rerank_success = int(getattr(route_report, "rerank_success", 0) or 0)
-        rerank_no_available = int(
-            getattr(route_report, "rerank_no_available", 0) or 0
-        )
+        rerank_no_available = int(getattr(route_report, "rerank_no_available", 0) or 0)
         rerank_stage = str(getattr(route_report, "rerank_stage", "") or "")
         rerank_reason = str(getattr(route_report, "rerank_reason", "") or "")
 
@@ -365,9 +358,7 @@ def render_route_observer_summary(limit: int = 200) -> str:
         "path: "
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["path_counts"].items())),
         "outcome: "
-        + ", ".join(
-            f"{k}={v}" for k, v in sorted(payload["outcome_counts"].items())
-        ),
+        + ", ".join(f"{k}={v}" for k, v in sorted(payload["outcome_counts"].items())),
         "stage: "
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["stage_counts"].items())),
         (

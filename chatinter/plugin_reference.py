@@ -21,6 +21,10 @@ from .models.pydantic_models import (
     PluginCommandSchema,
     PluginReference,
 )
+from .plugin_adapters import (
+    collect_prompt_score_hints,
+    command_family_from_adapter,
+)
 from .route_text import normalize_message_text
 
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
@@ -33,17 +37,10 @@ def _append_unique(target: list[str], value: object) -> None:
 
 
 def _command_family(schema: PluginCommandSchema, *, plugin_module: str) -> str:
-    command_id = normalize_message_text(schema.command_id).casefold()
+    adapter_family = command_family_from_adapter(schema, plugin_module=plugin_module)
+    if adapter_family:
+        return adapter_family
     module = normalize_message_text(plugin_module).casefold()
-    head = normalize_message_text(schema.head)
-    if "meme" in module or command_id.startswith("memes."):
-        return "meme"
-    if "gold_redbag" in module or "红包" in head:
-        return "gold_redbag"
-    if "translate" in module or command_id.startswith("translate."):
-        return "translate"
-    if "roll" in module or command_id.startswith("roll."):
-        return "choice"
     if schema.command_role in {"catalog", "helper", "usage"}:
         return schema.command_role
     return module.rsplit(".", 1)[-1] or "general"
@@ -375,19 +372,8 @@ def _score_schema_for_query(schema: PluginCommandSchema, query: str) -> float:
         score += 220.0
     if schema.command_role == "random" and "随机" in normalized:
         score += 100.0
-    if schema.command_id == "memes.search" and any(
-        token in normalized for token in ("相关表情", "找一下", "搜一下", "搜索")
-    ):
-        score += 260.0
-    if schema.command_id == "memes.info" and any(
-        token in normalized for token in ("怎么用", "用法", "详情")
-    ):
-        score += 220.0
-    if schema.requires.get("text") and any(
-        token in normalized
-        for token in ("支持哪些", "哪些语言", "语种", "支持什么语言")
-    ):
-        score -= 360.0
+    for hint in collect_prompt_score_hints(schema, normalized_query=normalized):
+        score += hint.score
     return score
 
 

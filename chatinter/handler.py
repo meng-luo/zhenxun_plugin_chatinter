@@ -23,17 +23,21 @@ from zhenxun.utils.message import MessageUtils
 
 from .agent_gate import decide_agent_gate
 from .agent_runner import run_chatinter_agent
+from .chat_dialogue_planner import ChatDialoguePlan, plan_chat_dialogue
+from .chat_feedback import ChatFeedbackStore
 from .chat_handler import (
     handle_chat_message,
     normalize_ai_reply_text,
     replace_mention_ids_with_names,
     reroute_to_plugin,
 )
+from .chat_quality_guard import refine_chat_reply
 from .command_planner import CommandPlanDecision, plan_command
 from .config import get_config_value, get_mcp_endpoints, get_model_name
 from .execution_observer import (
     EXECUTION_REASON_CANCELLED,
     EXECUTION_REASON_CHAT_COMPLETED,
+    EXECUTION_REASON_CHAT_REWRITTEN,
     EXECUTION_REASON_CLARIFY_REQUESTED,
     EXECUTION_REASON_ERROR,
     EXECUTION_REASON_MISSING_PARAMS,
@@ -75,6 +79,11 @@ from .pending_route import (
     remember_pending_route,
     try_resume_pending_route,
 )
+from .plugin_adapters import (
+    AdapterTargetPolicy,
+    get_adapter_notification_policy,
+    get_adapter_target_policy,
+)
 from .plugin_registry import (
     PluginRegistry,
     PluginSelectionContext,
@@ -100,7 +109,6 @@ from .route_text import (
 )
 from .schema_policy import (
     resolve_command_target_policy,
-    schema_allows_at,
     schema_is_self_only,
 )
 from .skill_registry import (
@@ -127,7 +135,6 @@ _DISABLE_PLUGINS_ATTR = "_chatinter_disable_plugins"
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@([^\]\s]+)\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[的，,。.!！？?]))"
 )
-_FOLLOWUP_MEME_HINTS = ("表情", "表情包", "梗图", "头像")
 _PLACEHOLDER_SEGMENT_PATTERN = re.compile(r"\[@[^\]]+\]|\[image(?:#\d+)?\]")
 _REPLY_TAG_PATTERN = re.compile(r"\[reply:[^\]]+\]", re.IGNORECASE)
 _REPLY_REF_HINTS = (
@@ -205,22 +212,6 @@ _CUTE_NOTIFY_TEMPLATES = (
     "等一下下，我这就帮你{target}。",
     "哼哼，这点小事马上给你{target}。",
 )
-_CUTE_MEME_NOTIFY_TEMPLATES = (
-    "好、好啦，真寻这就做{target}。",
-    "收到啦，马上给你做{target}。",
-    "诶嘿，开工咯，这就做{target}。",
-    "等我一下下，这就把{target}做出来。",
-    "哼，这个我超会，立刻做{target}。",
-    "软乎乎开工中，马上给你{target}。",
-)
-_CUTE_MEME_HELPER_TEMPLATES = (
-    "好、好啦，这就给你{target}。",
-    "收到啦，我马上帮你{target}。",
-    "唔，知道啦，这就去{target}。",
-    "安排上啦，立刻给你{target}。",
-    "等一下下，这就帮你{target}。",
-)
-_MEME_HELPER_COMMANDS = {"表情搜索", "表情详情", "启用表情", "更新表情"}
 _FUZZY_TARGET_HINT_PATTERN = re.compile(
     r"(?:给|帮|替|让|叫|喊|请)(?!我|自己|本人)(?P<name>[A-Za-z0-9\u4e00-\u9fff]{1,16}?)(?=(?:做|整|弄|来|发|签|点|查|看|问|生成|制作|的|表情|头像|图片|图|一下|一张|一个|个|张|首|[\s，,。.!！？?]|$))"
 )
@@ -393,10 +384,79 @@ async def _persist_final_only_dialog(
     )
 
 
+async def _handle_chat_dialogue_special_case(
+    *,
+    plan: ChatDialoguePlan,
+    trace: StageTrace,
+    user_id: str,
+    group_id: str | None,
+    nickname: str,
+    user_message,
+    bot_id: str | None,
+    session_key: str,
+    current_message: str,
+    route_report: RouteAttemptReport | None,
+    budget_controller: TurnBudgetController | None,
+    finalize_callback,
+) -> bool:
+    if plan.kind != "recap":
+        return False
+    recap = await _chat_memory.build_recent_conversation_recap(user_id, group_id)
+    envelope = TurnChannelEnvelope()
+    trace.update_tags(path="chat", outcome="chat_recap")
+    envelope.add(ChannelName.ANALYSIS, "chat dialogue special: recap")
+    envelope.add(ChannelName.FINAL, recap)
+    _log_turn_channels(envelope)
+    await _persist_final_only_dialog(
+        envelope=envelope,
+        user_id=user_id,
+        group_id=group_id,
+        nickname=nickname,
+        user_message=user_message,
+        bot_id=bot_id,
+    )
+    trace.stage("persist")
+    await MessageUtils.build_message(envelope.final).send()
+    trace.stage("send")
+    ChatFeedbackStore.record(
+        session_id=session_key,
+        kind="chat_completed",
+        message_text=current_message,
+        reply_text=envelope.final,
+        weight=0.2,
+    )
+    if finalize_callback is not None:
+        await finalize_callback(
+            response_text=envelope.final,
+            phase="post_gate:chat_recap",
+        )
+    _tag_execution_observation(
+        trace,
+        record_execution_observation(
+            action="chat",
+            success=True,
+            reason=EXECUTION_REASON_CHAT_COMPLETED,
+            session_id=session_key,
+            route_stage="chat_recap",
+            message_preview=current_message,
+        ),
+    )
+    _finish_trace(
+        trace=trace,
+        user_id=str(user_id),
+        group_id=group_id,
+        message_preview=current_message,
+        route_report=route_report,
+        budget_controller=budget_controller,
+    )
+    return True
+
+
 def _build_route_notify_text(
     plugin_name: str,
     plugin_module: str,
     route_command: str,
+    command_id: str = "",
 ) -> str:
     def _render(template_pool: tuple[str, ...], *, target: str, seed: str) -> str:
         if not template_pool:
@@ -412,18 +472,24 @@ def _build_route_notify_text(
     if not target:
         return _render(_CUTE_NOTIFY_TEMPLATES, target="处理一下", seed=seed_base)
 
-    is_meme_like = "meme" in (plugin_module or "").lower() or "表情" in (
-        plugin_name or ""
+    policy = get_adapter_notification_policy(
+        plugin_module=plugin_module,
+        command_id=command_id,
     )
-    if is_meme_like and "表情" not in target:
-        if target in _MEME_HELPER_COMMANDS:
+    if policy is not None and policy.default_templates:
+        if target in policy.helper_heads and policy.helper_templates:
             return _render(
-                _CUTE_MEME_HELPER_TEMPLATES, target=target, seed=f"{seed_base}|helper"
+                policy.helper_templates,
+                target=target,
+                seed=f"{seed_base}|helper",
             )
+        notify_target = target
+        if policy.target_suffix and policy.target_suffix not in notify_target:
+            notify_target = f"{notify_target}{policy.target_suffix}"
         return _render(
-            _CUTE_MEME_NOTIFY_TEMPLATES,
-            target=f"{target}表情",
-            seed=f"{seed_base}|meme",
+            policy.default_templates,
+            target=notify_target,
+            seed=f"{seed_base}|adapter",
         )
 
     return _render(_CUTE_NOTIFY_TEMPLATES, target=target, seed=f"{seed_base}|default")
@@ -935,23 +1001,29 @@ def _resolve_fuzzy_trigger_strength(
     *,
     original_message: str,
     route_message: str,
+    target_policy: AdapterTargetPolicy | None = None,
     command_heads: set[str] | None = None,
 ) -> str:
+    policy = target_policy or AdapterTargetPolicy()
     normalized_original = normalize_message_text(original_message or "")
     normalized_route = normalize_message_text(route_message or "")
     if not normalized_original or not normalized_route:
         return ""
     if _extract_at_tokens(normalized_route):
         return ""
-    if _is_technical_request_like(normalized_original) and not contains_any(
-        normalized_original, _FOLLOWUP_MEME_HINTS
-    ):
+    if _is_technical_request_like(
+        normalized_original
+    ) and not _has_adapter_context_hint(normalized_original, policy):
         return ""
     if _contains_non_self_target_phrase(normalized_original):
         return "strong"
     if _contains_third_person_reference(normalized_original):
         return "strong"
-    if _needs_target_for_meme_request(normalized_original, normalized_route):
+    if _needs_target_for_route(
+        normalized_original,
+        normalized_route,
+        target_policy=policy,
+    ):
         return "strong"
     if command_heads:
         for head in sorted(command_heads, key=len, reverse=True):
@@ -964,11 +1036,19 @@ def _resolve_fuzzy_trigger_strength(
     return ""
 
 
-def _needs_target_for_meme_request(message_text: str, route_message: str) -> bool:
+def _needs_target_for_route(
+    message_text: str,
+    route_message: str,
+    *,
+    target_policy: AdapterTargetPolicy | None = None,
+) -> bool:
+    policy = target_policy or AdapterTargetPolicy()
     normalized = normalize_message_text(message_text or "")
     if not normalized:
         return False
-    if not contains_any(normalized, _FOLLOWUP_MEME_HINTS):
+    if not policy.require_target_for_third_person:
+        return False
+    if not _has_adapter_context_hint(normalized, policy):
         return False
     if _contains_self_reference(normalized):
         return False
@@ -979,6 +1059,10 @@ def _needs_target_for_meme_request(message_text: str, route_message: str) -> boo
         return False
     has_target = bool(_extract_at_tokens(route_message))
     has_image = bool(_extract_image_tokens(route_message))
+    if has_target and policy.allow_at_as_target:
+        return False
+    if has_image and policy.allow_image_as_target:
+        return False
     return not has_target and not has_image
 
 
@@ -1082,21 +1166,23 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
     heads: set[str] = set()
     plugins = getattr(knowledge_base, "plugins", None) or []
     for plugin in plugins:
+        plugin_policy = _get_route_target_policy(
+            plugin_module=getattr(plugin, "module", ""),
+            plugin_name=getattr(plugin, "name", ""),
+        )
         for meta in getattr(plugin, "command_meta", None) or []:
-            policy = resolve_command_target_policy(meta)
-            allow_at = policy.allow_at
-            image_min = int(getattr(meta, "image_min", 0) or 0)
-            target_requirement = (
-                normalize_message_text(
-                    str(getattr(meta, "target_requirement", "") or "")
-                ).lower()
-                or "none"
+            policy = resolve_command_target_policy(
+                meta,
+                adapter_policy=plugin_policy,
             )
+            image_min = int(getattr(meta, "image_min", 0) or 0)
             allow_sticky_arg = bool(getattr(meta, "allow_sticky_arg", False))
             if (
-                not allow_at
+                not policy.allow_at
+                and not policy.allow_image_as_target
+                and not policy.allow_reply_image_as_target
                 and image_min <= 0
-                and target_requirement == "none"
+                and policy.target_requirement == "none"
                 and not allow_sticky_arg
             ):
                 continue
@@ -1110,6 +1196,39 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
                 if alias_text:
                     heads.add(normalize_message_text(alias_text.split(" ", 1)[0]))
     return {head for head in heads if head}
+
+
+def _get_route_target_policy(
+    *,
+    plugin_module: str = "",
+    plugin_name: str = "",
+    command_id: str = "",
+) -> AdapterTargetPolicy:
+    return get_adapter_target_policy(
+        plugin_module=plugin_module,
+        plugin_name=plugin_name,
+        command_id=command_id,
+    )
+
+
+def _route_target_policy_from_result(
+    route_result: RouteResolveResult,
+) -> AdapterTargetPolicy:
+    return _get_route_target_policy(
+        plugin_module=route_result.decision.plugin_module,
+        plugin_name=route_result.decision.plugin_name,
+        command_id=route_result.command_id or "",
+    )
+
+
+def _has_adapter_context_hint(
+    message_text: str,
+    policy: AdapterTargetPolicy,
+) -> bool:
+    hints = tuple(policy.context_hints or ())
+    if not hints:
+        return False
+    return contains_any(normalize_message_text(message_text or ""), hints)
 
 
 def _finish_trace(
@@ -1239,7 +1358,8 @@ def _is_public_command_meta(meta) -> bool:
 def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugins):
     decision = route_result.decision
     head = _normalize_head(decision.command)
-    if not head:
+    command_id = normalize_message_text(route_result.command_id or "").casefold()
+    if not head and not command_id:
         return None
     exact_module_plugins = [
         plugin
@@ -1250,6 +1370,13 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
         plugin for plugin in knowledge_plugins if plugin.name == decision.plugin_name
     ]
     for plugin in candidate_plugins:
+        if command_id:
+            for meta in plugin.command_meta:
+                meta_id = normalize_message_text(
+                    str(getattr(meta, "command_id", "") or "")
+                ).casefold()
+                if meta_id and meta_id == command_id:
+                    return meta
         plugin_aliases = {
             _normalize_head(alias).casefold()
             for alias in (getattr(plugin, "aliases", None) or [])
@@ -1621,14 +1748,16 @@ def _build_route_message_with_explicit_context(
     user_id: str,
     reply_image_count: int,
     reply_sender_id: str | None,
+    target_policy: AdapterTargetPolicy | None = None,
 ) -> str:
+    policy = target_policy or AdapterTargetPolicy()
     normalized = normalize_message_text(message_text or "")
     if not normalized:
         return normalized
 
     should_enrich = not is_usage_question(normalized) and (
         contains_any(normalized, ROUTE_ACTION_WORDS)
-        or contains_any(normalized, _FOLLOWUP_MEME_HINTS)
+        or _has_adapter_context_hint(normalized, policy)
         or "[image" in normalized
         or "[@" in normalized
         or _contains_reply_reference_hint(normalized)
@@ -1655,6 +1784,7 @@ def _build_route_message_with_explicit_context(
     if (
         reply_image_count > 0
         and not image_tokens
+        and (policy.allow_reply_image_as_target or policy.allow_image_as_target)
         and _contains_reply_reference_hint(normalized)
     ):
         suffix = " ".join("[image]" for _ in range(reply_image_count))
@@ -1700,6 +1830,7 @@ async def _enrich_route_message_with_fuzzy_target(
     original_message: str,
     route_message: str,
     mention_profiles: dict[str, dict[str, str]],
+    target_policy: AdapterTargetPolicy | None = None,
     command_heads: set[str] | None = None,
 ) -> tuple[str, dict[str, dict[str, str]], str | None]:
     if not group_id:
@@ -1710,6 +1841,7 @@ async def _enrich_route_message_with_fuzzy_target(
     trigger_strength = _resolve_fuzzy_trigger_strength(
         original_message=original_message,
         route_message=route_message,
+        target_policy=target_policy,
         command_heads=command_heads,
     )
     if not trigger_strength:
@@ -1769,11 +1901,17 @@ async def _enrich_route_message_with_fuzzy_target(
             _build_member_ambiguity_message(ambiguous_candidates),
         )
     if matched is None:
-        if _needs_target_for_meme_request(original_message, route_message):
+        policy = target_policy or AdapterTargetPolicy()
+        if _needs_target_for_route(
+            original_message,
+            route_message,
+            target_policy=policy,
+        ):
             return (
                 route_message,
                 mention_profiles,
-                "要帮别人做的话，请重新发送完整命令，并直接@目标成员，或者带上对方头像。",
+                policy.target_missing_message
+                or "要帮别人做的话，请重新发送完整命令，并补充目标成员。",
             )
         return route_message, mention_profiles, None
 
@@ -1799,6 +1937,46 @@ async def _enrich_route_message_with_fuzzy_target(
     if top_score >= 0.90:
         _remember_target_resolution(group_id, target_hint, user_id)
     return enriched_message, mention_profiles, None
+
+
+def _select_adapter_policy_for_message(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+) -> AdapterTargetPolicy:
+    normalized = normalize_message_text(message_text or "")
+    if not normalized:
+        return AdapterTargetPolicy()
+    best_policy = AdapterTargetPolicy()
+    best_score = 0
+    for plugin in knowledge_base.plugins:
+        policy = _get_route_target_policy(
+            plugin_module=plugin.module,
+            plugin_name=plugin.name,
+        )
+        if not policy.context_hints:
+            continue
+        score = 0
+        if policy.media_related:
+            score += 1
+        if _has_adapter_context_hint(normalized, policy):
+            score += 4
+        command_texts: list[str] = []
+        command_texts.extend(str(command or "") for command in plugin.commands)
+        command_texts.extend(str(alias or "") for alias in plugin.aliases)
+        for meta in getattr(plugin, "command_meta", None) or []:
+            command_texts.append(str(getattr(meta, "command", "") or ""))
+            command_texts.extend(
+                str(alias or "") for alias in getattr(meta, "aliases", None) or []
+            )
+        if any(
+            text and text in normalized
+            for text in (normalize_message_text(item) for item in command_texts)
+        ):
+            score += 3
+        if score > best_score:
+            best_policy = policy
+            best_score = score
+    return best_policy if best_score > 0 else AdapterTargetPolicy()
 
 
 def _build_reply_image_segments_for_reroute(
@@ -1999,9 +2177,7 @@ async def _record_route_feedback(
 
 
 def _contains_self_reference(message_text: str) -> bool:
-    normalized = normalize_message_text(
-        normalize_action_phrases(message_text or "")
-    )
+    normalized = normalize_message_text(normalize_action_phrases(message_text or ""))
     if not normalized:
         return False
     return any(
@@ -2011,9 +2187,7 @@ def _contains_self_reference(message_text: str) -> bool:
 
 
 def _contains_strong_self_reference(message_text: str) -> bool:
-    normalized = normalize_message_text(
-        normalize_action_phrases(message_text or "")
-    )
+    normalized = normalize_message_text(normalize_action_phrases(message_text or ""))
     if not normalized:
         return False
     return any(
@@ -2098,6 +2272,7 @@ def _build_route_result_from_intent(
             command,
             getattr(schema, "text_max", None),
         )
+    command_id = normalize_message_text(str(getattr(schema, "command_id", "") or ""))
     return RouteResolveResult(
         decision=SkillRouteDecision(
             plugin_name=plugin_name,
@@ -2107,6 +2282,7 @@ def _build_route_result_from_intent(
             skill_kind="intent",
         ),
         stage="intent",
+        command_id=command_id or None,
     )
 
 
@@ -2177,7 +2353,10 @@ def _build_plugin_usage_fallback_message(
             hints.append("参数: " + " / ".join(str(item) for item in schema.params))
         text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
         image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
-        policy = resolve_command_target_policy(schema)
+        policy = resolve_command_target_policy(
+            schema,
+            adapter_policy=_route_target_policy_from_result(route_result),
+        )
         if text_min > 0:
             hints.append(f"至少需要 {text_min} 段文本")
         if image_min > 0:
@@ -2209,14 +2388,7 @@ def _build_plugin_usage_fallback_message(
 
 
 def _is_image_related_route(route_result: RouteResolveResult) -> bool:
-    plugin_name = str(route_result.decision.plugin_name or "").lower()
-    module_name = str(route_result.decision.plugin_module or "").lower()
-    return (
-        "meme" in module_name
-        or "表情" in plugin_name
-        or "image" in module_name
-        or "图片" in plugin_name
-    )
+    return _route_target_policy_from_result(route_result).media_related
 
 
 def _append_unique_tokens(command: str, tokens: list[str]) -> str:
@@ -2410,13 +2582,12 @@ def _prepare_route_execution_plan(
 
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
-    target_requirement = (
-        normalize_message_text(
-            str(getattr(schema, "target_requirement", "") or "")
-        ).lower()
-        or "none"
+    policy = resolve_command_target_policy(
+        schema,
+        adapter_policy=_route_target_policy_from_result(route_result),
     )
-    allow_at = schema_allows_at(schema)
+    target_requirement = policy.target_requirement
+    allow_at = policy.allow_at
     if allow_at:
         command_at = _extract_at_tokens(command)
     else:
@@ -2457,7 +2628,10 @@ def _prepare_route_execution_plan(
             return RouteExecutionPlan(
                 command=_apply_route_command_prefixes(command, schema),
                 need_followup=True,
-                followup_message=_build_target_required_message(schema),
+                followup_message=(
+                    policy.target_missing_message
+                    or _build_target_required_message(schema)
+                ),
                 feedback_reason=_FEEDBACK_REASON_TARGET_REQUIRED,
                 allow_at=allow_at,
             )
@@ -2766,6 +2940,7 @@ async def _execute_route_decision(
         plugin_name=decision.plugin_name,
         plugin_module=decision.plugin_module,
         route_command=route_command,
+        command_id=route_result.command_id or "",
     )
     envelope.add(ChannelName.COMMENTARY, f"reroute command: {route_command}")
     envelope.add(ChannelName.FINAL, response_text)
@@ -3082,6 +3257,111 @@ async def _handle_router_clarify_response(
     )
 
 
+async def _build_chat_fallback_reply(
+    *,
+    bot: Bot,
+    event: Event,
+    user_id: str,
+    group_id: str | None,
+    nickname: str,
+    model_name: str | None,
+    mention_name_map: dict[str, str],
+    session_key: str,
+    current_message: str,
+    middleware_state: TurnMiddlewareState,
+    dialogue_plan: ChatDialoguePlan,
+    image_parts,
+    budget_controller: TurnBudgetController,
+    router_force_pure_chat: bool,
+) -> tuple[str, bool, bool]:
+    intent_profile = middleware_state.intent
+    if intent_profile is None:
+        raise RuntimeError("missing intent profile for chat fallback")
+    intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
+    agent_gate = decide_agent_gate(
+        config_enabled=bool(get_config_value("ENABLE_AGENT_MODE", True)),
+        intent=intent_profile,
+        message_text=middleware_state.message_text,
+        has_images=bool(image_parts),
+        has_mcp_endpoints=bool(get_mcp_endpoints()),
+    )
+    agent_enabled = False if router_force_pure_chat else agent_gate.enabled
+    logger.debug(
+        f"ChatInter agent gate: enabled={agent_enabled} reason={agent_gate.reason}"
+    )
+    reply: str | UniMessage | None = None
+    if agent_enabled:
+        middleware_state.metadata = {"phase": "agent_fallback"}
+        await get_middleware_manager().dispatch("before_agent", middleware_state)
+        try:
+            agent_response = await run_chatinter_agent(
+                bot=bot,
+                event=event,
+                user_id=str(user_id),
+                group_id=str(group_id) if group_id else None,
+                model=model_name,
+                timeout=max(intent_timeout, 5),
+                system_prompt=middleware_state.system_prompt,
+                context_xml=middleware_state.context_xml,
+                message_text=middleware_state.message_text,
+                image_parts=image_parts or None,
+                budget_controller=budget_controller,
+            )
+            if agent_response and str(agent_response.text or "").strip():
+                reply = str(agent_response.text)
+            usage = (
+                agent_response.usage_info
+                if agent_response and isinstance(agent_response.usage_info, dict)
+                else {}
+            )
+            logger.debug(
+                "chatinter agent reply ready: "
+                f"prompt_tokens={usage.get('prompt_tokens', 0)} "
+                f"completion_tokens={usage.get('completion_tokens', 0)} "
+                f"total_tokens={usage.get('total_tokens', 0)}"
+            )
+        except Exception as exc:
+            logger.warning(f"ChatInter agent 执行失败，降级普通对话: {exc}")
+    if reply is None:
+        reply = await handle_chat_message(
+            message=middleware_state.message_text,
+            user_id=user_id,
+            group_id=group_id,
+            nickname=nickname,
+            mention_name_map=mention_name_map,
+            session_key=session_key,
+            budget_controller=budget_controller,
+            dialogue_plan=dialogue_plan,
+            context_xml=middleware_state.context_xml,
+        )
+
+    reply_text = (
+        str(reply)
+        if reply is not None and str(reply).strip()
+        else "我暂时没想好怎么回答你。"
+    )
+    middleware_state.response_text = reply_text
+    if agent_enabled:
+        await get_middleware_manager().dispatch("after_agent", middleware_state)
+    await get_middleware_manager().dispatch("after_chat", middleware_state)
+    reply_text = (
+        middleware_state.response_text
+        if middleware_state.response_text is not None
+        else reply_text
+    )
+    reply_text = normalize_ai_reply_text(reply_text or "")
+    refined_reply_text = await refine_chat_reply(
+        plan=dialogue_plan,
+        user_message=current_message,
+        reply_text=reply_text,
+        context_xml=middleware_state.context_xml,
+        budget_controller=budget_controller,
+    )
+    rewritten = refined_reply_text != reply_text
+    reply_text = replace_mention_ids_with_names(refined_reply_text, mention_name_map)
+    return reply_text, rewritten, agent_enabled
+
+
 async def handle_fallback(
     bot: Bot,
     event: Event,
@@ -3185,6 +3465,10 @@ async def handle_fallback(
 
     try:
         await middleware.dispatch("pre_gate", middleware_state)
+        ChatFeedbackStore.inspect_user_followup(
+            session_id=session_key,
+            message_text=raw_message,
+        )
         await _apply_runtime_plugin_overrides(
             event=event,
             session_key=session_key,
@@ -3260,11 +3544,16 @@ async def handle_fallback(
         reply_image_segments_for_reroute = _build_reply_image_segments_for_reroute(
             reply_images_data
         )
+        pre_route_target_policy = _select_adapter_policy_for_message(
+            current_message,
+            knowledge_base,
+        )
         route_message_base = _build_route_message_with_explicit_context(
             message_text=current_message,
             user_id=str(user_id),
             reply_image_count=reply_image_count,
             reply_sender_id=reply_sender_id,
+            target_policy=pre_route_target_policy,
         )
         (
             route_message,
@@ -3275,6 +3564,7 @@ async def handle_fallback(
             original_message=current_message,
             route_message=route_message_base,
             mention_profiles=mention_profiles,
+            target_policy=pre_route_target_policy,
             command_heads=command_heads,
         )
         mention_name_map = _build_mention_name_map(mention_profiles)
@@ -3326,13 +3616,18 @@ async def handle_fallback(
             )
             return
 
-        if _needs_target_for_meme_request(current_message, route_message):
+        if _needs_target_for_route(
+            current_message,
+            route_message,
+            target_policy=pre_route_target_policy,
+        ):
             trace.set_tag("outcome", "target_required")
             envelope = TurnChannelEnvelope()
-            envelope.add(ChannelName.ANALYSIS, "target required for meme request")
+            envelope.add(ChannelName.ANALYSIS, "target required for adapter route")
             envelope.add(
                 ChannelName.FINAL,
-                "要帮别人制作的话，请补充完整昵称、直接@对方，或者发对方头像。",
+                pre_route_target_policy.target_missing_message
+                or "这个命令需要目标对象，请补充目标后重新发送完整命令。",
             )
             _log_turn_channels(envelope)
             await _persist_final_only_dialog(
@@ -3575,6 +3870,32 @@ async def handle_fallback(
                 logger.debug(f"回复链中包含 {len(reply_images_data)} 张图片")
         trace.stage("media")
         enriched_context_xml = context_xml
+        dialogue_plan = plan_chat_dialogue(
+            message_text=current_message,
+            intent=intent_profile,
+            has_images=bool(image_parts),
+            has_reply=has_reply,
+        )
+        trace.update_tags(
+            chat_kind=dialogue_plan.kind,
+            chat_style=dialogue_plan.style,
+            chat_reason=dialogue_plan.reason,
+        )
+        if await _handle_chat_dialogue_special_case(
+            plan=dialogue_plan,
+            trace=trace,
+            user_id=user_id,
+            group_id=group_id,
+            nickname=nickname,
+            user_message=uni_msg or current_message,
+            bot_id=bot_id,
+            session_key=session_key,
+            current_message=current_message,
+            route_report=route_report,
+            budget_controller=budget_controller,
+            finalize_callback=_dispatch_post_gate,
+        ):
+            return
         middleware_state.message_text = current_message
         middleware_state.system_prompt = chat_system_prompt
         middleware_state.context_xml = enriched_context_xml
@@ -3592,88 +3913,34 @@ async def handle_fallback(
                 f"ratio={budget_report.get('ratio')}"
             )
         trace.stage("agent_budget")
-        intent_timeout = int(get_config_value("INTENT_TIMEOUT", 20) or 20)
-        agent_gate = decide_agent_gate(
-            config_enabled=bool(get_config_value("ENABLE_AGENT_MODE", True)),
-            intent=intent_profile,
-            message_text=middleware_state.message_text,
-            has_images=bool(image_parts),
-            has_mcp_endpoints=bool(get_mcp_endpoints()),
-        )
-        agent_enabled = False if router_force_pure_chat else agent_gate.enabled
-        trace.update_tags(
-            agent_gate=agent_gate.reason, agent_enabled=int(agent_enabled)
-        )
-        logger.debug(
-            f"ChatInter agent gate: enabled={agent_enabled} reason={agent_gate.reason}"
-        )
         chat_execution_frame = start_execution_observation(
             action="chat",
-            route_stage="agent" if agent_enabled else "chat",
+            route_stage="chat",
             session_id=session_key,
             message_preview=current_message,
             **_route_report_observer_kwargs(route_report),
         )
-        reply: str | UniMessage | None = None
-        if agent_enabled:
-            middleware_state.metadata = {"phase": "agent_fallback"}
-            await middleware.dispatch("before_agent", middleware_state)
-            try:
-                agent_response = await run_chatinter_agent(
-                    bot=bot,
-                    event=event,
-                    user_id=str(user_id),
-                    group_id=str(group_id) if group_id else None,
-                    model=model_name,
-                    timeout=max(intent_timeout, 5),
-                    system_prompt=middleware_state.system_prompt,
-                    context_xml=middleware_state.context_xml,
-                    message_text=middleware_state.message_text,
-                    image_parts=image_parts or None,
-                    budget_controller=budget_controller,
-                )
-                if agent_response and str(agent_response.text or "").strip():
-                    reply = str(agent_response.text)
-                usage = (
-                    agent_response.usage_info
-                    if agent_response and isinstance(agent_response.usage_info, dict)
-                    else {}
-                )
-                logger.debug(
-                    "chatinter agent reply ready: "
-                    f"prompt_tokens={usage.get('prompt_tokens', 0)} "
-                    f"completion_tokens={usage.get('completion_tokens', 0)} "
-                    f"total_tokens={usage.get('total_tokens', 0)}"
-                )
-            except Exception as exc:
-                logger.warning(f"ChatInter agent 执行失败，降级普通对话: {exc}")
-        if reply is None:
-            reply = await handle_chat_message(
-                message=middleware_state.message_text,
-                user_id=user_id,
-                group_id=group_id,
-                nickname=nickname,
-                mention_name_map=mention_name_map,
-                session_key=session_key,
-                budget_controller=budget_controller,
-            )
+        reply_text, rewritten, agent_enabled = await _build_chat_fallback_reply(
+            bot=bot,
+            event=event,
+            user_id=user_id,
+            group_id=group_id,
+            nickname=nickname,
+            model_name=model_name,
+            mention_name_map=mention_name_map,
+            session_key=session_key,
+            current_message=current_message,
+            middleware_state=middleware_state,
+            dialogue_plan=dialogue_plan,
+            image_parts=image_parts,
+            budget_controller=budget_controller,
+            router_force_pure_chat=router_force_pure_chat,
+        )
+        trace.update_tags(
+            agent_enabled=int(agent_enabled),
+            chat_rewritten=int(rewritten),
+        )
         trace.stage("chat_fallback")
-        reply_text = (
-            str(reply)
-            if reply is not None and str(reply).strip()
-            else "我暂时没想好怎么回答你。"
-        )
-        middleware_state.response_text = reply_text
-        if agent_enabled:
-            await middleware.dispatch("after_agent", middleware_state)
-        await middleware.dispatch("after_chat", middleware_state)
-        reply_text = (
-            middleware_state.response_text
-            if middleware_state.response_text is not None
-            else reply_text
-        )
-        reply_text = normalize_ai_reply_text(reply_text or "")
-        reply_text = replace_mention_ids_with_names(reply_text, mention_name_map)
         envelope = TurnChannelEnvelope()
         trace.update_tags(path="chat", outcome="chat_fallback")
         envelope.add(ChannelName.ANALYSIS, "chat fallback")
@@ -3694,11 +3961,20 @@ async def handle_fallback(
             response_text=envelope.final,
             phase="post_gate:chat_fallback",
         )
+        ChatFeedbackStore.record(
+            session_id=session_key,
+            kind="chat_rewritten" if rewritten else "chat_completed",
+            message_text=current_message,
+            reply_text=envelope.final,
+            weight=0.35 if rewritten else 0.2,
+        )
         _tag_execution_observation(
             trace,
             chat_execution_frame.finish(
                 success=True,
-                reason=EXECUTION_REASON_CHAT_COMPLETED,
+                reason=EXECUTION_REASON_CHAT_REWRITTEN
+                if rewritten
+                else EXECUTION_REASON_CHAT_COMPLETED,
             ),
         )
         _finish_trace(

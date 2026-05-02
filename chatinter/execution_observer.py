@@ -20,6 +20,8 @@ ExecutionAction = Literal["chat", "usage", "clarify", "execute"]
 EXECUTION_REASON_SUCCESS = "success"
 EXECUTION_REASON_ROUTE_SUCCESS = "route_success"
 EXECUTION_REASON_CHAT_COMPLETED = "chat_completed"
+EXECUTION_REASON_CHAT_REWRITTEN = "chat_rewritten"
+EXECUTION_REASON_CHAT_EMPTY = "chat_empty"
 EXECUTION_REASON_USAGE_REPLIED = "usage_replied"
 EXECUTION_REASON_CLARIFY_REQUESTED = "clarify_requested"
 EXECUTION_REASON_MISSING_PARAMS = "missing_params"
@@ -190,12 +192,12 @@ class ExecutionObserver:
             selected_reason=normalize_message_text(selected_reason or "")[:120],
             no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
             no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
-            no_hit_recovery_query=normalize_message_text(
-                no_hit_recovery_query or ""
-            )[:160],
-            no_hit_recovery_reason=normalize_message_text(
-                no_hit_recovery_reason or ""
-            )[:160],
+            no_hit_recovery_query=normalize_message_text(no_hit_recovery_query or "")[
+                :160
+            ],
+            no_hit_recovery_reason=normalize_message_text(no_hit_recovery_reason or "")[
+                :160
+            ],
             rerank_attempts=max(int(rerank_attempts or 0), 0),
             rerank_success=max(int(rerank_success or 0), 0),
             rerank_no_available=max(int(rerank_no_available or 0), 0),
@@ -257,12 +259,12 @@ class ExecutionObserver:
             selected_reason=normalize_message_text(selected_reason or "")[:120],
             no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
             no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
-            no_hit_recovery_query=normalize_message_text(
-                no_hit_recovery_query or ""
-            )[:160],
-            no_hit_recovery_reason=normalize_message_text(
-                no_hit_recovery_reason or ""
-            )[:160],
+            no_hit_recovery_query=normalize_message_text(no_hit_recovery_query or "")[
+                :160
+            ],
+            no_hit_recovery_reason=normalize_message_text(no_hit_recovery_reason or "")[
+                :160
+            ],
             rerank_attempts=max(int(rerank_attempts or 0), 0),
             rerank_success=max(int(rerank_success or 0), 0),
             rerank_no_available=max(int(rerank_no_available or 0), 0),
@@ -384,9 +386,7 @@ class ExecutionObserver:
             "no_hit_recovery_attempts": sum(
                 row.no_hit_recovery_attempts for row in rows
             ),
-            "no_hit_recovery_success": sum(
-                row.no_hit_recovery_success for row in rows
-            ),
+            "no_hit_recovery_success": sum(row.no_hit_recovery_success for row in rows),
             "rerank_attempts": sum(row.rerank_attempts for row in rows),
             "rerank_success": sum(row.rerank_success for row in rows),
             "rerank_no_available": sum(row.rerank_no_available for row in rows),
@@ -485,6 +485,8 @@ def render_execution_observer_summary(limit: int = 200) -> str:
 __all__ = [
     "EXECUTION_REASON_CANCELLED",
     "EXECUTION_REASON_CHAT_COMPLETED",
+    "EXECUTION_REASON_CHAT_EMPTY",
+    "EXECUTION_REASON_CHAT_REWRITTEN",
     "EXECUTION_REASON_CLARIFY_REQUESTED",
     "EXECUTION_REASON_ERROR",
     "EXECUTION_REASON_INVALID_COMMAND",

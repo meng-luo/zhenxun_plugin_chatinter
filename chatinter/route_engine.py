@@ -26,6 +26,10 @@ from .config import (
 )
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .no_hit_recovery import CapabilityRewriteResult, recover_no_hit_candidates
+from .plugin_adapters import (
+    get_adapter_target_policy_for_schema,
+    resolve_adapter_clarify_route,
+)
 from .plugin_registry import PluginRegistry
 from .prompt_guard import guard_prompt_sections
 from .route_text import (
@@ -602,6 +606,7 @@ def _sanitize_command_with_schema(
     plugin: PluginInfo,
     *,
     command: str,
+    command_id: str | None = None,
 ) -> str:
     normalized = normalize_message_text(command)
     if not normalized:
@@ -615,7 +620,15 @@ def _sanitize_command_with_schema(
     if schema is None:
         return normalized
 
-    policy = resolve_command_target_policy(schema)
+    policy = resolve_command_target_policy(
+        schema,
+        adapter_policy=get_adapter_target_policy_for_schema(
+            schema,
+            plugin_module=plugin.module,
+            plugin_name=plugin.name,
+            command_id=command_id or "",
+        ),
+    )
     image_max_raw = getattr(schema, "image_max", None)
     image_max: int | None = None
     if image_max_raw is not None:
@@ -780,7 +793,11 @@ def _to_route_result(
     if command_head not in allowed_heads:
         return None
 
-    command = _sanitize_command_with_schema(plugin, command=command)
+    command = _sanitize_command_with_schema(
+        plugin,
+        command=command,
+        command_id=command_id,
+    )
     schema = _resolve_command_schema(plugin, command_head)
     if schema is not None:
         command = _rehydrate_command_payload_from_message(
@@ -1127,9 +1144,10 @@ def _resolve_command_index_route(
         speech_act=speech_act,
         missing=schema_missing,
     )
-    if schema.command_id == "memes.list" and top.reason == "meme_template_missing":
+    clarify_route = resolve_adapter_clarify_route(message_text, candidates)
+    if clarify_route is not None and schema.command_id == clarify_route.command_id:
         action = "clarify"
-        schema_missing = ["具体表情模板"]
+        schema_missing = list(clarify_route.missing)
     decision_command = schema.head if action == "usage" else rendered or schema.head
     decision_slots = {} if action == "usage" else route_slots
     decision_missing = [] if action == "usage" else list(schema_missing)
@@ -1204,7 +1222,6 @@ def _resolve_command_index_route(
     )
 
 
-
 def _rerank_to_command_selection(
     decision: ToolRerankDecision,
 ) -> LLMCommandSelection | None:
@@ -1267,8 +1284,7 @@ def _fallback_candidate_selection(
     strong_enough = top.exact_protected or (
         top.score >= 150.0
         and (
-            margin >= 18.0
-            or top.schema.command_role in {"catalog", "helper", "random"}
+            margin >= 18.0 or top.schema.command_role in {"catalog", "helper", "random"}
         )
     )
     if not strong_enough:
@@ -1320,73 +1336,6 @@ def _selection_matches_command_context(
     if requires.get("at") and not flags["has_at"]:
         return False, "missing at context"
     return True, ""
-
-
-def _is_generic_meme_creation_request(
-    message_text: str,
-    candidates: list[CommandCandidate],
-) -> bool:
-    normalized = normalize_message_text(message_text).casefold()
-    if not normalized:
-        return False
-    if has_chat_context_hint(normalized):
-        return False
-    if contains_any(
-        normalized,
-        (
-            "表情管理系统",
-            "表情包系统",
-            "架构",
-            "怎么设计",
-            "如何设计",
-            "系统设计",
-            "设计方案",
-        ),
-    ):
-        return False
-    meme_candidates = [item for item in candidates if item.family == "meme"]
-    if not meme_candidates:
-        return False
-    if "随机" in normalized:
-        return False
-    if not any(token in normalized for token in ("表情", "表情包", "梗图", "头像")):
-        return False
-    if not any(
-        token in normalized
-        for token in ("做", "制作", "生成", "整", "来个", "来一个", "来张", "来一张")
-    ):
-        return False
-    if any(
-        candidate.schema.command_id == "memes.list"
-        and candidate.reason == "meme_template_missing"
-        for candidate in meme_candidates
-    ):
-        return True
-    for candidate in meme_candidates:
-        schema = candidate.schema
-        if schema.command_role not in {"template", "random"}:
-            continue
-        phrases = [schema.head, *schema.aliases]
-        if any(
-            normalize_message_text(phrase).casefold()
-            and normalize_message_text(phrase).casefold() in normalized
-            for phrase in phrases
-        ):
-            return False
-    return True
-
-
-def _pick_meme_clarify_candidate(
-    candidates: list[CommandCandidate],
-) -> CommandCandidate | None:
-    meme_candidates = [item for item in candidates if item.family == "meme"]
-    for candidate in candidates:
-        if candidate.schema.command_id == "memes.list":
-            return candidate
-    for candidate in meme_candidates:
-        if candidate.schema.command_role in {"catalog", "helper"}:
-            return candidate
-    return meme_candidates[0] if meme_candidates else None
 
 
 def _candidate_selection_to_route_result(
@@ -1560,8 +1509,16 @@ async def _resolve_candidate_selection_route(
     report.candidate_total = max(report.candidate_total, len(candidates))
     report.note_tool_pool(len(candidates))
     report.note_prompt_exposure(candidates)
-    if _is_generic_meme_creation_request(message_text, candidates):
-        clarify_candidate = _pick_meme_clarify_candidate(candidates)
+    clarify_route = resolve_adapter_clarify_route(message_text, candidates)
+    if clarify_route is not None:
+        clarify_candidate = next(
+            (
+                item
+                for item in candidates
+                if item.schema.command_id == clarify_route.command_id
+            ),
+            None,
+        )
         if clarify_candidate is not None:
             route_result = _to_plugin_route_result(
                 plugin=_resolve_target_plugin(
@@ -1583,14 +1540,14 @@ async def _resolve_candidate_selection_route(
                 skill_kind=stage,
                 command=clarify_candidate.schema.head,
                 command_id=clarify_candidate.schema.command_id,
-                missing=["具体表情模板"],
+                missing=clarify_route.missing,
             )
             selection = LLMCommandSelection(
-                    action="clarify",
-                    command_id=clarify_candidate.schema.command_id,
-                    missing=["具体表情模板"],
-                    confidence=0.86,
-                    reason="generic_meme_template_missing",
+                action="clarify",
+                command_id=clarify_candidate.schema.command_id,
+                missing=list(clarify_route.missing),
+                confidence=clarify_route.confidence,
+                reason=clarify_route.reason,
             )
             if route_result is None:
                 return _candidate_selection_to_route_result(
@@ -1604,13 +1561,13 @@ async def _resolve_candidate_selection_route(
             return (
                 LLMRouterDecision(
                     action="clarify",
-                    confidence=0.86,
+                    confidence=clarify_route.confidence,
                     plugin_module=clarify_candidate.plugin_module,
                     plugin_name=clarify_candidate.plugin_name,
                     command_id=clarify_candidate.schema.command_id,
                     command=clarify_candidate.schema.head,
-                    missing=["具体表情模板"],
-                    reason="generic_meme_template_missing",
+                    missing=list(clarify_route.missing),
+                    reason=clarify_route.reason,
                 ),
                 RouteResolveResult(
                     decision=route_result.decision,
@@ -1686,7 +1643,6 @@ async def _resolve_candidate_selection_route(
     if result is not None:
         report.tool_choice_count += 1
     return result
-
 
 
 async def _resolve_no_hit_recovery_route(
@@ -1921,9 +1877,7 @@ async def resolve_llm_router(
         report.finalize(
             reason=decision.reason or f"command_selector_{decision.action}",
             stage=(
-                route_result.stage
-                if route_result is not None
-                else "command_selector"
+                route_result.stage if route_result is not None else "command_selector"
             ),
             plugin_name=route_result.decision.plugin_name if route_result else None,
             plugin_module=route_result.decision.plugin_module if route_result else None,
@@ -1945,9 +1899,7 @@ async def resolve_llm_router(
         report.finalize(
             reason=decision.reason or f"no_hit_recovery_{decision.action}",
             stage=(
-                route_result.stage
-                if route_result is not None
-                else "no_hit_recovery"
+                route_result.stage if route_result is not None else "no_hit_recovery"
             ),
             plugin_name=route_result.decision.plugin_name if route_result else None,
             plugin_module=route_result.decision.plugin_module if route_result else None,
@@ -2054,7 +2006,6 @@ async def resolve_llm_router(
         command=route_result.decision.command if route_result else None,
     )
     return decision, route_result, report
-
 
 
 __all__ = [

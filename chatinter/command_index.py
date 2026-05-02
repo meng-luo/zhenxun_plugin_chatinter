@@ -17,6 +17,7 @@ from .models.pydantic_models import (
     PluginCommandSchema,
     PluginKnowledgeBase,
 )
+from .plugin_adapters import collect_score_hints, extract_adapter_slots
 from .plugin_reference import build_command_tool_snapshots
 from .route_text import (
     match_command_head,
@@ -24,7 +25,6 @@ from .route_text import (
     normalize_message_text,
     strip_invoke_prefix,
 )
-from .slot_extractors import extract_builtin_slots
 
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
 _IMAGE_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
@@ -76,11 +76,13 @@ def _reason_feature_deltas(reason: str) -> dict[str, float]:
         "helper",
         "helper_langs",
         "random",
-        "about_intent",
-        "abbr_intent",
         "template",
         "meme_search_intent",
         "meme_info_intent",
+        "meme_catalog_intent",
+        "meme_template_missing",
+        "about_intent",
+        "abbr_intent",
     }:
         return {"semantic_score": 1.0}
     if reason == "slot_signal":
@@ -279,21 +281,6 @@ def _base_score_tool(
     ):
         score += 80.0
         reasons.append("catalog")
-    if schema.command_id == "memes.list" and any(
-        token in lowered for token in ("表情", "表情包", "梗图")
-    ):
-        if any(token in lowered for token in ("列表", "有哪些", "有什么")):
-            score += 180.0
-            reasons.append("meme_catalog_intent")
-        elif any(
-            token in lowered
-            for token in ("没说模板", "没选模板", "不知道模板", "哪个模板", "什么模板")
-        ):
-            score += 180.0
-            reasons.append("meme_template_missing")
-        elif any(token in lowered for token in ("做", "制作", "生成", "来个", "来张")):
-            score += 80.0
-            reasons.append("meme_catalog_intent")
     if role == "helper" and any(token in lowered for token in ("搜索", "找", "查找")):
         score += 70.0
         reasons.append("helper")
@@ -305,41 +292,15 @@ def _base_score_tool(
     if role == "random" and "随机" in lowered:
         score += 100.0
         reasons.append("random")
-    if (
-        schema.command_id == "about.info"
-        and any(token in lowered for token in ("真寻", "小真寻", "bot", "机器人"))
-        and any(token in lowered for token in ("信息", "介绍", "了解", "项目"))
+    for hint in collect_score_hints(
+        schema,
+        lowered_query=lowered,
+        stripped_lowered_query=stripped_lowered,
+        plugin_module=plugin_module,
     ):
-        score += 120.0
-        reasons.append("about_intent")
-    if schema.command_id == "nbnhhsh.expand" and re.search(
-        r"[0-9A-Za-z_]{2,}\s*(?:是)?(?:什么|啥|哪个)?缩写",
-        lowered,
-        re.IGNORECASE,
-    ):
-        score += 120.0
-        reasons.append("abbr_intent")
-    if role == "template" and any(
-        token in lowered for token in ("表情", "表情包", "梗图", "头像")
-    ):
-        score += 38.0
-        reasons.append("template")
-    if schema.command_id == "memes.search" and any(
-        token in lowered for token in ("相关表情", "找一下", "搜一下", "搜索")
-    ):
-        score += 260.0
-        reasons.append("meme_search_intent")
-    if schema.command_id == "memes.info" and any(
-        token in lowered for token in ("怎么用", "用法", "详情")
-    ):
-        score += 220.0
-        reasons.append("meme_info_intent")
-    if schema.requires.get("text") and any(
-        token in lowered for token in ("支持哪些", "哪些语言", "语种", "支持什么语言")
-    ):
-        score -= 360.0
-        reasons.append("text_lang_penalty")
-    if extract_builtin_slots(schema.command_id, normalized):
+        score += hint.score
+        reasons.append(hint.reason)
+    if extract_adapter_slots(schema.command_id, normalized):
         score += _SLOT_BOOST
         reasons.append("slot_signal")
 

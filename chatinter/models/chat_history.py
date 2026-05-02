@@ -213,3 +213,106 @@ class ChatInterChatHistory(Model):
             session_id: 会话标识
         """
         await cls.filter(session_id=session_id).delete()
+
+
+class ChatInterMemory(Model):
+    """ChatInter 结构化长期记忆表"""
+
+    id = fields.IntField(pk=True, generated=True, auto_increment=True)
+    session_id = fields.CharField(255, index=True)
+    user_id = fields.CharField(255, index=True)
+    group_id = fields.CharField(255, null=True, index=True)
+    memory_type = fields.CharField(64, index=True)
+    key = fields.CharField(128, index=True)
+    value = fields.TextField()
+    confidence = fields.FloatField(default=0.0)
+    source_message = fields.TextField(null=True)
+    source_dialog_id = fields.IntField(null=True)
+    expired = fields.BooleanField(default=False, index=True)
+    last_used_time = fields.DatetimeField(null=True)
+    create_time = fields.DatetimeField(auto_now_add=True, index=True)
+    update_time = fields.DatetimeField(auto_now=True)
+
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
+        table = "chatinter_memory"
+        table_description = "ChatInter 结构化长期记忆表"
+
+    @classmethod
+    async def upsert_memory(
+        cls,
+        *,
+        session_id: str,
+        user_id: str,
+        group_id: str | None,
+        memory_type: str,
+        key: str,
+        value: str,
+        confidence: float,
+        source_dialog_id: int | None = None,
+        source_message: str | None = None,
+    ) -> "ChatInterMemory":
+        existing = await cls.filter(
+            session_id=session_id,
+            user_id=user_id,
+            memory_type=memory_type,
+            key=key,
+            expired=False,
+        ).first()
+        if existing is not None:
+            if float(existing.confidence or 0.0) <= float(confidence or 0.0):
+                existing.value = value
+                existing.confidence = float(confidence or 0.0)
+                existing.group_id = group_id
+                existing.source_dialog_id = source_dialog_id
+                existing.source_message = source_message
+                await existing.save()
+            return existing
+        return await cls.create(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            memory_type=memory_type,
+            key=key,
+            value=value,
+            confidence=float(confidence or 0.0),
+            source_dialog_id=source_dialog_id,
+            source_message=source_message,
+        )
+
+    @classmethod
+    async def recall_memories(
+        cls,
+        *,
+        session_id: str,
+        user_id: str,
+        group_id: str | None,
+        query: str,
+        limit: int = 8,
+    ) -> list["ChatInterMemory"]:
+        query_text = str(query or "")
+        query_tokens = {
+            token
+            for token in query_text.replace("，", " ").replace("。", " ").split()
+            if token
+        }
+        rows = (
+            await cls.filter(user_id=user_id, expired=False)
+            .order_by("-confidence", "-update_time", "-id")
+            .limit(max(int(limit or 0) * 4, int(limit or 0), 1))
+        )
+        scoped: list[ChatInterMemory] = []
+        for row in rows:
+            if row.session_id != session_id and row.group_id not in {group_id, None}:
+                continue
+            value_text = str(row.value or "")
+            key_text = f"{row.memory_type} {row.key} {value_text}"
+            score = float(row.confidence or 0.0)
+            if query_tokens and any(token in key_text for token in query_tokens):
+                score += 0.2
+            setattr(row, "_chatinter_recall_score", score)
+            scoped.append(row)
+        scoped.sort(
+            key=lambda item: float(getattr(item, "_chatinter_recall_score", 0.0)),
+            reverse=True,
+        )
+        return scoped[: max(int(limit or 0), 0)]

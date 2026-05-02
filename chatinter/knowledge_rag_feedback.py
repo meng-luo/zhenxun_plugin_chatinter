@@ -1,5 +1,5 @@
-import re
 import asyncio
+import re
 import time
 from typing import ClassVar
 
@@ -137,13 +137,12 @@ class PluginRAGFeedbackMixin:
                     if reason_penalty[module] < _SESSION_REASON_MIN_SCORE:
                         reason_penalty.pop(module, None)
             normalized_reason = normalize_message_text(str(reason or "")).lower()
-            if (
-                normalized_reason
-                and normalized_reason != FEEDBACK_REASON_ROUTE_SUCCESS
-            ):
+            if normalized_reason and normalized_reason != FEEDBACK_REASON_ROUTE_SUCCESS:
                 penalty_step = max(abs(min(float(reward), 0.0)), 0.15)
                 for module in normalized_modules:
-                    reason_penalty[module] = reason_penalty.get(module, 0.0) + penalty_step
+                    reason_penalty[module] = (
+                        reason_penalty.get(module, 0.0) + penalty_step
+                    )
             elif normalized_reason == FEEDBACK_REASON_ROUTE_SUCCESS:
                 for module in normalized_modules:
                     restored = max(0.0, reason_penalty.get(module, 0.0) - 0.08)
@@ -174,7 +173,9 @@ class PluginRAGFeedbackMixin:
                         if abs(module_slots[slot_name]) < 0.02:
                             module_slots.pop(slot_name, None)
                     for slot_name, delta in normalized_slot_feedback.items():
-                        module_slots[slot_name] = module_slots.get(slot_name, 0.0) + delta
+                        module_slots[slot_name] = (
+                            module_slots.get(slot_name, 0.0) + delta
+                        )
                     if module_slots:
                         slot_store[module] = module_slots
                     else:
@@ -192,7 +193,7 @@ class PluginRAGFeedbackMixin:
                 }
             )
             if len(journal) > _SESSION_FEEDBACK_LOG_KEEP:
-                journal = journal[-_SESSION_FEEDBACK_LOG_KEEP :]
+                journal = journal[-_SESSION_FEEDBACK_LOG_KEEP:]
             cls._session_feedback_journal[session_id] = journal
             cls._session_preference_time[session_id] = now
             cls._clear_query_cache()
@@ -219,9 +220,7 @@ class PluginRAGFeedbackMixin:
         }
 
     @classmethod
-    def _session_reason_penalty_scores(
-        cls, session_id: str | None
-    ) -> dict[str, float]:
+    def _session_reason_penalty_scores(cls, session_id: str | None) -> dict[str, float]:
         if not session_id:
             return {}
         reason_penalty = cls._session_reason_penalty.get(session_id, {})
@@ -250,9 +249,8 @@ class PluginRAGFeedbackMixin:
             return {}
         merged_query = normalize_message_text(f"{query} {context_text}")
         active_slot_weights = {"command_head": 1.0}
-        if (
-            "[@" in merged_query
-            or contains_any(merged_query, ("给", "帮", "让", "他", "她", "ta", "@"))
+        if "[@" in merged_query or contains_any(
+            merged_query, ("给", "帮", "让", "他", "她", "ta", "@")
         ):
             active_slot_weights["target"] = 1.0
         if "[image" in merged_query or contains_any(
