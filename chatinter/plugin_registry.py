@@ -24,11 +24,13 @@ from .capability_graph import build_capability_graph_snapshot
 from .metadata_builder import AutoMetadataBuilder
 from .models.pydantic_models import (
     CapabilityGraphSnapshot,
+    CommandToolSnapshot,
     PluginInfo,
     PluginKnowledgeBase,
     PluginReference,
 )
 from .plugin_reference import (
+    build_command_tool_snapshots,
     build_plugin_references,
     build_router_cards_from_graph,
 )
@@ -42,6 +44,15 @@ class PluginSelectionContext:
     user_id: str | None = None
     group_id: str | None = None
     is_superuser: bool = False
+    event_type: str = "message"
+    adapter: str = ""
+    is_private: bool = False
+    has_image: bool = False
+    has_at: bool = False
+    has_reply: bool = False
+    supports_image: bool = True
+    supports_at: bool = True
+    supports_reply: bool = True
 
 
 class PluginRegistry:
@@ -1553,6 +1564,30 @@ class PluginRegistry:
         return True
 
     @classmethod
+    def _is_command_tool_available(
+        cls,
+        tool: CommandToolSnapshot,
+        selection_context: PluginSelectionContext,
+    ) -> bool:
+        requires = tool.requires or {}
+        if requires.get("image") and not selection_context.supports_image:
+            return False
+        if requires.get("at") and not selection_context.supports_at:
+            return False
+        if requires.get("reply") and not selection_context.supports_reply:
+            return False
+        if requires.get("reply") and not selection_context.has_reply:
+            return False
+        if requires.get("private") and not selection_context.is_private:
+            return False
+        if requires.get("to_me") and not selection_context.has_at:
+            return False
+        if tool.payload_policy in {"image_only", "text_or_image"}:
+            if not selection_context.supports_image:
+                return False
+        return True
+
+    @classmethod
     def _is_plugin_authorized(
         cls,
         plugin: PluginInfo,
@@ -1643,6 +1678,30 @@ class PluginRegistry:
         return build_plugin_references(graph, limit=limit)
 
     @classmethod
+    def build_command_tool_snapshots(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None = None,
+        limit: int | None = None,
+    ) -> list[CommandToolSnapshot]:
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=None,
+        )
+        snapshots = build_command_tool_snapshots(graph, limit=None)
+        if selection_context is not None:
+            snapshots = [
+                snapshot
+                for snapshot in snapshots
+                if cls._is_command_tool_available(snapshot, selection_context)
+            ]
+        if limit is not None:
+            return snapshots[: max(int(limit), 0)]
+        return snapshots
+
+    @classmethod
     def build_router_cards(
         cls,
         knowledge_base: PluginKnowledgeBase,
@@ -1667,72 +1726,6 @@ class PluginRegistry:
     ) -> list[dict[str, object]]:
         """兼容旧调用：返回 Router 使用的紧凑插件卡片。"""
         return cls.build_router_cards(knowledge_base, limit=limit)
-
-    @classmethod
-    def _build_compact_cards_legacy(
-        cls,
-        knowledge_base: PluginKnowledgeBase,
-        *,
-        limit: int | None = None,
-    ) -> list[dict[str, object]]:
-        """旧版卡片渲染逻辑，保留作对照与快速回退。"""
-        plugins = knowledge_base.plugins
-        if limit is not None:
-            plugins = plugins[: max(int(limit), 0)]
-
-        cards: list[dict[str, object]] = []
-        for plugin in plugins:
-            if not cls._is_allowed_plugin_info(plugin):
-                continue
-            commands: list[str] = []
-            aliases: list[str] = []
-            examples: list[str] = []
-            requires = {
-                "text": False,
-                "image": False,
-                "reply": False,
-                "at": False,
-            }
-            for meta in plugin.command_meta:
-                cls._append_command(commands, meta.command)
-                for alias in meta.aliases:
-                    cls._append_command(aliases, alias)
-                for example in meta.examples:
-                    text = cls._normalize_command(example)
-                    if text and text not in examples:
-                        examples.append(text)
-                requires["text"] = requires["text"] or bool(
-                    (meta.text_min or 0) > 0 or meta.params
-                )
-                requires["image"] = requires["image"] or bool((meta.image_min or 0) > 0)
-                requires["reply"] = requires["reply"] or bool(meta.requires_reply)
-                requires["at"] = requires["at"] or bool(
-                    meta.allow_at or "at" in meta.target_sources
-                )
-
-            for command in plugin.commands:
-                cls._append_command(commands, command)
-            for alias in plugin.aliases:
-                cls._append_command(aliases, alias)
-
-            does = normalize_message_text(plugin.description or "")
-            if does == "暂无描述" and plugin.usage:
-                does = normalize_message_text(plugin.usage)
-            if len(does) > 96:
-                does = does[:96].rstrip() + "..."
-
-            cards.append(
-                {
-                    "module": plugin.module,
-                    "name": plugin.name,
-                    "commands": commands[:10],
-                    "aliases": aliases[:6],
-                    "does": does,
-                    "examples": examples[:4],
-                    "requires": requires,
-                }
-            )
-        return cards
 
     @classmethod
     async def set_plugin_enabled(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import defaultdict
 from dataclasses import dataclass, field
 import hashlib
 import re
@@ -12,7 +12,7 @@ _DEFAULT_PROMPT_BUDGET = 9000
 _DEFAULT_TOOL_CALL_LIMIT = 12
 _DEFAULT_TOOL_BATCH_LIMIT = 6
 _DEFAULT_HOOK_LIMIT = 18
-_DEFAULT_CLASSIFIER_LIMIT = 6
+_DEFAULT_CLASSIFIER_LIMIT = 8
 _SESSION_PROMPT_CACHE: dict[str, tuple[str, float]] = {}
 
 
@@ -58,7 +58,9 @@ def detect_prompt_cache_break(
     _SESSION_PROMPT_CACHE[cache_key] = (fingerprint, now + _PROMPT_CACHE_TTL)
 
     expired_keys = [
-        key for key, (_value, deadline) in _SESSION_PROMPT_CACHE.items() if deadline <= now
+        key
+        for key, (_value, deadline) in _SESSION_PROMPT_CACHE.items()
+        if deadline <= now
     ]
     for key in expired_keys:
         _SESSION_PROMPT_CACHE.pop(key, None)
@@ -95,7 +97,9 @@ class TurnBudgetController:
     prompt_tokens: int = 0
     cache_breaks: set[str] = field(default_factory=set)
     compacted_stages: set[str] = field(default_factory=set)
-    durations: Counter[str] = field(default_factory=Counter)
+    durations: defaultdict[str, float] = field(
+        default_factory=lambda: defaultdict(float)
+    )
 
     @classmethod
     def for_session(
@@ -106,7 +110,10 @@ class TurnBudgetController:
     ) -> "TurnBudgetController":
         return cls(
             session_key=session_key,
-            prompt_budget_tokens=max(int(prompt_budget_tokens or _DEFAULT_PROMPT_BUDGET), 1200),
+            prompt_budget_tokens=max(
+                int(prompt_budget_tokens or _DEFAULT_PROMPT_BUDGET),
+                1200,
+            ),
         )
 
     def allow_classifier(self, label: str) -> bool:
@@ -132,7 +139,10 @@ class TurnBudgetController:
     def allow_tool_batch(self, *, call_count: int, batch_kind: str) -> bool:
         projected_calls = self.tool_calls + max(call_count, 0)
         projected_batches = self.tool_batches + 1
-        if projected_calls > self.max_tool_calls or projected_batches > self.max_tool_batches:
+        if (
+            projected_calls > self.max_tool_calls
+            or projected_batches > self.max_tool_batches
+        ):
             self.durations[f"tool_block:{batch_kind}"] += 0.0
             return False
         self.tool_calls = projected_calls
@@ -169,7 +179,8 @@ class TurnBudgetController:
             cache_breaks=tuple(sorted(self.cache_breaks)),
             compacted_stages=tuple(sorted(self.compacted_stages)),
             durations_ms={
-                key: round(value * 1000, 2) for key, value in sorted(self.durations.items())
+                key: round(value * 1000, 2)
+                for key, value in sorted(self.durations.items())
             },
         )
 

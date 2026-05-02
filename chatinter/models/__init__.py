@@ -9,9 +9,12 @@ ChatInter - 数据模型
 # Pydantic 模型（结构化输出）
 from .pydantic_models import (
     CapabilityGraphSnapshot,
+    CommandCandidateFeatures,
+    CommandCandidateSnapshot,
     CommandCapability,
     CommandRequirement,
     CommandSlotSpec,
+    CommandToolSnapshot,
     PluginCapability,
     PluginCommandSchema,
     PluginInfo,
@@ -21,9 +24,12 @@ from .pydantic_models import (
 
 __all__ = [
     "CapabilityGraphSnapshot",
+    "CommandCandidateFeatures",
+    "CommandCandidateSnapshot",
     "CommandCapability",
     "CommandRequirement",
     "CommandSlotSpec",
+    "CommandToolSnapshot",
     "PluginCapability",
     "PluginCommandSchema",
     "PluginInfo",

@@ -463,6 +463,27 @@ def _resolve_superuser(bot: Bot, user_id: str) -> bool:
     return str(user_id) in {str(item) for item in superusers}
 
 
+def _event_type_name(event: Event) -> str:
+    try:
+        return str(event.get_type() or "")
+    except Exception:
+        return str(getattr(event, "post_type", "") or "")
+
+
+def _event_adapter_name(bot: Bot) -> str:
+    return str(getattr(bot, "type", "") or getattr(bot, "adapter", "") or "")
+
+
+def _event_is_private(event: Event) -> bool:
+    message_type = str(getattr(event, "message_type", "") or "").lower()
+    if message_type == "private":
+        return True
+    try:
+        return str(event.get_type() or "").lower() == "private"
+    except Exception:
+        return False
+
+
 def _iter_runtime_plugin_overrides(event: Event, attr_name: str) -> set[str]:
     raw = getattr(event, attr_name, None)
     if raw is None:
@@ -1128,6 +1149,54 @@ def _tag_execution_observation(
         exec_reason=observation.reason,
         exec_latency_ms=observation.latency_ms,
     )
+
+
+def _route_report_value(
+    route_report: RouteAttemptReport | None,
+    name: str,
+    default: object = 0,
+):
+    if route_report is None:
+        return default
+    return getattr(route_report, name, default)
+
+
+def _route_report_observer_kwargs(
+    route_report: RouteAttemptReport | None,
+) -> dict[str, object]:
+    return {
+        "candidate_total": _route_report_value(route_report, "candidate_total", 0),
+        "tool_candidates": _route_report_value(route_report, "tool_candidates", 0),
+        "no_hit_recovery_attempts": _route_report_value(
+            route_report,
+            "no_hit_recovery_attempts",
+            0,
+        ),
+        "no_hit_recovery_success": _route_report_value(
+            route_report,
+            "no_hit_recovery_success",
+            0,
+        ),
+        "no_hit_recovery_query": _route_report_value(
+            route_report,
+            "no_hit_recovery_query",
+            "",
+        ),
+        "no_hit_recovery_reason": _route_report_value(
+            route_report,
+            "no_hit_recovery_reason",
+            "",
+        ),
+        "rerank_attempts": _route_report_value(route_report, "rerank_attempts", 0),
+        "rerank_success": _route_report_value(route_report, "rerank_success", 0),
+        "rerank_no_available": _route_report_value(
+            route_report,
+            "rerank_no_available",
+            0,
+        ),
+        "rerank_stage": _route_report_value(route_report, "rerank_stage", ""),
+        "rerank_reason": _route_report_value(route_report, "rerank_reason", ""),
+    }
 
 
 def _build_target_modules(
@@ -2489,6 +2558,9 @@ def _apply_command_plan_to_route_result(
         command_id=command_id,
         slots=merged_slots,
         missing=missing,
+        selected_rank=route_result.selected_rank,
+        selected_score=route_result.selected_score,
+        selected_reason=route_result.selected_reason,
     )
 
 
@@ -2598,6 +2670,10 @@ async def _execute_route_decision(
             route_stage=route_result.stage,
             session_id=session_id,
             message_preview=current_message,
+            selected_rank=route_result.selected_rank,
+            selected_score=route_result.selected_score,
+            selected_reason=route_result.selected_reason,
+            **_route_report_observer_kwargs(route_report),
         )
         trace.set_tag("outcome", "plugin_pending_route")
         usage_text = execution_plan.followup_message or (
@@ -2715,6 +2791,10 @@ async def _execute_route_decision(
         route_stage=route_result.stage,
         session_id=session_id,
         message_preview=current_message,
+        selected_rank=route_result.selected_rank,
+        selected_score=route_result.selected_score,
+        selected_reason=route_result.selected_reason,
+        **_route_report_observer_kwargs(route_report),
     )
     success = await reroute_to_plugin(
         bot,
@@ -2861,6 +2941,10 @@ async def _handle_router_usage_response(
         route_stage=route_result.stage,
         session_id=session_id,
         message_preview=route_message,
+        selected_rank=route_result.selected_rank,
+        selected_score=route_result.selected_score,
+        selected_reason=route_result.selected_reason,
+        **_route_report_observer_kwargs(route_report),
     )
     trace.update_tags(path="clarify", outcome="plugin_usage_redirect")
     envelope = TurnChannelEnvelope()
@@ -2938,6 +3022,12 @@ async def _handle_router_clarify_response(
         route_stage=clarify_stage,
         session_id=session_id,
         message_preview=route_message,
+        selected_rank=route_result.selected_rank if route_result is not None else 0,
+        selected_score=route_result.selected_score if route_result is not None else 0.0,
+        selected_reason=(
+            route_result.selected_reason if route_result is not None else ""
+        ),
+        **_route_report_observer_kwargs(route_report),
     )
     trace.update_tags(path="clarify", outcome="router_clarify")
     missing_text = "、".join(router_missing)
@@ -3285,6 +3375,12 @@ async def handle_fallback(
             user_id=str(user_id),
             group_id=str(group_id) if group_id else None,
             is_superuser=is_superuser,
+            event_type=_event_type_name(event),
+            adapter=_event_adapter_name(bot),
+            is_private=_event_is_private(event),
+            has_image=bool(_extract_image_tokens(route_message)),
+            has_at=bool(_extract_at_tokens(route_message)),
+            has_reply=has_reply,
         )
         knowledge_base = PluginRegistry.filter_knowledge_base(
             knowledge_base,
@@ -3308,6 +3404,11 @@ async def handle_fallback(
                         "检测到插件知识可能不完整，已执行一次自愈刷新："
                         f"{len(knowledge_base.plugins)} 个插件"
                     )
+
+        command_tools = PluginRegistry.build_command_tool_snapshots(
+            knowledge_base,
+            selection_context=selection_context,
+        )
 
         if await _try_execute_pending_route(
             bot=bot,
@@ -3360,6 +3461,7 @@ async def handle_fallback(
             session_key=session_key,
             budget_controller=budget_controller,
             has_reply=has_reply,
+            command_tools=command_tools,
         )
         trace.update_tags(
             router_action=router_decision.action,
@@ -3510,6 +3612,7 @@ async def handle_fallback(
             route_stage="agent" if agent_enabled else "chat",
             session_id=session_key,
             message_preview=current_message,
+            **_route_report_observer_kwargs(route_report),
         )
         reply: str | UniMessage | None = None
         if agent_enabled:

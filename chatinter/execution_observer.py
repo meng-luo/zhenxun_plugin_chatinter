@@ -51,6 +51,20 @@ class ExecutionObservation:
     session_id: str = ""
     message_preview: str = ""
     token_usage: dict[str, int] = field(default_factory=dict)
+    candidate_total: int = 0
+    tool_candidates: int = 0
+    selected_rank: int = 0
+    selected_score: float = 0.0
+    selected_reason: str = ""
+    no_hit_recovery_attempts: int = 0
+    no_hit_recovery_success: int = 0
+    no_hit_recovery_query: str = ""
+    no_hit_recovery_reason: str = ""
+    rerank_attempts: int = 0
+    rerank_success: int = 0
+    rerank_no_available: int = 0
+    rerank_stage: str = ""
+    rerank_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,6 +80,20 @@ class ExecutionFrame:
     route_stage: str = ""
     session_id: str = ""
     message_preview: str = ""
+    candidate_total: int = 0
+    tool_candidates: int = 0
+    selected_rank: int = 0
+    selected_score: float = 0.0
+    selected_reason: str = ""
+    no_hit_recovery_attempts: int = 0
+    no_hit_recovery_success: int = 0
+    no_hit_recovery_query: str = ""
+    no_hit_recovery_reason: str = ""
+    rerank_attempts: int = 0
+    rerank_success: int = 0
+    rerank_no_available: int = 0
+    rerank_stage: str = ""
+    rerank_reason: str = ""
     started_at: float = field(default_factory=time.perf_counter)
 
     def finish(
@@ -88,6 +116,20 @@ class ExecutionFrame:
             session_id=self.session_id,
             message_preview=self.message_preview,
             token_usage=token_usage,
+            candidate_total=self.candidate_total,
+            tool_candidates=self.tool_candidates,
+            selected_rank=self.selected_rank,
+            selected_score=self.selected_score,
+            selected_reason=self.selected_reason,
+            no_hit_recovery_attempts=self.no_hit_recovery_attempts,
+            no_hit_recovery_success=self.no_hit_recovery_success,
+            no_hit_recovery_query=self.no_hit_recovery_query,
+            no_hit_recovery_reason=self.no_hit_recovery_reason,
+            rerank_attempts=self.rerank_attempts,
+            rerank_success=self.rerank_success,
+            rerank_no_available=self.rerank_no_available,
+            rerank_stage=self.rerank_stage,
+            rerank_reason=self.rerank_reason,
         )
 
 
@@ -117,6 +159,20 @@ class ExecutionObserver:
         route_stage: str | None = None,
         session_id: str | None = None,
         message_preview: str | None = None,
+        candidate_total: int | None = None,
+        tool_candidates: int | None = None,
+        selected_rank: int | None = None,
+        selected_score: float | None = None,
+        selected_reason: str | None = None,
+        no_hit_recovery_attempts: int | None = None,
+        no_hit_recovery_success: int | None = None,
+        no_hit_recovery_query: str | None = None,
+        no_hit_recovery_reason: str | None = None,
+        rerank_attempts: int | None = None,
+        rerank_success: int | None = None,
+        rerank_no_available: int | None = None,
+        rerank_stage: str | None = None,
+        rerank_reason: str | None = None,
     ) -> ExecutionFrame:
         return ExecutionFrame(
             action=action,
@@ -127,6 +183,24 @@ class ExecutionObserver:
             route_stage=normalize_message_text(route_stage or ""),
             session_id=normalize_message_text(session_id or ""),
             message_preview=normalize_message_text(message_preview or "")[:120],
+            candidate_total=max(int(candidate_total or 0), 0),
+            tool_candidates=max(int(tool_candidates or 0), 0),
+            selected_rank=max(int(selected_rank or 0), 0),
+            selected_score=float(selected_score or 0.0),
+            selected_reason=normalize_message_text(selected_reason or "")[:120],
+            no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
+            no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
+            no_hit_recovery_query=normalize_message_text(
+                no_hit_recovery_query or ""
+            )[:160],
+            no_hit_recovery_reason=normalize_message_text(
+                no_hit_recovery_reason or ""
+            )[:160],
+            rerank_attempts=max(int(rerank_attempts or 0), 0),
+            rerank_success=max(int(rerank_success or 0), 0),
+            rerank_no_available=max(int(rerank_no_available or 0), 0),
+            rerank_stage=normalize_message_text(rerank_stage or "")[:80],
+            rerank_reason=normalize_message_text(rerank_reason or "")[:160],
         )
 
     @classmethod
@@ -145,6 +219,20 @@ class ExecutionObserver:
         session_id: str | None = None,
         message_preview: str | None = None,
         token_usage: dict[str, int] | None = None,
+        candidate_total: int | None = None,
+        tool_candidates: int | None = None,
+        selected_rank: int | None = None,
+        selected_score: float | None = None,
+        selected_reason: str | None = None,
+        no_hit_recovery_attempts: int | None = None,
+        no_hit_recovery_success: int | None = None,
+        no_hit_recovery_query: str | None = None,
+        no_hit_recovery_reason: str | None = None,
+        rerank_attempts: int | None = None,
+        rerank_success: int | None = None,
+        rerank_no_available: int | None = None,
+        rerank_stage: str | None = None,
+        rerank_reason: str | None = None,
     ) -> ExecutionObservation:
         start = started_at if started_at is not None else time.perf_counter()
         latency_ms = max(int((time.perf_counter() - start) * 1000), 0)
@@ -162,6 +250,24 @@ class ExecutionObserver:
             session_id=normalize_message_text(session_id or ""),
             message_preview=normalize_message_text(message_preview or "")[:120],
             token_usage=dict(token_usage or {}),
+            candidate_total=max(int(candidate_total or 0), 0),
+            tool_candidates=max(int(tool_candidates or 0), 0),
+            selected_rank=max(int(selected_rank or 0), 0),
+            selected_score=float(selected_score or 0.0),
+            selected_reason=normalize_message_text(selected_reason or "")[:120],
+            no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
+            no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
+            no_hit_recovery_query=normalize_message_text(
+                no_hit_recovery_query or ""
+            )[:160],
+            no_hit_recovery_reason=normalize_message_text(
+                no_hit_recovery_reason or ""
+            )[:160],
+            rerank_attempts=max(int(rerank_attempts or 0), 0),
+            rerank_success=max(int(rerank_success or 0), 0),
+            rerank_no_available=max(int(rerank_no_available or 0), 0),
+            rerank_stage=normalize_message_text(rerank_stage or "")[:80],
+            rerank_reason=normalize_message_text(rerank_reason or "")[:160],
         )
         cls.configure()
         cls._records.append(observation)
@@ -186,6 +292,10 @@ class ExecutionObserver:
             delta = -0.5
         if not delta:
             return
+        if observation.selected_rank > 1 and observation.success:
+            delta += min(observation.selected_rank, 8) * 0.08
+        if observation.selected_rank == 1 and not observation.success:
+            delta -= 0.15
 
         def clamp(value: float) -> float:
             return max(min(value, 36.0), -72.0)
@@ -226,7 +336,16 @@ class ExecutionObserver:
                 "success_counts": {},
                 "top_plugins": {},
                 "avg_latency_ms": 0.0,
+                "avg_candidate_total": 0.0,
+                "avg_tool_candidates": 0.0,
+                "avg_selected_rank": 0.0,
+                "avg_selected_score": 0.0,
                 "recent_failures": [],
+                "no_hit_recovery_attempts": 0,
+                "no_hit_recovery_success": 0,
+                "rerank_attempts": 0,
+                "rerank_success": 0,
+                "rerank_no_available": 0,
             }
         action_counts = Counter(row.action for row in rows)
         reason_counts = Counter(row.reason for row in rows)
@@ -245,7 +364,32 @@ class ExecutionObserver:
             "success_counts": dict(success_counts),
             "top_plugins": dict(top_plugins.most_common(8)),
             "avg_latency_ms": round(avg_latency_ms, 2),
+            "avg_candidate_total": round(
+                sum(row.candidate_total for row in rows) / len(rows),
+                2,
+            ),
+            "avg_tool_candidates": round(
+                sum(row.tool_candidates for row in rows) / len(rows),
+                2,
+            ),
+            "avg_selected_rank": round(
+                sum(row.selected_rank for row in rows) / len(rows),
+                2,
+            ),
+            "avg_selected_score": round(
+                sum(row.selected_score for row in rows) / len(rows),
+                2,
+            ),
             "recent_failures": recent_failures,
+            "no_hit_recovery_attempts": sum(
+                row.no_hit_recovery_attempts for row in rows
+            ),
+            "no_hit_recovery_success": sum(
+                row.no_hit_recovery_success for row in rows
+            ),
+            "rerank_attempts": sum(row.rerank_attempts for row in rows),
+            "rerank_success": sum(row.rerank_success for row in rows),
+            "rerank_no_available": sum(row.rerank_no_available for row in rows),
         }
 
     @classmethod
@@ -314,6 +458,12 @@ def render_execution_observer_summary(limit: int = 200) -> str:
         "reason: "
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["reason_counts"].items())),
         f"avg_latency_ms={payload['avg_latency_ms']}",
+        f"avg_candidates={payload.get('avg_candidate_total', 0.0)}, "
+        f"avg_tool_candidates={payload.get('avg_tool_candidates', 0.0)}, "
+        f"avg_selected_rank={payload.get('avg_selected_rank', 0.0)}",
+        f"rerank={payload.get('rerank_success', 0)}/"
+        f"{payload.get('rerank_attempts', 0)}, "
+        f"no_tool={payload.get('rerank_no_available', 0)}",
     ]
     top_plugins = payload.get("top_plugins") or {}
     if top_plugins:

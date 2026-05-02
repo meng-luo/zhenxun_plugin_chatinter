@@ -35,6 +35,39 @@ _SHORT_ACTION_SUFFIXES = (
     "梗图",
 )
 
+_MUSIC_HEADS = {"点歌", "搜歌", "播放音乐", "音乐搜索"}
+_MUSIC_ALIASES = (
+    "点一首歌",
+    "点首歌",
+    "点一首",
+    "点首",
+    "播一首歌",
+    "播首歌",
+    "来一首歌",
+    "来首歌",
+    "放一首歌",
+    "听歌",
+    "搜歌",
+    "找歌",
+)
+_SIGN_IN_HEADS = {"签到", "打卡", "补签"}
+_SIGN_IN_ALIASES = (
+    "打卡",
+    "签个到",
+    "签一下到",
+    "今日签到",
+    "今天签到",
+)
+_POETRY_HEADS = {"念诗", "来首诗", "念首诗", "古诗", "诗词"}
+_POETRY_ALIASES = (
+    "古诗",
+    "诗词",
+    "来首诗",
+    "念首诗",
+    "来一首古诗",
+    "来首古诗",
+)
+
 
 def normalize_alias(value: object) -> str:
     return normalize_message_text(str(value or "")).casefold()
@@ -76,6 +109,18 @@ def derive_semantic_aliases(
         if len(normalized) <= 2:
             for suffix in _SHORT_ACTION_SUFFIXES:
                 add(f"{normalized}{suffix}")
+
+    if normalized in _MUSIC_HEADS:
+        for alias in _MUSIC_ALIASES:
+            add(alias)
+
+    if normalized in _SIGN_IN_HEADS:
+        for alias in _SIGN_IN_ALIASES:
+            add(alias)
+
+    if normalized in _POETRY_HEADS:
+        for alias in _POETRY_ALIASES:
+            add(alias)
 
     return aliases
 

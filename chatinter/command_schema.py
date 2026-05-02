@@ -16,7 +16,7 @@ from .models.pydantic_models import (
     CommandSlotSpec,
     PluginCommandSchema,
 )
-from .route_text import normalize_message_text
+from .route_text import normalize_message_text, parse_command_with_head
 from .slot_extractors import extract_builtin_slots
 
 _CN_DIGITS = {
@@ -38,6 +38,14 @@ _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 _NUMBER_TEXT = r"\d+|[零〇一二两俩三四五六七八九十百千]+"
 _TEXT_PLACEHOLDER_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][0-9A-Za-z_]*)\}")
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
+_URL_PAYLOAD_PATTERN = re.compile(
+    r"https?://\S+|(?:BV|AV|av)[0-9A-Za-z]+",
+    re.IGNORECASE,
+)
+_TEXT_TAIL_PREFIX_PATTERN = re.compile(
+    r"^(?:这句话|这段话|这句|内容|文本|参数|链接|地址|是|为|叫|名称|名字|"
+    r"：|:|-|，|,|。)+"
+)
 
 
 @dataclass(frozen=True)
@@ -89,12 +97,32 @@ def _schema(
     source: str = "override",
     confidence: float = 0.85,
     matcher_key: str | None = None,
+    retrieval_phrases: list[str] | None = None,
 ) -> PluginCommandSchema:
+    normalized_head = normalize_message_text(head)
+    normalized_aliases = [
+        text
+        for text in (normalize_message_text(alias) for alias in list(aliases or []))
+        if text
+    ]
+    normalized_description = normalize_message_text(description)
+    phrase_values = [
+        normalized_head,
+        *normalized_aliases,
+        normalized_description,
+        command_id,
+        *(retrieval_phrases or []),
+    ]
+    phrases: list[str] = []
+    for value in phrase_values:
+        text = normalize_message_text(value)
+        if text and text not in phrases:
+            phrases.append(text)
     return PluginCommandSchema(
         command_id=command_id,
-        head=head,
-        aliases=list(aliases or []),
-        description=description,
+        head=normalized_head or head,
+        aliases=list(dict.fromkeys(normalized_aliases)),
+        description=normalized_description,
         slots=list(slots or []),
         render=render or head,
         requires={
@@ -110,6 +138,7 @@ def _schema(
         source=source,  # type: ignore[arg-type]
         confidence=confidence,
         matcher_key=matcher_key,
+        retrieval_phrases=phrases,
     )
 
 
@@ -207,8 +236,16 @@ _SCHEMA_OVERRIDES: dict[str, list[PluginCommandSchema]] = {
     "zhenxun.plugins.poetry": [
         _schema(
             "poetry.random",
-            "念诗",
-            aliases=["来首诗", "念首诗", "给我念一首诗"],
+            "古诗",
+            aliases=[
+                "念诗",
+                "来首诗",
+                "念首诗",
+                "给我念一首诗",
+                "来一首古诗",
+                "来首古诗",
+                "诗词",
+            ],
             description="随机发送一首古诗词",
             render="念诗",
         )
@@ -240,7 +277,7 @@ _SCHEMA_OVERRIDES: dict[str, list[PluginCommandSchema]] = {
             aliases=["翻译一下", "翻成中文", "翻译成中文", "帮我翻译", "用中文说一下"],
             description="翻译给定文本；需要 text，不用于查看支持语种",
             slots=[_slot("text", "text", required=True, aliases=["文本", "内容"])],
-            render='翻译 "{text}"',
+            render="翻译 {text}",
             requires={"text": True},
             payload_policy="text",
             extra_text_policy="slot_only",
@@ -346,7 +383,13 @@ def _requires_from_capability(command: CommandCapability) -> dict[str, bool]:
         "text": bool(requirement.text_min > 0 or params_require_text),
         "image": bool(requirement.image_min > 0),
         "reply": bool(requirement.requires_reply),
-        "at": bool(requirement.target_requirement == "required"),
+        "private": bool(requirement.requires_private),
+        "to_me": bool(requirement.requires_to_me),
+        "at": bool(
+            requirement.allow_at
+            or "at" in requirement.target_sources
+            or requirement.target_requirement == "required"
+        ),
     }
 
 
@@ -650,7 +693,13 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _schema_phrases(schema: PluginCommandSchema) -> list[str]:
-    values = [schema.head, *schema.aliases, schema.description]
+    values = [
+        schema.command_id,
+        schema.head,
+        *schema.aliases,
+        schema.description,
+        *schema.retrieval_phrases,
+    ]
     for slot in schema.slots:
         values.extend([slot.name, slot.description, *slot.aliases])
     result: list[str] = []
@@ -1020,11 +1069,16 @@ def _extract_cover_slots(message_text: str) -> dict[str, Any]:
 
 def _extract_nbnhhsh_slots(message_text: str) -> dict[str, Any]:
     text = normalize_message_text(message_text)
-    match = re.search(r"(?:缩写|解释一下缩写|解释)\s*(?P<text>[0-9A-Za-z_]+)", text)
-    if match:
-        return {"text": match.group("text")}
-    tokens = re.findall(r"[A-Za-z_]{2,}", text)
-    return {"text": tokens[-1]} if tokens else {}
+    patterns = (
+        r"(?P<text>[0-9A-Za-z_]{2,16})\s*(?:是)?(?:什么|啥|哪个)?缩写",
+        r"(?:缩写|解释一下缩写|解释)\s*(?P<text>[0-9A-Za-z_]{2,16})",
+        r"(?P<text>[0-9A-Za-z_]{2,16}).{0,4}(?:展开|啥意思|什么意思|是什么意思)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return {"text": match.group("text")}
+    return {}
 
 
 def _infer_builtin_slots(
@@ -1032,6 +1086,21 @@ def _infer_builtin_slots(
     message_text: str,
 ) -> dict[str, Any]:
     command_id = normalize_message_text(schema.command_id)
+    normalized = normalize_message_text(message_text)
+    if not command_id:
+        return {}
+    if command_id == "translate.text" and normalized in {"帮我翻译一下", "翻译一下"}:
+        return {}
+    if command_id != "translate.text" and not (
+        command_id == "gold_redbag.send"
+        or command_id == "nbnhhsh.expand"
+        or command_id.startswith("nonebot_plugin_memes.")
+        or command_id in {"memes.search", "memes.info"}
+        or any(char.isdigit() for char in normalized)
+        or any(char in normalized for char in _CN_DIGITS)
+        or any(char in normalized for char in _CN_UNITS)
+    ):
+        return {}
     extracted = extract_builtin_slots(command_id, message_text)
     if extracted:
         return extracted
@@ -1042,6 +1111,101 @@ def _infer_builtin_slots(
     if command_id == "nbnhhsh.expand":
         return _extract_nbnhhsh_slots(message_text)
     return {}
+
+
+def _clean_text_payload(value: str) -> str:
+    payload = normalize_message_text(value)
+    while payload:
+        cleaned = normalize_message_text(_TEXT_TAIL_PREFIX_PATTERN.sub("", payload))
+        if cleaned == payload:
+            break
+        payload = cleaned
+    return payload
+
+
+def _extract_command_tail_payload(
+    schema: PluginCommandSchema,
+    message_text: str,
+) -> str:
+    heads = [schema.head, *schema.aliases]
+    for head in heads:
+        normalized_head = normalize_message_text(head)
+        if not normalized_head:
+            continue
+        parsed = parse_command_with_head(
+            message_text,
+            normalized_head,
+            allow_sticky=True,
+            max_prefix_len=12,
+        )
+        if parsed is None:
+            continue
+        payload = _clean_text_payload(parsed.payload_text)
+        if payload:
+            return payload
+    return ""
+
+
+def _slot_accepts_url(slot: CommandSlotSpec) -> bool:
+    text = normalize_message_text(
+        " ".join([slot.name, slot.description, *slot.aliases])
+    ).casefold()
+    return any(
+        token in text
+        for token in ("链接", "地址", "url", "bv", "av", "视频", "link")
+    )
+
+
+def _extract_url_payload(message_text: str) -> str:
+    match = _URL_PAYLOAD_PATTERN.search(normalize_message_text(message_text))
+    return match.group(0) if match else ""
+
+
+def _fill_slots_from_payload(
+    merged: dict[str, Any],
+    schema: PluginCommandSchema,
+    payload: str,
+) -> None:
+    argument_payload = _clean_text_payload(payload)
+    if not argument_payload:
+        return
+    payload_tokens = [token for token in argument_payload.split(" ") if token]
+    token_index = 0
+    for slot in schema.slots:
+        if slot.name in merged or slot.type == "text":
+            continue
+        if token_index >= len(payload_tokens):
+            break
+        value: Any = payload_tokens[token_index]
+        token_index += 1
+        if slot.type == "int":
+            parsed_value = _parse_int_token(value)
+            if parsed_value is None:
+                continue
+            value = parsed_value
+        merged[slot.name] = value
+    for slot in schema.slots:
+        if slot.name in merged or slot.type != "text":
+            continue
+        merged[slot.name] = argument_payload
+        break
+
+
+def _fill_link_slots_from_message(
+    merged: dict[str, Any],
+    schema: PluginCommandSchema,
+    message_text: str,
+) -> None:
+    url_payload = _extract_url_payload(message_text)
+    if not url_payload:
+        return
+    for slot in schema.slots:
+        if slot.name in merged or slot.type != "text":
+            continue
+        if not _slot_accepts_url(slot):
+            continue
+        merged[slot.name] = url_payload
+        return
 
 
 def complete_slots(
@@ -1066,30 +1230,12 @@ def complete_slots(
     merged.update(
         inferred,
     )
+    _fill_link_slots_from_message(merged, schema, message_text)
     argument_payload = normalize_message_text(arguments_text)
+    if not argument_payload:
+        argument_payload = _extract_command_tail_payload(schema, message_text)
     if argument_payload:
-        payload_tokens = [token for token in argument_payload.split(" ") if token]
-        token_index = 0
-        for slot in schema.slots:
-            if slot.name in merged or slot.type == "text":
-                continue
-            if token_index >= len(payload_tokens):
-                break
-            value: Any = payload_tokens[token_index]
-            token_index += 1
-            if slot.type == "int":
-                parsed_value = _parse_int_token(value)
-                if parsed_value is None:
-                    continue
-                value = parsed_value
-            merged[slot.name] = value
-        for slot in schema.slots:
-            if slot.name in merged:
-                continue
-            if slot.type != "text":
-                continue
-            merged[slot.name] = argument_payload
-            break
+        _fill_slots_from_payload(merged, schema, argument_payload)
 
     missing: list[str] = []
     for slot in schema.slots:

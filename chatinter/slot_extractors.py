@@ -75,6 +75,25 @@ def _split_options(raw: str) -> str:
     return options
 
 
+def _split_text_parts(raw: str, *, max_parts: int) -> list[str]:
+    text = normalize_message_text(raw)
+    if not text:
+        return []
+    text = re.sub(r"^(?:文字|内容|文本)(?:是|为)?\s*", "", text)
+    text = re.sub(r"^(?:四格|四段|四句)\s*", "", text)
+    parts = [
+        normalize_message_text(part)
+        for part in re.split(r"\s*[，,、/|；;]\s*|\s{2,}", text)
+        if normalize_message_text(part)
+    ]
+    if len(parts) >= max_parts:
+        return parts[:max_parts]
+    spaced = [part for part in text.split(" ") if part]
+    if len(spaced) >= max_parts:
+        return spaced[:max_parts]
+    return parts
+
+
 def extract_redbag_slots(message_text: str) -> dict[str, Any]:
     text = normalize_message_text(message_text)
     slots: dict[str, Any] = {}
@@ -181,6 +200,34 @@ def extract_meme_slots(command_id: str, message_text: str) -> dict[str, Any]:
             r"表情详情\s*(?P<keyword>.+)",
         )
     else:
+        if normalized_id.endswith(".王境泽"):
+            if "王境泽" not in text:
+                return {}
+            match = re.search(r"(?:文字|内容|台词)(?:是|为)?\s*(?P<text>.+)", text)
+            source = match.group("text") if match else text
+            parts = _split_text_parts(source, max_parts=4)
+            if len(parts) >= 4:
+                return {
+                    "文本1": parts[0],
+                    "文本2": parts[1],
+                    "文本3": parts[2],
+                    "文本4": parts[3],
+                }
+        if normalized_id.endswith(".5000兆"):
+            if "5000" not in text and not ("上" in text and "下" in text):
+                return {}
+            match = re.search(
+                r"上(?:面|方)?(?:写|文字是)?\s*(?P<top>.+?)\s*下(?:面|方)?(?:写|文字是)?\s*(?P<bottom>.+)",
+                text,
+            )
+            if match:
+                return {
+                    "上文字": normalize_message_text(match.group("top")),
+                    "下文字": normalize_message_text(match.group("bottom")),
+                }
+            parts = _split_text_parts(text, max_parts=2)
+            if len(parts) >= 2:
+                return {"上文字": parts[0], "下文字": parts[1]}
         return {}
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -196,8 +243,8 @@ def extract_meme_slots(command_id: str, message_text: str) -> dict[str, Any]:
 def extract_nbnhhsh_slots(message_text: str) -> dict[str, Any]:
     text = normalize_message_text(message_text)
     patterns = (
-        r"(?:nbnhhsh|能不能好好说话|解释(?:一下)?缩写|缩写)\s*(?P<text>[0-9A-Za-z_]{2,16})",
         r"(?P<text>[0-9A-Za-z_]{2,16})\s*(?:是)?(?:什么|啥|哪个)?缩写",
+        r"(?:nbnhhsh|能不能好好说话|解释(?:一下)?缩写|缩写)\s*(?P<text>[0-9A-Za-z_]{2,16})",
         r"(?P<text>[0-9A-Za-z_]{2,16}).{0,4}(?:展开|啥意思|什么意思|是什么意思)",
     )
     for pattern in patterns:
@@ -223,6 +270,8 @@ def extract_builtin_slots(
     if command_id == "roll.choose":
         return extract_roll_slots(source)
     if command_id in {"memes.search", "memes.info"}:
+        return extract_meme_slots(command_id, source)
+    if command_id.startswith("nonebot_plugin_memes."):
         return extract_meme_slots(command_id, source)
     if command_id == "nbnhhsh.expand":
         return extract_nbnhhsh_slots(source)

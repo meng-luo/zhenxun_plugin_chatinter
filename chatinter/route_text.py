@@ -58,6 +58,10 @@ STRONG_USAGE_WORDS = (
     "怎么做",
     "如何做",
     "怎样做",
+    "规则是什么",
+    "规则是啥",
+    "有什么规则",
+    "规则说明",
 )
 
 WEAK_USAGE_HINTS = (
@@ -156,9 +160,7 @@ EXECUTE_WORDS = (
     "看下",
     "生成",
     "制作",
-    "点歌",
     "播放",
-    "签到",
     "启动",
     "来个",
     "来一张",
@@ -218,9 +220,7 @@ ROUTE_ACTION_WORDS = (
     "设置",
     "生成",
     "制作",
-    "点歌",
     "播放",
-    "签到",
     "启动",
     "来个",
     "做个",
@@ -231,15 +231,28 @@ ROUTE_ACTION_WORDS = (
 ROUTE_NEGATIVE_HINT_WORDS = (
     "不是在让你执行",
     "不是让你执行",
+    "不要执行命令",
+    "不用执行命令",
     "不是让你",
     "不是叫你",
     "不是命令",
+    "不执行命令",
+    "不要执行",
+    "不用执行",
     "别执行",
+    "别调用",
+    "不用调用",
+    "不是让你点歌",
+    "不是要你",
+    "不用发",
+    "不是要发",
     "只是提到",
     "只是说说",
+    "只是说",
     "只是聊",
     "只是问问",
     "只是讨论",
+    "只是在讨论",
     "我在讨论",
     "我在聊",
     "我在想",
@@ -257,6 +270,34 @@ ROUTE_NEGATIVE_HINT_WORDS = (
     "是什么意思",
     "看到有人说",
     "听到有人说",
+)
+
+CHAT_CONTEXT_HINT_WORDS = (
+    "陪我聊",
+    "聊聊",
+    "聊天",
+    "安慰",
+    "不是插件",
+    "不是命令",
+    "不是让你",
+    "不是要你",
+    "这个词",
+    "这个概念",
+    "这种机制",
+    "这件事",
+    "文化",
+    "原理",
+    "为什么",
+    "怎么理解",
+    "什么意思",
+    "如何理解",
+    "架构",
+    "架构上",
+    "怎么设计",
+    "如何设计",
+    "系统设计",
+    "管理系统",
+    "设计方案",
 )
 
 TEMPLATE_ROUTE_HINT_WORDS = (
@@ -312,23 +353,13 @@ KNOWLEDGE_REFRESH_WORDS = (
     "如何用",
     "生成",
     "制作",
-    "点歌",
-    "签到",
     "启动",
     "开关",
 )
 
-ACTION_REWRITES = (
-    ("点一首", "点歌 "),
-    ("点首", "点歌 "),
-    ("来一首", "点歌 "),
-    ("来首", "点歌 "),
-    ("播一首", "点歌 "),
-    ("播首", "点歌 "),
-    ("签个到", "签到"),
-    ("签一下到", "签到"),
-    ("签个", "签到"),
-)
+# 不在全局把自然语言短语改写成具体插件命令，避免插件未安装时污染
+# speech-act / 候选召回。具体命令的自然别名由已安装插件的 schema 派生。
+ACTION_REWRITES: tuple[tuple[str, str], ...] = ()
 
 _TEMPLATE_TAIL_NOISE_WORDS = (
     "表情包",
@@ -973,6 +1004,10 @@ def has_negative_route_intent(text: str) -> bool:
     return contains_any(text, ROUTE_NEGATIVE_HINT_WORDS)
 
 
+def has_chat_context_hint(text: str) -> bool:
+    return contains_any(text, CHAT_CONTEXT_HINT_WORDS)
+
+
 def _is_meme_plugin(plugin: PluginInfo) -> bool:
     module_l = plugin.module.lower()
     name_l = plugin.name.lower()
@@ -1160,6 +1195,7 @@ __all__ = [
     "collect_placeholders",
     "collect_weak_route_signals",
     "contains_any",
+    "has_chat_context_hint",
     "has_negative_route_intent",
     "has_template_route_context",
     "is_usage_question",

@@ -8,6 +8,7 @@ from typing import Literal
 from .route_text import (
     ROUTE_ACTION_WORDS,
     contains_any,
+    has_chat_context_hint,
     has_negative_route_intent,
     is_usage_question,
     normalize_action_phrases,
@@ -28,11 +29,15 @@ _DISCUSSION_MARKERS = (
     "这个概念",
     "这件事",
     "这种",
+    "作为",
     "本身",
     "为什么",
     "是不是",
     "是什么",
     "什么意思",
+    "怎么理解",
+    "优点",
+    "缺点",
     "挺",
     "文化",
     "设计",
@@ -94,7 +99,11 @@ def classify_speech_act(
     if not stripped:
         return "casual_chat"
     if has_negative_route_intent(stripped):
-        return "casual_chat"
+        return "discuss_command"
+    if has_chat_context_hint(stripped) and not contains_any(
+        stripped, _STRONG_PERFORM_MARKERS
+    ):
+        return "discuss_command"
     if is_usage_question(stripped):
         return "ask_usage"
     if _ABBR_QUERY_PATTERN.search(stripped):
@@ -106,6 +115,10 @@ def classify_speech_act(
             return "perform_command"
         return "clarify"
     if contains_any(stripped, _STRONG_PERFORM_MARKERS):
+        if has_chat_context_hint(stripped) and any(
+            marker in stripped for marker in ("不是", "不要", "不用", "别", "陪我聊")
+        ):
+            return "discuss_command"
         return "perform_command"
     if contains_any(stripped, _DISCUSSION_MARKERS):
         return "discuss_command"

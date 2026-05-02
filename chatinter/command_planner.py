@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 
 from .command_schema import complete_slots, render_command, select_command_schema
 from .models.pydantic_models import PluginReference
-from .route_text import collect_placeholders, normalize_message_text
+from .route_text import (
+    collect_placeholders,
+    normalize_message_text,
+    strip_invoke_prefix,
+)
 
 
 class CommandPlanDecision(BaseModel):
@@ -107,6 +111,13 @@ def _has_image_context(message_text: str, image_count: int) -> bool:
     )
 
 
+def _has_at_context(message_text: str) -> bool:
+    return any(
+        token.startswith("[@") or token.startswith("@")
+        for token in collect_placeholders(message_text or "")
+    )
+
+
 def _text_payload_count(command: str) -> int:
     tail = _command_tail(command)
     if not tail:
@@ -127,6 +138,29 @@ def _merge_command_and_arguments(command: str, arguments_text: str) -> str:
     if arguments in normalized_command:
         return normalized_command
     return normalize_message_text(f"{normalized_command} {arguments}")
+
+
+def _extract_command_arguments_from_message(command: str, message_text: str) -> str:
+    head = _command_head(command)
+    if not head:
+        return ""
+    normalized_message = normalize_message_text(strip_invoke_prefix(message_text or ""))
+    if not normalized_message:
+        return ""
+    command_text = normalize_message_text(command or "")
+    if normalized_message == head:
+        return ""
+    if normalized_message.startswith(head + " "):
+        tail = normalize_message_text(normalized_message[len(head) :])
+        if tail in {"一下", "下", "一下吧", "下吧"}:
+            return ""
+        return tail
+    if command_text and normalized_message.startswith(command_text + " "):
+        tail = normalize_message_text(normalized_message[len(command_text) :])
+        if tail in {"一下", "下", "一下吧", "下吧"}:
+            return ""
+        return tail
+    return ""
 
 
 def plan_command(
@@ -167,6 +201,12 @@ def plan_command(
         plugin_name=plugin_name,
     )
     final_command = _merge_command_and_arguments(command or "", arguments_text)
+    effective_arguments_text = normalize_message_text(arguments_text)
+    if not effective_arguments_text:
+        effective_arguments_text = _extract_command_arguments_from_message(
+            final_command or command or "",
+            current_message,
+        )
     schema = None
     if reference is not None:
         selection = select_command_schema(
@@ -174,7 +214,7 @@ def plan_command(
             command_id=command_id,
             command=final_command or command,
             message_text=current_message,
-            arguments_text=arguments_text,
+            arguments_text=effective_arguments_text,
             slots=slots,
             action=action,
         )
@@ -187,13 +227,13 @@ def plan_command(
             schema,
             slots=completed_slots,
             message_text=current_message,
-            arguments_text=arguments_text,
+            arguments_text=effective_arguments_text,
         )
         rendered, schema_missing = render_command(
             schema,
             slots=completed_slots,
             message_text=current_message,
-            arguments_text=arguments_text,
+            arguments_text=effective_arguments_text,
         )
         if rendered:
             final_command = rendered
@@ -221,10 +261,11 @@ def plan_command(
     missing_items = [*list(missing or []), *schema_missing]
     if reference is not None:
         requires = (schema.requires if schema is not None else reference.requires) or {}
-        if requires.get("image") and not _has_image_context(
-            f"{current_message} {final_command}",
-            image_count,
-        ):
+        context_text = f"{current_message} {final_command}"
+        image_satisfied = _has_image_context(context_text, image_count) or (
+            requires.get("at") and _has_at_context(context_text)
+        )
+        if requires.get("image") and not image_satisfied:
             if "image" not in missing_items and "图片" not in missing_items:
                 missing_items.append("image")
         if requires.get("reply") and not has_reply:
@@ -233,6 +274,12 @@ def plan_command(
         if requires.get("text") and _text_payload_count(final_command) <= 0:
             if "text" not in missing_items and "文本" not in missing_items:
                 missing_items.append("text")
+        if requires.get("private"):
+            if "private" not in missing_items and "私聊" not in missing_items:
+                missing_items.append("private")
+        if requires.get("to_me"):
+            if "to_me" not in missing_items and "@机器人" not in missing_items:
+                missing_items.append("to_me")
 
     planned_action: Literal["execute", "clarify"] = (
         "clarify" if action == "clarify" or missing_items else "execute"
@@ -244,7 +291,7 @@ def plan_command(
         command_id=command_id,
         command_head=head or None,
         slots=completed_slots,
-        arguments_text=normalize_message_text(arguments_text),
+        arguments_text=effective_arguments_text,
         final_command=normalize_message_text(final_command) or None,
         missing=missing_items,
         confidence=confidence,

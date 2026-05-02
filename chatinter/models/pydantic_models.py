@@ -212,6 +212,121 @@ class PluginCommandSchema(BaseModel):
         default=None,
         description="可选 matcher 标识，后续可用于更精确的事件重投扇出控制",
     )
+    retrieval_phrases: list[str] = Field(
+        default_factory=list,
+        description="工具检索短语，不直接暴露为可执行命令",
+    )
+
+
+class CommandToolSnapshot(BaseModel):
+    """安全过滤后的命令级工具快照。"""
+
+    command_id: str = Field(description="稳定命令 ID")
+    plugin_module: str = Field(description="插件模块名")
+    plugin_name: str = Field(description="插件名称")
+    head: str = Field(description="最终执行命令头")
+    aliases: list[str] = Field(default_factory=list, description="自然语言别名")
+    description: str = Field(default="", description="命令用途")
+    usage: str | None = Field(default=None, description="插件用法")
+    examples: list[str] = Field(default_factory=list, description="示例")
+    slots: list[CommandSlotSpec] = Field(default_factory=list, description="参数槽位")
+    requires: dict[str, bool] = Field(default_factory=dict, description="命令级需求")
+    render: str = Field(default="", description="命令渲染模板")
+    payload_policy: Literal[
+        "none",
+        "text",
+        "slots",
+        "image_only",
+        "text_or_image",
+        "free_tail",
+    ] = Field(default="none", description="命令对自然语言尾巴的接收策略")
+    extra_text_policy: Literal["keep", "discard", "slot_only"] = Field(
+        default="keep",
+        description="schema 渲染后多余文本的处理策略",
+    )
+    command_role: Literal[
+        "execute",
+        "helper",
+        "usage",
+        "catalog",
+        "template",
+        "random",
+    ] = Field(default="execute", description="命令在路由中的语义角色")
+    family: str = Field(default="general", description="候选多样化分组")
+    retrieval_phrases: list[str] = Field(
+        default_factory=list,
+        description="用于本地召回/向量召回的自然语言短语",
+    )
+    capability_text: str = Field(
+        default="",
+        description="统一、短句化的能力摘要，用于 no-hit 能力检索",
+    )
+    task_verbs: list[str] = Field(
+        default_factory=list,
+        description="该命令支持的通用动作词，如 查询/生成/识别",
+    )
+    input_requirements: list[str] = Field(
+        default_factory=list,
+        description="输入需求摘要，如 文本/图片/回复/链接/@",
+    )
+    source: Literal["explicit", "matcher", "metadata", "fallback", "override"] = Field(
+        default="fallback",
+        description="schema 来源，用于候选诊断和路由加权",
+    )
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="schema 自动生成置信度",
+    )
+    matcher_key: str | None = Field(
+        default=None,
+        description="可选 matcher 标识",
+    )
+    source_signature: str = Field(default="", description="工具快照失效签名")
+
+
+class CommandCandidateFeatures(BaseModel):
+    """候选命令进入 LLM 重排前的可解释特征。"""
+
+    lexical_score: float = Field(default=0.0, description="本地词法/别名召回分")
+    exact_score: float = Field(default=0.0, description="真实命令头/别名命中分")
+    semantic_score: float = Field(default=0.0, description="自然语言短语召回分")
+    slot_score: float = Field(default=0.0, description="参数槽位命中分")
+    context_score: float = Field(default=0.0, description="图片/@/回复上下文命中分")
+    feedback_score: float = Field(default=0.0, description="执行反馈加权分")
+    negative_score: float = Field(default=0.0, description="冲突或不兼容惩罚分")
+
+
+class CommandCandidateSnapshot(BaseModel):
+    """给 LLM 重排/分类使用的候选命令包。"""
+
+    rank: int = Field(description="候选排名")
+    score: float = Field(description="最终本地召回分")
+    reason: str = Field(default="", description="命中原因")
+    exact_protected: bool = Field(default=False, description="是否真实命令头命中")
+    plugin_module: str = Field(description="插件模块名")
+    plugin_name: str = Field(description="插件名称")
+    family: str = Field(default="general", description="候选族群")
+    command_id: str = Field(description="稳定命令 ID")
+    head: str = Field(description="最终执行命令头")
+    aliases: list[str] = Field(default_factory=list, description="自然语言别名")
+    description: str = Field(default="", description="命令用途")
+    requires: dict[str, bool] = Field(default_factory=dict, description="命令级需求")
+    slots: list[CommandSlotSpec] = Field(default_factory=list, description="参数槽位")
+    render: str = Field(default="", description="命令渲染模板")
+    payload_policy: str = Field(default="none", description="负载策略")
+    command_role: str = Field(default="execute", description="命令角色")
+    source: str = Field(default="fallback", description="schema 来源")
+    confidence: float = Field(default=0.5, description="schema 置信度")
+    features: CommandCandidateFeatures = Field(
+        default_factory=CommandCandidateFeatures,
+        description="候选可解释特征",
+    )
+    prompt_level: Literal["full", "compact", "name_only"] = Field(
+        default="full",
+        description="进入提示词时的暴露层级",
+    )
 
 
 class CapabilityGraphSnapshot(BaseModel):

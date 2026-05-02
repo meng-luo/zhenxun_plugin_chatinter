@@ -1,10 +1,10 @@
-import asyncio
 import ast
+import asyncio
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-import re
 import math
+import re
 import time
 from typing import Any, ClassVar, Literal
 
@@ -15,8 +15,8 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 from zhenxun.services.log import logger
 
-from .plugin_registry import PluginRegistry
 from .config import get_mcp_endpoints
+from .plugin_registry import PluginRegistry
 from .sandbox import get_sandbox_manager
 
 _MCP_DISCOVER_PATH = "/v1/tools"
@@ -241,8 +241,8 @@ _TOOL_POLICIES: dict[str, ToolPolicy] = {
     "chatinter_lookup_plugin": ToolPolicy(
         aliases=("插件检索", "功能检索", "命令检索", "查插件"),
         examples=(
-            "查一下点歌命令",
-            "有哪些表情命令",
+            "查一下某个插件命令",
+            "有哪些可用命令",
             "查帮助命令",
         ),
         min_score=0.1,
@@ -498,8 +498,10 @@ class ChatInterToolRegistry:
     def get_access_mode(cls, tool_name: str) -> Literal["readonly", "write", "unknown"]:
         policy = cls._get_policy(tool_name)
         access_mode = str(policy.access_mode or "unknown").strip().lower()
-        if access_mode in {"readonly", "write"}:
-            return access_mode
+        if access_mode == "readonly":
+            return "readonly"
+        if access_mode == "write":
+            return "write"
         return "unknown"
 
     @classmethod
