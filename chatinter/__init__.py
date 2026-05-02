@@ -47,7 +47,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="Copaan & meng-luo",
-        version="1.3.0",
+        version="1.4.0",
         plugin_type=PluginType.DEPENDANT,
         menu_type="其他",
         ignore_prompt=True,

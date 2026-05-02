@@ -2,18 +2,22 @@
 
 **ChatInter** 是一个基于 AI 意图识别的智能对话插件，为 [真寻Bot](https://github.com/zhenxun-org/zhenxun_bot) 提供强大的对话能力。
 
-当用户消息未被其他插件匹配时，ChatInter 使用大语言模型分析用户意图，实现：
-- **功能调用意图** → 自动重路由到对应插件
+当用户消息未被其他插件匹配时，ChatInter 使用统一的 LLM Router 分析用户意图，实现：
+- **插件执行意图** → 自动选择并重路由到对应插件命令
+- **插件用法查询** → 返回匹配插件/命令的使用说明
+- **信息缺失场景** → 主动澄清并等待用户补充
 - **普通聊天意图** → 进行自然对话回复
 
 > [!WARNING]
 >
-> 由于上下文包含了插件的帮助信息，导致消耗的 tokens 会随着插件的数量增加而增加
+> Router 会使用精简插件卡片与命令候选进行判断，但 token 消耗仍会随着插件数量和命令复杂度增加。
 
 ## ✨ 特性
 
 - 🤖 **AI 意图识别** - 使用 LLM 精准分析用户真实意图
-- 🔀 **智能重路由** - 识别插件调用命令时自动转发到对应插件
+- 🔀 **统一路由决策** - 在聊天、执行插件、查询用法和澄清补充之间直接决策
+- 🧩 **插件卡片索引** - 从插件知识库生成精简能力卡片，提升候选发现质量
+- 🛠️ **命令候选重排** - 结合本地命令索引与 LLM rerank，减少误触发
 - 💬 **自然对话** - 支持多轮对话，保持上下文连贯性
 - 🖼️ **多模态支持** - 支持图片识别和理解
 - 🧠 **聊天记忆** - 持久化存储对话历史，支持语境构建
@@ -31,18 +35,25 @@ chatinter/
 ├── chat_handler.py          # 对话回复生成
 ├── memory.py                # 会话记忆与上下文构建
 ├── intent_classifier.py     # 意图分类
-├── route_engine.py          # 路由引擎
-├── route_tool_planner.py    # 工具/命令规划
-├── route_policy.py          # 路由策略约束
+├── route_engine.py          # 统一 LLM Router 与候选路由
+├── command_index.py         # 命令候选索引与检索
+├── command_schema.py        # 插件命令 Schema 构建
+├── command_planner.py       # 路由结果到可执行命令的规划
+├── plugin_reference.py      # 插件引用与 Router 卡片生成
 ├── skill_registry.py        # 技能注册与命令归一化
 ├── plugin_registry.py       # 插件发现与缓存
+├── plugin_adapters/         # 内置插件适配策略
+├── pending_route.py         # 待补全路由状态管理
 ├── agent_gate.py            # Agent 启用判定
 ├── agent_runner.py          # Agent 工具调用循环
 ├── tool_registry.py         # Tool 注册与暴露
 ├── tool_orchestration.py    # 工具编排
+├── tool_reranker.py         # 命令候选 LLM 重排
 ├── subagent_handoff.py      # 子代理交接逻辑
 ├── knowledge_rag.py         # 知识检索服务
+├── knowledge_rag_retrieval.py # 知识库索引与召回
 ├── retrieval.py             # 历史召回与检索辅助
+├── execution_observer.py    # 插件执行观察与统计
 ├── prompt_guard.py          # Prompt 安全护栏
 ├── lifecycle.py             # 生命周期钩子
 ├── trace.py                 # 追踪与调试
@@ -113,10 +124,12 @@ chatinter统计   # 查看最近路由统计
 ```text
 用户消息
   → ChatInter 接管兜底消息
-  → 意图分析与路由候选筛选
-  → 按策略决定：插件命令 / 帮助 / 普通对话
-      ├── 插件命令：重写消息并交还给目标插件执行
-      └── 普通对话：构建上下文 → Agent / 普通聊天生成 → 保存记忆 → 返回回复
+  → 构建插件知识库、命令索引与精简 Router 卡片
+  → LLM Router 判断：执行插件 / 查询用法 / 澄清补充 / 普通聊天
+      ├── 执行插件：规划命令 → 重写消息 → 交还给目标插件执行
+      ├── 查询用法：返回匹配插件或命令的用法说明
+      ├── 澄清补充：记录待补全路由并等待后续消息
+      └── 普通聊天：构建上下文 → Agent / 普通聊天生成 → 保存记忆 → 返回回复
 ```
 
 ### Agent 能力
@@ -125,6 +138,7 @@ ChatInter 当前支持：
 
 - **Tool Calling** - LLM 可调用工具获取实时信息
 - **插件查询** - 动态检索可用插件和命令
+- **路由观察** - 记录路由候选、重排和插件执行结果，便于排查误判
 - **MCP 集成** - 支持外部 MCP 工具服务
 - **失败熔断** - 工具连续失败后自动停用并总结
 - **子代理分流** - 针对复杂任务自动切换到子代理工作流
@@ -162,6 +176,15 @@ class ChatInterChatHistory(Model):
 ![example](docs_image/1.png)
 
 ## 🚀 更新日志
+
+### v1.4.0
+
+- 使用统一的 LLM Router 替换旧的 gate/policy 路由链路，直接决策聊天、插件执行、用法查询与澄清补充
+- 新增插件能力图、命令 Schema、命令索引与精简 Router 卡片，提升插件发现和命令选择质量
+- 新增命令候选 LLM rerank、no-hit recovery 与待补全路由恢复，降低误触发并改善缺参场景
+- 过滤基础设施、管理员专用和非公开插件，避免路由进入不应暴露的管理类工具
+- 优化多模态图片抽取、@ 提及处理、目标用户解析和插件执行观察统计
+- 调整路由候选数量与 prompt token 预算，增强复杂插件集合下的匹配稳定性
 
 ### v1.3.0
 
