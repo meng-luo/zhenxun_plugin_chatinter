@@ -44,6 +44,19 @@ _DISCUSSION_MARKERS = (
     "活动",
     "口头禅",
     "不是插件",
+    "公平吗",
+    "经济学",
+    "会怎样",
+    "系统从",
+    "模型",
+    "训练",
+    "原理",
+    "期望怎么算",
+    "概率",
+    "只想聊",
+    "不想听歌",
+    "这件事",
+    "件事",
 )
 
 _STRONG_PERFORM_MARKERS = (
@@ -78,6 +91,42 @@ _STRONG_PERFORM_MARKERS = (
     "选一个",
     "挑一个",
     "帮我选",
+    "放一首",
+    "放首",
+    "播一首",
+    "播首",
+    "掷骰子",
+    "掷个骰子",
+    "投骰子",
+)
+_META_DISCUSSION_MARKERS = (
+    "架构",
+    "架构上",
+    "怎么设计",
+    "如何设计",
+    "怎样设计",
+    "系统设计",
+    "管理系统",
+    "设计方案",
+    "原理",
+    "技术背后",
+)
+_DISCUSSION_QUESTION_MARKERS = (
+    "为什么",
+    "是什么",
+    "什么意思",
+    "怎么理解",
+    "如何理解",
+    "这件事",
+    "件事",
+    "文化",
+    "原理",
+    "公平吗",
+    "经济学",
+    "期望怎么算",
+    "模型",
+    "训练",
+    "容易",
 )
 
 _ABBR_QUERY_PATTERN = re.compile(
@@ -100,8 +149,18 @@ def classify_speech_act(
         return "casual_chat"
     if has_negative_route_intent(stripped):
         return "discuss_command"
+    if not (has_image or has_at or has_reply) and contains_any(
+        stripped, _META_DISCUSSION_MARKERS
+    ):
+        return "discuss_command"
     if has_chat_context_hint(stripped) and not contains_any(
         stripped, _STRONG_PERFORM_MARKERS
+    ):
+        return "discuss_command"
+    if (
+        not (has_image or has_at or has_reply)
+        and has_chat_context_hint(stripped)
+        and contains_any(stripped, _DISCUSSION_QUESTION_MARKERS)
     ):
         return "discuss_command"
     if is_usage_question(stripped):

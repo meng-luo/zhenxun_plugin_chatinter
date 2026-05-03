@@ -32,6 +32,7 @@ from .handler import handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
 from .memory import _chat_memory
 from .plugin_registry import PluginRegistry
+from .reflection_observer import get_reflection_observer_snapshot
 from .turn_metrics import render_route_observer_summary
 from .utils.unimsg_utils import uni_to_text_with_tags
 
@@ -287,8 +288,20 @@ async def _handle_reset_by_alconna(
 
 @_stats_matcher.handle()
 async def _handle_stats_by_alconna():
+    reflection = get_reflection_observer_snapshot()
+    reflection_summary = (
+        "ChatInter 记忆反思最近 "
+        f"{reflection['total']} 条\n"
+        "action: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(reflection["action_counts"].items()))
+        + f"\nwritten={reflection['written']}"
+    )
     await MessageUtils.build_message(
-        render_route_observer_summary() + "\n\n" + render_execution_observer_summary()
+        render_route_observer_summary()
+        + "\n\n"
+        + render_execution_observer_summary()
+        + "\n\n"
+        + reflection_summary
     ).send()
 
 

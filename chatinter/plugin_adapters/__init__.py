@@ -60,7 +60,6 @@ SlotExtractor = Callable[[str, str], dict[str, Any]]
 SchemaBuilder = Callable[[str, list[CommandCapability]], list[PluginCommandSchema]]
 SemanticAliasProvider = Callable[[str, str, bool], list[str]]
 ScoreHintProvider = Callable[[PluginCommandSchema, str, str], list[AdapterScoreHint]]
-PromptScoreHintProvider = Callable[[PluginCommandSchema, str], list[AdapterScoreHint]]
 ClarifyRouteResolver = Callable[
     [str, list["CommandCandidate"]], AdapterClarifyRoute | None
 ]
@@ -80,7 +79,6 @@ class PluginCommandAdapter:
     slot_extractor_prefixes: tuple[str, ...] = ()
     slot_extractor: SlotExtractor | None = None
     score_hints: ScoreHintProvider | None = None
-    prompt_score_hints: PromptScoreHintProvider | None = None
     clarify_route: ClarifyRouteResolver | None = None
 
 
@@ -269,19 +267,6 @@ def collect_score_hints(
     return hints
 
 
-def collect_prompt_score_hints(
-    schema: PluginCommandSchema,
-    *,
-    normalized_query: str,
-) -> list[AdapterScoreHint]:
-    hints: list[AdapterScoreHint] = []
-    for adapter in iter_adapters():
-        if adapter.prompt_score_hints is None:
-            continue
-        hints.extend(adapter.prompt_score_hints(schema, normalized_query))
-    return hints
-
-
 def resolve_adapter_clarify_route(
     message_text: str,
     candidates: list["CommandCandidate"],
@@ -381,7 +366,6 @@ __all__ = [
     "AdapterTargetPolicy",
     "PluginCommandAdapter",
     "build_adapter_schemas",
-    "collect_prompt_score_hints",
     "collect_score_hints",
     "command_family_from_adapter",
     "derive_adapter_semantic_aliases",

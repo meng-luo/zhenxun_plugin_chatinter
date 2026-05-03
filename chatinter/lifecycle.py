@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
+import importlib
 import re
 from typing import Any, Literal
 
@@ -45,7 +46,7 @@ _MIDDLE_CONTEXT_BUDGET = 3500
 _BUDGET_ALERT_RATIO = 0.90
 
 try:
-    import tiktoken
+    tiktoken = importlib.import_module("tiktoken")
 except Exception:
     tiktoken = None
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -138,9 +138,7 @@ def _extract_reply_context(
         if not reply_id:
             reply_id = (
                 str(
-                    getattr(reply, "message_id", "")
-                    or getattr(reply, "id", "")
-                    or ""
+                    getattr(reply, "message_id", "") or getattr(reply, "id", "") or ""
                 ).strip()
                 or None
             )
@@ -203,12 +201,15 @@ def build_event_context(
     reply = _extract_reply_context(event, uni_msg or raw_message)
     images = _extract_images(message_text)
 
-    event_id = str(
-        getattr(event, "message_id", "")
-        or getattr(event, "event_id", "")
-        or getattr(event, "id", "")
-        or ""
-    ).strip() or None
+    event_id = (
+        str(
+            getattr(event, "message_id", "")
+            or getattr(event, "event_id", "")
+            or getattr(event, "id", "")
+            or ""
+        ).strip()
+        or None
+    )
 
     return ChatInterEventContext(
         adapter=_event_adapter_name(bot),

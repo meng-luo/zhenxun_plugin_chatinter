@@ -58,10 +58,10 @@ class ExecutionObservation:
     selected_rank: int = 0
     selected_score: float = 0.0
     selected_reason: str = ""
-    no_hit_recovery_attempts: int = 0
-    no_hit_recovery_success: int = 0
-    no_hit_recovery_query: str = ""
-    no_hit_recovery_reason: str = ""
+    query_expansion_attempts: int = 0
+    query_expansion_success: int = 0
+    query_expansion_query: str = ""
+    query_expansion_reason: str = ""
     rerank_attempts: int = 0
     rerank_success: int = 0
     rerank_no_available: int = 0
@@ -87,10 +87,10 @@ class ExecutionFrame:
     selected_rank: int = 0
     selected_score: float = 0.0
     selected_reason: str = ""
-    no_hit_recovery_attempts: int = 0
-    no_hit_recovery_success: int = 0
-    no_hit_recovery_query: str = ""
-    no_hit_recovery_reason: str = ""
+    query_expansion_attempts: int = 0
+    query_expansion_success: int = 0
+    query_expansion_query: str = ""
+    query_expansion_reason: str = ""
     rerank_attempts: int = 0
     rerank_success: int = 0
     rerank_no_available: int = 0
@@ -123,10 +123,10 @@ class ExecutionFrame:
             selected_rank=self.selected_rank,
             selected_score=self.selected_score,
             selected_reason=self.selected_reason,
-            no_hit_recovery_attempts=self.no_hit_recovery_attempts,
-            no_hit_recovery_success=self.no_hit_recovery_success,
-            no_hit_recovery_query=self.no_hit_recovery_query,
-            no_hit_recovery_reason=self.no_hit_recovery_reason,
+            query_expansion_attempts=self.query_expansion_attempts,
+            query_expansion_success=self.query_expansion_success,
+            query_expansion_query=self.query_expansion_query,
+            query_expansion_reason=self.query_expansion_reason,
             rerank_attempts=self.rerank_attempts,
             rerank_success=self.rerank_success,
             rerank_no_available=self.rerank_no_available,
@@ -141,6 +141,7 @@ class ExecutionObserver:
     _command_feedback: ClassVar[dict[str, float]] = {}
     _session_command_feedback: ClassVar[dict[str, dict[str, float]]] = {}
     _module_feedback: ClassVar[dict[str, float]] = {}
+    _reason_feedback: ClassVar[dict[str, dict[str, float]]] = {}
 
     @classmethod
     def configure(cls, *, max_records: int | None = None) -> None:
@@ -166,10 +167,10 @@ class ExecutionObserver:
         selected_rank: int | None = None,
         selected_score: float | None = None,
         selected_reason: str | None = None,
-        no_hit_recovery_attempts: int | None = None,
-        no_hit_recovery_success: int | None = None,
-        no_hit_recovery_query: str | None = None,
-        no_hit_recovery_reason: str | None = None,
+        query_expansion_attempts: int | None = None,
+        query_expansion_success: int | None = None,
+        query_expansion_query: str | None = None,
+        query_expansion_reason: str | None = None,
         rerank_attempts: int | None = None,
         rerank_success: int | None = None,
         rerank_no_available: int | None = None,
@@ -190,12 +191,12 @@ class ExecutionObserver:
             selected_rank=max(int(selected_rank or 0), 0),
             selected_score=float(selected_score or 0.0),
             selected_reason=normalize_message_text(selected_reason or "")[:120],
-            no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
-            no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
-            no_hit_recovery_query=normalize_message_text(no_hit_recovery_query or "")[
+            query_expansion_attempts=max(int(query_expansion_attempts or 0), 0),
+            query_expansion_success=max(int(query_expansion_success or 0), 0),
+            query_expansion_query=normalize_message_text(query_expansion_query or "")[
                 :160
             ],
-            no_hit_recovery_reason=normalize_message_text(no_hit_recovery_reason or "")[
+            query_expansion_reason=normalize_message_text(query_expansion_reason or "")[
                 :160
             ],
             rerank_attempts=max(int(rerank_attempts or 0), 0),
@@ -226,10 +227,10 @@ class ExecutionObserver:
         selected_rank: int | None = None,
         selected_score: float | None = None,
         selected_reason: str | None = None,
-        no_hit_recovery_attempts: int | None = None,
-        no_hit_recovery_success: int | None = None,
-        no_hit_recovery_query: str | None = None,
-        no_hit_recovery_reason: str | None = None,
+        query_expansion_attempts: int | None = None,
+        query_expansion_success: int | None = None,
+        query_expansion_query: str | None = None,
+        query_expansion_reason: str | None = None,
         rerank_attempts: int | None = None,
         rerank_success: int | None = None,
         rerank_no_available: int | None = None,
@@ -257,12 +258,12 @@ class ExecutionObserver:
             selected_rank=max(int(selected_rank or 0), 0),
             selected_score=float(selected_score or 0.0),
             selected_reason=normalize_message_text(selected_reason or "")[:120],
-            no_hit_recovery_attempts=max(int(no_hit_recovery_attempts or 0), 0),
-            no_hit_recovery_success=max(int(no_hit_recovery_success or 0), 0),
-            no_hit_recovery_query=normalize_message_text(no_hit_recovery_query or "")[
+            query_expansion_attempts=max(int(query_expansion_attempts or 0), 0),
+            query_expansion_success=max(int(query_expansion_success or 0), 0),
+            query_expansion_query=normalize_message_text(query_expansion_query or "")[
                 :160
             ],
-            no_hit_recovery_reason=normalize_message_text(no_hit_recovery_reason or "")[
+            query_expansion_reason=normalize_message_text(query_expansion_reason or "")[
                 :160
             ],
             rerank_attempts=max(int(rerank_attempts or 0), 0),
@@ -283,15 +284,7 @@ class ExecutionObserver:
         if not command_id and not plugin_module:
             return
 
-        delta = 0.0
-        if observation.action == "execute":
-            delta = 1.0 if observation.success else -1.2
-        elif observation.action == "clarify":
-            delta = -0.35
-        elif observation.action == "usage" and observation.success:
-            delta = 0.25
-        elif not observation.success:
-            delta = -0.5
+        delta = cls._feedback_delta(observation)
         if not delta:
             return
         if observation.selected_rank > 1 and observation.success:
@@ -322,9 +315,61 @@ class ExecutionObserver:
                     for key, _ in weakest:
                         session_bucket.pop(key, None)
         if plugin_module:
+            module_weight = 0.35
+            if not command_id and observation.reason in {
+                EXECUTION_REASON_INVALID_COMMAND,
+                EXECUTION_REASON_REROUTE_FAILED,
+            }:
+                module_weight = 1.0
             cls._module_feedback[plugin_module] = clamp(
-                cls._module_feedback.get(plugin_module, 0.0) + delta * 0.35
+                cls._module_feedback.get(plugin_module, 0.0) + delta * module_weight
             )
+        if command_id and observation.reason:
+            reason_bucket = cls._reason_feedback.setdefault(observation.reason, {})
+            reason_bucket[command_id] = clamp(
+                reason_bucket.get(command_id, 0.0) + delta
+            )
+            if len(reason_bucket) > 256:
+                weakest = sorted(reason_bucket.items(), key=lambda item: abs(item[1]))[
+                    :32
+                ]
+                for key, _ in weakest:
+                    reason_bucket.pop(key, None)
+
+    @classmethod
+    def _feedback_delta(cls, observation: ExecutionObservation) -> float:
+        reason = normalize_message_text(observation.reason)
+        if observation.action == "execute" and observation.success:
+            return 1.0
+        if observation.action == "usage" and observation.success:
+            return 0.25
+        if observation.action == "clarify":
+            return -0.18
+        if reason in {
+            EXECUTION_REASON_MISSING_IMAGE,
+            EXECUTION_REASON_MISSING_REPLY,
+            EXECUTION_REASON_MISSING_TEXT,
+            EXECUTION_REASON_MISSING_PARAMS,
+            EXECUTION_REASON_CLARIFY_REQUESTED,
+        }:
+            return -0.12
+        if reason == EXECUTION_REASON_PERMISSION_DENIED:
+            return -0.04
+        if reason == EXECUTION_REASON_PLUGIN_NOT_LOADED:
+            return -0.2
+        if reason in {
+            EXECUTION_REASON_INVALID_COMMAND,
+            EXECUTION_REASON_REROUTE_FAILED,
+        }:
+            return -1.4
+        if reason in {
+            EXECUTION_REASON_TIMEOUT,
+            EXECUTION_REASON_LLM_ERROR,
+            EXECUTION_REASON_CANCELLED,
+            EXECUTION_REASON_ERROR,
+        }:
+            return -0.45
+        return -0.5 if not observation.success else 0.0
 
     @classmethod
     def snapshot(cls, limit: int = 200) -> dict[str, Any]:
@@ -343,8 +388,8 @@ class ExecutionObserver:
                 "avg_selected_rank": 0.0,
                 "avg_selected_score": 0.0,
                 "recent_failures": [],
-                "no_hit_recovery_attempts": 0,
-                "no_hit_recovery_success": 0,
+                "query_expansion_attempts": 0,
+                "query_expansion_success": 0,
                 "rerank_attempts": 0,
                 "rerank_success": 0,
                 "rerank_no_available": 0,
@@ -383,10 +428,10 @@ class ExecutionObserver:
                 2,
             ),
             "recent_failures": recent_failures,
-            "no_hit_recovery_attempts": sum(
-                row.no_hit_recovery_attempts for row in rows
+            "query_expansion_attempts": sum(
+                row.query_expansion_attempts for row in rows
             ),
-            "no_hit_recovery_success": sum(row.no_hit_recovery_success for row in rows),
+            "query_expansion_success": sum(row.query_expansion_success for row in rows),
             "rerank_attempts": sum(row.rerank_attempts for row in rows),
             "rerank_success": sum(row.rerank_success for row in rows),
             "rerank_no_available": sum(row.rerank_no_available for row in rows),
@@ -398,6 +443,7 @@ class ExecutionObserver:
         cls._command_feedback.clear()
         cls._session_command_feedback.clear()
         cls._module_feedback.clear()
+        cls._reason_feedback.clear()
 
     @classmethod
     def command_feedback_score(

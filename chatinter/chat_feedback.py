@@ -70,6 +70,11 @@ class ChatFeedbackStore:
                 normalize_message_text(message_text),
                 normalize_message_text(reply_text),
             )
+        cls._record_memory_feedback(
+            session_id=normalized_session,
+            kind=kind,
+            weight=float(weight or 0.0),
+        )
         cls._prune(now)
 
     @classmethod
@@ -126,6 +131,12 @@ class ChatFeedbackStore:
     def clear(cls) -> None:
         cls._records.clear()
         cls._last_chat.clear()
+        try:
+            from .memory_feedback_reranker import MemoryFeedbackReranker
+
+            MemoryFeedbackReranker.clear()
+        except Exception:
+            pass
 
     @classmethod
     def _prune(cls, now: float) -> None:
@@ -136,6 +147,26 @@ class ChatFeedbackStore:
         ]
         for session in expired_sessions:
             cls._last_chat.pop(session, None)
+
+    @staticmethod
+    def _record_memory_feedback(
+        *,
+        session_id: str,
+        kind: ChatFeedbackKind,
+        weight: float,
+    ) -> None:
+        if kind not in {"user_corrected", "user_thanks", "followup_same_topic"}:
+            return
+        try:
+            from .memory_feedback_reranker import MemoryFeedbackReranker
+
+            MemoryFeedbackReranker.record_feedback(
+                session_id=session_id,
+                kind=kind,
+                weight=weight,
+            )
+        except Exception:
+            pass
 
 
 def _shared_token_count(left: str, right: str) -> int:

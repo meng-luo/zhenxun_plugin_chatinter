@@ -52,6 +52,7 @@ from .config import (
     get_config_value,
     get_model_name,
 )
+from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .utils.cache import get_user_impression_with_cache
@@ -101,6 +102,9 @@ _COMPLEX_QUERY_HINTS = (
 
 
 class DialogueContextPack(Protocol):
+    @property
+    def thread(self) -> object | None: ...
+
     def to_context_xml(self) -> str: ...
 
 
@@ -632,7 +636,7 @@ class ChatMemory:
         user_message: str | UniMessage,
         ai_response: str | UniMessage,
         bot_id: str | None = None,
-    ):
+    ) -> ChatInterChatHistory | None:
         """添加一轮对话到数据库（一问一答）"""
         session_id = self.get_session_id(user_id, group_id)
 
@@ -649,13 +653,7 @@ class ChatMemory:
                 ai_response=formatted_ai_response,
                 bot_id=bot_id,
             )
-        await ChatMemoryStore.record_from_dialog(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            message_text=formatted_user_message,
-            source_dialog_id=getattr(dialog, "id", None),
-        )
+        return dialog
 
     async def build_full_context(
         self,
@@ -734,6 +732,15 @@ class ChatMemory:
             if packed_context:
                 lines.append(packed_context)
         lines.extend(self._build_conversation_focus(current_message_text))
+        thread = getattr(dialogue_context, "thread", None)
+        addressee = getattr(dialogue_context, "addressee", None)
+        thread_id = str(getattr(thread, "thread_id", "") or "").strip()
+        thread_user_ids = tuple(
+            str(item)
+            for item in getattr(thread, "related_user_ids", ()) or ()
+            if str(item)
+        )
+        addressee_user_id = str(getattr(addressee, "target_user_id", "") or "")
 
         session_id = self.get_session_id(user_id, group_id)
         isolate_context, isolate_reason = await self._should_isolate_context(
@@ -761,6 +768,7 @@ class ChatMemory:
                 user_id,
                 group_id,
                 current_message_text=current_message_text,
+                thread_id=thread_id or None,
             )
             if history_context_lines:
                 lines.append("<history_context>")
@@ -773,6 +781,7 @@ class ChatMemory:
                 group_id,
                 bot_id,
                 current_message_text=current_message_text,
+                thread_user_ids=thread_user_ids,
             )
             if group_background_lines:
                 lines.append("<history>")
@@ -785,6 +794,16 @@ class ChatMemory:
                 user_id=user_id,
                 group_id=group_id,
                 query=current_message_text,
+                recall_context=MemoryRecallContext.build(
+                    session_id=session_id,
+                    user_id=user_id,
+                    group_id=group_id,
+                    thread_id=thread_id or None,
+                    topic_key=str(getattr(thread, "topic_key", "") or ""),
+                    participants=thread_user_ids,
+                    addressee_user_id=addressee_user_id or None,
+                    query=current_message_text,
+                ),
             )
             if memory_lines:
                 lines.append("<long_term_memory>")
@@ -1079,6 +1098,7 @@ class ChatMemory:
         user_id: str,
         group_id: str | None,
         current_message_text: str = "",
+        thread_id: str | None = None,
     ) -> list[str]:
         """构建对话历史 XML（来自 ChatInterChatHistory）
 
@@ -1103,9 +1123,21 @@ class ChatMemory:
             max_context * self._compression_fetch_factor,
             recall_candidate_limit,
         )
+        thread_dialogs = await self._load_thread_dialogs(
+            thread_id=thread_id,
+            group_id=group_id,
+            limit=max_context,
+        )
+        thread_dialog_ids = {int(dialog.id or 0) for dialog in thread_dialogs}
         dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
+        if thread_dialog_ids:
+            dialogs = [
+                dialog
+                for dialog in dialogs
+                if int(dialog.id or 0) not in thread_dialog_ids
+            ]
 
-        if not dialogs:
+        if not dialogs and not thread_dialogs:
             return []
 
         history_summary = ""
@@ -1153,7 +1185,7 @@ class ChatMemory:
                 recalled_dialogs.sort(key=lambda item: int(item.id or 0))
 
         if group_id:
-            display_dialogs = [*dialogs, *recalled_dialogs]
+            display_dialogs = [*thread_dialogs, *dialogs, *recalled_dialogs]
             user_ids_to_fetch = {
                 dlg.user_id
                 for dlg in display_dialogs
@@ -1162,83 +1194,102 @@ class ChatMemory:
             await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
 
         history_lines: list[str] = []
+        if thread_dialogs:
+            history_lines.append(f"当前话题历史({len(thread_dialogs)}条):")
+            for dlg in thread_dialogs:
+                history_lines.extend(self._format_dialog_history_lines(dlg, group_id))
         if history_summary:
             history_lines.append(history_summary)
         if recalled_dialogs:
             history_lines.append(f"相关历史记忆({len(recalled_dialogs)}条):")
             for dlg in recalled_dialogs:
-                if dlg.create_time:
-                    timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
-                else:
-                    timestamp = "??:??:??"
-                if group_id:
-                    cached_nick = self._user_nickname_cache.get(dlg.user_id)
-                    sender = (
-                        f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
-                    )
-                else:
-                    sender = f"[{dlg.nickname}]"
-
-                recalled_user_msg = self._clip_context_line(
-                    self._strip_non_final_channel_text(
-                        uni_to_text_with_tags(dlg.user_message)
-                    ),
-                    120,
+                history_lines.extend(
+                    self._format_dialog_history_lines(dlg, group_id, limit=120)
                 )
-                history_lines.append(f"[{timestamp}] {sender}: {recalled_user_msg}")
-
-                if dlg.ai_response:
-                    ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-                    recalled_ai_msg = self._clip_context_line(
-                        self._strip_non_final_channel_text(
-                            uni_to_text_with_tags(dlg.ai_response)
-                        ),
-                        120,
-                    )
-                    history_lines.append(
-                        f"[{timestamp}] {ai_sender}: {recalled_ai_msg}"
-                    )
 
         for dlg in dialogs:
-            if dlg.create_time:
-                timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
-            else:
-                timestamp = "??:??:??"
-
-            if group_id:
-                cached_nick = self._user_nickname_cache.get(dlg.user_id)
-                sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
-            else:
-                sender = f"[{dlg.nickname}]"
-
-            user_msg = self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dlg.user_message)
-            )
-            history_lines.append(f"[{timestamp}] {sender}: {user_msg}")
-
-            if dlg.ai_response:
-                ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-                ai_msg = self._strip_non_final_channel_text(
-                    uni_to_text_with_tags(dlg.ai_response)
-                )
-                history_lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
+            history_lines.extend(self._format_dialog_history_lines(dlg, group_id))
 
         return history_lines
+
+    async def _load_thread_dialogs(
+        self,
+        *,
+        thread_id: str | None,
+        group_id: str | None,
+        limit: int,
+    ) -> list[ChatInterChatHistory]:
+        if not thread_id:
+            return []
+        try:
+            from .thread_store import get_recent_thread_dialog_ids
+
+            dialog_ids = await get_recent_thread_dialog_ids(
+                thread_id=thread_id,
+                group_id=group_id,
+                limit=limit,
+            )
+        except Exception:
+            return []
+        if not dialog_ids:
+            return []
+        try:
+            rows = await ChatInterChatHistory.filter(id__in=dialog_ids).all()
+        except Exception:
+            return []
+        by_id = {int(row.id or 0): row for row in rows}
+        return [by_id[item] for item in dialog_ids if item in by_id]
+
+    def _format_dialog_history_lines(
+        self,
+        dlg: ChatInterChatHistory,
+        group_id: str | None,
+        *,
+        limit: int = 0,
+    ) -> list[str]:
+        timestamp = (
+            dlg.create_time.strftime("%m-%d %H:%M:%S")
+            if dlg.create_time
+            else "??:??:??"
+        )
+        if group_id:
+            cached_nick = self._user_nickname_cache.get(dlg.user_id)
+            sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
+        else:
+            sender = f"[{dlg.nickname}]"
+
+        user_msg = self._strip_non_final_channel_text(
+            uni_to_text_with_tags(dlg.user_message)
+        )
+        if limit > 0:
+            user_msg = self._clip_context_line(user_msg, limit)
+        lines = [f"[{timestamp}] {sender}: {user_msg}"]
+
+        if dlg.ai_response:
+            ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
+            ai_msg = self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dlg.ai_response)
+            )
+            if limit > 0:
+                ai_msg = self._clip_context_line(ai_msg, limit)
+            lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
+        return lines
 
     async def _build_group_background_xml(
         self,
         group_id: str | None,
         bot_id: str | None = None,
         current_message_text: str = "",
+        thread_user_ids: tuple[str, ...] = (),
     ) -> list[str]:
-        """构建群聊背景 XML（最近 5 条群消息，来自 ChatHistory）
+        """构建群聊背景 XML（最近群消息，来自 ChatHistory）
 
         格式：[时间][发送者]: 内容
 
         参数:
-            user_id: 用户 ID
             group_id: 群组 ID
             bot_id: Bot ID
+            thread_user_ids: 当前话题参与者，召回时提高这些人的消息权重
 
         返回:
             list[str]: XML 行列表
@@ -1270,6 +1321,9 @@ class ChatMemory:
             return lines
 
         query_tokens = self._tokenize_context_text(current_message_text)
+        thread_user_id_set = {
+            str(item).strip() for item in thread_user_ids if str(item).strip()
+        }
         user_ids_to_fetch = set()
         for msg in chat_history_msgs:
             is_bot_msg = bot_id and msg.user_id == bot_id
@@ -1287,6 +1341,8 @@ class ChatMemory:
             score = (
                 self._similarity_score(query_tokens, content) if query_tokens else 0.0
             )
+            if str(msg.user_id or "") in thread_user_id_set:
+                score += 0.22
             scored_msgs.append((msg, content, score))
 
         if not scored_msgs:
@@ -1310,6 +1366,20 @@ class ChatMemory:
                 reverse=True,
             )
             for item in related_candidates[:relevant_limit]:
+                selected.append(item)
+                selected_ids.add(int(item[0].id))
+        elif thread_user_id_set and relevant_limit > 0:
+            thread_candidates = [
+                item
+                for item in scored_msgs
+                if int(item[0].id) not in selected_ids
+                and str(item[0].user_id or "") in thread_user_id_set
+            ]
+            thread_candidates.sort(
+                key=lambda item: (item[2], int(item[0].id)),
+                reverse=True,
+            )
+            for item in thread_candidates[:relevant_limit]:
                 selected.append(item)
                 selected_ids.add(int(item[0].id))
 

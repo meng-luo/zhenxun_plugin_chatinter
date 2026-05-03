@@ -29,10 +29,10 @@ class TurnMetricsSnapshot:
     route_prompt_full_candidates: int
     route_prompt_compact_candidates: int
     route_prompt_name_only_candidates: int
-    no_hit_recovery_attempts: int = 0
-    no_hit_recovery_success: int = 0
-    no_hit_recovery_query: str = ""
-    no_hit_recovery_reason: str = ""
+    query_expansion_attempts: int = 0
+    query_expansion_success: int = 0
+    query_expansion_query: str = ""
+    query_expansion_reason: str = ""
     rerank_attempts: int = 0
     rerank_success: int = 0
     rerank_no_available: int = 0
@@ -76,17 +76,17 @@ def build_turn_metrics_snapshot(
         route_prompt_name_only_candidates=(
             route_report.prompt_name_only_candidates if route_report else 0
         ),
-        no_hit_recovery_attempts=(
-            route_report.no_hit_recovery_attempts if route_report else 0
+        query_expansion_attempts=(
+            route_report.query_expansion_attempts if route_report else 0
         ),
-        no_hit_recovery_success=(
-            route_report.no_hit_recovery_success if route_report else 0
+        query_expansion_success=(
+            route_report.query_expansion_success if route_report else 0
         ),
-        no_hit_recovery_query=(
-            route_report.no_hit_recovery_query if route_report else ""
+        query_expansion_query=(
+            route_report.query_expansion_query if route_report else ""
         ),
-        no_hit_recovery_reason=(
-            route_report.no_hit_recovery_reason if route_report else ""
+        query_expansion_reason=(
+            route_report.query_expansion_reason if route_report else ""
         ),
         rerank_attempts=(route_report.rerank_attempts if route_report else 0),
         rerank_success=(route_report.rerank_success if route_report else 0),
@@ -124,10 +124,10 @@ class RouteObservation:
     prompt_full_candidates: int
     prompt_compact_candidates: int
     prompt_name_only_candidates: int
-    no_hit_recovery_attempts: int
-    no_hit_recovery_success: int
-    no_hit_recovery_query: str
-    no_hit_recovery_reason: str
+    query_expansion_attempts: int
+    query_expansion_success: int
+    query_expansion_query: str
+    query_expansion_reason: str
     rerank_attempts: int
     rerank_success: int
     rerank_no_available: int
@@ -163,8 +163,8 @@ class _RouteObserver:
                 "avg_prompt_compact_candidates": 0.0,
                 "avg_prompt_name_only_candidates": 0.0,
                 "recent_failures": [],
-                "no_hit_recovery_attempts": 0,
-                "no_hit_recovery_success": 0,
+                "query_expansion_attempts": 0,
+                "query_expansion_success": 0,
                 "rerank_attempts": 0,
                 "rerank_success": 0,
                 "rerank_no_available": 0,
@@ -209,10 +209,10 @@ class _RouteObserver:
                 2,
             ),
             "recent_failures": recent_failures,
-            "no_hit_recovery_attempts": sum(
-                row.no_hit_recovery_attempts for row in rows
+            "query_expansion_attempts": sum(
+                row.query_expansion_attempts for row in rows
             ),
-            "no_hit_recovery_success": sum(row.no_hit_recovery_success for row in rows),
+            "query_expansion_success": sum(row.query_expansion_success for row in rows),
             "rerank_attempts": sum(row.rerank_attempts for row in rows),
             "rerank_success": sum(row.rerank_success for row in rows),
             "rerank_no_available": sum(row.rerank_no_available for row in rows),
@@ -246,10 +246,10 @@ def record_route_observation(
     prompt_full_candidates = 0
     prompt_compact_candidates = 0
     prompt_name_only_candidates = 0
-    no_hit_recovery_attempts = 0
-    no_hit_recovery_success = 0
-    no_hit_recovery_query = ""
-    no_hit_recovery_reason = ""
+    query_expansion_attempts = 0
+    query_expansion_success = 0
+    query_expansion_query = ""
+    query_expansion_reason = ""
     rerank_attempts = 0
     rerank_success = 0
     rerank_no_available = 0
@@ -290,17 +290,17 @@ def record_route_observation(
         prompt_name_only_candidates = int(
             getattr(route_report, "prompt_name_only_candidates", 0) or 0
         )
-        no_hit_recovery_attempts = int(
-            getattr(route_report, "no_hit_recovery_attempts", 0) or 0
+        query_expansion_attempts = int(
+            getattr(route_report, "query_expansion_attempts", 0) or 0
         )
-        no_hit_recovery_success = int(
-            getattr(route_report, "no_hit_recovery_success", 0) or 0
+        query_expansion_success = int(
+            getattr(route_report, "query_expansion_success", 0) or 0
         )
-        no_hit_recovery_query = str(
-            getattr(route_report, "no_hit_recovery_query", "") or ""
+        query_expansion_query = str(
+            getattr(route_report, "query_expansion_query", "") or ""
         )
-        no_hit_recovery_reason = str(
-            getattr(route_report, "no_hit_recovery_reason", "") or ""
+        query_expansion_reason = str(
+            getattr(route_report, "query_expansion_reason", "") or ""
         )
         rerank_attempts = int(getattr(route_report, "rerank_attempts", 0) or 0)
         rerank_success = int(getattr(route_report, "rerank_success", 0) or 0)
@@ -331,10 +331,10 @@ def record_route_observation(
             prompt_full_candidates=prompt_full_candidates,
             prompt_compact_candidates=prompt_compact_candidates,
             prompt_name_only_candidates=prompt_name_only_candidates,
-            no_hit_recovery_attempts=no_hit_recovery_attempts,
-            no_hit_recovery_success=no_hit_recovery_success,
-            no_hit_recovery_query=no_hit_recovery_query,
-            no_hit_recovery_reason=no_hit_recovery_reason,
+            query_expansion_attempts=query_expansion_attempts,
+            query_expansion_success=query_expansion_success,
+            query_expansion_query=query_expansion_query,
+            query_expansion_reason=query_expansion_reason,
             rerank_attempts=rerank_attempts,
             rerank_success=rerank_success,
             rerank_no_available=rerank_no_available,

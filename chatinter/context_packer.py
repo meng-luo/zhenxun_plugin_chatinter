@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from .addressee_resolver import AddresseeResult, format_addressee_xml
 from .event_context import ChatInterEventContext
@@ -89,9 +89,13 @@ def _event_lines(event_context: ChatInterEventContext) -> list[str]:
         )
     if event_context.reply:
         if event_context.reply.message_id:
-            lines.append(f"reply_message_id={_xml_escape(event_context.reply.message_id)}")
+            lines.append(
+                f"reply_message_id={_xml_escape(event_context.reply.message_id)}"
+            )
         if event_context.reply.sender_id:
-            lines.append(f"reply_sender_id={_xml_escape(event_context.reply.sender_id)}")
+            lines.append(
+                f"reply_sender_id={_xml_escape(event_context.reply.sender_id)}"
+            )
     if event_context.images:
         lines.append(f"image_count={len(event_context.images)}")
     lines.append("</event_context>")

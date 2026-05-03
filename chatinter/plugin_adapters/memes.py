@@ -35,6 +35,9 @@ _CANONICAL_ALIAS_MAP: dict[str, str] = {
     "扔出去": "丢",
     "丢出": "丢",
     "扔出": "丢",
+    "天使": "小天使",
+    "天使头像": "小天使",
+    "小天使头像": "小天使",
 }
 
 _SHORT_ACTION_SUFFIXES = (
@@ -66,6 +69,7 @@ _HELPER_NOTIFY_TEMPLATES = (
 )
 
 _HELPER_HEADS = frozenset({"表情搜索", "表情详情", "启用表情", "更新表情"})
+_ADAPTER_OWNED_HEADS = frozenset({"表情包制作", "随机表情", *_HELPER_HEADS})
 
 
 def _meme_semantic_aliases(
@@ -88,6 +92,10 @@ def _meme_semantic_aliases(
     if len(head) <= 2:
         for suffix in _SHORT_ACTION_SUFFIXES:
             add(f"{head}{suffix}")
+    if head == "小天使":
+        add("天使")
+        add("天使头像")
+        add("小天使头像")
     return aliases
 
 
@@ -190,19 +198,30 @@ def _build_meme_schemas(
         schema(
             "memes.random",
             "随机表情",
-            aliases=["随机做个表情", "随机表情包", "随便做个表情"],
+            aliases=[
+                "随机做个表情",
+                "随机表情包",
+                "随便做个表情",
+                "随便做表情",
+                "随便把图整成表情",
+            ],
             description="使用当前图片/文字随机制作一个表情包",
             render="随机表情",
             requires={"image": False, "text": False},
             command_role="random",
             payload_policy="text_or_image",
             extra_text_policy="discard",
+            retrieval_phrases=[
+                "随便 表情",
+                "随机 表情",
+                "随便 把 图 整成 表情",
+            ],
         ),
     ]
     seen = {item.command_id for item in schemas}
     for command in commands:
         head = normalize_message_text(command.command)
-        if not head or _is_shadowed_meme_head(head):
+        if not head or head in _ADAPTER_OWNED_HEADS or _is_shadowed_meme_head(head):
             continue
         command_schema = _schema_from_capability(module, command)
         if command_schema is None or command_schema.command_id in seen:
@@ -215,6 +234,15 @@ def _build_meme_schemas(
 def _meme_slot_extractor(command_id: str, source: str) -> dict[str, Any]:
     normalized_id = normalize_message_text(command_id)
     text = normalize_message_text(source)
+    if normalized_id.endswith((".吃", ".拍")) and re.search(
+        r"\[image(?:#\d+)?\]",
+        text,
+        re.IGNORECASE,
+    ):
+        if normalized_id.endswith(".吃") and "吃" in text:
+            return {"image": "[image]"}
+        if normalized_id.endswith(".拍") and "拍" in text:
+            return {"image": "[image]"}
     if normalized_id == "memes.search":
         patterns = (
             r"(?:查找|搜索|找|搜|查)(?:一下)?\s*(?P<keyword>.+?)(?:相关)?(?:的)?表情",
@@ -288,6 +316,20 @@ def _meme_score_hints(
             token in lowered_query for token in ("做", "制作", "生成", "来个", "来张")
         ):
             hints.append(AdapterScoreHint(80.0, "meme_catalog_intent"))
+    if command_id == "memes.list" and any(
+        token in lowered_query for token in ("随便", "随机")
+    ):
+        hints.append(AdapterScoreHint(-160.0, "meme_catalog_random_penalty"))
+    if (
+        command_id == "memes.random"
+        and any(token in lowered_query for token in ("随机", "随便"))
+        and any(token in lowered_query for token in ("图", "表情", "梗图"))
+    ):
+        hints.append(AdapterScoreHint(260.0, "meme_random_intent"))
+    if command_id.endswith(".小天使") and any(
+        token in lowered_query for token in ("天使", "天使头像")
+    ):
+        hints.append(AdapterScoreHint(280.0, "meme_semantic_template"))
     if schema_value.command_role == "template" and any(
         token in lowered_query for token in ("表情", "表情包", "梗图", "头像")
     ):
@@ -297,9 +339,14 @@ def _meme_score_hints(
     ):
         hints.append(AdapterScoreHint(260.0, "meme_search_intent"))
     if command_id == "memes.info" and any(
-        token in lowered_query for token in ("怎么用", "用法", "详情")
+        token in lowered_query
+        for token in ("怎么用", "用法", "详情", "参数怎么看", "参数怎么", "参数")
     ):
         hints.append(AdapterScoreHint(220.0, "meme_info_intent"))
+    if command_id == "memes.info" and any(
+        token in lowered_query for token in ("表情详情", "表情用法", "表情参数")
+    ):
+        hints.append(AdapterScoreHint(360.0, "meme_info_head_intent"))
     return hints
 
 
@@ -328,7 +375,15 @@ def _is_generic_meme_creation_request(
     meme_candidates = [item for item in candidates if item.family == "meme"]
     if not meme_candidates:
         return False
-    if "随机" in normalized:
+    if any(token in normalized for token in ("随机", "随便")):
+        return False
+    if any(
+        normalize_message_text(phrase).casefold() in normalized
+        for candidate in meme_candidates
+        if candidate.schema.command_role == "template"
+        for phrase in [candidate.schema.head, *candidate.schema.aliases]
+        if normalize_message_text(phrase)
+    ):
         return False
     if not any(token in normalized for token in ("表情", "表情包", "梗图", "头像")):
         return False
@@ -422,9 +477,6 @@ register_adapter(
         if command_id.startswith("nonebot_plugin_memes.")
         else {},
         score_hints=_meme_score_hints,
-        prompt_score_hints=lambda schema_value, normalized_query: _meme_score_hints(
-            schema_value, normalized_query, normalized_query
-        ),
         clarify_route=_meme_clarify_route,
     )
 )

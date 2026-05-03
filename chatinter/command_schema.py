@@ -32,6 +32,19 @@ _TEXT_TAIL_PREFIX_PATTERN = re.compile(
     r"^(?:这句话|这段话|这句|内容|文本|参数|链接|地址|是|为|叫|名称|名字|"
     r"：|:|-|，|,|。)+"
 )
+_EMPTY_TEXT_PAYLOAD_WORDS = {
+    "一下",
+    "一下子",
+    "一下下",
+    "看看",
+    "看下",
+    "帮我",
+    "请",
+    "麻烦",
+    "吧",
+    "一下吧",
+    "下吧",
+}
 
 
 @dataclass(frozen=True)
@@ -610,6 +623,24 @@ def _clean_text_payload(value: str) -> str:
     return payload
 
 
+def _clean_head_payload(raw_payload: str, head: str) -> str:
+    payload = normalize_message_text(raw_payload)
+    if not payload:
+        return ""
+    head_text = normalize_message_text(head)
+    if head_text and payload.startswith(head_text):
+        payload = normalize_message_text(payload[len(head_text) :])
+    payload = re.sub(
+        r"^(?:做一句|做一段|写一句|写一段|说一句|说一段|做|写|说|"
+        r"内容(?:是|为)?|文本(?:是|为)?|文字(?:是|为)?|"
+        r"：|:|，|,|。)+",
+        "",
+        payload,
+    )
+    payload = _clean_text_payload(payload)
+    return "" if payload in _EMPTY_TEXT_PAYLOAD_WORDS else payload
+
+
 def _extract_command_tail_payload(
     schema: PluginCommandSchema,
     message_text: str,
@@ -619,6 +650,16 @@ def _extract_command_tail_payload(
         normalized_head = normalize_message_text(head)
         if not normalized_head:
             continue
+        head_index = normalize_message_text(message_text).find(normalized_head)
+        if head_index > 0:
+            payload = _clean_head_payload(
+                normalize_message_text(
+                    message_text[head_index + len(normalized_head) :]
+                ),
+                normalized_head,
+            )
+            if payload:
+                return payload
         parsed = parse_command_with_head(
             message_text,
             normalized_head,
@@ -627,7 +668,7 @@ def _extract_command_tail_payload(
         )
         if parsed is None:
             continue
-        payload = _clean_text_payload(parsed.payload_text)
+        payload = _clean_head_payload(parsed.payload_text, normalized_head)
         if payload:
             return payload
     return ""

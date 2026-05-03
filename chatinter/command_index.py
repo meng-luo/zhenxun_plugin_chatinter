@@ -36,6 +36,7 @@ _RRF_K = 60.0
 _FAMILY_SOFT_CAP = 6
 _PLUGIN_SOFT_CAP = 8
 _EXACT_KEEP_LIMIT = 8
+_CJK_COMMAND_BOUNDARY_CHARS = frozenset(" ，,。.!！？?；;：:/|）)]】}《<>")
 
 
 @dataclass(frozen=True)
@@ -126,11 +127,17 @@ def _build_candidate_features(
 
 
 def _tokens(text: str) -> set[str]:
-    return {
+    tokens = {
         token.casefold()
         for token in _TOKEN_PATTERN.findall(normalize_message_text(text))
         if token
     }
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", normalize_message_text(text)):
+        max_size = min(len(chunk), 4)
+        for size in range(2, max_size + 1):
+            for start in range(0, len(chunk) - size + 1):
+                tokens.add(chunk[start : start + size].casefold())
+    return tokens
 
 
 def _schema_text(schema: PluginCommandSchema) -> str:
@@ -196,6 +203,32 @@ def _match_exact_or_alias(
     return exact_head, exact_alias
 
 
+def _has_cjk_command_boundary(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    start = 0
+    while True:
+        index = text.find(phrase, start)
+        if index < 0:
+            return False
+        end = index + len(phrase)
+        if end >= len(text) or text[end] in _CJK_COMMAND_BOUNDARY_CHARS:
+            return True
+        start = index + 1
+
+
+def _is_embedded_short_cjk_match(text: str, phrase: str) -> bool:
+    normalized_text = normalize_message_text(text).casefold()
+    normalized_phrase = normalize_message_text(phrase).casefold()
+    if len(normalized_phrase) > 1:
+        return False
+    if not normalized_text or not normalized_phrase:
+        return False
+    if match_command_head(normalized_text, normalized_phrase):
+        return False
+    return not _has_cjk_command_boundary(normalized_text, normalized_phrase)
+
+
 def _base_score_tool(
     tool: CommandToolSnapshot,
     schema: PluginCommandSchema,
@@ -235,14 +268,18 @@ def _base_score_tool(
     if head and lowered.startswith(head):
         score += 260.0
         reasons.append("head_prefix")
-    if head and head in lowered:
+    if head and head in lowered and not _is_embedded_short_cjk_match(lowered, head):
         score += 120.0 + min(len(head), 8)
         reasons.append("head")
     for alias in aliases:
         if alias and lowered.startswith(alias):
             score += 240.0
             reasons.append("alias_prefix")
-        elif alias and alias in lowered:
+        elif (
+            alias
+            and alias in lowered
+            and not _is_embedded_short_cjk_match(lowered, alias)
+        ):
             score += 150.0 + min(len(alias), 12)
             reasons.append("alias")
 
@@ -554,11 +591,37 @@ def build_command_candidates(
     session_id: str | None = None,
     diversify: bool = True,
     tools: list[CommandToolSnapshot] | None = None,
+    expanded_queries: list[str] | None = None,
 ) -> list[CommandCandidate]:
     if tools is None:
         graph = build_capability_graph_snapshot(knowledge_base)
         tools = build_command_tool_snapshots(graph)
-    ranked = _score_all_tools(tools, query, session_id=session_id)
+    queries: list[str] = []
+    for value in [query, *(expanded_queries or [])]:
+        normalized = normalize_message_text(value)
+        if normalized and normalized not in queries:
+            queries.append(normalized)
+    if not queries:
+        queries = [query]
+    ranked: list[_ScoredCandidate] = []
+    for index, item_query in enumerate(queries):
+        query_ranked = _score_all_tools(tools, item_query, session_id=session_id)
+        if index > 0:
+            query_ranked = [
+                _ScoredCandidate(
+                    tool=item.tool,
+                    schema=item.schema,
+                    score=item.score * max(0.86 - index * 0.04, 0.66),
+                    reasons=(
+                        *item.reasons,
+                        f"query_expansion_{index}",
+                    ),
+                    exact_protected=item.exact_protected,
+                    features=item.features,
+                )
+                for item in query_ranked
+            ]
+        ranked.extend(query_ranked)
     merged = _merge_ranked_candidates(ranked)
     selected = _diversify_candidates(
         merged,
@@ -579,65 +642,6 @@ def build_command_candidates(
         )
         for item in selected
     ]
-
-
-def build_recovered_command_candidates(
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    original_query: str,
-    capability_query: str,
-    limit: int = 48,
-    session_id: str | None = None,
-    tools: list[CommandToolSnapshot] | None = None,
-) -> list[CommandCandidate]:
-    """Recall tools with a rewritten capability query, scoped to installed tools."""
-
-    if tools is None:
-        graph = build_capability_graph_snapshot(knowledge_base)
-        tools = build_command_tool_snapshots(graph)
-    recovered = build_command_candidates(
-        knowledge_base,
-        capability_query,
-        limit=max(limit * 2, limit),
-        session_id=session_id,
-        diversify=False,
-        tools=tools,
-    )
-    if not recovered:
-        return []
-    original_ranked = {
-        candidate.schema.command_id: candidate
-        for candidate in build_command_candidates(
-            knowledge_base,
-            original_query,
-            limit=max(limit, 8),
-            session_id=session_id,
-            diversify=False,
-            tools=tools,
-        )
-    }
-    merged: list[CommandCandidate] = []
-    for candidate in recovered:
-        original = original_ranked.get(candidate.schema.command_id)
-        score = candidate.score + (original.score * 0.25 if original else 0.0)
-        reason = f"recovery:{candidate.reason}"
-        if original is not None:
-            reason = f"{reason};original:{original.reason}"
-        merged.append(
-            CommandCandidate(
-                plugin_module=candidate.plugin_module,
-                plugin_name=candidate.plugin_name,
-                schema=candidate.schema,
-                score=score,
-                reason=reason,
-                family=candidate.family,
-                reasons=("recovery", *candidate.reasons),
-                exact_protected=candidate.exact_protected,
-                features=candidate.features,
-            )
-        )
-    merged.sort(key=lambda item: item.score, reverse=True)
-    return merged[:limit]
 
 
 def group_candidates_by_module(
@@ -801,7 +805,6 @@ __all__ = [
     "CommandCandidate",
     "build_candidate_snapshots",
     "build_command_candidates",
-    "build_recovered_command_candidates",
     "dump_candidate_for_prompt",
     "dump_schema_for_prompt",
     "find_schema_in_candidates",

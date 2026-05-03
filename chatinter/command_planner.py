@@ -125,6 +125,20 @@ def _text_payload_count(command: str) -> int:
     for token in collect_placeholders(tail):
         tail = tail.replace(token, " ")
     tail = normalize_message_text(tail)
+    if tail in {
+        "一下",
+        "一下子",
+        "一下下",
+        "看看",
+        "看下",
+        "帮我",
+        "请",
+        "麻烦",
+        "吧",
+        "一下吧",
+        "下吧",
+    }:
+        return 0
     return len([item for item in tail.split(" ") if item])
 
 

@@ -196,7 +196,9 @@ class PluginRAGFeedbackMixin:
                 journal = journal[-_SESSION_FEEDBACK_LOG_KEEP:]
             cls._session_feedback_journal[session_id] = journal
             cls._session_preference_time[session_id] = now
-            cls._clear_query_cache()
+            clear_query_cache = getattr(cls, "_clear_query_cache", None)
+            if callable(clear_query_cache):
+                clear_query_cache()
 
     @classmethod
     def _session_pref_scores(cls, session_id: str | None) -> dict[str, float]:
@@ -236,7 +238,7 @@ class PluginRAGFeedbackMixin:
         cls,
         session_id: str | None,
         query: str,
-        context_text: str,
+        context_text: str = "",
     ) -> dict[str, float]:
         if not session_id:
             return {}

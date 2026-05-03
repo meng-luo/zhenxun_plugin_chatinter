@@ -20,7 +20,7 @@ from .turn_runtime import TurnBudgetController
 
 def _debug_log(message: str) -> None:
     try:
-        from zhenxun.services import logger
+        from zhenxun.services.log import logger
 
         logger.debug(message)
     except Exception:
@@ -159,13 +159,20 @@ def build_tool_rerank_prompt(
         }
         if recovery_query or recovery_reason
         else None,
+        "decision_order": [
+            "1 判断 action：chat / no_available_tool / usage / clarify / execute",
+            "2 如果调用工具，先选最匹配的 family/plugin，再选 command_id",
+            "3 联合抽取 slots；缺必填文本/图片/回复/目标时 clarify",
+            "4 exact_protected/score/reason 只是本地召回证据，不是最终决策",
+            "5 如果用户在讨论命令、概念或功能体验，选择 chat",
+        ],
         "task": (
             "在 candidates 中重排并分类。只允许选择一个 command_id；"
-            "如果用户只是聊天/讨论，返回 chat；"
-            "如果用户确实想调用工具但候选没有合适工具，返回 no_available_tool；"
-            "如果询问怎么用/用法，返回 usage；"
-            "如果工具明确但缺少必填输入，返回 clarify 并列出 missing；"
-            "如果可执行，返回 execute 并填写 slots。"
+            "不要因为候选分数高或 exact_protected 就自动执行；"
+            "普通聊天/讨论/概念解释返回 chat；"
+            "有工具意图但候选都不合适返回 no_available_tool；"
+            "问用法/参数/怎么用返回 usage；工具明确但缺输入返回 clarify；"
+            "可执行则 execute 并填写 slots。"
         ),
         "candidates": _candidate_payload(candidates),
     }
@@ -235,11 +242,11 @@ async def request_tool_rerank(
         recovery_reason=recovery_reason,
     )
     instruction = (
-        "你是 ChatInter 的命令候选重排器。"
-        "只能在 candidates 里选择 command_id，不能发明工具、命令、插件或槽位。"
+        "你是 ChatInter 的 LLM 工具决策器。先判断用户是否真的要调用工具，"
+        "再按 action -> family/plugin -> command_id -> slots 决策。只能在 candidates "
+        "里选择 command_id，不能发明工具、命令、插件或槽位。本地 score、reason、"
+        "exact_protected 只是召回证据；用户讨论命令/功能/概念时必须选 chat。"
         "命令头已由系统保存，输出 command_id 和 slots 即可。"
-        "把普通聊天和工具调用严格分开；把候选不足与普通聊天区分开。"
-        "exact_protected=true 表示用户输入了真实命令头，除非明显闲聊，否则优先保留。"
     )
 
     async def _validate(decision: ToolRerankDecision) -> None:
@@ -256,7 +263,7 @@ async def request_tool_rerank(
             user_text=prompt,
             controller=budget_controller,
         )
-        from zhenxun.services import generate_structured
+        from zhenxun.services.llm import generate_structured
 
         decision = await generate_structured(
             guarded.user_text,

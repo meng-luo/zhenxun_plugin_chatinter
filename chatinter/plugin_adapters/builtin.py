@@ -53,6 +53,12 @@ def _extract_redbag_slots(message_text: str) -> dict[str, Any]:
         text,
         "num",
     )
+    if num is None:
+        num = _extract_number(
+            rf"(?P<num>{NUMBER_TEXT})\s*(?:个人|人)\s*领",
+            text,
+            "num",
+        )
     if amount is not None:
         slots["amount"] = amount
     if num is not None:
@@ -95,13 +101,14 @@ def _extract_redbag_slots(message_text: str) -> dict[str, Any]:
 
 def _extract_translate_slots(message_text: str) -> dict[str, Any]:
     text = normalize_message_text(message_text)
-    if text in {"帮我翻译一下", "翻译一下"}:
+    if text in {"帮我翻译一下", "翻译一下", "翻译一下吧", "翻译吧"}:
         return {}
     if any(
         token in text for token in ("支持哪些语言", "支持什么语言", "翻译语种", "语种")
     ):
         return {}
     for pattern in (
+        r"把\s*(?P<text>.+?)\s*翻(?:译)?(?:一下)?(?:成(?:中文|英文|日文|韩文))?",
         r"把\s*(?P<text>.+?)\s*翻(?:译)?成(?:中文|英文|日文|韩文)",
         r"用中文说一下\s*(?P<text>.+)",
         r"翻译一下\s*(?P<text>.+)",
@@ -110,7 +117,7 @@ def _extract_translate_slots(message_text: str) -> dict[str, Any]:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             value = normalize_message_text(match.group("text"))
-            if value:
+            if value and value not in {"吧", "一下", "一下吧"}:
                 return {"text": value}
     return {}
 
@@ -148,6 +155,26 @@ def _extract_nbnhhsh_slots(message_text: str) -> dict[str, Any]:
     return {}
 
 
+def _extract_word_bank_slots(message_text: str) -> dict[str, Any]:
+    text = normalize_message_text(message_text)
+    for pattern in (
+        r"(?:问题是|问题为)\s*(?P<q>.+?)\s*(?:回答是|回答为|答案是|答案为)\s*(?P<a>.+)",
+        r"(?:添加问答|添加词条|问答添加|加个词条)\s*(?P<text>.+)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        if "text" in match.groupdict():
+            value = normalize_message_text(match.group("text"))
+        else:
+            question = normalize_message_text(match.group("q"))
+            answer = normalize_message_text(match.group("a"))
+            value = f"{question}={answer}" if question and answer else ""
+        if value:
+            return {"text": value}
+    return {}
+
+
 def _same_command(command_id: str):
     def extractor(_command_id: str, source: str) -> dict[str, Any]:
         if command_id == "gold_redbag.send":
@@ -158,6 +185,8 @@ def _same_command(command_id: str):
             return _extract_roll_slots(source)
         if command_id == "nbnhhsh.expand":
             return _extract_nbnhhsh_slots(source)
+        if command_id == "word_bank.add":
+            return _extract_word_bank_slots(source)
         return {}
 
     return extractor
@@ -210,6 +239,9 @@ def _music_semantic_aliases(
             "听歌",
             "搜歌",
             "找歌",
+            "放一首",
+            "放首",
+            "给我放一首",
         ),
     )
 
@@ -272,6 +304,24 @@ def _builtin_score_hints(
         re.IGNORECASE,
     ):
         hints.append(AdapterScoreHint(120.0, "abbr_intent"))
+    if command_id == "gold_redbag.return" and any(
+        token in lowered_query
+        for token in ("退回", "退还", "没领完", "没抢完", "没抢完的红包退")
+    ):
+        hints.append(AdapterScoreHint(260.0, "redbag_return_intent"))
+    if command_id == "gold_redbag.open" and any(
+        token in lowered_query for token in ("没领完", "没抢完", "退回", "退还")
+    ):
+        hints.append(AdapterScoreHint(-260.0, "redbag_open_penalty"))
+    if command_id == "gold_redbag.send" and any(
+        token in lowered_query
+        for token in ("发个金币红包", "金币红包", "发红包", "总额", "个人领", "人领")
+    ):
+        hints.append(AdapterScoreHint(160.0, "redbag_send_intent"))
+    if command_id == "gold_redbag.open" and any(
+        token in lowered_query for token in ("总额", "个人领", "人领")
+    ):
+        hints.append(AdapterScoreHint(-220.0, "redbag_open_send_penalty"))
     lang_query_tokens = ("支持哪些", "哪些语言", "语种", "支持什么语言")
     if schema_value.requires.get("text") and any(
         token in lowered_query for token in lang_query_tokens
@@ -289,8 +339,61 @@ register_adapter(
 
 register_adapter(
     PluginCommandAdapter(
+        modules=("zhenxun.plugins.word_bank",),
+        family="word_bank",
+        schemas=(
+            schema(
+                "word_bank.add",
+                "添加问答",
+                aliases=["添加词条", "问答添加", "加个词条", "新增问答"],
+                description="添加词库问答；需要问题和回答文本",
+                slots=[slot("text", "text", required=True, aliases=["问题=回答"])],
+                render="添加问答 {text}",
+                requires={"text": True},
+                payload_policy="text",
+                extra_text_policy="slot_only",
+            ),
+        ),
+        slot_extractors={"word_bank.add": _same_command("word_bank.add")},
+    )
+)
+
+register_adapter(
+    PluginCommandAdapter(
         modules=("zhenxun.plugins.music",),
         semantic_aliases=_music_semantic_aliases,
+        family="music",
+        schemas=(
+            schema(
+                "music.play",
+                "点歌",
+                aliases=[
+                    "点歌",
+                    "搜歌",
+                    "音乐",
+                    "点一首歌",
+                    "点首歌",
+                    "播一首歌",
+                    "播首歌",
+                    "来一首歌",
+                    "放一首歌",
+                    "给我放一首",
+                ],
+                description="点歌、搜歌、播放歌曲；需要歌曲名",
+                slots=[slot("text", "text", required=True, aliases=["歌曲名", "歌名"])],
+                render="点歌 {text}",
+                requires={"text": True},
+                payload_policy="text",
+                extra_text_policy="slot_only",
+            ),
+        ),
+        slot_extractors={
+            "music.play": _simple_text_extractor(
+                (
+                    r"(?:点歌|搜歌|音乐|点一首歌|点首歌|播一首歌|播首歌|来一首歌|放一首歌|给我放一首)\s*(?P<text>.+)",
+                )
+            )
+        },
     )
 )
 
@@ -350,6 +453,7 @@ register_adapter(
             ),
         ),
         slot_extractors={"gold_redbag.send": _same_command("gold_redbag.send")},
+        score_hints=_builtin_score_hints,
     )
 )
 
@@ -393,6 +497,11 @@ register_adapter(
                 aliases=[
                     "随机数字",
                     "掷骰子",
+                    "掷个骰子",
+                    "帮我掷骰子",
+                    "帮我掷个骰子",
+                    "投骰子",
+                    "扔骰子",
                     "roll点",
                     "随机一个数字",
                     "投个随机数字",
@@ -463,6 +572,31 @@ register_adapter(
 
 register_adapter(
     PluginCommandAdapter(
+        modules=("zhenxun.plugins.parse_bilibili",),
+        family="link_parser",
+        schemas=(
+            schema(
+                "parse_bilibili.video",
+                "B站解析",
+                aliases=["解析B站", "bilibili解析", "解析b站视频", "解析视频"],
+                description="解析哔哩哔哩/B站/b23/BV 视频链接",
+                slots=[slot("target", "text", required=True, aliases=["链接", "BV号"])],
+                render="B站解析 {target}",
+                requires={"text": True},
+                payload_policy="slots",
+                extra_text_policy="slot_only",
+            ),
+        ),
+        slot_extractors={
+            "parse_bilibili.video": _simple_text_extractor(
+                (r"(?P<target>https?://\S+|BV[0-9A-Za-z]+|av\d+)",)
+            )
+        },
+    )
+)
+
+register_adapter(
+    PluginCommandAdapter(
         modules=("zhenxun.plugins.translate",),
         family="translate",
         schemas=(
@@ -495,9 +629,6 @@ register_adapter(
         ),
         slot_extractors={"translate.text": _same_command("translate.text")},
         score_hints=_builtin_score_hints,
-        prompt_score_hints=lambda schema_value, normalized_query: _builtin_score_hints(
-            schema_value, normalized_query, normalized_query
-        ),
     )
 )
 
@@ -548,8 +679,52 @@ register_adapter(
         ),
         slot_extractors={"nbnhhsh.expand": _same_command("nbnhhsh.expand")},
         score_hints=_builtin_score_hints,
-        prompt_score_hints=lambda schema_value, normalized_query: _builtin_score_hints(
-            schema_value, normalized_query, normalized_query
+    )
+)
+
+register_adapter(
+    PluginCommandAdapter(
+        modules=("zhenxun.plugins.what_anime",),
+        family="image_recognition",
+        schemas=(
+            schema(
+                "what_anime.search",
+                "搜番",
+                aliases=["识别番剧", "这是什么番", "识别动漫", "动漫图是什么番"],
+                description="根据图片识别动画、番剧、哪部番或动漫来源",
+                retrieval_phrases=[
+                    "哪部番",
+                    "什么番",
+                    "截图是哪部番",
+                    "动画截图识别",
+                ],
+                render="搜番",
+                requires={"image": True, "reply": True},
+                command_role="template",
+                payload_policy="image_only",
+                extra_text_policy="discard",
+            ),
+        ),
+    )
+)
+
+register_adapter(
+    PluginCommandAdapter(
+        modules=("zhenxun.plugins.what_role",),
+        family="image_recognition",
+        schemas=(
+            schema(
+                "what_role.search",
+                "识别角色",
+                aliases=["角色识别", "这是谁", "识别人物", "图里的角色是谁"],
+                description="根据图片识别动漫角色、人物或角色来源",
+                retrieval_phrases=["图片里这位是谁", "图里是谁", "角色识别"],
+                render="识别角色",
+                requires={"image": True, "reply": True},
+                command_role="template",
+                payload_policy="image_only",
+                extra_text_policy="discard",
+            ),
         ),
     )
 )
@@ -603,8 +778,5 @@ register_adapter(
             ),
         ),
         score_hints=_builtin_score_hints,
-        prompt_score_hints=lambda schema_value, normalized_query: _builtin_score_hints(
-            schema_value, normalized_query, normalized_query
-        ),
     )
 )

@@ -32,7 +32,6 @@ from .models.pydantic_models import (
 from .plugin_reference import (
     build_command_tool_snapshots,
     build_plugin_references,
-    build_router_cards_from_graph,
 )
 from .route_text import normalize_message_text
 
@@ -1704,32 +1703,6 @@ class PluginRegistry:
         if limit is not None:
             return snapshots[: max(int(limit), 0)]
         return snapshots
-
-    @classmethod
-    def build_router_cards(
-        cls,
-        knowledge_base: PluginKnowledgeBase,
-        *,
-        selection_context: PluginSelectionContext | None = None,
-        limit: int | None = None,
-        query: str = "",
-    ) -> list[dict[str, object]]:
-        graph = cls.build_capability_graph(
-            knowledge_base,
-            selection_context=selection_context,
-            limit=limit,
-        )
-        return build_router_cards_from_graph(graph, limit=limit, query=query)
-
-    @classmethod
-    def build_compact_cards(
-        cls,
-        knowledge_base: PluginKnowledgeBase,
-        *,
-        limit: int | None = None,
-    ) -> list[dict[str, object]]:
-        """兼容旧调用：返回 Router 使用的紧凑插件卡片。"""
-        return cls.build_router_cards(knowledge_base, limit=limit)
 
     @classmethod
     async def set_plugin_enabled(

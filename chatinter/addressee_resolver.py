@@ -1,10 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
 
 from .event_context import ChatInterEventContext
-from .person_registry import PersonProfile
+from .person_registry import (
+    AliasCandidate,
+    PersonProfile,
+    normalize_alias_key,
+    resolve_alias_candidates,
+)
 from .route_text import normalize_message_text
 
 AddresseeSource = Literal[
@@ -34,14 +39,28 @@ class AddresseeResult:
 
 _SELF_NAME_HINTS = ("小真寻", "真寻", "机器人", "bot")
 _BROADCAST_HINTS = ("大家", "全体", "有人", "有没有人", "谁来")
+_ALIAS_INTENT_HINTS = (
+    "在吗",
+    "看看",
+    "看下",
+    "问问",
+    "告诉",
+    "给",
+    "帮",
+    "叫",
+    "找",
+    "说",
+)
+_THIRD_PERSON_REPLY_HINTS = ("他", "她", "ta", "对方", "那位", "上面那位", "刚才那位")
 
 
-def resolve_addressee(
+async def resolve_addressee(
     *,
     event_context: ChatInterEventContext,
     bot_names: tuple[str, ...] = (),
     mention_profiles: dict[str, dict[str, str]] | None = None,
     speaker_profile: PersonProfile | None = None,
+    alias_candidates: list[AliasCandidate] | None = None,
 ) -> AddresseeResult:
     text = normalize_message_text(event_context.message_text_with_tags)
     bot_id = str(event_context.bot_id or "").strip()
@@ -70,13 +89,14 @@ def resolve_addressee(
         target_id = str(event_context.reply.sender_id).strip()
         if bot_id and target_id == bot_id:
             return AddresseeResult(bot_id, None, "self", 0.92, reason="reply_to_bot")
-        return AddresseeResult(
-            target_id,
-            target_id,
-            "reply",
-            0.82,
-            reason="reply_to_user",
-        )
+        if any(hint in text for hint in _THIRD_PERSON_REPLY_HINTS) or not text:
+            return AddresseeResult(
+                target_id,
+                target_id,
+                "reply",
+                0.84,
+                reason="reply_target",
+            )
 
     normalized_names = tuple(
         normalize_message_text(name).lower()
@@ -87,6 +107,14 @@ def resolve_addressee(
     if any(name and name in lowered for name in (*normalized_names, *_SELF_NAME_HINTS)):
         return AddresseeResult(bot_id or None, None, "self", 0.78, reason="bot_name")
 
+    alias_result = await _resolve_alias_addressee(
+        event_context=event_context,
+        message_text=text,
+        alias_candidates=alias_candidates,
+    )
+    if alias_result is not None:
+        return alias_result
+
     if any(hint in text for hint in _BROADCAST_HINTS):
         return AddresseeResult(None, None, "broadcast", 0.45, reason="broadcast_hint")
 
@@ -95,6 +123,60 @@ def resolve_addressee(
         pass
 
     return AddresseeResult(None, None, "unknown", 0.0, reason="no_signal")
+
+
+async def _resolve_alias_addressee(
+    *,
+    event_context: ChatInterEventContext,
+    message_text: str,
+    alias_candidates: list[AliasCandidate] | None,
+) -> AddresseeResult | None:
+    normalized = normalize_message_text(message_text)
+    if not normalized or not event_context.group_id:
+        return None
+    if not _has_alias_context(normalized):
+        return None
+
+    candidates = alias_candidates
+    if candidates is None:
+        candidates = await resolve_alias_candidates(
+            group_id=event_context.group_id,
+            text=normalized,
+            exclude_user_id=event_context.user_id,
+            limit=5,
+        )
+    if not candidates:
+        return None
+
+    top = candidates[0]
+    if len(candidates) > 1:
+        second = candidates[1]
+        if top.score < 0.92 or (top.score - second.score) < 0.12:
+            names = "、".join(item.profile.display_name for item in candidates[:3])
+            return AddresseeResult(
+                None,
+                names or None,
+                "alias",
+                top.score,
+                ambiguous=True,
+                reason="alias_ambiguous",
+            )
+    if top.score < 0.86:
+        return None
+    return AddresseeResult(
+        top.profile.user_id,
+        top.profile.display_name,
+        "alias",
+        min(top.score, 0.96),
+        ambiguous=bool(top.profile.conflict_state),
+        reason=f"alias:{normalize_alias_key(top.matched_alias)}",
+    )
+
+
+def _has_alias_context(text: str) -> bool:
+    if any(hint in text for hint in _ALIAS_INTENT_HINTS):
+        return True
+    return len(text) <= 16
 
 
 def format_addressee_xml(result: AddresseeResult) -> list[str]:
