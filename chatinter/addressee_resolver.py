@@ -149,6 +149,16 @@ async def _resolve_alias_addressee(
         return None
 
     top = candidates[0]
+    if top.profile.conflict_state:
+        names = "、".join(item.profile.display_name for item in candidates[:3])
+        return AddresseeResult(
+            None,
+            names or top.profile.display_name or None,
+            "alias",
+            min(top.score, 0.92),
+            ambiguous=True,
+            reason=f"alias_conflict:{normalize_alias_key(top.matched_alias)}",
+        )
     if len(candidates) > 1:
         second = candidates[1]
         if top.score < 0.92 or (top.score - second.score) < 0.12:
@@ -168,7 +178,7 @@ async def _resolve_alias_addressee(
         top.profile.display_name,
         "alias",
         min(top.score, 0.96),
-        ambiguous=bool(top.profile.conflict_state),
+        ambiguous=False,
         reason=f"alias:{normalize_alias_key(top.matched_alias)}",
     )
 

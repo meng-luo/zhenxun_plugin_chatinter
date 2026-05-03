@@ -13,6 +13,7 @@ _PROFILE_CACHE_TTL = 300.0
 _PROFILE_CACHE_MAX = 2048
 _GROUP_ALIAS_CACHE_TTL = 300.0
 _GROUP_ALIAS_CACHE_MAX = 128
+_ALIAS_CONFLICT_PREFIX = "alias_conflict:"
 _profile_cache: dict[str, tuple[float, "PersonProfile"]] = {}
 _group_alias_cache: dict[str, tuple[float, list["PersonProfile"]]] = {}
 _ALIAS_SPLIT_PATTERN = re.compile(r"[\s,，/、|;；]+")
@@ -43,6 +44,15 @@ class AliasCandidate:
     profile: PersonProfile
     score: float
     matched_alias: str = ""
+
+
+@dataclass(frozen=True)
+class RelevantPerson:
+    profile: PersonProfile
+    reason: str
+    confidence: float
+    matched_alias: str = ""
+    is_current_speaker: bool = False
 
 
 def _cache_key(group_id: str | None, user_id: str) -> str:
@@ -202,6 +212,109 @@ async def upsert_seen_person(
             _group_alias_cache.pop(str(group_id), None)
 
 
+async def upsert_person_alias(
+    *,
+    user_id: str,
+    group_id: str | None,
+    alias: str,
+    source: str,
+    confidence: float = 0.78,
+) -> bool:
+    normalized_user_id = str(user_id or "").strip()
+    normalized_alias = normalize_message_text(alias)
+    alias_key = _normalize_alias(normalized_alias)
+    if not normalized_user_id or len(alias_key) < 2:
+        return False
+    try:
+        model = _get_person_model()
+        if model is None:
+            return False
+        conflict_rows = await _find_alias_conflict_rows(
+            model,
+            group_id=group_id,
+            alias_key=alias_key,
+            exclude_user_id=normalized_user_id,
+        )
+        has_external_conflict = await _has_group_member_alias_conflict(
+            group_id=group_id,
+            alias_key=alias_key,
+            exclude_user_id=normalized_user_id,
+        )
+        conflict_state = (
+            _alias_conflict_state(alias_key)
+            if conflict_rows or has_external_conflict
+            else ""
+        )
+        existing = await model.filter(
+            user_id=normalized_user_id,
+            group_id=group_id,
+        ).first()
+        alias_weight = max(min(float(confidence or 0.0), 0.98), 0.0)
+        source_text = normalize_message_text(source)[:64] or "alias"
+        if existing is None:
+            await model.create(
+                user_id=normalized_user_id,
+                group_id=group_id,
+                nickname="",
+                aliases=normalized_alias[:512],
+                alias_weights=_dump_json_dict({alias_key: alias_weight}),
+                alias_sources=_dump_json_dict({alias_key: source_text}),
+                conflict_state=conflict_state,
+                confidence=alias_weight,
+            )
+        else:
+            aliases = list(_split_aliases(getattr(existing, "aliases", "") or ""))
+            if all(_normalize_alias(item) != alias_key for item in aliases):
+                aliases.append(normalized_alias)
+            alias_weights = _load_json_dict(
+                str(getattr(existing, "alias_weights", "") or "")
+            )
+            alias_sources = _load_json_dict(
+                str(getattr(existing, "alias_sources", "") or "")
+            )
+            _merge_alias_weight(alias_weights, normalized_alias, weight=alias_weight)
+            alias_sources.setdefault(alias_key, source_text)
+            existing.aliases = "、".join(aliases[:8])[:512]
+            existing.alias_weights = _dump_json_dict(alias_weights)
+            existing.alias_sources = _dump_json_dict(alias_sources)
+            existing.conflict_state = _merge_conflict_state(
+                str(getattr(existing, "conflict_state", "") or ""),
+                conflict_state,
+                alias_key=alias_key,
+            )
+            existing.confidence = max(
+                float(getattr(existing, "confidence", 0.0) or 0.0),
+                alias_weight,
+            )
+            await existing.save()
+        await _mark_alias_conflict_rows(conflict_rows, alias_key)
+    except Exception:
+        return False
+    finally:
+        _profile_cache.pop(_cache_key(group_id, normalized_user_id), None)
+        if group_id:
+            _group_alias_cache.pop(str(group_id), None)
+    return True
+
+
+def format_person_history_label(
+    profile: PersonProfile,
+    *,
+    fallback_name: str = "",
+) -> str:
+    """Compact stable identity label for chat history lines."""
+
+    name = normalize_message_text(profile.display_name or fallback_name)
+    parts = [f"name={_xml_escape(name or profile.user_id)}"]
+    if profile.user_id:
+        parts.append(f"user_id={_xml_escape(profile.user_id)}")
+    if profile.aliases:
+        parts.append(f"aliases={_xml_escape('、'.join(profile.aliases[:4]))}")
+    if profile.conflict_state:
+        parts.append(f"conflict={_xml_escape(profile.conflict_state)}")
+    return "[" + "; ".join(parts) + "]"
+
+
 def format_profile_lines(profile: PersonProfile, *, prefix: str = "") -> list[str]:
     if not profile.user_id:
         return []
@@ -244,6 +357,132 @@ async def resolve_alias_candidates(
         scored.append(AliasCandidate(profile, score, matched_alias))
     scored.sort(key=lambda item: (item.score, item.profile.confidence), reverse=True)
     return scored[: max(int(limit or 0), 0)]
+
+
+async def resolve_relevant_people(
+    *,
+    group_id: str | None,
+    message_text: str,
+    speaker_profile: PersonProfile | None = None,
+    bot_id: str | None = None,
+    mention_user_ids: tuple[str, ...] = (),
+    reply_sender_id: str | None = None,
+    thread_user_ids: tuple[str, ...] = (),
+    entity_hints: tuple[str, ...] = (),
+    limit: int = 8,
+) -> tuple[RelevantPerson, ...]:
+    """Collect compact person candidates for LLM grounding.
+
+    This is intentionally a context-building helper, not a routing decision maker.
+    It only exposes likely relevant people so the LLM can distinguish speaker,
+    mentioned users, reply target, and nickname candidates.
+    """
+
+    max_items = max(int(limit or 0), 0)
+    if max_items <= 0:
+        return ()
+
+    people: dict[str, RelevantPerson] = {}
+
+    def upsert(
+        profile: PersonProfile | None,
+        *,
+        reason: str,
+        confidence: float,
+        matched_alias: str = "",
+        is_current_speaker: bool = False,
+    ) -> None:
+        if profile is None or not profile.user_id:
+            return
+        key = profile.user_id
+        current = people.get(key)
+        if current is not None and current.confidence >= confidence:
+            if not is_current_speaker or current.is_current_speaker:
+                return
+        people[key] = RelevantPerson(
+            profile=profile,
+            reason=reason,
+            confidence=max(float(confidence or 0.0), 0.0),
+            matched_alias=matched_alias,
+            is_current_speaker=is_current_speaker,
+        )
+
+    speaker_id = speaker_profile.user_id if speaker_profile else ""
+    skipped_ids = {item for item in (speaker_id, str(bot_id or "").strip()) if item}
+    if speaker_profile is not None:
+        upsert(
+            speaker_profile,
+            reason="current_speaker",
+            confidence=max(speaker_profile.confidence, 0.95),
+            is_current_speaker=True,
+        )
+
+    for user_id in mention_user_ids:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id or normalized_user_id in skipped_ids:
+            continue
+        profile = await get_person_profile(
+            user_id=normalized_user_id,
+            group_id=group_id,
+        )
+        upsert(profile, reason="mentioned", confidence=max(profile.confidence, 0.9))
+
+    reply_id = str(reply_sender_id or "").strip()
+    if reply_id and reply_id not in skipped_ids:
+        profile = await get_person_profile(user_id=reply_id, group_id=group_id)
+        upsert(profile, reason="reply_sender", confidence=max(profile.confidence, 0.82))
+
+    for user_id in thread_user_ids:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id or normalized_user_id in skipped_ids:
+            continue
+        if normalized_user_id in people:
+            continue
+        profile = await get_person_profile(
+            user_id=normalized_user_id,
+            group_id=group_id,
+        )
+        upsert(
+            profile,
+            reason="thread_participant",
+            confidence=max(profile.confidence, 0.68),
+        )
+
+    for search_text, reason in (
+        (message_text, "alias_match"),
+        (" ".join(item for item in entity_hints if item), "pending_entity"),
+    ):
+        remaining = max_items - len(people)
+        if remaining <= 0 or not group_id or not search_text:
+            continue
+        alias_candidates = await resolve_alias_candidates(
+            group_id=group_id,
+            text=search_text,
+            exclude_user_id=None,
+            limit=max(remaining + 2, 4),
+        )
+        for candidate in alias_candidates:
+            if len(people) >= max_items:
+                break
+            if candidate.profile.user_id in skipped_ids:
+                continue
+            upsert(
+                candidate.profile,
+                reason=reason,
+                confidence=max(candidate.score, candidate.profile.confidence),
+                matched_alias=candidate.matched_alias,
+            )
+
+    ordered = sorted(
+        people.values(),
+        key=lambda item: (
+            1 if item.is_current_speaker else 0,
+            item.confidence,
+            item.profile.confidence,
+        ),
+        reverse=True,
+    )
+    return tuple(ordered[:max_items])
 
 
 async def _load_person_profile(
@@ -484,6 +723,112 @@ def _score_alias_match(alias_key: str, profile: PersonProfile) -> tuple[float, s
     return max(best_score, 0.0), best_alias
 
 
+async def _find_alias_conflict_rows(
+    model: Any,
+    *,
+    group_id: str | None,
+    alias_key: str,
+    exclude_user_id: str,
+) -> list[Any]:
+    if not alias_key:
+        return []
+    try:
+        rows = await model.filter(group_id=group_id).all()
+    except Exception:
+        return []
+    conflicts: list[Any] = []
+    for row in rows:
+        user_id = str(getattr(row, "user_id", "") or "").strip()
+        if not user_id or user_id == exclude_user_id:
+            continue
+        if alias_key in _row_alias_keys(row):
+            conflicts.append(row)
+    return conflicts
+
+
+async def _has_group_member_alias_conflict(
+    *,
+    group_id: str | None,
+    alias_key: str,
+    exclude_user_id: str,
+) -> bool:
+    if not group_id or not alias_key:
+        return False
+    try:
+        from zhenxun.models.group_member_info import GroupInfoUser
+
+        members = await GroupInfoUser.filter(group_id=group_id).all()
+    except Exception:
+        return False
+    for member in members:
+        user_id = str(getattr(member, "user_id", "") or "").strip()
+        if not user_id or user_id == exclude_user_id:
+            continue
+        aliases = _split_aliases(
+            "、".join(
+                item
+                for item in (
+                    str(getattr(member, "nickname", "") or ""),
+                    str(getattr(member, "user_name", "") or ""),
+                )
+                if item
+            )
+        )
+        if alias_key in {_normalize_alias(alias) for alias in aliases}:
+            return True
+    return False
+
+
+def _row_alias_keys(row: Any) -> set[str]:
+    keys = {
+        _normalize_alias(item)
+        for item in (
+            str(getattr(row, "nickname", "") or ""),
+            str(getattr(row, "group_card", "") or ""),
+        )
+        if item
+    }
+    keys.update(_normalize_alias(alias) for alias in _split_aliases(row.aliases or ""))
+    keys.update(
+        str(key)
+        for key in _load_json_dict(str(getattr(row, "alias_weights", "") or ""))
+        if str(key)
+    )
+    return {key for key in keys if len(key) >= 2}
+
+
+async def _mark_alias_conflict_rows(rows: list[Any], alias_key: str) -> None:
+    conflict_state = _alias_conflict_state(alias_key)
+    for row in rows:
+        try:
+            row.conflict_state = _merge_conflict_state(
+                str(getattr(row, "conflict_state", "") or ""),
+                conflict_state,
+                alias_key=alias_key,
+            )
+            await row.save()
+        except Exception:
+            continue
+
+
+def _alias_conflict_state(alias_key: str) -> str:
+    return f"{_ALIAS_CONFLICT_PREFIX}{alias_key[:48]}"
+
+
+def _merge_conflict_state(
+    current: str,
+    incoming: str,
+    *,
+    alias_key: str,
+) -> str:
+    current_text = normalize_message_text(current)
+    if incoming:
+        return incoming
+    if current_text == _alias_conflict_state(alias_key):
+        return ""
+    return current_text[:64]
+
+
 def _get_person_model() -> Any | None:
     try:
         from .models.chat_history import ChatInterPersonProfile
@@ -506,9 +851,13 @@ def _xml_escape(value: str) -> str:
 __all__ = [
     "AliasCandidate",
     "PersonProfile",
+    "RelevantPerson",
+    "format_person_history_label",
     "format_profile_lines",
     "get_person_profile",
     "normalize_alias_key",
     "resolve_alias_candidates",
+    "resolve_relevant_people",
+    "upsert_person_alias",
     "upsert_seen_person",
 ]

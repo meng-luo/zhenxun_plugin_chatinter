@@ -6,12 +6,31 @@ import time
 
 from .addressee_resolver import AddresseeResult
 from .event_context import ChatInterEventContext
-from .route_text import normalize_message_text
-from .thread_store import find_recent_thread, get_thread_by_message
+from .route_text import contains_any, normalize_message_text
+from .thread_store import (
+    find_recent_pending_thread,
+    find_recent_thread,
+    get_thread_by_message,
+)
 
 _THREAD_TTL = 20 * 60.0
 _THREAD_CACHE_MAX = 512
 _thread_cache: dict[str, tuple[float, "ThreadContext"]] = {}
+_PENDING_FOLLOWUP_HINTS = (
+    "那个",
+    "那位",
+    "这个人",
+    "那个人",
+    "群里那个",
+    "群里的",
+    "刚才那个",
+    "刚说的",
+    "上面那个",
+    "他",
+    "她",
+    "ta",
+    "TA",
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +40,8 @@ class ThreadContext:
     confidence: float
     related_user_ids: tuple[str, ...] = ()
     topic_key: str = ""
+    pending_entities: tuple[str, ...] = ()
+    entity_hints: tuple[str, ...] = ()
 
     @property
     def participants(self) -> tuple[str, ...]:
@@ -49,6 +70,8 @@ async def resolve_thread_context(
                 confidence=max(stored.confidence, 0.96),
                 related_user_ids=stored.participants or participants,
                 topic_key=stored.topic_key,
+                pending_entities=stored.pending_entities,
+                entity_hints=stored.entity_hints,
             )
             _thread_cache[ctx.thread_id] = (now, ctx)
             return ctx
@@ -76,9 +99,29 @@ async def resolve_thread_context(
             confidence=max(stored.confidence, 0.62),
             related_user_ids=stored.participants or participants,
             topic_key=stored.topic_key or topic_key,
+            pending_entities=stored.pending_entities,
+            entity_hints=stored.entity_hints,
         )
         _thread_cache[ctx.thread_id] = (now, ctx)
         return ctx
+
+    if _is_pending_entity_followup(event_context.normalized_text):
+        stored = await find_recent_pending_thread(
+            group_id=event_context.group_id,
+            participants=participants,
+        )
+        if stored is not None and stored.thread_id:
+            ctx = ThreadContext(
+                thread_id=stored.thread_id,
+                source="pending_entity_store",
+                confidence=max(stored.confidence, 0.7),
+                related_user_ids=stored.participants or participants,
+                topic_key=stored.topic_key or topic_key,
+                pending_entities=stored.pending_entities,
+                entity_hints=stored.entity_hints,
+            )
+            _thread_cache[ctx.thread_id] = (now, ctx)
+            return ctx
 
     target_id = addressee.target_user_id or "broadcast"
     seed = f"topic:{group_key}:{target_id}:{topic_key}"
@@ -102,6 +145,12 @@ def format_thread_xml(thread: ThreadContext) -> list[str]:
         lines.append(f"topic_key={_xml_escape(thread.topic_key)}")
     if thread.related_user_ids:
         lines.append(f"related_user_ids={','.join(thread.related_user_ids)}")
+    if thread.pending_entities:
+        lines.append(
+            f"pending_entities={_xml_escape('、'.join(thread.pending_entities))}"
+        )
+    if thread.entity_hints:
+        lines.append(f"entity_hints={_xml_escape('、'.join(thread.entity_hints))}")
     lines.append("</thread>")
     return lines
 
@@ -126,6 +175,13 @@ def _topic_key(text: str) -> str:
     if tokens:
         return " ".join(tokens[:8])[:120]
     return normalized[:24]
+
+
+def _is_pending_entity_followup(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    return contains_any(normalized, _PENDING_FOLLOWUP_HINTS)
 
 
 def _stable_thread_id(seed: str) -> str:

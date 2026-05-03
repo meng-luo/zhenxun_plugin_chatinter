@@ -61,10 +61,6 @@ def decide_memory_policy(
     response = normalize_message_text(response_text or "")
     if not text:
         return MemoryPolicyDecision("skip", reason="empty_message")
-    if text.endswith(_QUESTION_SUFFIXES) or any(
-        hint in text for hint in _LOW_VALUE_MEMORY_HINTS
-    ):
-        return MemoryPolicyDecision("skip", reason="question_or_memory_probe")
     if memory_candidate_count > 0:
         return MemoryPolicyDecision(
             "write",
@@ -72,6 +68,10 @@ def decide_memory_policy(
             confidence=0.86,
             reason="explicit_personal_memory",
         )
+    if text.endswith(_QUESTION_SUFFIXES) or any(
+        hint in text for hint in _LOW_VALUE_MEMORY_HINTS
+    ):
+        return MemoryPolicyDecision("skip", reason="question_or_memory_probe")
     if any(hint in text for hint in _PERSONAL_MEMORY_HINTS):
         return MemoryPolicyDecision(
             "write",

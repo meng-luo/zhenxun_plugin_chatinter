@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from typing import Any
 
 from .route_text import normalize_message_text
@@ -18,6 +19,8 @@ class StoredThreadSnapshot:
     topic_key: str = ""
     source: str = ""
     confidence: float = 0.0
+    pending_entities: tuple[str, ...] = ()
+    entity_hints: tuple[str, ...] = ()
     last_active: datetime | None = None
 
 
@@ -108,6 +111,34 @@ async def find_recent_thread(
     return None
 
 
+async def find_recent_pending_thread(
+    *,
+    group_id: str | None,
+    participants: tuple[str, ...],
+) -> StoredThreadSnapshot | None:
+    thread_model = _get_thread_model()
+    if thread_model is None or not group_id:
+        return None
+    try:
+        rows = (
+            await thread_model.filter(
+                group_id=group_id,
+                archived=False,
+            )
+            .exclude(pending_entities="")
+            .order_by("-last_active", "-id")
+            .limit(8)
+        )
+    except Exception:
+        return None
+    participant_set = set(participants)
+    for row in rows:
+        stored = _split_participants(str(row.participants or ""))
+        if not participant_set or participant_set.intersection(stored):
+            return _snapshot_from_row(row)
+    return None
+
+
 async def record_thread_message(
     *,
     thread_id: str,
@@ -120,6 +151,8 @@ async def record_thread_message(
     source: str,
     confidence: float,
     message_text: str,
+    pending_entities: tuple[str, ...] = (),
+    entity_hints: tuple[str, ...] = (),
 ) -> None:
     thread_model = _get_thread_model()
     message_model = _get_thread_message_model()
@@ -129,6 +162,8 @@ async def record_thread_message(
     participants_text = ",".join(item for item in dict.fromkeys(participants) if item)[
         :1024
     ]
+    pending_text = _dump_items(pending_entities)
+    hints_text = _dump_items(entity_hints)
     try:
         row = (
             await thread_model.filter(thread_id=thread_id, group_id=group_id)
@@ -142,6 +177,8 @@ async def record_thread_message(
                 participants=participants_text,
                 topic_key=topic_key,
                 topic_summary=topic_key,
+                pending_entities=pending_text,
+                entity_hints=hints_text,
                 last_message=preview,
                 source=source,
                 confidence=float(confidence or 0.0),
@@ -153,6 +190,14 @@ async def record_thread_message(
             row.participants = ",".join(merged_participants)[:1024]
             row.topic_key = topic_key or row.topic_key
             row.topic_summary = row.topic_summary or topic_key
+            if pending_text:
+                row.pending_entities = _dump_items(
+                    (*_load_items(row.pending_entities), *pending_entities)
+                )
+            if hints_text:
+                row.entity_hints = _dump_items(
+                    (*_load_items(row.entity_hints), *entity_hints)
+                )
             row.last_message = preview
             row.source = source or row.source
             row.confidence = max(float(row.confidence or 0.0), float(confidence or 0.0))
@@ -179,6 +224,8 @@ def _snapshot_from_row(row: Any) -> StoredThreadSnapshot:
         topic_key=str(getattr(row, "topic_key", "") or ""),
         source=str(getattr(row, "source", "") or ""),
         confidence=float(getattr(row, "confidence", 0.0) or 0.0),
+        pending_entities=_load_items(getattr(row, "pending_entities", "") or ""),
+        entity_hints=_load_items(getattr(row, "entity_hints", "") or ""),
         last_active=getattr(row, "last_active", None),
     )
 
@@ -189,6 +236,46 @@ def _split_participants(raw: str) -> tuple[str, ...]:
             item.strip() for item in str(raw or "").split(",") if item.strip()
         )
     )
+
+
+def _load_items(raw: object) -> tuple[str, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return ()
+    try:
+        value = json.loads(text)
+    except Exception:
+        value = None
+    if isinstance(value, list):
+        items = value
+    else:
+        items = _split_items_fallback(text)
+    return tuple(
+        dict.fromkeys(
+            normalize_message_text(str(item))
+            for item in items
+            if normalize_message_text(str(item))
+        )
+    )[:8]
+
+
+def _split_items_fallback(text: str) -> list[str]:
+    return [
+        item.strip()
+        for item in text.replace("，", ",").replace("、", ",").split(",")
+        if item.strip()
+    ]
+
+
+def _dump_items(items: tuple[str, ...]) -> str:
+    normalized = [
+        item
+        for item in dict.fromkeys(normalize_message_text(value) for value in items)
+        if item
+    ][:8]
+    if not normalized:
+        return ""
+    return json.dumps(normalized, ensure_ascii=False)[:512]
 
 
 def _get_thread_model() -> Any | None:
@@ -211,6 +298,7 @@ def _get_thread_message_model() -> Any | None:
 
 __all__ = [
     "StoredThreadSnapshot",
+    "find_recent_pending_thread",
     "find_recent_thread",
     "get_recent_thread_dialog_ids",
     "get_thread_by_message",

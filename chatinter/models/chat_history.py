@@ -450,6 +450,8 @@ class ChatInterThread(Model):
     participants = fields.TextField(default="")
     topic_key = fields.CharField(255, default="", index=True)
     topic_summary = fields.TextField(default="")
+    pending_entities = fields.TextField(default="")
+    entity_hints = fields.TextField(default="")
     last_message = fields.TextField(default="")
     source = fields.CharField(64, default="")
     confidence = fields.FloatField(default=0.0)
@@ -461,6 +463,14 @@ class ChatInterThread(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "chatinter_thread"
         table_description = "ChatInter 群聊短期话题线程表"
+
+    @classmethod
+    async def _run_script(cls):
+        return [
+            "ALTER TABLE chatinter_thread "
+            "ADD COLUMN pending_entities TEXT DEFAULT '';",
+            "ALTER TABLE chatinter_thread " "ADD COLUMN entity_hints TEXT DEFAULT '';",
+        ]
 
 
 class ChatInterThreadMessage(Model):

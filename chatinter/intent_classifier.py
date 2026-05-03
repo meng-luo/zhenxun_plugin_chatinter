@@ -115,7 +115,32 @@ _CHAT_IDENTITY_TARGET_PATTERNS = (
         r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
         r"(?:是谁|是啥|什么人|哪位|是谁呀|是谁吗|是谁嘛|是谁啊)"
     ),
+    re.compile(
+        r"(?:知道|认识|了解|你知道|你认识|你了解)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:吗|嘛|么|不|没有|没)"
+    ),
+    re.compile(
+        r"(?:群里|这里|这个群里)?(?:谁|哪个|哪位)"
+        r"(?:叫|是|昵称是|群昵称是)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+    ),
+    re.compile(
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:是哪个|是哪位|是群里哪个|是群里哪位|是不是群里的)"
+    ),
+    re.compile(
+        r"(?:我是不是|你忘了我是|还记得我是)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+    ),
     re.compile(r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})(?:是谁|是啥|什么人|哪位)"),
+)
+_CHAT_SELF_IDENTITY_HINTS = (
+    "我是谁",
+    "我叫啥",
+    "我叫什么",
+    "我是哪个",
+    "我是哪位",
 )
 _CHAT_MEMORY_TARGET_PATTERNS = (
     re.compile(
@@ -346,7 +371,7 @@ def _extract_chat_target_hint(
         match = pattern.search(compact)
         if not match:
             continue
-        hint = normalize_message_text(match.group("hint") or "")
+        hint = normalize_message_text(match.groupdict().get("hint", ""))
         if not hint or hint in _SELF_REF_HINTS:
             continue
         if len(hint) > 16:
@@ -390,7 +415,7 @@ def _classify_chat_dialogue(
         compact,
         _CHAT_IDENTITY_TARGET_PATTERNS,
     )
-    if identity_hint:
+    if identity_hint or contains_any(compact, _CHAT_SELF_IDENTITY_HINTS):
         return "identity_query", identity_hint, "identity_query_request"
 
     if query_families and query_families[0] == "general":

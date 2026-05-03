@@ -20,7 +20,11 @@ def build_chat_strategy_prompt(plan: ChatDialoguePlan | None) -> str:
     if plan.kind == "recap":
         return common + "回顾对话时只基于给定历史，不要补不存在的内容。"
     if plan.kind == "identity_query":
-        return common + "身份/称呼问题只基于上下文和记忆回答，不确定就请用户确认。"
+        return (
+            common + "身份/称呼问题只基于 <turn_identity>、<relevant_people>、"
+            "<thread> 和长期记忆回答；有唯一高置信候选才说明是谁，"
+            "多候选或无候选时直接说明不确定并请用户@确认。"
+        )
     if plan.kind == "memory_update":
         return common + "记忆确认要谨慎：可确认已记录/会参考，但不要承诺永久准确。"
     if plan.kind == "explain_context":

@@ -54,7 +54,9 @@ from .config import (
 )
 from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
+from .person_registry import format_person_history_label, get_person_profile
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
+from .route_text import normalize_message_text
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
     extract_reply_from_message,
@@ -1197,18 +1199,20 @@ class ChatMemory:
         if thread_dialogs:
             history_lines.append(f"当前话题历史({len(thread_dialogs)}条):")
             for dlg in thread_dialogs:
-                history_lines.extend(self._format_dialog_history_lines(dlg, group_id))
+                history_lines.extend(
+                    await self._format_dialog_history_lines(dlg, group_id)
+                )
         if history_summary:
             history_lines.append(history_summary)
         if recalled_dialogs:
             history_lines.append(f"相关历史记忆({len(recalled_dialogs)}条):")
             for dlg in recalled_dialogs:
                 history_lines.extend(
-                    self._format_dialog_history_lines(dlg, group_id, limit=120)
+                    await self._format_dialog_history_lines(dlg, group_id, limit=120)
                 )
 
         for dlg in dialogs:
-            history_lines.extend(self._format_dialog_history_lines(dlg, group_id))
+            history_lines.extend(await self._format_dialog_history_lines(dlg, group_id))
 
         return history_lines
 
@@ -1240,7 +1244,7 @@ class ChatMemory:
         by_id = {int(row.id or 0): row for row in rows}
         return [by_id[item] for item in dialog_ids if item in by_id]
 
-    def _format_dialog_history_lines(
+    async def _format_dialog_history_lines(
         self,
         dlg: ChatInterChatHistory,
         group_id: str | None,
@@ -1252,11 +1256,12 @@ class ChatMemory:
             if dlg.create_time
             else "??:??:??"
         )
-        if group_id:
-            cached_nick = self._user_nickname_cache.get(dlg.user_id)
-            sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
-        else:
-            sender = f"[{dlg.nickname}]"
+        sender = await self._format_history_sender(
+            user_id=str(dlg.user_id or ""),
+            group_id=group_id,
+            fallback_name=str(dlg.nickname or ""),
+            bot_id=None,
+        )
 
         user_msg = self._strip_non_final_channel_text(
             uni_to_text_with_tags(dlg.user_message)
@@ -1274,6 +1279,31 @@ class ChatMemory:
                 ai_msg = self._clip_context_line(ai_msg, limit)
             lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
         return lines
+
+    async def _format_history_sender(
+        self,
+        *,
+        user_id: str,
+        group_id: str | None,
+        fallback_name: str = "",
+        bot_id: str | None = None,
+    ) -> str:
+        if bot_id and user_id == bot_id:
+            bot_name = self._bot_nickname or BotConfig.self_nickname
+            return f"[name={bot_name}; user_id={user_id}]"
+        if not group_id:
+            name = normalize_message_text(fallback_name) or user_id
+            return f"[name={name}; user_id={user_id}]"
+        cached_nick = self._user_nickname_cache.get(user_id, "")
+        profile = await get_person_profile(
+            user_id=user_id,
+            group_id=group_id,
+            fallback_name=cached_nick or fallback_name,
+        )
+        return format_person_history_label(
+            profile,
+            fallback_name=cached_nick or fallback_name,
+        )
 
     async def _build_group_background_xml(
         self,
@@ -1393,11 +1423,12 @@ class ChatMemory:
             else:
                 timestamp = "??:??:??"
             is_bot_msg = bot_id and msg.user_id == bot_id
-            if is_bot_msg:
-                sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-            else:
-                cached_nick = self._user_nickname_cache.get(msg.user_id)
-                sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{msg.user_id}]"
+            sender = await self._format_history_sender(
+                user_id=str(msg.user_id or ""),
+                group_id=group_id,
+                fallback_name=self._user_nickname_cache.get(msg.user_id, ""),
+                bot_id=bot_id if is_bot_msg else None,
+            )
 
             lines.append(f"[{timestamp}] {sender}: {content}")
 

@@ -77,7 +77,12 @@ from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState, get_middleware_manager
 from .models.pydantic_models import PluginKnowledgeBase
-from .person_registry import PersonProfile, get_person_profile, upsert_seen_person
+from .person_registry import (
+    PersonProfile,
+    get_person_profile,
+    resolve_relevant_people,
+    upsert_seen_person,
+)
 from .plugin_adapters import (
     AdapterTargetPolicy,
     get_adapter_notification_policy,
@@ -242,6 +247,21 @@ _TECHNICAL_REQUEST_HINT_WORDS = (
     "pull",
     "push",
 )
+_IDENTITY_PENDING_PATTERNS = (
+    re.compile(
+        r"(?:知道|认识|了解|你知道|你认识|你了解)"
+        r"(?P<entity>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:吗|嘛|么|不|没有|没)?"
+    ),
+    re.compile(
+        r"(?P<entity>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:是谁|是啥|什么人|哪位|是哪个|是哪位)"
+    ),
+    re.compile(
+        r"(?:谁|哪个|哪位)(?:叫|是|昵称是|群昵称是)"
+        r"(?P<entity>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+    ),
+)
 _NON_SELF_TARGET_PATTERN = re.compile(r"(?:给|帮|替|让|叫|喊|请)(?!我|自己|本人)")
 _ROUTE_FEEDBACK_REWARD = {
     _FEEDBACK_REASON_ROUTE_SUCCESS: 1.0,
@@ -315,6 +335,25 @@ def _log_turn_channels(envelope: TurnChannelEnvelope) -> None:
         logger.debug("[ChatInter][commentary] " + " | ".join(envelope.commentary))
 
 
+def _extract_pending_entities(message_text: str) -> tuple[str, ...]:
+    normalized = normalize_message_text(message_text)
+    if not normalized:
+        return ()
+    compact = normalized.replace(" ", "")
+    values: list[str] = []
+    for pattern in _IDENTITY_PENDING_PATTERNS:
+        for match in pattern.finditer(compact):
+            entity = normalize_message_text(match.group("entity") or "")
+            if not entity:
+                continue
+            if entity in _SELF_REF_HINTS or entity in {"你", "真寻", "小真寻", "bot"}:
+                continue
+            if _is_technical_request_like(entity):
+                continue
+            values.append(entity[:24])
+    return tuple(dict.fromkeys(values))[:4]
+
+
 async def _persist_final_only_dialog(
     *,
     envelope: TurnChannelEnvelope,
@@ -338,6 +377,14 @@ async def _persist_final_only_dialog(
         bot_id=bot_id,
     )
     if event_context is not None and thread_context is not None:
+        pending_entities = tuple(
+            dict.fromkeys(
+                (
+                    *thread_context.pending_entities,
+                    *_extract_pending_entities(uni_to_text_with_tags(user_message)),
+                )
+            )
+        )
         await record_thread_message(
             thread_id=thread_context.thread_id,
             group_id=group_id,
@@ -349,6 +396,8 @@ async def _persist_final_only_dialog(
             source=thread_context.source,
             confidence=thread_context.confidence,
             message_text=uni_to_text_with_tags(user_message),
+            pending_entities=pending_entities,
+            entity_hints=thread_context.entity_hints,
         )
     await MemoryWriter.write_from_dialog(
         MemoryWriteContext(
@@ -1180,6 +1229,35 @@ async def _build_dialogue_context_pack(
         event_context=event_context,
         addressee=addressee,
     )
+    relevant_people = await resolve_relevant_people(
+        group_id=event_context.group_id,
+        message_text=event_context.message_text_with_tags,
+        speaker_profile=speaker_profile,
+        bot_id=event_context.bot_id,
+        mention_user_ids=tuple(event_context.mentioned_user_ids),
+        reply_sender_id=event_context.reply.sender_id
+        if event_context.reply is not None
+        else None,
+        thread_user_ids=thread.participants,
+        entity_hints=thread.pending_entities,
+    )
+    current_pending_entities = _extract_pending_entities(
+        event_context.message_text_with_tags
+    )
+    if current_pending_entities:
+        thread = ThreadContext(
+            thread_id=thread.thread_id,
+            source=thread.source,
+            confidence=thread.confidence,
+            related_user_ids=thread.related_user_ids,
+            topic_key=thread.topic_key,
+            pending_entities=tuple(
+                dict.fromkeys((*thread.pending_entities, *current_pending_entities))
+            )[:8],
+            entity_hints=tuple(dict.fromkeys((*thread.entity_hints, "identity_query")))[
+                :8
+            ],
+        )
     route_signal = (
         contains_any(event_context.normalized_text, ROUTE_ACTION_WORDS)
         or bool(event_context.mentions)
@@ -1195,6 +1273,7 @@ async def _build_dialogue_context_pack(
         speaker_profile=speaker_profile,
         addressee=addressee,
         thread=thread,
+        relevant_people=relevant_people,
     )
     return pack, speaker_profile, addressee, thread, intervention
 
