@@ -38,7 +38,9 @@ def guard_prompt_sections(
     system_text = str(system_prompt or "")
     context_value = str(context_text or "")
     user_value = str(user_text or "")
-    fingerprint = fingerprint_prompt_section(system_text, context_value[:512], user_value[:256])
+    fingerprint = fingerprint_prompt_section(
+        system_text, context_value[:512], user_value[:256]
+    )
     cache_break = detect_prompt_cache_break(
         session_key=session_key,
         stage=stage,
@@ -47,7 +49,11 @@ def guard_prompt_sections(
 
     if controller is not None:
         remaining = controller.prompt_budget_remaining()
-        token_budget = remaining if remaining > 0 else max(int(controller.prompt_budget_tokens * 0.1), 200)
+        token_budget = (
+            remaining
+            if remaining > 0
+            else max(int(controller.prompt_budget_tokens * 0.1), 200)
+        )
     else:
         token_budget = 4000
     soft_budget = max(int(token_budget * _SOFT_PROMPT_RATIO), 48)
@@ -62,7 +68,9 @@ def guard_prompt_sections(
         system_text = trim_text_to_tokens(system_text, system_budget)
         context_value = trim_text_to_tokens(context_value, context_budget)
         user_value = trim_text_to_tokens(user_value, user_budget)
-        estimated = estimate_text_tokens(f"{system_text}\n{context_value}\n{user_value}")
+        estimated = estimate_text_tokens(
+            f"{system_text}\n{context_value}\n{user_value}"
+        )
 
     if controller is not None:
         controller.record_prompt_use(
@@ -102,7 +110,11 @@ def compact_agent_messages(
 
     if controller is not None:
         remaining = controller.prompt_budget_remaining()
-        token_budget = remaining if remaining > 0 else max(int(controller.prompt_budget_tokens * 0.1), 200)
+        token_budget = (
+            remaining
+            if remaining > 0
+            else max(int(controller.prompt_budget_tokens * 0.1), 200)
+        )
     else:
         token_budget = 4000
     total_tokens = sum(_message_tokens(message) for message in messages)
@@ -118,7 +130,11 @@ def compact_agent_messages(
 
     system_messages = [message for message in messages if message.role == "system"]
     tail_messages = messages[-_MESSAGE_COMPACT_KEEP:]
-    middle_messages = messages[len(system_messages) : max(len(messages) - _MESSAGE_COMPACT_KEEP, len(system_messages))]
+    middle_messages = messages[
+        len(system_messages) : max(
+            len(messages) - _MESSAGE_COMPACT_KEEP, len(system_messages)
+        )
+    ]
     summary_lines: list[str] = []
     for message in middle_messages[-8:]:
         role = str(message.role or "unknown")
@@ -134,7 +150,9 @@ def compact_agent_messages(
     cache_break = detect_prompt_cache_break(
         session_key=session_key,
         stage=stage,
-        fingerprint=fingerprint_prompt_section(*(str(_message_preview(m)) for m in compacted_messages)),
+        fingerprint=fingerprint_prompt_section(
+            *(str(_message_preview(m)) for m in compacted_messages)
+        ),
     )
     if controller is not None:
         controller.record_prompt_use(
@@ -151,7 +169,9 @@ def _message_preview(message: LLMMessage) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for part in content:
-            text = getattr(part, "text", None) or getattr(part, "thought_text", None) or ""
+            text = (
+                getattr(part, "text", None) or getattr(part, "thought_text", None) or ""
+            )
             if text:
                 parts.append(str(text))
         source = " ".join(parts)

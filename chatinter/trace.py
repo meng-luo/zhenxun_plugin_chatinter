@@ -19,13 +19,13 @@ class StageTrace:
         self._stages.append((label, now - self._last))
         self._last = now
 
-    def set_tag(self, key: str, value: str | int | float | None) -> None:
+    def set_tag(self, key: str, value: str | float | None) -> None:
         if value is None:
             self.tags.pop(key, None)
             return
         self.tags[str(key)] = str(value)
 
-    def update_tags(self, **kwargs: str | int | float | None) -> None:
+    def update_tags(self, **kwargs: str | float | None) -> None:
         for key, value in kwargs.items():
             self.set_tag(key, value)
 

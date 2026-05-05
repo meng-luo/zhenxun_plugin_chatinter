@@ -3,6 +3,7 @@ import re
 from typing import Literal
 
 from .models.pydantic_models import PluginKnowledgeBase
+from .plugin_adapters import get_adapter_target_policy_for_schema
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
@@ -24,11 +25,11 @@ from .schema_policy import resolve_command_target_policy
 from .skill_registry import (
     SkillCommandSchema,
     SkillSpec,
-    get_skill_registry,
-    infer_query_families,
-    infer_command_role,
-    _extract_explicit_value,
     _extract_argument_around_head,
+    _extract_explicit_value,
+    get_skill_registry,
+    infer_command_role,
+    infer_query_families,
     skill_search,
 )
 
@@ -48,7 +49,7 @@ IntentSchemaState = Literal[
     "missing_text",
 ]
 
-_AT_TOKEN_PATTERN = re.compile(r"\[@\d{5,20}\]")
+_AT_TOKEN_PATTERN = re.compile(r"\[@[^\]\s]+\]")
 _IMAGE_TOKEN_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _SELF_REF_HINTS = ("我", "自己", "本人", "我自己", "自己的")
 _TECHNICAL_HINTS = (
@@ -115,8 +116,31 @@ _CHAT_IDENTITY_TARGET_PATTERNS = (
         r"(?:是谁|是啥|什么人|哪位|是谁呀|是谁吗|是谁嘛|是谁啊)"
     ),
     re.compile(
-        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})(?:是谁|是啥|什么人|哪位)"
+        r"(?:知道|认识|了解|你知道|你认识|你了解)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:吗|嘛|么|不|没有|没)"
     ),
+    re.compile(
+        r"(?:群里|这里|这个群里)?(?:谁|哪个|哪位)"
+        r"(?:叫|是|昵称是|群昵称是)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+    ),
+    re.compile(
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+        r"(?:是哪个|是哪位|是群里哪个|是群里哪位|是不是群里的)"
+    ),
+    re.compile(
+        r"(?:我是不是|你忘了我是|还记得我是)"
+        r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})"
+    ),
+    re.compile(r"(?P<hint>[A-Za-z0-9\u4e00-\u9fff]{1,16})(?:是谁|是啥|什么人|哪位)"),
+)
+_CHAT_SELF_IDENTITY_HINTS = (
+    "我是谁",
+    "我叫啥",
+    "我叫什么",
+    "我是哪个",
+    "我是哪位",
 )
 _CHAT_MEMORY_TARGET_PATTERNS = (
     re.compile(
@@ -231,7 +255,10 @@ def _find_skill(
     return None
 
 
-def _find_schema(skill: SkillSpec | None, command_head: str) -> SkillCommandSchema | None:
+def _find_schema(
+    skill: SkillSpec | None,
+    command_head: str,
+) -> SkillCommandSchema | None:
     if skill is None:
         return None
     normalized_head = normalize_message_text(command_head)
@@ -248,10 +275,7 @@ def _find_schema(skill: SkillSpec | None, command_head: str) -> SkillCommandSche
         for alias in (skill.aliases or ())
         if normalize_message_text(alias)
     }
-    if (
-        normalized_head in normalized_aliases
-        and len(skill.command_schemas) == 1
-    ):
+    if normalized_head in normalized_aliases and len(skill.command_schemas) == 1:
         return skill.command_schemas[0]
     return None
 
@@ -347,7 +371,7 @@ def _extract_chat_target_hint(
         match = pattern.search(compact)
         if not match:
             continue
-        hint = normalize_message_text(match.group("hint") or "")
+        hint = normalize_message_text(match.groupdict().get("hint", ""))
         if not hint or hint in _SELF_REF_HINTS:
             continue
         if len(hint) > 16:
@@ -373,7 +397,17 @@ def _classify_chat_dialogue(
     memory_hint = _extract_chat_target_hint(compact, _CHAT_MEMORY_TARGET_PATTERNS)
     if memory_hint or contains_any(
         compact,
-        ("记住了吗", "记住了么", "记一下", "记住这个", "以后叫", "就叫", "叫他", "叫她", "叫它"),
+        (
+            "记住了吗",
+            "记住了么",
+            "记一下",
+            "记住这个",
+            "以后叫",
+            "就叫",
+            "叫他",
+            "叫她",
+            "叫它",
+        ),
     ):
         return "memory_confirm", memory_hint, "memory_confirm_request"
 
@@ -381,17 +415,24 @@ def _classify_chat_dialogue(
         compact,
         _CHAT_IDENTITY_TARGET_PATTERNS,
     )
-    if identity_hint:
+    if identity_hint or contains_any(compact, _CHAT_SELF_IDENTITY_HINTS):
         return "identity_query", identity_hint, "identity_query_request"
 
     if query_families and query_families[0] == "general":
         has_context_hint = contains_any(compact, _CHAT_EXPLAIN_CONTEXT_HINTS)
         if has_context_hint and contains_any(compact, _CHAT_EXPLAIN_HINTS):
             return "explain_context", "", "context_explain_request"
-        if has_context_hint and contains_any(
-            compact,
-            ("知道", "了解", "想问", "问一下", "请问"),
-        ) and contains_any(compact, ("是什么", "是啥", "什么意思", "什么含义", "怎么回事")):
+        if (
+            has_context_hint
+            and contains_any(
+                compact,
+                ("知道", "了解", "想问", "问一下", "请问"),
+            )
+            and contains_any(
+                compact,
+                ("是什么", "是啥", "什么意思", "什么含义", "怎么回事"),
+            )
+        ):
             return "explain_context", "", "context_explain_request"
 
     return "general_chat", "", "general_chat"
@@ -411,7 +452,9 @@ def _looks_like_chatty_sticky_payload(
         return False
     if payload_text in _SELF_REF_HINTS:
         return False
-    if normalized_message.endswith(("吗", "嘛", "么", "呢", "吧", "呀", "啦", "？", "?")):
+    if normalized_message.endswith(
+        ("吗", "嘛", "么", "呢", "吧", "呀", "啦", "？", "?")
+    ):
         return True
     return bool(re.search(r"(怎么|如何|为什么|是不是|对不对)", normalized_message))
 
@@ -492,8 +535,7 @@ def _fallback_explicit_command(
                         image_max=getattr(meta, "image_max", None),
                         allow_at=bool(getattr(meta, "allow_at", False)),
                         actor_scope=str(
-                            getattr(meta, "actor_scope", "allow_other")
-                            or "allow_other"
+                            getattr(meta, "actor_scope", "allow_other") or "allow_other"
                         ),
                         target_requirement=str(
                             getattr(meta, "target_requirement", "none") or "none"
@@ -656,7 +698,10 @@ def _should_demote_explicit_command_to_chat(
         return True
     if contains_any(payload_text, _TECHNICAL_HINTS):
         return True
-    if contains_any(payload_text, ("什么", "啥", "怎么", "如何", "为什么", "多少", "哪", "哪种")):
+    if contains_any(
+        payload_text,
+        ("什么", "啥", "怎么", "如何", "为什么", "多少", "哪", "哪种"),
+    ):
         return True
     return False
 
@@ -721,7 +766,14 @@ def _classify_explicit_command(
             rewrite_command=rewrite_command,
         )
 
-    policy = resolve_command_target_policy(schema)
+    policy = resolve_command_target_policy(
+        schema,
+        adapter_policy=get_adapter_target_policy_for_schema(
+            schema,
+            plugin_module=plugin_module,
+            plugin_name=plugin_name,
+        ),
+    )
     available_target_units = image_count
     if has_at and policy.allow_at:
         available_target_units += 1
@@ -855,7 +907,11 @@ def classify_message_intent(
             skill = _find_skill(knowledge_base, plugin_name, plugin_module)
             route_role = infer_command_role(
                 command_head,
-                family=getattr(skill, "kind", "general") if skill is not None else "general",
+                family=(
+                    getattr(skill, "kind", "general")
+                    if skill is not None
+                    else "general"
+                ),
             )
             if (
                 route_role in {"query", "catalog"}
@@ -913,7 +969,9 @@ def classify_message_intent(
     if explicit_command is not None:
         plugin_name, plugin_module, command_head = explicit_command
         skill = _find_skill(knowledge_base, plugin_name, plugin_module)
-        fallback_schema = fallback_explicit[3] if fallback_explicit is not None else None
+        fallback_schema = (
+            fallback_explicit[3] if fallback_explicit is not None else None
+        )
         schema = _find_schema(skill, command_head) or fallback_schema
         if _should_demote_explicit_command_to_chat(
             normalized_message=normalized,
@@ -937,9 +995,8 @@ def classify_message_intent(
         normalized,
         query_families=query_families,
     )
-    if (
-        fallback_intent.kind == "ambiguous"
-        and contains_any(normalized, _EXECUTE_NEED_ARG_HINTS)
+    if fallback_intent.kind == "ambiguous" and contains_any(
+        normalized, _EXECUTE_NEED_ARG_HINTS
     ):
         return fallback_intent
     return fallback_intent

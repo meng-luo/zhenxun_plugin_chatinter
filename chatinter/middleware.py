@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
+import time
 from typing import Any, Literal
 
 from .intent_classifier import IntentClassification
@@ -40,7 +40,9 @@ class TurnMiddlewareState:
 
 
 class ChatInterMiddlewareManager:
-    async def dispatch(self, stage: MiddlewareStage, state: TurnMiddlewareState) -> None:
+    async def dispatch(
+        self, stage: MiddlewareStage, state: TurnMiddlewareState
+    ) -> None:
         controller = state.budget_controller
         started = time.perf_counter()
         if controller is not None and not controller.allow_hook(stage):
@@ -51,7 +53,9 @@ class ChatInterMiddlewareManager:
             if controller is not None:
                 controller.record_hook(stage, time.perf_counter() - started)
 
-    async def _run_stage(self, stage: MiddlewareStage, state: TurnMiddlewareState) -> None:
+    async def _run_stage(
+        self, stage: MiddlewareStage, state: TurnMiddlewareState
+    ) -> None:
         lifecycle = get_lifecycle_manager()
         phase = state.metadata.get("phase") or stage
         payload = LifecyclePayload(

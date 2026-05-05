@@ -7,12 +7,44 @@ ChatInter - 数据模型
 """
 
 # Pydantic 模型（结构化输出）
+from .chat_history import (
+    ChatInterChatHistory,
+    ChatInterMemory,
+    ChatInterPersonProfile,
+    ChatInterThread,
+    ChatInterThreadMessage,
+)
 from .pydantic_models import (
+    CapabilityGraphSnapshot,
+    CommandCandidateFeatures,
+    CommandCandidateSnapshot,
+    CommandCapability,
+    CommandRequirement,
+    CommandSlotSpec,
+    CommandToolSnapshot,
+    PluginCapability,
+    PluginCommandSchema,
     PluginInfo,
     PluginKnowledgeBase,
+    PluginReference,
 )
 
 __all__ = [
+    "CapabilityGraphSnapshot",
+    "ChatInterChatHistory",
+    "ChatInterMemory",
+    "ChatInterPersonProfile",
+    "ChatInterThread",
+    "ChatInterThreadMessage",
+    "CommandCandidateFeatures",
+    "CommandCandidateSnapshot",
+    "CommandCapability",
+    "CommandRequirement",
+    "CommandSlotSpec",
+    "CommandToolSnapshot",
+    "PluginCapability",
+    "PluginCommandSchema",
     "PluginInfo",
     "PluginKnowledgeBase",
+    "PluginReference",
 ]

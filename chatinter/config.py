@@ -36,13 +36,13 @@ HISTORY_SELECTOR_MIN_CANDIDATES = 8
 HISTORY_SELECTOR_TIMEOUT = 6
 MAX_REPLY_LAYERS = 3
 ROUTE_CANDIDATE_EXPAND_STEP = 1
-ROUTE_CANDIDATE_INITIAL_LIMIT = 6
-ROUTE_CANDIDATE_MAX_LIMIT = 6
+ROUTE_CANDIDATE_INITIAL_LIMIT = 24
+ROUTE_CANDIDATE_MAX_LIMIT = 30
 ROUTE_CANDIDATE_MIN_SCORE = 0.35
 ROUTE_DEFERRED_NAMESPACE_ENABLED = False
 LLM_VERIFY_ALL_ROUTES = True
 ROUTE_OBSERVER_MAX_RECORDS = 400
-ROUTE_PROMPT_TOKEN_BUDGET = 2600
+ROUTE_PROMPT_TOKEN_BUDGET = 5600
 SESSION_CONTEXT_LIMIT = 20
 USE_SIGN_IN_IMPRESSION = True
 
@@ -141,11 +141,7 @@ def build_reasoning_generation_config() -> LLMGenerationConfig | None:
     effort_text = get_config_value("REASONING_EFFORT", "")
     if not effort_text:
         return None
-    effort = (
-        ReasoningEffort.MEDIUM
-        if effort_text == "MEDIUM"
-        else ReasoningEffort.HIGH
-    )
+    effort = ReasoningEffort.MEDIUM if effort_text == "MEDIUM" else ReasoningEffort.HIGH
     return LLMGenerationConfig(
         reasoning=ReasoningConfig(
             effort=effort,

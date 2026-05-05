@@ -86,7 +86,9 @@ def decide_subagent_handoff(
             filtered or tool_names[:4],
         )
 
-    return SubagentHandoffDecision(True, "workflow_planner", "multi_step_task", tool_names[:4])
+    return SubagentHandoffDecision(
+        True, "workflow_planner", "multi_step_task", tool_names[:4]
+    )
 
 
 def build_subagent_instruction(
@@ -95,12 +97,21 @@ def build_subagent_instruction(
     decision: SubagentHandoffDecision,
 ) -> str:
     role_note = {
-        "plugin_researcher": "你是插件研究子代理，只负责确认最合适的插件和命令，不要闲聊。",
-        "tool_operator": "你是工具执行子代理，只负责安全地规划和调用工具，不要扩展闲聊。",
+        "plugin_researcher": (
+            "你是插件研究子代理，只负责确认最合适的插件和命令，不要闲聊。"
+        ),
+        "tool_operator": (
+            "你是工具执行子代理，只负责安全地规划和调用工具，不要扩展闲聊。"
+        ),
         "retrieval_worker": "你是检索子代理，只负责快速检索并给出最小结论。",
-        "workflow_planner": "你是工作流规划子代理，只负责把复杂任务拆成最少步骤并执行。",
+        "workflow_planner": (
+            "你是工作流规划子代理，只负责把复杂任务拆成最少步骤并执行。"
+        ),
     }.get(decision.role, "你是子代理，只负责当前交付，不要偏离任务。")
-    return f"{base_instruction}\n\n{role_note}\n若能直接完成就直接完成，不能完成时说明限制。"
+    return (
+        f"{base_instruction}\n\n{role_note}\n"
+        "若能直接完成就直接完成，不能完成时说明限制。"
+    )
 
 
 def _filter_tool_names(

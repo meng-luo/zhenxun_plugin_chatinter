@@ -17,8 +17,9 @@ from collections import Counter
 import json
 import re
 import time
+from typing import Protocol, cast
 
-from nonebot.adapters import Bot, Event
+from nonebot.adapters import Bot, Event, Message
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 from nonebot_plugin_alconna.uniseg.tools import reply_fetch
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
 from zhenxun.services import generate_structured, logger
 
+from .chat_memory_store import ChatMemoryStore
 from .config import (
     CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
     CONTEXT_PREFIX_SIZE,
@@ -50,8 +52,11 @@ from .config import (
     get_config_value,
     get_model_name,
 )
-from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
+from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
+from .person_registry import format_person_history_label, get_person_profile
+from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
+from .route_text import normalize_message_text
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
     extract_reply_from_message,
@@ -96,6 +101,15 @@ _COMPLEX_QUERY_HINTS = (
     "python",
     "api",
 )
+
+
+class DialogueContextPack(Protocol):
+    @property
+    def thread(self) -> object | None: ...
+
+    def to_context_xml(self) -> str: ...
+
+
 _FOLLOWUP_QUERY_HINTS = (
     "然后",
     "接着",
@@ -204,9 +218,10 @@ class ChatMemory:
             return True
         if normalized.startswith(_COMMAND_LIKE_PREFIX):
             return True
-        if normalized.lower().startswith(("http://", "https://")) and len(
-            normalized
-        ) <= 64:
+        if (
+            normalized.lower().startswith(("http://", "https://"))
+            and len(normalized) <= 64
+        ):
             return True
         if _LOW_VALUE_ONLY_SYMBOLS.fullmatch(normalized):
             return True
@@ -304,7 +319,7 @@ class ChatMemory:
             f"当前问题:\n{self._normalize_context_text(query_text)}\n\n"
             "候选历史记忆:\n"
             f"{chr(10).join(manifest_lines)}\n\n"
-            "返回格式：{\"selected_ids\": [id...]}"
+            '返回格式：{"selected_ids": [id...]}'
         )
         timeout = max(int(HISTORY_SELECTOR_TIMEOUT), 2)
         model_name = get_model_name()
@@ -498,8 +513,10 @@ class ChatMemory:
         url_text = str(url_value or "").strip()
         path_text = str(path_value or "").strip()
 
-        if not url_text and file_text and not file_text.startswith(
-            ("http://", "https://", "base64://")
+        if (
+            not url_text
+            and file_text
+            and not file_text.startswith(("http://", "https://", "base64://"))
         ):
             url_text = await self._resolve_onebot_image_url(bot, file_text)
 
@@ -621,7 +638,7 @@ class ChatMemory:
         user_message: str | UniMessage,
         ai_response: str | UniMessage,
         bot_id: str | None = None,
-    ):
+    ) -> ChatInterChatHistory | None:
         """添加一轮对话到数据库（一问一答）"""
         session_id = self.get_session_id(user_id, group_id)
 
@@ -629,7 +646,7 @@ class ChatMemory:
         formatted_ai_response = uni_to_text_with_tags(ai_response)
 
         async with self._lock:
-            await ChatInterChatHistory.add_dialog(
+            dialog = await ChatInterChatHistory.add_dialog(
                 session_id=session_id,
                 user_id=user_id,
                 group_id=group_id,
@@ -638,6 +655,7 @@ class ChatMemory:
                 ai_response=formatted_ai_response,
                 bot_id=bot_id,
             )
+        return dialog
 
     async def build_full_context(
         self,
@@ -648,6 +666,7 @@ class ChatMemory:
         bot: Bot | None = None,
         bot_id: str | None = None,
         event: Event | None = None,
+        dialogue_context: DialogueContextPack | None = None,
     ) -> tuple[str, str, list[Image]]:
         """构建完整的上下文（System + Context + Current）
 
@@ -690,7 +709,7 @@ class ChatMemory:
             group_name = group_id
             if bot:
                 try:
-                    group_info = await bot.get_group_info(group_id=int(group_id))
+                    group_info = await bot.get_group_info(group_id=group_id)
                     if group_info and group_info.get("group_name"):
                         group_name = group_info.get("group_name")
                 except Exception as e:
@@ -710,7 +729,20 @@ class ChatMemory:
             ]
         )
         lines.extend(qq_context_lines)
+        if dialogue_context is not None:
+            packed_context = dialogue_context.to_context_xml()
+            if packed_context:
+                lines.append(packed_context)
         lines.extend(self._build_conversation_focus(current_message_text))
+        thread = getattr(dialogue_context, "thread", None)
+        addressee = getattr(dialogue_context, "addressee", None)
+        thread_id = str(getattr(thread, "thread_id", "") or "").strip()
+        thread_user_ids = tuple(
+            str(item)
+            for item in getattr(thread, "related_user_ids", ()) or ()
+            if str(item)
+        )
+        addressee_user_id = str(getattr(addressee, "target_user_id", "") or "")
 
         session_id = self.get_session_id(user_id, group_id)
         isolate_context, isolate_reason = await self._should_isolate_context(
@@ -738,6 +770,7 @@ class ChatMemory:
                 user_id,
                 group_id,
                 current_message_text=current_message_text,
+                thread_id=thread_id or None,
             )
             if history_context_lines:
                 lines.append("<history_context>")
@@ -750,11 +783,34 @@ class ChatMemory:
                 group_id,
                 bot_id,
                 current_message_text=current_message_text,
+                thread_user_ids=thread_user_ids,
             )
             if group_background_lines:
                 lines.append("<history>")
                 lines.extend(group_background_lines)
                 lines.append("</history>")
+
+        if not isolate_context:
+            memory_lines = await ChatMemoryStore.recall(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                query=current_message_text,
+                recall_context=MemoryRecallContext.build(
+                    session_id=session_id,
+                    user_id=user_id,
+                    group_id=group_id,
+                    thread_id=thread_id or None,
+                    topic_key=str(getattr(thread, "topic_key", "") or ""),
+                    participants=thread_user_ids,
+                    addressee_user_id=addressee_user_id or None,
+                    query=current_message_text,
+                ),
+            )
+            if memory_lines:
+                lines.append("<long_term_memory>")
+                lines.extend(memory_lines)
+                lines.append("</long_term_memory>")
 
         # 4. 当前消息层（Layer 0 + 回复链追溯）
         (
@@ -860,7 +916,7 @@ class ChatMemory:
             if isinstance(raw_message, UniMessage):
                 uni_msg = raw_message
             else:
-                uni_msg = UniMessage.of(raw_message)
+                uni_msg = UniMessage.of(cast(Message, raw_message))
         except Exception:
             uni_msg = None
 
@@ -890,13 +946,6 @@ class ChatMemory:
                 except Exception as e:
                     logger.debug(f"从 reply_fetch 获取回复 ID 失败：{e}")
 
-            if not reply_id:
-                reply_id = (
-                    extract_reply_from_message(raw_message)
-                    if isinstance(raw_message, str)
-                    else None
-                )
-
             if reply_id:
                 seen_ids: set[str] = set()
                 current_reply_id = reply_id
@@ -907,7 +956,7 @@ class ChatMemory:
                     seen_ids.add(current_reply_id)
 
                     try:
-                        msg_data = await bot.get_msg(message_id=int(current_reply_id))
+                        msg_data = await bot.get_msg(message_id=current_reply_id)
                         if not msg_data:
                             break
 
@@ -916,6 +965,7 @@ class ChatMemory:
 
                         try:
                             from nonebot.adapters.onebot.v11 import Message as OBMessage
+
                             if isinstance(raw_msg, list):
                                 from nonebot_plugin_alconna.uniseg import At, Text
 
@@ -1030,9 +1080,10 @@ class ChatMemory:
                                     break
 
                         if not next_reply_id:
-                            next_reply_id = extract_reply_from_message(
-                                uni_msg_layer or plain_text
-                            )
+                            if uni_msg_layer is not None:
+                                next_reply_id = extract_reply_from_message(
+                                    uni_msg_layer
+                                )
 
                         if not next_reply_id:
                             break
@@ -1049,6 +1100,7 @@ class ChatMemory:
         user_id: str,
         group_id: str | None,
         current_message_text: str = "",
+        thread_id: str | None = None,
     ) -> list[str]:
         """构建对话历史 XML（来自 ChatInterChatHistory）
 
@@ -1073,9 +1125,21 @@ class ChatMemory:
             max_context * self._compression_fetch_factor,
             recall_candidate_limit,
         )
+        thread_dialogs = await self._load_thread_dialogs(
+            thread_id=thread_id,
+            group_id=group_id,
+            limit=max_context,
+        )
+        thread_dialog_ids = {int(dialog.id or 0) for dialog in thread_dialogs}
         dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
+        if thread_dialog_ids:
+            dialogs = [
+                dialog
+                for dialog in dialogs
+                if int(dialog.id or 0) not in thread_dialog_ids
+            ]
 
-        if not dialogs:
+        if not dialogs and not thread_dialogs:
             return []
 
         history_summary = ""
@@ -1123,7 +1187,7 @@ class ChatMemory:
                 recalled_dialogs.sort(key=lambda item: int(item.id or 0))
 
         if group_id:
-            display_dialogs = [*dialogs, *recalled_dialogs]
+            display_dialogs = [*thread_dialogs, *dialogs, *recalled_dialogs]
             user_ids_to_fetch = {
                 dlg.user_id
                 for dlg in display_dialogs
@@ -1132,85 +1196,130 @@ class ChatMemory:
             await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
 
         history_lines: list[str] = []
+        if thread_dialogs:
+            history_lines.append(f"当前话题历史({len(thread_dialogs)}条):")
+            for dlg in thread_dialogs:
+                history_lines.extend(
+                    await self._format_dialog_history_lines(dlg, group_id)
+                )
         if history_summary:
             history_lines.append(history_summary)
         if recalled_dialogs:
             history_lines.append(f"相关历史记忆({len(recalled_dialogs)}条):")
             for dlg in recalled_dialogs:
-                if dlg.create_time:
-                    timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
-                else:
-                    timestamp = "??:??:??"
-                if group_id:
-                    cached_nick = self._user_nickname_cache.get(dlg.user_id)
-                    sender = (
-                        f"[{cached_nick}]"
-                        if cached_nick
-                        else f"[QQ:{dlg.user_id}]"
-                    )
-                else:
-                    sender = f"[{dlg.nickname}]"
-
-                recalled_user_msg = self._clip_context_line(
-                    self._strip_non_final_channel_text(
-                        uni_to_text_with_tags(dlg.user_message)
-                    ),
-                    120,
+                history_lines.extend(
+                    await self._format_dialog_history_lines(dlg, group_id, limit=120)
                 )
-                history_lines.append(f"[{timestamp}] {sender}: {recalled_user_msg}")
-
-                if dlg.ai_response:
-                    ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-                    recalled_ai_msg = self._clip_context_line(
-                        self._strip_non_final_channel_text(
-                            uni_to_text_with_tags(dlg.ai_response)
-                        ),
-                        120,
-                    )
-                    history_lines.append(
-                        f"[{timestamp}] {ai_sender}: {recalled_ai_msg}"
-                    )
 
         for dlg in dialogs:
-            if dlg.create_time:
-                timestamp = dlg.create_time.strftime("%m-%d %H:%M:%S")
-            else:
-                timestamp = "??:??:??"
-
-            if group_id:
-                cached_nick = self._user_nickname_cache.get(dlg.user_id)
-                sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{dlg.user_id}]"
-            else:
-                sender = f"[{dlg.nickname}]"
-
-            user_msg = self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dlg.user_message)
-            )
-            history_lines.append(f"[{timestamp}] {sender}: {user_msg}")
-
-            if dlg.ai_response:
-                ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-                ai_msg = self._strip_non_final_channel_text(
-                    uni_to_text_with_tags(dlg.ai_response)
-                )
-                history_lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
+            history_lines.extend(await self._format_dialog_history_lines(dlg, group_id))
 
         return history_lines
+
+    async def _load_thread_dialogs(
+        self,
+        *,
+        thread_id: str | None,
+        group_id: str | None,
+        limit: int,
+    ) -> list[ChatInterChatHistory]:
+        if not thread_id:
+            return []
+        try:
+            from .thread_store import get_recent_thread_dialog_ids
+
+            dialog_ids = await get_recent_thread_dialog_ids(
+                thread_id=thread_id,
+                group_id=group_id,
+                limit=limit,
+            )
+        except Exception:
+            return []
+        if not dialog_ids:
+            return []
+        try:
+            rows = await ChatInterChatHistory.filter(id__in=dialog_ids).all()
+        except Exception:
+            return []
+        by_id = {int(row.id or 0): row for row in rows}
+        return [by_id[item] for item in dialog_ids if item in by_id]
+
+    async def _format_dialog_history_lines(
+        self,
+        dlg: ChatInterChatHistory,
+        group_id: str | None,
+        *,
+        limit: int = 0,
+    ) -> list[str]:
+        timestamp = (
+            dlg.create_time.strftime("%m-%d %H:%M:%S")
+            if dlg.create_time
+            else "??:??:??"
+        )
+        sender = await self._format_history_sender(
+            user_id=str(dlg.user_id or ""),
+            group_id=group_id,
+            fallback_name=str(dlg.nickname or ""),
+            bot_id=None,
+        )
+
+        user_msg = self._strip_non_final_channel_text(
+            uni_to_text_with_tags(dlg.user_message)
+        )
+        if limit > 0:
+            user_msg = self._clip_context_line(user_msg, limit)
+        lines = [f"[{timestamp}] {sender}: {user_msg}"]
+
+        if dlg.ai_response:
+            ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
+            ai_msg = self._strip_non_final_channel_text(
+                uni_to_text_with_tags(dlg.ai_response)
+            )
+            if limit > 0:
+                ai_msg = self._clip_context_line(ai_msg, limit)
+            lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
+        return lines
+
+    async def _format_history_sender(
+        self,
+        *,
+        user_id: str,
+        group_id: str | None,
+        fallback_name: str = "",
+        bot_id: str | None = None,
+    ) -> str:
+        if bot_id and user_id == bot_id:
+            bot_name = self._bot_nickname or BotConfig.self_nickname
+            return f"[name={bot_name}; user_id={user_id}]"
+        if not group_id:
+            name = normalize_message_text(fallback_name) or user_id
+            return f"[name={name}; user_id={user_id}]"
+        cached_nick = self._user_nickname_cache.get(user_id, "")
+        profile = await get_person_profile(
+            user_id=user_id,
+            group_id=group_id,
+            fallback_name=cached_nick or fallback_name,
+        )
+        return format_person_history_label(
+            profile,
+            fallback_name=cached_nick or fallback_name,
+        )
 
     async def _build_group_background_xml(
         self,
         group_id: str | None,
         bot_id: str | None = None,
         current_message_text: str = "",
+        thread_user_ids: tuple[str, ...] = (),
     ) -> list[str]:
-        """构建群聊背景 XML（最近 5 条群消息，来自 ChatHistory）
+        """构建群聊背景 XML（最近群消息，来自 ChatHistory）
 
         格式：[时间][发送者]: 内容
 
         参数:
-            user_id: 用户 ID
             group_id: 群组 ID
             bot_id: Bot ID
+            thread_user_ids: 当前话题参与者，召回时提高这些人的消息权重
 
         返回:
             list[str]: XML 行列表
@@ -1242,6 +1351,9 @@ class ChatMemory:
             return lines
 
         query_tokens = self._tokenize_context_text(current_message_text)
+        thread_user_id_set = {
+            str(item).strip() for item in thread_user_ids if str(item).strip()
+        }
         user_ids_to_fetch = set()
         for msg in chat_history_msgs:
             is_bot_msg = bot_id and msg.user_id == bot_id
@@ -1257,10 +1369,10 @@ class ChatMemory:
             if self._is_low_value_background_message(content):
                 continue
             score = (
-                self._similarity_score(query_tokens, content)
-                if query_tokens
-                else 0.0
+                self._similarity_score(query_tokens, content) if query_tokens else 0.0
             )
+            if str(msg.user_id or "") in thread_user_id_set:
+                score += 0.22
             scored_msgs.append((msg, content, score))
 
         if not scored_msgs:
@@ -1286,6 +1398,20 @@ class ChatMemory:
             for item in related_candidates[:relevant_limit]:
                 selected.append(item)
                 selected_ids.add(int(item[0].id))
+        elif thread_user_id_set and relevant_limit > 0:
+            thread_candidates = [
+                item
+                for item in scored_msgs
+                if int(item[0].id) not in selected_ids
+                and str(item[0].user_id or "") in thread_user_id_set
+            ]
+            thread_candidates.sort(
+                key=lambda item: (item[2], int(item[0].id)),
+                reverse=True,
+            )
+            for item in thread_candidates[:relevant_limit]:
+                selected.append(item)
+                selected_ids.add(int(item[0].id))
 
         selected.sort(key=lambda item: int(item[0].id))
         if len(selected) > prefix_size:
@@ -1297,11 +1423,12 @@ class ChatMemory:
             else:
                 timestamp = "??:??:??"
             is_bot_msg = bot_id and msg.user_id == bot_id
-            if is_bot_msg:
-                sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-            else:
-                cached_nick = self._user_nickname_cache.get(msg.user_id)
-                sender = f"[{cached_nick}]" if cached_nick else f"[QQ:{msg.user_id}]"
+            sender = await self._format_history_sender(
+                user_id=str(msg.user_id or ""),
+                group_id=group_id,
+                fallback_name=self._user_nickname_cache.get(msg.user_id, ""),
+                bot_id=bot_id if is_bot_msg else None,
+            )
 
             lines.append(f"[{timestamp}] {sender}: {content}")
 
@@ -1314,7 +1441,7 @@ class ChatMemory:
         current_message_text: str = "",
     ) -> str:
         """构建系统提示词"""
-        chat_style = get_config_value("CHAT_STYLE", "")
+        chat_style = str(get_config_value("CHAT_STYLE", "") or "")
         if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and self._is_complex_query(
             current_message_text
         ):

@@ -121,7 +121,7 @@ class ChatInterRuntimeScheduler:
                 return
             self._last_metrics_log = now
             snapshot = self._metrics.snapshot()
-        logger.debug("chatinter scheduler metrics: %s", snapshot)
+        logger.debug(f"chatinter scheduler metrics: {snapshot}")
 
     async def get_metrics_snapshot(self) -> dict[str, float | int | dict[str, int]]:
         async with self._lock:
@@ -151,10 +151,8 @@ class ChatInterRuntimeScheduler:
                 await self._record_wait(waited_ms=waited_ms, model_key=model_key)
                 if waited_ms >= _QUEUE_WAIT_LOG_THRESHOLD_MS:
                     logger.debug(
-                        "chatinter queue waited %.1fms session=%s model=%s",
-                        waited_ms,
-                        session_key,
-                        model_key,
+                        "chatinter queue waited "
+                        f"{waited_ms:.1f}ms session={session_key} model={model_key}"
                     )
                 current_task = asyncio.current_task()
                 await self._set_active(session_key, current_task)

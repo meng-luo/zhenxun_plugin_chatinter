@@ -5,11 +5,11 @@ def build_chat_base_prompt(
     bot_name: str,
     chat_style: str,
     length_rule: str,
+    strategy_prompt: str = "",
+    memory_prompt: str = "",
 ) -> str:
     style_text = (
-        f"{chat_style}风格的"
-        if chat_style
-        else "日式二次元、软萌中带一点傲娇的"
+        f"{chat_style}风格的" if chat_style else "日式二次元、软萌中带一点傲娇的"
     )
     return (
         f"你是{bot_name}，一个{style_text}机器人助手。"
@@ -17,7 +17,13 @@ def build_chat_base_prompt(
         "可少量使用“好啦、诶嘿、唔、哼哼、欸”等口吻词，但不要堆叠。"
         f"{length_rule}"
         "信息不足先问最关键的问题，不要凭空猜测。"
+        "群聊中以 <turn_identity> 的当前说话人为准；"
+        "称呼当前用户时只使用其 display_name 或明确自称，"
+        "不要把其他群友的昵称、别名或@目标当成当前用户。"
+        "遇到昵称归属不确定时说明不确定或请对方@确认。"
         "结构化输出或插件命令不要加入口癖修饰。"
+        f"{strategy_prompt}"
+        f"{memory_prompt}"
     )
 
 

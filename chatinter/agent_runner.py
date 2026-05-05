@@ -27,13 +27,13 @@ from .lifecycle import ToolLifecyclePayload, get_lifecycle_manager
 from .prompt_guard import compact_agent_messages, guard_prompt_sections
 from .runtime import get_runtime_scheduler
 from .subagent_handoff import build_subagent_instruction, decide_subagent_handoff
-from .tool_registry import ChatInterToolRegistry, ToolSelectionContext
 from .tool_orchestration import (
     ToolExecutionMode,
     allow_tool_batch,
     build_tool_execution_plan,
     record_tool_batch,
 )
+from .tool_registry import ChatInterToolRegistry, ToolSelectionContext
 from .turn_runtime import TurnBudgetController
 
 TOOL_EXEC_TIMEOUT = 8.0
@@ -297,7 +297,10 @@ async def _execute_concurrent_batch_fail_fast(
                     )
 
     finalized = [
-        message or _tool_error_message(tool_call=batch_calls[idx], reason="Tool execution failed")
+        message
+        or _tool_error_message(
+            tool_call=batch_calls[idx], reason="Tool execution failed"
+        )
         for idx, message in enumerate(messages)
     ]
     return finalized, has_failure
@@ -334,14 +337,21 @@ async def _execute_tool_calls_partitioned(
             raise asyncio.TimeoutError
 
         # read-only batch concurrency; write/unknown batch serial.
-        if batch.mode == ToolExecutionMode.READONLY and batch.concurrency_safe and len(batch_calls) > 1:
+        if (
+            batch.mode == ToolExecutionMode.READONLY
+            and batch.concurrency_safe
+            and len(batch_calls) > 1
+        ):
             chunk_size = max(parallel_limit, 1)
             for start in range(0, len(batch_calls), chunk_size):
                 chunk = batch_calls[start : start + chunk_size]
                 remaining = max(deadline - time.monotonic(), 0.0)
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                chunk_messages, chunk_failed = await _execute_concurrent_batch_fail_fast(
+                (
+                    chunk_messages,
+                    chunk_failed,
+                ) = await _execute_concurrent_batch_fail_fast(
                     invoker=invoker,
                     batch_calls=chunk,
                     available_tools=available_tools,
@@ -660,7 +670,10 @@ async def run_chatinter_agent(
 
         user_content: str | list[LLMContentPart]
         if image_parts:
-            user_content = [LLMContentPart.text_part(guarded_prompt.user_text), *image_parts]
+            user_content = [
+                LLMContentPart.text_part(guarded_prompt.user_text),
+                *image_parts,
+            ]
         else:
             user_content = guarded_prompt.user_text
 
@@ -679,7 +692,9 @@ async def run_chatinter_agent(
             request_timeout: float | None = None,
         ) -> LLMResponse:
             started = time.perf_counter()
-            if budget_controller is not None and not budget_controller.allow_classifier(stage):
+            if budget_controller is not None and not budget_controller.allow_classifier(
+                stage
+            ):
                 logger.debug(
                     "chatinter agent classifier budget exhausted: "
                     f"session={session_key} stage={stage}"
@@ -796,9 +811,10 @@ async def run_chatinter_agent(
                 total_tokens=0,
             )
             if str(subagent_response.text or "").strip():
+                subagent_summary = subagent_response.text.strip()
                 messages.append(
                     LLMMessage.system(
-                        f"子代理({handoff_decision.role})结论: {subagent_response.text.strip()}"
+                        f"子代理({handoff_decision.role})结论: {subagent_summary}"
                     )
                 )
             if handoff_decision.tool_names:
@@ -813,9 +829,7 @@ async def run_chatinter_agent(
             user_id=str(user_id),
             group_id=str(group_id) if group_id else None,
         ).bind_budget_controller(budget_controller)
-        invoker = ToolInvoker(
-            callbacks=[lifecycle_callback]
-        )
+        invoker = ToolInvoker(callbacks=[lifecycle_callback])
         context = RunContext(
             session_id=session_key,
             scope={"bot": bot, "event": event},
@@ -923,7 +937,10 @@ async def run_chatinter_agent(
                 break
 
             try:
-                tool_messages, had_batch_failure = await _execute_tool_calls_partitioned(
+                (
+                    tool_messages,
+                    had_batch_failure,
+                ) = await _execute_tool_calls_partitioned(
                     invoker=invoker,
                     tool_calls=tool_calls,
                     available_tools=active_tools,
@@ -970,9 +987,7 @@ async def run_chatinter_agent(
                 )
                 continue
             if had_batch_failure and abort_parallel_on_failure:
-                messages.append(
-                    LLMMessage.system(_TOOL_BATCH_FAIL_FAST_SYSTEM_NOTE)
-                )
+                messages.append(LLMMessage.system(_TOOL_BATCH_FAIL_FAST_SYSTEM_NOTE))
 
             messages.append(_assistant_message_from_response(response))
             messages.extend(tool_messages)

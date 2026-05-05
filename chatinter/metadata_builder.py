@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 import re
 import sys
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from zhenxun.services.log import logger
 
@@ -24,12 +24,8 @@ class AutoMetadataBuilder:
     - meme manager 反射提取模板类命令参数范围
     """
 
-    _module_alias_cache: ClassVar[
-        dict[str, tuple[int, dict[str, list[str]]]]
-    ] = {}
-    _module_prefix_cache: ClassVar[
-        dict[str, tuple[int, dict[str, list[str]]]]
-    ] = {}
+    _module_alias_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
+    _module_prefix_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
     _module_context_cache: ClassVar[
         dict[str, tuple[int, dict[str, dict[str, bool]]]]
     ] = {}
@@ -40,9 +36,7 @@ class AutoMetadataBuilder:
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
-    _regex_head_pattern: ClassVar[re.Pattern[str]] = re.compile(
-        r"[\[\(\.\*\+\?\|\$\\]"
-    )
+    _regex_head_pattern: ClassVar[re.Pattern[str]] = re.compile(r"[\[\(\.\*\+\?\|\$\\]")
     _image_type_hints: ClassVar[tuple[str, ...]] = (
         "image",
         "uniimg",
@@ -119,7 +113,9 @@ class AutoMetadataBuilder:
             handler_hint = cls._extract_handler_hint(matcher)
             context_hint = cls._extract_matcher_context_hint(matcher)
             parser_shortcut_aliases = (
-                cls._extract_parser_shortcut_aliases(parser) if parser is not None else []
+                cls._extract_parser_shortcut_aliases(parser)
+                if parser is not None
+                else []
             )
             for payload in cls._extract_rule_command_data(
                 matcher=matcher,
@@ -255,7 +251,7 @@ class AutoMetadataBuilder:
             module_obj=module_obj,
         ):
             container = getattr(candidate_module, "matchers", None)
-            if not isinstance(container, (list, tuple, set, frozenset)):
+            if not isinstance(container, list | tuple | set | frozenset):
                 continue
             for matcher in container:
                 if id(matcher) in seen_ids or not cls._looks_like_matcher(matcher):
@@ -474,7 +470,7 @@ class AutoMetadataBuilder:
         for command in getattr(checker_call, "cmds", ()) or ():
             if isinstance(command, str):
                 command_parts = (command,)
-            elif isinstance(command, (list, tuple)):
+            elif isinstance(command, list | tuple):
                 command_parts = tuple(str(part or "").strip() for part in command)
             else:
                 continue
@@ -499,7 +495,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _load_module_context_map(cls, module_obj: object) -> dict[str, dict[str, bool]]:
-        source_file = inspect.getsourcefile(module_obj)
+        source_file = inspect.getsourcefile(cast(Any, module_obj))
         if not source_file:
             return {}
         try:
@@ -593,9 +589,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _extract_parser_command_head(cls, parser: object) -> str:
-        command_head = cls._normalize_command(
-            str(getattr(parser, "command", "") or "")
-        )
+        command_head = cls._normalize_command(str(getattr(parser, "command", "") or ""))
         if not command_head:
             return ""
         if command_head.startswith("re:"):
@@ -610,7 +604,7 @@ class AutoMetadataBuilder:
     ) -> list[str]:
         aliases: list[str] = []
         raw_aliases = getattr(parser, "aliases", None)
-        if isinstance(raw_aliases, (list, tuple, set, frozenset)):
+        if isinstance(raw_aliases, list | tuple | set | frozenset):
             for alias in raw_aliases:
                 alias_text = cls._normalize_command(str(alias or ""))
                 if alias_text and alias_text != command_head:
@@ -631,7 +625,7 @@ class AutoMetadataBuilder:
             raw_prefixes = getattr(candidate, "prefixes", None)
             if isinstance(raw_prefixes, str):
                 raw_prefixes = [raw_prefixes]
-            if isinstance(raw_prefixes, (list, tuple, set, frozenset)):
+            if isinstance(raw_prefixes, list | tuple | set | frozenset):
                 for prefix in raw_prefixes:
                     prefix_text = cls._normalize_command(str(prefix or ""))
                     if prefix_text:
@@ -639,7 +633,7 @@ class AutoMetadataBuilder:
 
             for attr_name in ("parser", "meta", "config", "_config", "namespace"):
                 nested = getattr(candidate, attr_name, None)
-                if nested is not None and not isinstance(nested, (str, bytes)):
+                if nested is not None and not isinstance(nested, str | bytes):
                     candidates.append(nested)
         return cls._merge_unique_strings(prefixes, [])
 
@@ -648,7 +642,10 @@ class AutoMetadataBuilder:
         shortcuts: list[str] = []
         for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
             shortcuts.extend(
-                cls._extract_shortcut_labels(shortcut_key=shortcut_key, shortcut_obj=shortcut_obj)
+                cls._extract_shortcut_labels(
+                    shortcut_key=shortcut_key,
+                    shortcut_obj=shortcut_obj,
+                )
             )
         return cls._merge_unique_strings(shortcuts, [])
 
@@ -687,9 +684,6 @@ class AutoMetadataBuilder:
                 continue
             if cls._contains_any(arg_repr, cls._at_type_hints):
                 allow_at = True
-                image_min += 0 if is_optional else 1
-                if image_max is not None:
-                    image_max = None if is_variadic else image_max + 1
                 for source in ("at", "reply", "nickname"):
                     if source not in target_sources:
                         target_sources.append(source)
@@ -801,9 +795,7 @@ class AutoMetadataBuilder:
         rule_repr = repr(rule).lower() if rule is not None else ""
         before_rules = getattr(rule, "before_rules", None)
         before_repr = repr(before_rules).lower() if before_rules is not None else ""
-        combined_repr = " ".join(
-            part for part in (rule_repr, before_repr) if part
-        )
+        combined_repr = " ".join(part for part in (rule_repr, before_repr) if part)
         if "reply" in combined_repr:
             requires_reply = True
         if "tome" in combined_repr or "to_me" in combined_repr:
@@ -818,7 +810,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _load_handler_hint(cls, call: object) -> dict[str, bool]:
-        source_file = inspect.getsourcefile(call)
+        source_file = inspect.getsourcefile(cast(Any, call))
         qualname = str(getattr(call, "__qualname__", "") or repr(call))
         cache_key = f"{source_file or ''}:{qualname}"
         try:
@@ -831,33 +823,47 @@ class AutoMetadataBuilder:
             return cached[1]
 
         try:
-            source = inspect.getsource(call)
+            source = inspect.getsource(cast(Any, call))
         except Exception:
             source = ""
         lowered = source.lower()
+        reply_source = any(
+            marker in lowered
+            for marker in (
+                "event.reply",
+                ".reply",
+                "get_reply",
+                "reply_event",
+                "reply_source",
+                "reply_msg",
+                "reply_message",
+            )
+        )
+        # reply_to=True 只是“回复用户消息”的发送方式，不代表命令需要回复上下文。
+        reply_source = reply_source and "reply_to" not in lowered
         hint = {
             "allow_at": "at(" in lowered
             or "argot" in lowered
             or "msgtarget" in lowered
-            or "\"at\"" in lowered
+            or '"at"' in lowered
             or "'at'" in lowered,
-            "reply_source": "reply" in lowered,
+            "reply_source": reply_source,
             "at_source": "at(" in lowered
             or "msgtarget" in lowered
-            or "\"at\"" in lowered
+            or '"at"' in lowered
             or "'at'" in lowered,
             "self_source": "自己" in source or "user_id" in lowered,
             "requires_superuser": "dependssuperuser" in lowered
             or "depends(superuser" in lowered
             or "depends(superuser()" in lowered
-            or "is_superuser" in lowered and "depends(" in lowered,
+            or ("is_superuser" in lowered and "depends(" in lowered),
         }
         cls._handler_hint_cache[cache_key] = (mtime_ns, hint)
         return hint
 
     @classmethod
     def _load_module_access_map(cls, module_obj: object) -> dict[str, str]:
-        source_file = inspect.getsourcefile(module_obj)
+        source_file = inspect.getsourcefile(cast(Any, module_obj))
         if not source_file:
             return {}
         try:
@@ -899,9 +905,7 @@ class AutoMetadataBuilder:
                 if keyword.arg == "permission":
                     level = cls._merge_access_level(
                         level,
-                        cls._infer_access_level_from_expr(
-                            keyword.value, symbol_levels
-                        ),
+                        cls._infer_access_level_from_expr(keyword.value, symbol_levels),
                     )
                 elif keyword.arg == "rule":
                     level = cls._merge_access_level(
@@ -927,9 +931,12 @@ class AutoMetadataBuilder:
             mapped = symbol_levels.get(expr.id.casefold())
             if mapped:
                 return mapped
-        try:
-            text = ast.unparse(expr)
-        except Exception:
+        if isinstance(expr, ast.AST):
+            try:
+                text = ast.unparse(expr)
+            except Exception:
+                text = str(expr or "")
+        else:
             text = str(expr or "")
         return cls._infer_access_level_from_text(text, symbol_levels)
 
@@ -1005,7 +1012,10 @@ class AutoMetadataBuilder:
     def _resolve_access_level(cls, *levels: object) -> str:
         resolved = "public"
         for level in levels:
-            resolved = cls._merge_access_level(resolved, level if level else "public")
+            resolved = cls._merge_access_level(
+                resolved,
+                str(level) if level else "public",
+            )
         return resolved
 
     @classmethod
@@ -1023,7 +1033,7 @@ class AutoMetadataBuilder:
             return []
         if isinstance(memes, dict):
             meme_items = list(memes.values())
-        elif isinstance(memes, (list, tuple, set)):
+        elif isinstance(memes, list | tuple | set):
             meme_items = list(memes)
         else:
             return []
@@ -1046,12 +1056,8 @@ class AutoMetadataBuilder:
                         "command": normalized,
                         "text_min": cls._safe_int(getattr(params, "min_texts", None)),
                         "text_max": cls._safe_int(getattr(params, "max_texts", None)),
-                        "image_min": cls._safe_int(
-                            getattr(params, "min_images", None)
-                        ),
-                        "image_max": cls._safe_int(
-                            getattr(params, "max_images", None)
-                        ),
+                        "image_min": cls._safe_int(getattr(params, "min_images", None)),
+                        "image_max": cls._safe_int(getattr(params, "max_images", None)),
                         "allow_at": True,
                         "target_requirement": "optional",
                         "target_sources": ["at", "reply", "nickname", "self"],
@@ -1201,7 +1207,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _load_module_alias_map(cls, module_obj: object) -> dict[str, list[str]]:
-        source_file = inspect.getsourcefile(module_obj)
+        source_file = inspect.getsourcefile(cast(Any, module_obj))
         if not source_file:
             return {}
         try:
@@ -1227,8 +1233,8 @@ class AutoMetadataBuilder:
             command = cls._extract_command_from_call_node(node)
             aliases = cls._extract_aliases_from_call_node(node)
             if not command or not aliases:
-                shortcut_command, shortcut_aliases = cls._extract_shortcut_from_call_node(
-                    node
+                shortcut_command, shortcut_aliases = (
+                    cls._extract_shortcut_from_call_node(node)
                 )
                 if not shortcut_command or not shortcut_aliases:
                     continue
@@ -1246,7 +1252,7 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _load_module_prefix_map(cls, module_obj: object) -> dict[str, list[str]]:
-        source_file = inspect.getsourcefile(module_obj)
+        source_file = inspect.getsourcefile(cast(Any, module_obj))
         if not source_file:
             return {}
         try:
@@ -1334,7 +1340,7 @@ class AutoMetadataBuilder:
             if text:
                 result.append(text)
             return result
-        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        if isinstance(node, ast.List | ast.Tuple | ast.Set):
             for item in node.elts:
                 result.extend(cls._extract_strings_from_node(item))
             return cls._merge_unique_strings(result, [])
@@ -1359,7 +1365,7 @@ class AutoMetadataBuilder:
                 return []
             if isinstance(raw_aliases, str):
                 return [cls._normalize_command(raw_aliases)]
-            if not isinstance(raw_aliases, (list, tuple, set, frozenset)):
+            if not isinstance(raw_aliases, list | tuple | set | frozenset):
                 return []
             return [
                 cls._normalize_command(str(alias or ""))
@@ -1490,7 +1496,7 @@ class AutoMetadataBuilder:
             if isinstance(raw_shortcuts, dict):
                 for key, value in raw_shortcuts.items():
                     add_record(key, value)
-            elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+            elif isinstance(raw_shortcuts, list | tuple | set | frozenset):
                 for item in raw_shortcuts:
                     add_record(item, item)
 
@@ -1498,16 +1504,18 @@ class AutoMetadataBuilder:
         if isinstance(raw_shortcuts, dict):
             for key, value in raw_shortcuts.items():
                 add_record(key, value)
-        elif isinstance(raw_shortcuts, (list, tuple, set, frozenset)):
+        elif isinstance(raw_shortcuts, list | tuple | set | frozenset):
             for item in raw_shortcuts:
                 add_record(item, item)
 
         info = getattr(owner, "info", None)
-        nested_shortcuts = getattr(info, "shortcuts", None) if info is not None else None
+        nested_shortcuts = (
+            getattr(info, "shortcuts", None) if info is not None else None
+        )
         if isinstance(nested_shortcuts, dict):
             for key, value in nested_shortcuts.items():
                 add_record(key, value)
-        elif isinstance(nested_shortcuts, (list, tuple, set, frozenset)):
+        elif isinstance(nested_shortcuts, list | tuple | set | frozenset):
             for item in nested_shortcuts:
                 add_record(item, item)
 
@@ -1532,7 +1540,7 @@ class AutoMetadataBuilder:
         if value is None:
             return None
         try:
-            return int(value)
+            return int(cast(Any, value))
         except (TypeError, ValueError):
             return None
 
@@ -1588,9 +1596,9 @@ class AutoMetadataBuilder:
             current["requires_reply"] = bool(current.get("requires_reply")) or bool(
                 payload.get("requires_reply")
             )
-            current["requires_private"] = bool(
-                current.get("requires_private")
-            ) or bool(payload.get("requires_private"))
+            current["requires_private"] = bool(current.get("requires_private")) or bool(
+                payload.get("requires_private")
+            )
             current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
                 payload.get("requires_to_me")
             )

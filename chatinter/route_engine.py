@@ -1,140 +1,170 @@
 from dataclasses import dataclass, field
-import json
 import re
-import time
-from typing import Any
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from zhenxun.services import generate_structured, logger
-from .config import (
-    get_config_value,
-    get_model_name,
+from zhenxun.services.log import logger
+
+from .capability_graph import build_capability_graph_snapshot
+from .command_index import (
+    CommandCandidate,
+    build_candidate_snapshots,
+    build_command_candidates,
 )
-from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
-from .prompt_guard import guard_prompt_sections
+from .command_schema import complete_slots, render_command
+from .config import get_config_value
+from .models.pydantic_models import PluginKnowledgeBase
+from .plugin_adapters import (
+    extract_adapter_slots,
+    resolve_adapter_clarify_route,
+)
+from .plugin_reference import build_command_tool_snapshots
 from .route_text import (
-    collect_placeholders,
-    collect_weak_route_signals,
+    STRONG_EXECUTE_WORDS,
     contains_any,
+    has_chat_context_hint,
+    has_negative_route_intent,
     is_usage_question,
-    match_command_head_or_sticky,
-    normalize_action_phrases,
+    match_command_head,
     normalize_message_text,
-    parse_command_with_head,
-    ROUTE_ACTION_WORDS,
     strip_invoke_prefix,
 )
-from .route_policy import is_route_action_compatible
-from .route_policy import infer_message_action_role
-from .route_policy import infer_route_action_role
-from .schema_policy import resolve_command_target_policy
-from .skill_registry import (
-    SkillRouteDecision,
-    _extract_argument_around_head,
-    _message_has_payload_signals,
-    get_skill_registry,
-    infer_query_family,
-    render_skill_namespace,
-    select_relevant_skills,
-    skill_execute,
-    skill_search,
+from .skill_registry import SkillRouteDecision
+from .speech_act import classify_speech_act
+from .tool_candidate_policy import select_rerank_candidates
+from .tool_query_rewriter import (
+    ToolQueryDescriptor,
+    build_tool_query_descriptor,
+    expand_tool_queries,
 )
+from .tool_reranker import ToolRerankDecision, request_tool_rerank
 from .turn_runtime import TurnBudgetController
 
-_ROUTE_NAMESPACE_LIMIT = 12
-_ROUTE_PLUGIN_SHORTLIST_LIMIT = 8
-_WEAK_SIGNAL_SHORTLIST_LIMIT = 5
-_SHORTLIST_ALIGNMENT_INSTRUCTION = """\
-你是 ChatInter 的 shortlist 对齐器。
-给你的不是全库，而是当前消息最可能命中的少量插件卡片。
-你的任务只有三种：
-1. route：用户明确想要调用插件功能（发命令、请求操作、生成内容等）。
-2. usage：明显有插件调用意图，但参数、图片、目标或上下文不够，适合返回插件用法。
-3. skip：更像普通聊天、讨论、吐槽、闲聊，或者仍然无法可靠判断。
-
-假阳性防护（最重要）：
-很多插件命令名是日常汉语词汇（如 无语、需要、震惊、禁止、控制、翻译、签到、垃圾、一起、远离 等）。
-当这些词出现在自然对话语境中时，绝对不能路由到插件。
-
-判断标准：
-- 用户是在"使用"功能（想让 bot 执行操作），还是只是"提到/谈论"了这个词？
-- 命令词后面跟着自然语句（聊天、讨论、吐槽、陈述）-> skip
-- 命令词后面跟着该命令的合理参数/目标（如"翻译 hello"）-> route
-- 用户在讨论某功能/工具但不是要求执行（如"签到功能好用吗""翻译软件用哪个好"）-> skip
-- 命令词嵌在更长的句子中间、不在句首控制位 -> skip
-
-严格遵守：
-1. 只能从 skills_json 里选择 plugin_module 与 command。
-2. command 只能填命令头，不要把数字、文本、[@...]、[image] 拼进去；本地会绑定显式参数。
-3. 不要臆造当前消息里不存在的参数、目标或图片。
-4. "怎么用/帮助/用法/参数/说明"优先 usage。
-5. 对红包、查询、搜索、今日类命令，优先依据动作词和时间词选择插件内正确动作。
-6. 无法可靠判断时返回 skip。
-7. 宁可 skip 也不要误路由——假阳性比漏路由更严重。""".strip()
-_WEAK_SIGNAL_ALIGNMENT_INSTRUCTION = """
-你是 ChatInter 的弱词歧义判别器。
-输入里只有少量弱词，没有明确命令头时，才使用你。
-你的任务只有四类：
-1. chat：普通聊天、解释、讨论、反问，或者不应进入插件。
-2. usage：明显是在问某个插件或功能怎么用，但当前输入还缺上下文、参数、reply、图片或目标。
-3. execute：在给定 shortlist 中已经能确定插件与命令，并且输入足够执行。
-4. ambiguous：介于 usage 和 execute 之间，或者锚点还不稳。
-
-严格遵守：
-1. 只能从 cards_json 里选择 plugin_module 与 command。
-2. 不要发明插件、命令或参数。
-3. 如果没有明确插件锚点，优先 chat。
-4. 如果只是弱词泛问，没有足够插件锚点，也优先 chat。
-5. usage 只在明显是在问插件用法时返回。
-6. execute 只能在 shortlist 内且语义足够明确时返回。
-""".strip()
-_TOOL_ROUTE_INSTRUCTION = """
-你是 ChatInter 的工具式路由规划器。
-给你的每个工具都已经绑定到一个明确的插件命令。
-严格遵守：
-1. 明显对应当前诉求的工具才调用，且只调用一个。
-2. text 只填额外纯文本，不要重复命令头、[@...]、[image]、reply。
-3. 命令不需要文本参数时不要传 text。
-4. 像普通对话、闲聊、澄清或把握不足时，直接回复 SKIP。
-5. "怎么用/用法/帮助/参数"类问题优先帮助型命令，不要误调用业务动作命令。
-""".strip()
-_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-_AT_PLACEHOLDER_PATTERN = re.compile(r"\[@\d{5,20}\]")
+_AT_PLACEHOLDER_PATTERN = re.compile(r"\[@[^\]\s]+\]")
 _AT_INLINE_PATTERN = re.compile(r"@\d{5,20}")
 _IMAGE_PLACEHOLDER_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _ROUTE_TRACE_SAMPLE_LIMIT = 12
-_SHORTLIST_ENTITY_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+", re.IGNORECASE)
-_SHORTLIST_ENTITY_STOPWORDS = {
-    "帮我",
-    "请",
-    "麻烦",
-    "一下",
-    "一个",
-    "一张",
-    "这个",
-    "那个",
-    "看看",
-    "看下",
-    "查看",
-    "查询",
-    "设置",
-    "生成",
-    "制作",
-    "来个",
-    "做个",
-    "做一个",
-    "做一张",
-    "什么",
-    "怎么",
-    "为什么",
-    "多少",
-    "一下子",
-    "可以",
-}
-_SHORTLIST_COMPACT_ROUTE_HINTS = ("抽", "找", "搜", "查", "查询", "来个", "做个")
-_SHORTLIST_COMPACT_QUESTION_HINTS = ("什么", "怎么", "为什么", "多少", "吗", "嘛", "呢")
+
+
+def _action_for_schema(
+    *,
+    schema: Any,
+    speech_act: str,
+    missing: list[str] | tuple[str, ...],
+) -> Literal["chat", "execute", "usage", "clarify"]:
+    role = normalize_message_text(getattr(schema, "command_role", "") or "").lower()
+    if speech_act == "ask_usage" or role == "usage":
+        return "usage"
+    if role == "template" and missing:
+        requires = getattr(schema, "requires", {}) or {}
+        context_missing = {"image", "reply", "at", "context", "target"}
+        if requires.get("image") or requires.get("reply") or requires.get("at"):
+            if set(missing).issubset(context_missing):
+                return "execute"
+    if missing:
+        return "clarify"
+    return "execute"
+
+
+def _has_payload_for_schema(schema: Any, message_text: str) -> bool:
+    normalized = normalize_message_text(message_text)
+    if not normalized:
+        return False
+    values = [
+        normalize_message_text(getattr(schema, "head", "") or ""),
+        *[
+            normalize_message_text(alias)
+            for alias in getattr(schema, "aliases", []) or []
+            if normalize_message_text(alias)
+        ],
+    ]
+    text = normalized
+    for value in values:
+        if value and value in text:
+            text = text.replace(value, " ", 1)
+    text = _AT_PLACEHOLDER_PATTERN.sub(" ", text)
+    text = _IMAGE_PLACEHOLDER_PATTERN.sub(" ", text)
+    for noise in (
+        "帮我",
+        "给我",
+        "请",
+        "麻烦",
+        "做",
+        "做个",
+        "做一张",
+        "来张",
+        "来一张",
+        "用",
+        "让",
+        "写",
+        "内容是",
+        "文字是",
+        "牌子写",
+        "一句",
+        "一段",
+        "这个",
+        "这张",
+        "表情",
+        "表情包",
+        "梗图",
+        "图片",
+        "：",
+        ":",
+        "，",
+        ",",
+    ):
+        text = text.replace(noise, " ")
+    return bool(normalize_message_text(text))
+
+
+def _payload_slot_items(schema: Any, message_text: str) -> list["LLMSlotValue"]:
+    if not _has_payload_for_schema(schema, message_text):
+        return []
+    slots = list(getattr(schema, "slots", []) or [])
+    target = next(
+        (
+            slot
+            for slot in slots
+            if getattr(slot, "type", "") == "text"
+            and bool(getattr(slot, "required", False))
+        ),
+        None,
+    )
+    if target is None:
+        return []
+    normalized = normalize_message_text(message_text)
+    head = normalize_message_text(getattr(schema, "head", "") or "")
+    payload = normalized
+    aliases = [
+        normalize_message_text(alias)
+        for alias in getattr(schema, "aliases", []) or []
+        if normalize_message_text(alias)
+    ]
+    for marker in [head, *aliases]:
+        if marker and marker in payload:
+            before, _sep, after = payload.partition(marker)
+            payload = after or before
+            break
+    for prefix in (
+        "做一句",
+        "做一段",
+        "说",
+        "写",
+        "内容是",
+        "文字是",
+        "牌子写",
+        "：",
+        ":",
+        "，",
+        ",",
+        "一下",
+    ):
+        payload = payload.replace(prefix, " ")
+    payload = normalize_message_text(payload)
+    if not payload:
+        return []
+    return [LLMSlotValue(name=str(getattr(target, "name", "")), value=payload)]
 
 
 @dataclass(frozen=True)
@@ -142,6 +172,12 @@ class RouteResolveResult:
     decision: SkillRouteDecision
     stage: str
     report: "RouteAttemptReport | None" = None
+    command_id: str | None = None
+    slots: dict[str, Any] = field(default_factory=dict)
+    missing: tuple[str, ...] = ()
+    selected_rank: int = 0
+    selected_score: float = 0.0
+    selected_reason: str = ""
 
 
 @dataclass
@@ -155,6 +191,20 @@ class RouteAttemptReport:
     tool_attempts: int = 0
     tool_candidates: int = 0
     tool_choice_count: int = 0
+    prompt_full_candidates: int = 0
+    prompt_compact_candidates: int = 0
+    prompt_name_only_candidates: int = 0
+    query_expansion_attempts: int = 0
+    query_expansion_success: int = 0
+    query_expansion_query: str = ""
+    query_expansion_reason: str = ""
+    candidate_policy_reason: str = ""
+    candidate_policy_limit: int = 0
+    rerank_attempts: int = 0
+    rerank_success: int = 0
+    rerank_no_available: int = 0
+    rerank_stage: str = ""
+    rerank_reason: str = ""
     final_reason: str = "init"
     selected_stage: str | None = None
     selected_plugin: str | None = None
@@ -170,6 +220,60 @@ class RouteAttemptReport:
         self.tool_attempts += 1
         self.tool_candidates = max(self.tool_candidates, max(tool_count, 0))
         self.tool_choice_count += max(choice_count, 0)
+
+    def note_prompt_exposure(self, candidates: list[CommandCandidate]) -> None:
+        snapshots = build_candidate_snapshots(candidates)
+        self.prompt_full_candidates = max(
+            self.prompt_full_candidates,
+            sum(1 for item in snapshots if item.prompt_level == "full"),
+        )
+        self.prompt_compact_candidates = max(
+            self.prompt_compact_candidates,
+            sum(1 for item in snapshots if item.prompt_level == "compact"),
+        )
+        self.prompt_name_only_candidates = max(
+            self.prompt_name_only_candidates,
+            sum(1 for item in snapshots if item.prompt_level == "name_only"),
+        )
+
+    def note_query_expansion(
+        self,
+        descriptor: ToolQueryDescriptor | None,
+        *,
+        queries: list[str],
+    ) -> None:
+        self.query_expansion_attempts += 1
+        if descriptor is not None and len(queries) > 1:
+            self.query_expansion_success += 1
+            self.query_expansion_query = normalize_message_text(
+                descriptor.capability_query
+            )[:160]
+            self.query_expansion_reason = normalize_message_text(
+                descriptor.reason or descriptor.action
+            )[:160]
+
+    def note_candidate_policy(self, *, reason: str, limit: int) -> None:
+        self.candidate_policy_reason = normalize_message_text(reason)[:120]
+        self.candidate_policy_limit = max(int(limit or 0), 0)
+
+    def note_rerank(
+        self,
+        *,
+        stage: str,
+        decision: ToolRerankDecision | None,
+        success: bool,
+    ) -> None:
+        self.rerank_attempts += 1
+        self.rerank_stage = normalize_message_text(stage)[:80]
+        if success:
+            self.rerank_success += 1
+        if decision is None:
+            return
+        if decision.action == "no_available_tool":
+            self.rerank_no_available += 1
+        self.rerank_reason = normalize_message_text(
+            decision.reason or decision.no_available_tool_reason or decision.action
+        )[:160]
 
     def finalize(
         self,
@@ -191,1309 +295,766 @@ class RouteAttemptReport:
             self.selected_command = command
 
 
-class _LLMRouteDecision(BaseModel):
-    action: Literal["route", "skip"] = Field(
-        default="skip", description="route=调用插件；skip=不路由"
-    )
-    plugin_module: str | None = Field(
-        default=None, description="目标插件模块，必须来自 skills_json"
-    )
-    plugin_name: str | None = Field(default=None, description="目标插件名称，可选")
-    command: str | None = Field(default=None, description="最终可执行命令")
+class LLMSlotValue(BaseModel):
+    name: str = Field(description="槽位名称，必须来自候选 schema")
+    value: str = Field(default="", description="槽位值，统一以字符串填写")
 
 
-class _ShortlistAlignmentDecision(BaseModel):
-    action: Literal["route", "usage", "skip"] = Field(
-        default="skip",
-        description="route=直接执行；usage=返回该插件用法；skip=按普通聊天处理",
-    )
-    plugin_module: str | None = Field(
-        default=None,
-        description="目标插件模块，必须来自 skills_json",
-    )
-    plugin_name: str | None = Field(default=None, description="目标插件名称，可选")
-    command: str | None = Field(
-        default=None,
-        description="命令头，不要带参数、[@...]、[image]",
-    )
+def _slots_to_items(value: Any) -> list[LLMSlotValue]:
+    if not value:
+        return []
+    if isinstance(value, dict):
+        return [
+            LLMSlotValue(name=str(key), value=str(slot_value))
+            for key, slot_value in value.items()
+            if normalize_message_text(str(key or ""))
+        ]
+    items: list[LLMSlotValue] = []
+    if isinstance(value, list | tuple):
+        for item in value:
+            if isinstance(item, LLMSlotValue):
+                name = item.name
+                slot_value = item.value
+            elif isinstance(item, dict):
+                name = str(item.get("name", "") or "")
+                slot_value = str(item.get("value", "") or "")
+            else:
+                continue
+            if normalize_message_text(name):
+                items.append(LLMSlotValue(name=name, value=slot_value))
+    return items
 
 
-class _WeakSignalDecision(BaseModel):
-    action: Literal["chat", "usage", "execute", "ambiguous"] = Field(
+def _slots_to_dict(value: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in _slots_to_items(value):
+        name = normalize_message_text(item.name)
+        if name:
+            result[name] = str(item.value or "")
+    return result
+
+
+class LLMRouterDecision(BaseModel):
+    action: Literal["chat", "execute", "usage", "clarify"] = Field(
         default="chat",
-        description="chat=普通聊天；usage=插件用法；execute=直接执行；ambiguous=介于两者之间",
-    )
-    plugin_module: str | None = Field(
-        default=None,
-        description="目标插件模块，必须来自 cards_json",
-    )
-    plugin_name: str | None = Field(default=None, description="目标插件名称，可选")
-    command: str | None = Field(
-        default=None,
-        description="命令头，不要带参数、[@...]、[image]",
+        description="chat=普通对话；execute=执行插件；usage=查询用法；clarify=需要补充信息",
     )
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    reason: str | None = Field(default=None, description="简短原因")
-    missing_context: list[str] = Field(
+    plugin_module: str | None = Field(default=None, description="必须来自 plugin_cards")
+    plugin_name: str | None = Field(default=None, description="插件名称，可选")
+    command_id: str | None = Field(default=None, description="优先使用的命令 schema ID")
+    command: str | None = Field(default=None, description="插件命令头")
+    slots: list[LLMSlotValue] = Field(
         default_factory=list,
-        description="缺失的上下文，例如 at/image/reply/target/参数",
+        description="命令槽位列表，格式为 [{name,value}]，不要使用任意对象键",
     )
+    arguments_text: str = Field(default="", description="命令后的自然语言参数")
+    missing: list[str] = Field(default_factory=list, description="缺失信息")
+    reason: str | None = Field(default=None, description="简短原因")
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, value: Any) -> list[LLMSlotValue]:
+        return _slots_to_items(value)
 
 
-def _resolve_target_plugin(
-    decision: _LLMRouteDecision,
-    knowledge_base: PluginKnowledgeBase,
-) -> PluginInfo | None:
-    module_text = normalize_message_text(decision.plugin_module or "")
-    if module_text:
-        module_fold = module_text.casefold()
-        for plugin in knowledge_base.plugins:
-            if normalize_message_text(plugin.module).casefold() == module_fold:
-                return plugin
-        tail_matches = [
-            plugin
-            for plugin in knowledge_base.plugins
-            if normalize_message_text(plugin.module.rsplit(".", 1)[-1]).casefold()
-            == module_fold
-        ]
-        if len(tail_matches) == 1:
-            return tail_matches[0]
-
-    name_text = normalize_message_text(decision.plugin_name or "")
-    if name_text:
-        name_fold = name_text.casefold()
-        for plugin in knowledge_base.plugins:
-            if normalize_message_text(plugin.name).casefold() == name_fold:
-                return plugin
-    return None
-
-
-def _is_public_command_meta(meta: object) -> bool:
-    return (
-        normalize_message_text(str(getattr(meta, "access_level", "public") or "public"))
-        .lower()
-        == "public"
+class LLMCommandSelection(BaseModel):
+    action: Literal["chat", "execute", "usage", "clarify"] = Field(
+        default="chat",
+        description="chat=普通对话；execute=执行候选命令；usage=查询候选命令用法；clarify=需要补充信息",
     )
-
-
-def _collect_allowed_heads(plugin: PluginInfo) -> set[str]:
-    allowed: set[str] = set()
-    if plugin.command_meta:
-        metas = plugin.command_meta
-    else:
-        metas = []
-    for meta in metas:
-        if not _is_public_command_meta(meta):
-            continue
-        command_head = normalize_message_text(getattr(meta, "command", ""))
-        if command_head:
-            allowed.add(command_head.casefold())
-        for alias in getattr(meta, "aliases", None) or []:
-            alias_text = normalize_message_text(alias)
-            if alias_text:
-                allowed.add(alias_text.casefold())
-    if not allowed:
-        for command in plugin.commands:
-            normalized = normalize_message_text(command)
-            if normalized:
-                allowed.add(normalized.casefold())
-    return allowed
-
-
-def _collect_helper_heads(
-    plugin_module: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> set[str]:
-    registry = get_skill_registry(knowledge_base)
-    for skill in registry.skills:
-        if skill.plugin_module != plugin_module:
-            continue
-        return {
-            normalize_message_text(command).casefold()
-            for command in skill.helper_commands
-            if normalize_message_text(command)
-        }
-    return set()
-
-
-def _resolve_command_schema(plugin: PluginInfo, command_head: str):
-    normalized_head = normalize_message_text(command_head).casefold()
-    if not normalized_head:
-        return None
-    for meta in plugin.command_meta:
-        if not _is_public_command_meta(meta):
-            continue
-        head = normalize_message_text(getattr(meta, "command", "")).casefold()
-        if head and head == normalized_head:
-            return meta
-        for alias in getattr(meta, "aliases", None) or []:
-            alias_text = normalize_message_text(alias).casefold()
-            if alias_text and alias_text == normalized_head:
-                return meta
-    return None
-
-
-def _strip_supported_command_prefixes(command: str, plugin: PluginInfo) -> str:
-    normalized = normalize_message_text(command)
-    if not normalized:
-        return ""
-
-    prefixes: list[str] = []
-    for meta in plugin.command_meta:
-        if not _is_public_command_meta(meta):
-            continue
-        for prefix in getattr(meta, "prefixes", None) or []:
-            prefix_text = normalize_message_text(str(prefix or ""))
-            if prefix_text and prefix_text not in prefixes:
-                prefixes.append(prefix_text)
-
-    for prefix in sorted(prefixes, key=len, reverse=True):
-        if normalized.startswith(prefix):
-            stripped = normalize_message_text(normalized[len(prefix) :])
-            if stripped:
-                return stripped
-
-    if normalized.startswith("/") and len(normalized) > 1:
-        stripped = normalize_message_text(normalized[1:])
-        if stripped:
-            return stripped
-    return normalized
-
-
-def _collect_placeholder_tokens(command: str) -> set[str]:
-    tokens: set[str] = set()
-    for token in collect_placeholders(command):
-        normalized = normalize_message_text(token)
-        if not normalized:
-            continue
-        if _AT_INLINE_PATTERN.fullmatch(normalized):
-            normalized = f"[{normalized}]"
-        tokens.add(normalized)
-    return tokens
-
-
-def _normalize_placeholder_tokens(
-    command: str,
-    *,
-    include_at: bool = True,
-    include_image: bool = True,
-) -> tuple[list[str], list[str]]:
-    at_tokens: list[str] = []
-    image_tokens: list[str] = []
-    for token in collect_placeholders(command):
-        normalized = normalize_message_text(token)
-        if not normalized:
-            continue
-        if _AT_INLINE_PATTERN.fullmatch(normalized):
-            normalized = f"[{normalized}]"
-        if include_at and _AT_PLACEHOLDER_PATTERN.fullmatch(normalized):
-            if normalized not in at_tokens:
-                at_tokens.append(normalized)
-            continue
-        is_image_token = _IMAGE_PLACEHOLDER_PATTERN.fullmatch(normalized) or (
-            normalized.lower().startswith("[image")
-        )
-        if include_image and is_image_token:
-            if normalized not in image_tokens:
-                image_tokens.append(normalized)
-    return at_tokens, image_tokens
-
-
-def _is_explicit_helper_command_request(
-    message_text: str,
-    command_head: str,
-) -> bool:
-    normalized_message = normalize_message_text(
-        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
+    command_id: str | None = Field(
+        default=None,
+        description="必须来自 candidates.command_id；chat 时为空",
     )
-    normalized_head = normalize_message_text(command_head)
-    if not normalized_message or not normalized_head:
-        return False
-    if normalized_message == normalized_head:
-        return True
-    return match_command_head_or_sticky(
-        normalized_message,
-        normalized_head,
-        allow_sticky=True,
-    )
-
-
-def _sanitize_command_with_schema(
-    plugin: PluginInfo,
-    *,
-    command: str,
-) -> str:
-    normalized = normalize_message_text(command)
-    if not normalized:
-        return ""
-    parts = normalized.split(" ")
-    head = normalize_message_text(parts[0] if parts else "")
-    if not head:
-        return ""
-
-    schema = _resolve_command_schema(plugin, head)
-    if schema is None:
-        return normalized
-
-    policy = resolve_command_target_policy(schema)
-    image_max_raw = getattr(schema, "image_max", None)
-    image_max: int | None = None
-    if image_max_raw is not None:
-        image_max = max(int(image_max_raw), 0)
-    accepts_at_target = policy.allow_at and policy.target_requirement != "none"
-    include_image = image_max is None or image_max > 0
-    placeholder_tokens = _collect_placeholder_tokens(normalized)
-    at_tokens, image_tokens = _normalize_placeholder_tokens(
-        normalized,
-        include_at=accepts_at_target,
-        include_image=include_image,
-    )
-
-    text_tokens: list[str] = []
-    for token in parts[1:]:
-        token_text = normalize_message_text(token)
-        if not token_text:
-            continue
-        if token_text in placeholder_tokens:
-            continue
-        text_tokens.append(token_text)
-
-    if image_max is not None:
-        image_tokens = image_tokens[:image_max]
-
-    text_max = getattr(schema, "text_max", None)
-    if text_max is not None:
-        text_max = max(int(text_max), 0)
-        if text_max == 0:
-            text_tokens = []
-        elif text_max == 1 and len(text_tokens) > 1:
-            text_tokens = [" ".join(text_tokens)]
-        elif len(text_tokens) > text_max:
-            text_tokens = text_tokens[:text_max]
-
-    payload = [*text_tokens, *at_tokens, *image_tokens]
-    return normalize_message_text(" ".join([head, *payload]).strip())
-
-
-def _rehydrate_command_payload_from_message(
-    command: str,
-    *,
-    message_text: str,
-    schema,
-) -> str:
-    normalized = normalize_message_text(command)
-    if not normalized:
-        return normalized
-    if len(normalized.split(" ", 1)) > 1:
-        return normalized
-
-    has_payload_signal = _message_has_payload_signals(message_text)
-    if schema is None and not has_payload_signal:
-        return normalized
-
-    text_min = max(int(getattr(schema, "text_min", 0) or 0), 0) if schema is not None else 0
-    has_params = bool(getattr(schema, "params", None)) if schema is not None else False
-    if text_min <= 0 and not has_params and not has_payload_signal:
-        return normalized
-
-    command_head = normalize_message_text(normalized.split(" ", 1)[0])
-    if not command_head:
-        return normalized
-
-    allow_sticky = bool(getattr(schema, "allow_sticky_arg", False)) if schema is not None else False
-    recovered = parse_command_with_head(
-        message_text,
-        command_head,
-        allow_sticky=allow_sticky,
-        max_prefix_len=16,
-    )
-    payload = normalize_message_text((recovered.payload_text if recovered else "") or "")
-    if not payload:
-        payload = normalize_message_text(
-            _extract_argument_around_head(message_text, command_head)
-        )
-    if not payload:
-        return normalized
-
-    payload_tokens = [token for token in payload.split(" ") if token]
-    if not payload_tokens:
-        return normalized
-
-    text_max = getattr(schema, "text_max", None) if schema is not None else None
-    if text_max is not None:
-        try:
-            text_max_int = max(int(text_max), 0)
-        except Exception:
-            text_max_int = None
-        if text_max_int is not None:
-            if text_max_int == 0:
-                return command_head
-            if text_max_int == 1 and len(payload_tokens) > 1:
-                payload_tokens = [" ".join(payload_tokens)]
-            elif len(payload_tokens) > text_max_int:
-                payload_tokens = payload_tokens[:text_max_int]
-
-    return normalize_message_text(" ".join([command_head, *payload_tokens]).strip())
-
-
-def _to_route_result(
-    decision: _LLMRouteDecision,
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> RouteResolveResult | None:
-    if decision.action != "route":
-        return None
-
-    plugin = _resolve_target_plugin(decision, knowledge_base)
-    if plugin is None:
-        return None
-
-    command = normalize_message_text(decision.command or "")
-    if not command:
-        return None
-    command = _strip_supported_command_prefixes(command, plugin)
-    command_head = normalize_message_text(command.split(" ", 1)[0]).casefold()
-    if not command_head:
-        return None
-
-    allowed_heads = _collect_allowed_heads(plugin)
-    if command_head not in allowed_heads:
-        for candidate_head in sorted(allowed_heads, key=len, reverse=True):
-            if not candidate_head:
-                continue
-            if command.casefold().startswith(candidate_head):
-                remainder = normalize_message_text(command[len(candidate_head) :])
-                if not remainder:
-                    continue
-                command = normalize_message_text(f"{candidate_head} {remainder}")
-                command_head = candidate_head
-                break
-    if command_head not in allowed_heads:
-        return None
-
-    command = _sanitize_command_with_schema(plugin, command=command)
-    schema = _resolve_command_schema(plugin, command_head)
-    if schema is not None:
-        command = _rehydrate_command_payload_from_message(
-            command,
-            message_text=message_text,
-            schema=schema,
-        )
-    elif _message_has_payload_signals(message_text):
-        command = _rehydrate_command_payload_from_message(
-            command,
-            message_text=message_text,
-            schema=None,
-        )
-    command_head = normalize_message_text(command.split(" ", 1)[0]).casefold()
-    if not command_head or command_head not in allowed_heads:
-        return None
-
-    helper_heads = _collect_helper_heads(plugin.module, knowledge_base)
-    if (
-        helper_heads
-        and command_head in helper_heads
-        and not is_usage_question(message_text)
-        and not _is_explicit_helper_command_request(message_text, command_head)
-    ):
-        return None
-
-    route_decision = SkillRouteDecision(
-        plugin_name=plugin.name,
-        plugin_module=plugin.module,
-        command=command,
-        source="llm",
-        skill_kind="llm",
-    )
-    return RouteResolveResult(decision=route_decision, stage="llm")
-
-
-def _validate_existing_route_result(
-    route_result: RouteResolveResult,
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> RouteResolveResult | None:
-    validated = _to_route_result(
-        _LLMRouteDecision(
-            action="route",
-            plugin_module=route_result.decision.plugin_module,
-            plugin_name=route_result.decision.plugin_name,
-            command=route_result.decision.command,
+    slots: list[LLMSlotValue] = Field(
+        default_factory=list,
+        description=(
+            "按候选 schema 填写的槽位列表，格式为 [{name,value}]，"
+            "不要臆造 schema 之外的槽位"
         ),
-        message_text,
-        knowledge_base,
     )
-    if validated is None:
-        return None
-    return RouteResolveResult(
-        decision=SkillRouteDecision(
-            plugin_name=validated.decision.plugin_name,
-            plugin_module=validated.decision.plugin_module,
-            command=validated.decision.command,
-            source=route_result.decision.source,
-            skill_kind=route_result.decision.skill_kind,
-        ),
-        stage=route_result.stage,
+    missing: list[str] = Field(
+        default_factory=list,
+        description="缺失的必填槽位或上下文，例如 text/image/reply/target",
     )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = Field(default="", description="简短选择理由")
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, value: Any) -> list[LLMSlotValue]:
+        return _slots_to_items(value)
 
 
-def _extract_alignment_numbers(message_text: str) -> list[str]:
+def _is_exact_command_candidate(candidate: CommandCandidate | None) -> bool:
+    return bool(candidate and candidate.exact_protected)
+
+
+def _should_force_chat_before_llm(message_text: str, speech_act: str) -> bool:
     normalized = normalize_message_text(message_text)
-    if not normalized:
-        return []
-    values: list[str] = []
-    for match in re.findall(r"\d+(?:\.\d+)?", normalized):
-        if match not in values:
-            values.append(match)
-    return values[:6]
-
-
-def _build_shortlist_alignment_prompt(
-    *,
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    local_hint: RouteResolveResult | None,
-    entity_hint: RouteResolveResult | None,
-    has_reply: bool,
-) -> str:
-    skills_json = render_skill_namespace(
-        knowledge_base,
-        query=message_text,
-        limit=max(len(knowledge_base.plugins), 1),
-        preferred_modules=[
-            item
-            for item in (
-                local_hint.decision.plugin_module if local_hint is not None else "",
-                entity_hint.decision.plugin_module if entity_hint is not None else "",
-            )
-            if item
-        ],
-        include_helpers=True,
-        mask_module=False,
-    )
-    signal_payload = {
-        "entity_tokens": list(_extract_shortlist_entity_tokens(message_text)),
-        "numbers": _extract_alignment_numbers(message_text),
-        "has_at": bool(_AT_PLACEHOLDER_PATTERN.search(message_text) or _AT_INLINE_PATTERN.search(message_text)),
-        "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
-        "has_reply": has_reply,
-        "is_usage_question": is_usage_question(message_text),
-        "message_role": infer_message_action_role(message_text),
-        "local_hint": {
-            "plugin_module": local_hint.decision.plugin_module,
-            "command": local_hint.decision.command,
-            "source": local_hint.decision.source,
-        }
-        if local_hint is not None
-        else None,
-        "entity_hint": {
-            "plugin_module": entity_hint.decision.plugin_module,
-            "command": entity_hint.decision.command,
-            "source": entity_hint.decision.source,
-        }
-        if entity_hint is not None
-        else None,
-    }
-    return (
-        f"用户消息:\n{message_text}\n\n"
-        f"消息信号 JSON:\n{json.dumps(signal_payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
-        "候选插件卡片 JSON:\n"
-        f"{skills_json}\n\n"
-        "只基于上述 shortlist 做对齐。"
-    )
-
-
-def _build_weak_signal_alignment_prompt(
-    *,
-    message_text: str,
-    original_message_text: str | None,
-    knowledge_base: PluginKnowledgeBase,
-    has_at: bool,
-    has_image: bool,
-    has_reply: bool,
-    is_private: bool,
-) -> str:
-    normalized_message = normalize_message_text(
-        normalize_action_phrases(strip_invoke_prefix(message_text or ""))
-    )
-    weak_tags = list(collect_weak_route_signals(normalized_message))
-    shortlist_limit = max(_WEAK_SIGNAL_SHORTLIST_LIMIT, 1)
-    registry = get_skill_registry(knowledge_base)
-    selected_skills = list(
-        select_relevant_skills(
-            registry,
-            normalized_message,
-            limit=shortlist_limit,
-        )
-    )
-    preferred_modules = [
-        normalize_message_text(skill.plugin_module)
-        for skill in selected_skills
-        if normalize_message_text(skill.plugin_module)
-    ]
-    cards_json = render_skill_namespace(
-        knowledge_base,
-        query=normalized_message,
-        limit=shortlist_limit,
-        preferred_modules=preferred_modules,
-        include_helpers=True,
-        mask_module=False,
-    )
-    signal_payload = {
-        "original_text": original_message_text or message_text,
-        "normalized_text": normalized_message,
-        "weak_tags": weak_tags,
-        "context": {
-            "has_at": has_at,
-            "has_image": has_image,
-            "has_reply": has_reply,
-            "is_private": is_private,
-            "message_role": infer_message_action_role(normalized_message),
-        },
-        "shortlist_modules": preferred_modules,
-    }
-    return (
-        f"用户原文:\n{original_message_text or message_text}\n\n"
-        f"归一化文本:\n{normalized_message}\n\n"
-        f"弱词标签 JSON:\n{json.dumps(signal_payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
-        "候选插件卡片 JSON:\n"
-        f"{cards_json}\n\n"
-        "只基于上述 cards_json 判定 chat / usage / execute / ambiguous。"
-    )
-
-
-def _subset_knowledge_base_by_modules(
-    knowledge_base: PluginKnowledgeBase,
-    modules: list[str],
-) -> PluginKnowledgeBase:
-    if not modules:
-        return knowledge_base
-    normalized_modules = {
-        normalize_message_text(module)
-        for module in modules
-        if normalize_message_text(module)
-    }
-    if not normalized_modules:
-        return knowledge_base
-    plugins = [
-        plugin
-        for plugin in knowledge_base.plugins
-        if normalize_message_text(plugin.module) in normalized_modules
-    ]
-    if not plugins:
-        return knowledge_base
-    return PluginKnowledgeBase(plugins=plugins, user_role=knowledge_base.user_role)
-
-
-def _has_strong_shortlist_entity_signal(entity_tokens: tuple[str, ...]) -> bool:
-    if not entity_tokens:
-        return False
-    if len(entity_tokens) >= 2:
+    stripped = normalize_message_text(strip_invoke_prefix(normalized))
+    if has_negative_route_intent(normalized) or has_negative_route_intent(stripped):
         return True
-    token = entity_tokens[0].strip()
-    if not token:
+    if speech_act == "discuss_command":
+        return not contains_any(stripped, STRONG_EXECUTE_WORDS)
+    if speech_act != "casual_chat":
         return False
-    if any(char.isascii() for char in token):
-        return len(token) >= 5
-    return len(token) >= 4
+    if not has_chat_context_hint(stripped):
+        return False
+    return not contains_any(stripped, STRONG_EXECUTE_WORDS)
 
 
-def _extract_shortlist_entity_tokens(message_text: str) -> tuple[str, ...]:
-    normalized = normalize_message_text(strip_invoke_prefix(message_text or "")).lower()
+def _message_context_flags(
+    message_text: str, *, has_reply: bool = False
+) -> dict[str, bool]:
+    return {
+        "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
+        "has_at": bool(
+            _AT_PLACEHOLDER_PATTERN.search(message_text)
+            or _AT_INLINE_PATTERN.search(message_text)
+        ),
+        "has_reply": has_reply,
+    }
+
+
+def _has_exact_tool_head(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    command_tools: list[Any] | None,
+) -> bool:
+    normalized = normalize_message_text(message_text)
+    stripped = normalize_message_text(strip_invoke_prefix(normalized))
     if not normalized:
-        return ()
-
-    tokens: list[str] = []
-    for token in _SHORTLIST_ENTITY_TOKEN_PATTERN.findall(normalized):
-        value = token.strip()
-        if not value or value in _SHORTLIST_ENTITY_STOPWORDS:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fff]{2,}", value):
-            for size in range(min(3, len(value)), 1, -1):
-                for start in range(0, len(value) - size + 1):
-                    fragment = value[start : start + size]
-                    if fragment in _SHORTLIST_ENTITY_STOPWORDS:
-                        continue
-                    if fragment not in tokens:
-                        tokens.append(fragment)
-            continue
-        if len(value) >= 3 and value not in tokens:
-            tokens.append(value)
-    return tuple(tokens[:24])
-
-
-def _looks_like_compact_route_query(message_text: str) -> bool:
-    normalized = normalize_message_text(strip_invoke_prefix(message_text or "")).lower()
-    if not normalized or is_usage_question(normalized):
         return False
-    if any(marker in normalized for marker in _SHORTLIST_COMPACT_QUESTION_HINTS):
-        return False
-    compact = normalized.replace(" ", "")
-    if len(compact) > 10:
-        return False
-    return contains_any(normalized, ROUTE_ACTION_WORDS) or any(
-        hint in normalized for hint in _SHORTLIST_COMPACT_ROUTE_HINTS
-    )
+    texts = [normalized]
+    if stripped and stripped != normalized:
+        texts.append(stripped)
+    for tool in _ensure_command_tools(knowledge_base, command_tools):
+        terms = [
+            normalize_message_text(getattr(tool, "head", "") or ""),
+            *[
+                normalize_message_text(alias)
+                for alias in getattr(tool, "aliases", []) or []
+                if normalize_message_text(alias)
+            ],
+        ]
+        if any(
+            term and any(match_command_head(text, term) for text in texts)
+            for term in terms
+        ):
+            return True
+    return False
 
 
-def _skill_matches_shortlist_entities(skill: Any, entity_tokens: tuple[str, ...]) -> bool:
-    if not entity_tokens:
-        return False
-    haystack = normalize_message_text(
-        " ".join(
-            [
-                str(getattr(skill, "plugin_name", "") or ""),
-                str(getattr(skill, "plugin_module", "") or ""),
-                " ".join(getattr(skill, "commands", ()) or ()),
-                " ".join(getattr(skill, "aliases", ()) or ()),
-                " ".join(getattr(skill, "examples", ()) or ()),
-                str(getattr(skill, "usage", "") or ""),
-            ]
-        )
-    ).lower()
-    if not haystack:
-        return False
-    return any(token in haystack for token in entity_tokens)
+def _ensure_command_tools(
+    knowledge_base: PluginKnowledgeBase,
+    command_tools: list[Any] | None,
+) -> list[Any]:
+    if command_tools:
+        return list(command_tools)
+    graph = build_capability_graph_snapshot(knowledge_base)
+    return list(build_command_tool_snapshots(graph))
 
 
-def _build_shortlist_knowledge_base(
+def _build_command_candidate_pool(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
     *,
-    limit: int,
-) -> tuple[PluginKnowledgeBase, list[str]]:
-    shortlist_limit = max(int(limit), 1)
-    registry = get_skill_registry(knowledge_base)
-    selected_skills = list(
-        select_relevant_skills(
-            registry,
-            message_text,
-            limit=shortlist_limit,
+    session_key: str | None = None,
+    command_tools: list[Any] | None = None,
+    expanded_queries: list[str] | None = None,
+    limit: int | None = None,
+    diversify: bool = True,
+) -> list[CommandCandidate]:
+    tools = _ensure_command_tools(knowledge_base, command_tools)
+    candidate_limit = limit
+    if candidate_limit is None:
+        candidate_limit = max(
+            int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
+            8,
         )
+    return build_command_candidates(
+        knowledge_base,
+        message_text,
+        limit=candidate_limit,
+        session_id=session_key,
+        diversify=diversify,
+        tools=tools,
+        expanded_queries=expanded_queries,
     )
-    entity_tokens = _extract_shortlist_entity_tokens(message_text)
-    enable_entity_enrichment = _has_strong_shortlist_entity_signal(entity_tokens)
-    if enable_entity_enrichment and entity_tokens:
-        entity_skills = [
-            skill
-            for skill in registry.skills
-            if _skill_matches_shortlist_entities(skill, entity_tokens)
-        ]
-        merged: list[Any] = []
-        seen_modules: set[str] = set()
-        for skill in [*entity_skills, *selected_skills]:
-            module = normalize_message_text(getattr(skill, "plugin_module", ""))
-            if not module or module in seen_modules:
-                continue
-            seen_modules.add(module)
-            merged.append(skill)
-            if len(merged) >= shortlist_limit:
-                break
-        selected_skills = merged
-
-    selected_modules = [
-        normalize_message_text(skill.plugin_module)
-        for skill in selected_skills
-        if normalize_message_text(skill.plugin_module)
-    ]
-    subset = _subset_knowledge_base_by_modules(knowledge_base, selected_modules)
-    if not selected_modules:
-        selected_modules = [
-            normalize_message_text(plugin.module)
-            for plugin in subset.plugins
-            if normalize_message_text(plugin.module)
-        ]
-    return subset, selected_modules
 
 
-def _resolve_shortlist_local_route(
+def _has_adapter_slot_signal(candidate: CommandCandidate, message_text: str) -> bool:
+    try:
+        slots = extract_adapter_slots(candidate.schema.command_id, message_text)
+    except Exception:
+        return False
+    if any(
+        slot.name in slots
+        for slot in candidate.schema.slots
+        if normalize_message_text(slot.name)
+    ):
+        return True
+    if not slots:
+        return False
+    requires = candidate.schema.requires or {}
+    return bool(
+        (requires.get("image") and "image" in slots)
+        or (requires.get("reply") and "reply" in slots)
+        or (requires.get("at") and ("at" in slots or "target" in slots))
+    )
+
+
+def _rerank_to_command_selection(
+    decision: ToolRerankDecision,
+) -> LLMCommandSelection | None:
+    if decision.action == "no_available_tool":
+        return LLMCommandSelection(
+            action="chat",
+            confidence=decision.confidence,
+            reason=(
+                "no_available_tool:"
+                + normalize_message_text(
+                    decision.no_available_tool_reason or decision.reason
+                )
+            ),
+        )
+    if decision.action == "chat":
+        return LLMCommandSelection(
+            action="chat",
+            confidence=decision.confidence,
+            reason=decision.reason or "tool_rerank_chat",
+        )
+    command_id = normalize_message_text(decision.command_id or "")
+    if not command_id:
+        return None
+    return LLMCommandSelection(
+        action=decision.action,
+        command_id=command_id,
+        slots=[
+            LLMSlotValue(name=item.name, value=item.value)
+            for item in decision.slots
+            if normalize_message_text(item.name)
+        ],
+        missing=list(decision.missing),
+        confidence=decision.confidence,
+        reason=decision.reason or f"tool_rerank:{decision.action}",
+    )
+
+
+def _fallback_candidate_selection(
+    *,
+    message_text: str,
+    candidates: list[CommandCandidate],
+    has_reply: bool,
+) -> LLMCommandSelection | None:
+    if not candidates:
+        return None
+    flags = _message_context_flags(message_text, has_reply=has_reply)
+    speech_act = classify_speech_act(message_text, **flags)
+    if _should_force_chat_before_llm(message_text, speech_act):
+        return LLMCommandSelection(
+            action="chat",
+            confidence=0.82,
+            reason=f"speech_act:{speech_act}",
+        )
+
+    top = candidates[0]
+    second_score = candidates[1].score if len(candidates) > 1 else 0.0
+    margin = top.score - second_score
+    if speech_act == "ask_usage" and (
+        top.exact_protected or top.score >= 130.0 or is_usage_question(message_text)
+    ):
+        return LLMCommandSelection(
+            action="usage",
+            command_id=top.schema.command_id,
+            confidence=min(max(top.score / 360.0, 0.0), 0.88),
+            reason=f"local_unavailable_usage:{top.reason}",
+        )
+
+    # Local execution is only a safety net for classifier outages. Fuzzy or semantic
+    # matches stay in chat unless the user hit an actual command head/alias with a
+    # clear margin. Normal routing decisions belong to the LLM reranker.
+    if not _is_exact_command_candidate(top):
+        return None
+    if speech_act in {"casual_chat", "discuss_command"}:
+        return None
+    if margin < 18.0 and top.schema.command_role not in {"catalog", "helper"}:
+        return None
+
+    slots, missing = complete_slots(
+        top.schema,
+        slots={},
+        message_text=message_text,
+        arguments_text="",
+    )
+    payload_items = _payload_slot_items(top.schema, message_text)
+    if payload_items:
+        slots.update(_slots_to_dict(payload_items))
+        missing = []
+    elif missing and _has_payload_for_schema(top.schema, message_text):
+        missing = []
+    action = _action_for_schema(
+        schema=top.schema,
+        speech_act=speech_act,
+        missing=missing,
+    )
+    return LLMCommandSelection(
+        action=action,
+        command_id=top.schema.command_id,
+        slots=_slots_to_items(slots),
+        missing=[] if action == "usage" else list(missing),
+        confidence=min(max(top.score / 420.0, 0.0), 0.86),
+        reason=(
+            "local_unavailable_exact:"
+            f"{top.reason};score={top.score:.1f};margin={margin:.1f}"
+        ),
+    )
+
+
+def _selection_matches_command_context(
+    *,
+    selection: LLMCommandSelection,
+    candidate: CommandCandidate,
+    message_text: str,
+    has_reply: bool,
+) -> tuple[bool, str]:
+    if selection.action == "usage":
+        return True, ""
+    requires = candidate.schema.requires or {}
+    flags = _message_context_flags(message_text, has_reply=has_reply)
+    image_satisfied = flags["has_image"] or (requires.get("at") and flags["has_at"])
+    if requires.get("image") and not image_satisfied:
+        return False, "missing image context"
+    if requires.get("reply") and not flags["has_reply"]:
+        return False, "missing reply context"
+    if (
+        requires.get("at")
+        and not flags["has_at"]
+        and not (requires.get("image") and flags["has_image"])
+    ):
+        return False, "missing at context"
+    return True, ""
+
+
+def _candidate_selection_to_route_result(
+    *,
+    selection: LLMCommandSelection,
+    candidates: list[CommandCandidate],
+    message_text: str,
+    stage: str,
+    has_reply: bool = False,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    if selection.action == "chat":
+        return (
+            LLMRouterDecision(
+                action="chat",
+                confidence=selection.confidence,
+                reason=selection.reason or f"{stage}:chat",
+            ),
+            None,
+        )
+
+    command_id = normalize_message_text(selection.command_id or "")
+    if not command_id:
+        return None
+    candidate = next(
+        (
+            item
+            for item in candidates
+            if normalize_message_text(item.schema.command_id) == command_id
+        ),
+        None,
+    )
+    if candidate is None:
+        return None
+    context_ok, context_reason = _selection_matches_command_context(
+        selection=selection,
+        candidate=candidate,
+        message_text=message_text,
+        has_reply=has_reply,
+    )
+    if not context_ok:
+        missing_name = context_reason.rsplit(" ", 1)[-1] or "context"
+        selection = LLMCommandSelection(
+            action="clarify",
+            command_id=candidate.schema.command_id,
+            slots=_slots_to_items(selection.slots),
+            missing=[*selection.missing, missing_name],
+            confidence=min(selection.confidence, 0.82),
+            reason=f"{selection.reason};validator:{context_reason}",
+        )
+
+    schema = candidate.schema
+    route_slots = _slots_to_dict(selection.slots)
+    if not route_slots:
+        route_slots.update(_slots_to_dict(_payload_slot_items(schema, message_text)))
+    if selection.action == "usage":
+        rendered = schema.head
+        schema_missing: list[str] | tuple[str, ...] = ()
+        route_slots = {}
+    else:
+        route_slots, schema_missing = complete_slots(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+        if schema_missing and _has_payload_for_schema(schema, message_text):
+            schema_missing = []
+        rendered, schema_missing = render_command(
+            schema,
+            slots=route_slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+        if schema_missing and _has_payload_for_schema(schema, message_text):
+            schema_missing = []
+    missing = [*selection.missing, *list(schema_missing)]
+    action = _action_for_schema(
+        schema=schema,
+        speech_act=classify_speech_act(
+            message_text,
+            **_message_context_flags(message_text, has_reply=has_reply),
+        ),
+        missing=missing,
+    )
+    if selection.action == "clarify":
+        action = "clarify"
+    elif selection.action == "usage":
+        action = "usage"
+    if action == "execute" and missing:
+        action = "clarify"
+    if (
+        action == "clarify"
+        and selection.action == "execute"
+        and getattr(schema, "command_role", "") == "template"
+        and (getattr(schema, "requires", {}) or {}).get("image")
+    ):
+        context_missing = {"image", "reply", "at", "context", "target"}
+        if (
+            set(missing).issubset(context_missing)
+            and _message_context_flags(
+                message_text,
+                has_reply=has_reply,
+            )["has_image"]
+        ):
+            action = "execute"
+            missing = []
+
+    command = schema.head if action == "usage" else rendered or schema.head
+    decision = LLMRouterDecision(
+        action=action,
+        confidence=selection.confidence,
+        plugin_module=candidate.plugin_module,
+        plugin_name=candidate.plugin_name,
+        command_id=schema.command_id,
+        command=command,
+        slots=[] if action == "usage" else _slots_to_items(route_slots),
+        missing=[] if action == "usage" else missing,
+        reason=selection.reason or f"{stage}:{candidate.reason}",
+    )
+    route_result = RouteResolveResult(
+        decision=SkillRouteDecision(
+            plugin_name=candidate.plugin_name,
+            plugin_module=candidate.plugin_module,
+            command=command,
+            source=stage,
+            skill_kind=stage,
+        ),
+        stage=stage,
+        command_id=schema.command_id,
+        slots=_slots_to_dict(decision.slots),
+        missing=tuple(decision.missing),
+        selected_rank=next(
+            (
+                index
+                for index, item in enumerate(candidates, 1)
+                if item.schema.command_id == schema.command_id
+            ),
+            0,
+        ),
+        selected_score=candidate.score,
+        selected_reason=candidate.reason,
+    )
+    return decision, route_result
+
+
+async def _resolve_candidate_selection_route(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
-) -> RouteResolveResult | None:
-    search_result = skill_search(
+    *,
+    session_key: str | None,
+    budget_controller: TurnBudgetController | None,
+    has_reply: bool,
+    report: RouteAttemptReport,
+    command_tools: list[Any] | None = None,
+    candidates: list[CommandCandidate] | None = None,
+    stage: str = "command_selector",
+    use_reranker: bool = False,
+    recovery_query: str = "",
+    recovery_reason: str = "",
+    expanded_queries: list[str] | None = None,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    if candidates is None:
+        candidates = _build_command_candidate_pool(
+            message_text,
+            knowledge_base,
+            session_key=session_key,
+            command_tools=command_tools,
+            expanded_queries=expanded_queries,
+        )
+    if not candidates:
+        return None
+
+    policy = select_rerank_candidates(
+        candidates,
+        stage=stage,
+        base_limit=max(
+            int(get_config_value("ROUTE_COMMAND_RERANK_LIMIT", 24) or 24),
+            8,
+        ),
+        max_limit=max(
+            int(get_config_value("ROUTE_COMMAND_RERANK_MAX_LIMIT", 48) or 48),
+            16,
+        ),
+    )
+    report.note_candidate_policy(reason=policy.reason, limit=policy.limit)
+    candidates = policy.candidates
+    report.candidate_total = max(report.candidate_total, len(candidates))
+    report.note_tool_pool(len(candidates))
+    report.note_prompt_exposure(candidates)
+
+    # Very weak candidates are better left to query expansion or the chat fallback.
+    if (
+        stage != "query_expansion"
+        and candidates[0].score < 80.0
+        and not candidates[0].exact_protected
+        and not any(
+            _has_adapter_slot_signal(item, message_text) for item in candidates[:8]
+        )
+    ):
+        return None
+
+    selection: LLMCommandSelection | None = None
+    rerank_decision: ToolRerankDecision | None = None
+    try:
+        rerank_decision = await request_tool_rerank(
+            message_text=message_text,
+            candidates=candidates,
+            has_reply=has_reply,
+            stage=stage if use_reranker else "command_selector",
+            session_key=session_key,
+            budget_controller=budget_controller,
+            recovery_query=recovery_query,
+            recovery_reason=recovery_reason,
+        )
+        report.note_rerank(
+            stage=stage,
+            decision=rerank_decision,
+            success=bool(
+                rerank_decision
+                and rerank_decision.action in {"execute", "usage", "clarify"}
+            ),
+        )
+        if rerank_decision is not None:
+            selection = _rerank_to_command_selection(rerank_decision)
+    except Exception as exc:
+        logger.debug(f"ChatInter tool rerank failed, trying local fallback: {exc}")
+
+    if selection is None and rerank_decision is None:
+        clarify_route = resolve_adapter_clarify_route(message_text, candidates)
+        if clarify_route is not None:
+            selection = LLMCommandSelection(
+                action="clarify",
+                command_id=clarify_route.command_id,
+                missing=list(clarify_route.missing),
+                confidence=clarify_route.confidence,
+                reason=f"adapter_fallback:{clarify_route.reason}",
+            )
+        else:
+            selection = _fallback_candidate_selection(
+                message_text=message_text,
+                candidates=candidates,
+                has_reply=has_reply,
+            )
+
+    if selection is None:
+        return None
+    result = _candidate_selection_to_route_result(
+        selection=selection,
+        candidates=candidates,
+        message_text=message_text,
+        stage=stage,
+        has_reply=has_reply,
+    )
+    if result is not None:
+        report.tool_choice_count += 1
+    return result
+
+
+async def _resolve_query_expansion_route(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    session_key: str | None,
+    budget_controller: TurnBudgetController | None,
+    has_reply: bool,
+    report: RouteAttemptReport,
+    command_tools: list[Any] | None = None,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None] | None:
+    tools = _ensure_command_tools(knowledge_base, command_tools)
+    if not tools:
+        return None
+    descriptor = await build_tool_query_descriptor(
+        message_text,
+        tools=tools,
+        has_reply=has_reply,
+    )
+    queries = expand_tool_queries(message_text, descriptor)
+    report.note_query_expansion(descriptor, queries=queries)
+    if descriptor is None or descriptor.action != "expand" or len(queries) <= 1:
+        return None
+    candidates = _build_command_candidate_pool(
         message_text,
         knowledge_base,
-        include_usage=True,
-        include_similarity=True,
+        session_key=session_key,
+        command_tools=tools,
+        expanded_queries=queries[1:],
+        diversify=False,
     )
-    decision = skill_execute(search_result, message_text, knowledge_base)
-    if decision is None:
+    if not candidates:
         return None
-    return RouteResolveResult(decision=decision, stage="shortlist")
-
-
-def _resolve_shortlist_entity_route(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> RouteResolveResult | None:
-    entity_tokens = _extract_shortlist_entity_tokens(message_text)
-    if not _has_strong_shortlist_entity_signal(entity_tokens):
+    top = candidates[0]
+    if top.score < 88.0 and not top.exact_protected:
         return None
-
-    query_family = infer_query_family(message_text)
-    normalized = normalize_message_text(message_text).lower()
-    registry = get_skill_registry(knowledge_base)
-
-    best_skill: Any | None = None
-    best_command: str | None = None
-    best_score = 0.0
-    for skill in registry.skills:
-        command_pool: list[str] = []
-        for command in [*skill.commands, *skill.aliases]:
-            normalized_command = normalize_message_text(command)
-            if normalized_command and normalized_command not in command_pool:
-                command_pool.append(normalized_command)
-        if not command_pool:
-            continue
-
-        skill_best_score = 0.0
-        skill_best_command: str | None = None
-        for candidate in command_pool:
-            candidate_lower = candidate.lower()
-            matched = [token for token in entity_tokens if token and token in candidate_lower]
-            if not matched:
-                continue
-            score = len(matched) * 10.0 + max(len(token) for token in matched)
-            if candidate_lower == normalized:
-                score += 24.0
-            elif candidate_lower.startswith(normalized) or normalized.startswith(candidate_lower):
-                score += 10.0
-            if len(candidate_lower) <= len(normalized):
-                score += 2.0
-            if query_family == "search":
-                score += 2.0
-            if score > skill_best_score:
-                skill_best_score = score
-                skill_best_command = candidate
-
-        if skill_best_command is None:
-            continue
-        if skill_best_score > best_score:
-            best_score = skill_best_score
-            best_skill = skill
-            best_command = skill_best_command
-
-    if best_skill is None:
-        return None
-    if best_command is None:
-        return None
-
-    return RouteResolveResult(
-        decision=SkillRouteDecision(
-            plugin_name=best_skill.plugin_name,
-            plugin_module=best_skill.plugin_module,
-            command=best_command,
-            source="shortlist_entity",
-            skill_kind=best_skill.kind,
-        ),
-        stage="shortlist",
-    )
-
-
-def _pick_shortlist_fallback_route(
-    message_text: str,
-    local_hint: RouteResolveResult | None,
-    entity_hint: RouteResolveResult | None,
-) -> RouteResolveResult | None:
-    if local_hint is None:
-        return entity_hint
-    if entity_hint is None:
-        return local_hint
-
-    message_role = infer_message_action_role(message_text)
-    local_role = infer_route_action_role(local_hint.decision.command)
-    entity_role = infer_route_action_role(entity_hint.decision.command)
-
-    if message_role in {"create", "open", "return", "query"}:
-        if local_role == "other" and entity_role != "other":
-            return entity_hint
-        if entity_role == message_role and local_role != message_role:
-            return entity_hint
-        if local_role == message_role and entity_role != message_role:
-            return local_hint
-
-    local_is_strong = local_hint.decision.source in {"fast", "rank_exact"}
-    entity_is_strong = entity_hint.decision.source in {"fast", "rank_exact"}
-    if local_is_strong and not entity_is_strong:
-        return local_hint
-    if entity_is_strong and not local_is_strong:
-        return entity_hint
-
-    local_has_payload = " " in normalize_message_text(local_hint.decision.command)
-    entity_has_payload = " " in normalize_message_text(entity_hint.decision.command)
-    if entity_has_payload and not local_has_payload:
-        return entity_hint
-    if local_has_payload and not entity_has_payload:
-        return local_hint
-
-    return local_hint
-
-
-def probe_shortlist_route(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    shortlist_limit: int | None = None,
-) -> tuple[RouteResolveResult | None, RouteAttemptReport]:
-    normalized_message = normalize_message_text(message_text)
-    report = RouteAttemptReport(helper_mode=is_usage_question(normalized_message))
-    if not normalized_message or not knowledge_base.plugins:
-        report.finalize(reason="empty_input")
-        return None, report
-
-    full_plugins = list(knowledge_base.plugins)
-    report.candidate_total = len(full_plugins)
-    effective_limit = max(
-        int(
-            shortlist_limit
-            or get_config_value(
-                "ROUTE_PLUGIN_SHORTLIST_LIMIT",
-                _ROUTE_PLUGIN_SHORTLIST_LIMIT,
-            )
-            or _ROUTE_PLUGIN_SHORTLIST_LIMIT
-        ),
-        1,
-    )
-    attempt_kb, shortlisted_modules = _build_shortlist_knowledge_base(
-        normalized_message,
-        knowledge_base,
-        limit=effective_limit,
-    )
-    report.lexical_candidates = len(attempt_kb.plugins)
-    report.direct_candidates = len(attempt_kb.plugins)
-    report.vector_candidates = 0
-
-    attempt_modules = shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT]
-    if not attempt_modules:
-        attempt_modules = [
-            normalize_message_text(plugin.module)
-            for plugin in attempt_kb.plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
-        ]
-    report.note_attempt(attempt_modules)
-
-    entity_route_result = _resolve_shortlist_entity_route(
-        normalized_message,
-        attempt_kb,
-    )
-    shortlist_route_result = _resolve_shortlist_local_route(
-        normalized_message,
-        attempt_kb,
-    )
-    if entity_route_result is not None:
-        if shortlist_route_result is None or shortlist_route_result.decision.source not in {
-            "fast",
-            "rank_exact",
-        }:
-            shortlist_route_result = entity_route_result
-    if shortlist_route_result is None:
-        report.finalize(reason="shortlist_probe_miss")
-        return None, report
-
-    validated_shortlist_result = _validate_existing_route_result(
-        shortlist_route_result,
-        normalized_message,
-        attempt_kb,
-    )
-    if validated_shortlist_result is None:
-        report.finalize(reason="shortlist_probe_invalid")
-        return None, report
-
-    report.finalize(
-        reason="shortlist_route",
-        stage=validated_shortlist_result.stage,
-        plugin_name=validated_shortlist_result.decision.plugin_name,
-        plugin_module=validated_shortlist_result.decision.plugin_module,
-        command=validated_shortlist_result.decision.command,
-    )
-    return (
-        RouteResolveResult(
-            decision=validated_shortlist_result.decision,
-            stage=validated_shortlist_result.stage,
-            report=report,
-        ),
-        report,
-    )
-
-
-async def _request_shortlist_alignment_decision(
-    *,
-    prompt: str,
-    timeout_value: float | None,
-    session_key: str,
-    budget_controller: TurnBudgetController | None,
-) -> _ShortlistAlignmentDecision | None:
-    try:
-        if budget_controller is not None and not budget_controller.allow_classifier(
-            "shortlist_align"
-        ):
-            return None
-        started = time.perf_counter()
-        guarded = guard_prompt_sections(
-            session_key=session_key,
-            stage="shortlist_align",
-            system_prompt=_SHORTLIST_ALIGNMENT_INSTRUCTION,
-            user_text=prompt,
-            controller=budget_controller,
-        )
-        decision = await generate_structured(
-            guarded.user_text,
-            _ShortlistAlignmentDecision,
-            model=get_model_name(),
-            instruction=guarded.system_prompt,
-            timeout=timeout_value,
-        )
-        if budget_controller is not None:
-            budget_controller.record_classifier(
-                "shortlist_align",
-                time.perf_counter() - started,
-            )
-        return decision
-    except Exception as exc:
-        logger.debug(f"ChatInter shortlist 对齐失败: {exc}")
-        return None
-
-
-async def _request_weak_signal_decision(
-    *,
-    prompt: str,
-    timeout_value: float | None,
-    session_key: str,
-    budget_controller: TurnBudgetController | None,
-) -> _WeakSignalDecision | None:
-    try:
-        if budget_controller is not None and not budget_controller.allow_classifier(
-            "weak_signal_align"
-        ):
-            return None
-        started = time.perf_counter()
-        guarded = guard_prompt_sections(
-            session_key=session_key,
-            stage="weak_signal_align",
-            system_prompt=_WEAK_SIGNAL_ALIGNMENT_INSTRUCTION,
-            user_text=prompt,
-            controller=budget_controller,
-        )
-        decision = await generate_structured(
-            guarded.user_text,
-            _WeakSignalDecision,
-            model=get_model_name(),
-            instruction=guarded.system_prompt,
-            timeout=timeout_value,
-        )
-        if budget_controller is not None:
-            budget_controller.record_classifier(
-                "weak_signal_align",
-                time.perf_counter() - started,
-            )
-        return decision
-    except Exception as exc:
-        logger.debug(f"ChatInter 弱词对齐失败: {exc}")
-        return None
-
-
-async def resolve_shortlist_alignment(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    session_key: str | None = None,
-    budget_controller: TurnBudgetController | None = None,
-    has_reply: bool = False,
-) -> tuple[_ShortlistAlignmentDecision | None, RouteResolveResult | None, RouteAttemptReport]:
-    normalized_message = normalize_message_text(message_text)
-    report = RouteAttemptReport(helper_mode=is_usage_question(normalized_message))
-    if not normalized_message or not knowledge_base.plugins:
-        report.finalize(reason="shortlist_alignment_empty")
-        return None, None, report
-
-    timeout = get_config_value("INTENT_TIMEOUT", 20)
-    try:
-        timeout_value = float(timeout) if timeout else None
-    except (TypeError, ValueError):
-        timeout_value = None
-
-    shortlist_limit = max(
-        int(
-            get_config_value(
-                "ROUTE_PLUGIN_SHORTLIST_LIMIT",
-                _ROUTE_PLUGIN_SHORTLIST_LIMIT,
-            )
-            or _ROUTE_PLUGIN_SHORTLIST_LIMIT
-        ),
-        1,
-    )
-    attempt_kb, shortlisted_modules = _build_shortlist_knowledge_base(
-        normalized_message,
-        knowledge_base,
-        limit=shortlist_limit,
-    )
-    report.candidate_total = len(knowledge_base.plugins)
-    report.lexical_candidates = len(attempt_kb.plugins)
-    report.direct_candidates = len(attempt_kb.plugins)
-    report.vector_candidates = 0
-    attempt_modules = shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT]
-    if not attempt_modules:
-        attempt_modules = [
-            normalize_message_text(plugin.module)
-            for plugin in attempt_kb.plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
-        ]
-    report.note_attempt(attempt_modules)
-
-    local_hint = _resolve_shortlist_local_route(normalized_message, attempt_kb)
-    entity_hint = _resolve_shortlist_entity_route(normalized_message, attempt_kb)
-    prompt = _build_shortlist_alignment_prompt(
-        message_text=normalized_message,
-        knowledge_base=attempt_kb,
-        local_hint=local_hint,
-        entity_hint=entity_hint,
-        has_reply=has_reply,
-    )
-    decision = await _request_shortlist_alignment_decision(
-        prompt=prompt,
-        timeout_value=timeout_value,
-        session_key=session_key or "global",
-        budget_controller=budget_controller,
-    )
-    if decision is None:
-        fallback = _pick_shortlist_fallback_route(
-            normalized_message,
-            local_hint,
-            entity_hint,
-        )
-        if fallback is not None:
-            if not is_route_action_compatible(
-                normalized_message,
-                fallback.decision.command,
-            ):
-                fallback = None
-        if fallback is not None:
-            validated_fallback = _validate_existing_route_result(
-                fallback,
-                normalized_message,
-                attempt_kb,
-            )
-            if validated_fallback is not None:
-                report.finalize(
-                    reason="shortlist_alignment_fallback",
-                    stage=validated_fallback.stage,
-                    plugin_name=validated_fallback.decision.plugin_name,
-                    plugin_module=validated_fallback.decision.plugin_module,
-                    command=validated_fallback.decision.command,
-                )
-                return None, validated_fallback, report
-        report.finalize(reason="shortlist_alignment_miss")
-        return None, None, report
-
-    if decision.action == "skip":
-        report.finalize(reason="shortlist_alignment_skip")
-        return decision, None, report
-
-    route_result = _to_route_result(
-        _LLMRouteDecision(
-            action="route",
-            plugin_module=decision.plugin_module,
-            plugin_name=decision.plugin_name,
-            command=decision.command,
-        ),
-        normalized_message,
-        attempt_kb,
-    )
-    if route_result is None:
-        report.finalize(reason="shortlist_alignment_invalid")
-        return decision, None, report
-    if not is_route_action_compatible(
-        normalized_message,
-        route_result.decision.command,
-    ):
-        fallback = _pick_shortlist_fallback_route(
-            normalized_message,
-            local_hint,
-            entity_hint,
-        )
-        if fallback is not None and is_route_action_compatible(
-            normalized_message,
-            fallback.decision.command,
-        ):
-            validated_fallback = _validate_existing_route_result(
-                fallback,
-                normalized_message,
-                attempt_kb,
-            )
-            if validated_fallback is not None:
-                report.finalize(
-                    reason="shortlist_alignment_fallback",
-                    stage=validated_fallback.stage,
-                    plugin_name=validated_fallback.decision.plugin_name,
-                    plugin_module=validated_fallback.decision.plugin_module,
-                    command=validated_fallback.decision.command,
-                )
-                return None, validated_fallback, report
-        report.finalize(reason="shortlist_alignment_incompatible")
-        return decision, None, report
-
-    stage_name = "shortlist_align_usage" if decision.action == "usage" else "shortlist_align"
-    report.finalize(
-        reason=f"shortlist_alignment_{decision.action}",
-        stage=stage_name,
-        plugin_name=route_result.decision.plugin_name,
-        plugin_module=route_result.decision.plugin_module,
-        command=route_result.decision.command,
-    )
-    return (
-        decision,
-        RouteResolveResult(
-            decision=SkillRouteDecision(
-                plugin_name=route_result.decision.plugin_name,
-                plugin_module=route_result.decision.plugin_module,
-                command=route_result.decision.command,
-                source="shortlist_align",
-                skill_kind="shortlist_align",
-            ),
-            stage=stage_name,
-        ),
-        report,
-    )
-
-
-async def resolve_weak_signal_intent(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    original_message_text: str | None = None,
-    has_at: bool = False,
-    has_image: bool = False,
-    has_reply: bool = False,
-    is_private: bool = False,
-    session_key: str | None = None,
-    budget_controller: TurnBudgetController | None = None,
-) -> tuple[_WeakSignalDecision | None, RouteResolveResult | None, RouteAttemptReport]:
-    normalized_message = normalize_message_text(message_text)
-    weak_tags = collect_weak_route_signals(normalized_message)
-    report = RouteAttemptReport(helper_mode=bool(weak_tags))
-    if not normalized_message or not knowledge_base.plugins or not weak_tags:
-        report.finalize(reason="weak_signal_empty")
-        return None, None, report
-
-    timeout = get_config_value("INTENT_TIMEOUT", 20)
-    try:
-        timeout_value = float(timeout) if timeout else None
-    except (TypeError, ValueError):
-        timeout_value = None
-
-    shortlist_limit = max(_WEAK_SIGNAL_SHORTLIST_LIMIT, 1)
-    attempt_kb, shortlisted_modules = _build_shortlist_knowledge_base(
-        normalized_message,
-        knowledge_base,
-        limit=shortlist_limit,
-    )
-    report.candidate_total = len(knowledge_base.plugins)
-    report.lexical_candidates = len(attempt_kb.plugins)
-    report.direct_candidates = len(attempt_kb.plugins)
-    report.vector_candidates = 0
-    attempt_modules = shortlisted_modules[:_ROUTE_TRACE_SAMPLE_LIMIT]
-    if not attempt_modules:
-        attempt_modules = [
-            normalize_message_text(plugin.module)
-            for plugin in attempt_kb.plugins[:_ROUTE_TRACE_SAMPLE_LIMIT]
-        ]
-    report.note_attempt(attempt_modules)
-
-    prompt = _build_weak_signal_alignment_prompt(
-        message_text=normalized_message,
-        original_message_text=original_message_text,
-        knowledge_base=attempt_kb,
-        has_at=has_at,
-        has_image=has_image,
-        has_reply=has_reply,
-        is_private=is_private,
-    )
-    decision = await _request_weak_signal_decision(
-        prompt=prompt,
-        timeout_value=timeout_value,
-        session_key=session_key or "global",
-        budget_controller=budget_controller,
-    )
-    if decision is None:
-        report.finalize(reason="weak_signal_miss")
-        return None, None, report
-
-    if decision.action in {"chat", "ambiguous"}:
-        report.finalize(
-            reason=f"weak_signal_{decision.action}",
-            stage="weak_signal_chat",
-        )
-        return decision, None, report
-
-    route_result = _to_route_result(
-        _LLMRouteDecision(
-            action="route",
-            plugin_module=decision.plugin_module,
-            plugin_name=decision.plugin_name,
-            command=decision.command,
-        ),
-        normalized_message,
-        attempt_kb,
-    )
-    if route_result is None:
-        report.finalize(reason="weak_signal_invalid")
-        return decision, None, report
-    if not is_route_action_compatible(
-        normalized_message,
-        route_result.decision.command,
-    ):
-        report.finalize(reason="weak_signal_incompatible")
-        return decision, None, report
-
-    stage_name = "weak_signal_usage" if decision.action == "usage" else "weak_signal_route"
-    report.finalize(
-        reason=f"weak_signal_{decision.action}",
-        stage=stage_name,
-        plugin_name=route_result.decision.plugin_name,
-        plugin_module=route_result.decision.plugin_module,
-        command=route_result.decision.command,
-    )
-    return (
-        decision,
-        RouteResolveResult(
-            decision=SkillRouteDecision(
-                plugin_name=route_result.decision.plugin_name,
-                plugin_module=route_result.decision.plugin_module,
-                command=route_result.decision.command,
-                source="weak_signal_llm",
-                skill_kind="weak_signal_llm",
-            ),
-            stage=stage_name,
-        ),
-        report,
-    )
-
-
-async def resolve_llm_align_route(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    session_key: str | None = None,
-    budget_controller: TurnBudgetController | None = None,
-    has_reply: bool = False,
-) -> tuple[_ShortlistAlignmentDecision | None, RouteResolveResult | None, RouteAttemptReport]:
-    """明确表达 ChatInter 的 LLM 对齐阶段。
-
-    保留旧函数名 `resolve_shortlist_alignment` 作为兼容入口，但主链路使用这个别名更清晰：
-    direct -> llm_align -> validator -> route
-    """
-    return await resolve_shortlist_alignment(
+    result = await _resolve_candidate_selection_route(
         message_text,
         knowledge_base,
         session_key=session_key,
         budget_controller=budget_controller,
         has_reply=has_reply,
+        report=report,
+        command_tools=tools,
+        candidates=candidates,
+        stage="query_expansion",
+        use_reranker=True,
+        recovery_query=descriptor.capability_query,
+        recovery_reason=descriptor.reason,
+    )
+    if result is None:
+        return None
+    decision, route_result = result
+    decision.reason = normalize_message_text(
+        f"{decision.reason};query_expansion:{descriptor.capability_query}"
+    )
+    if route_result is not None:
+        route_result = RouteResolveResult(
+            decision=route_result.decision,
+            stage=route_result.stage,
+            report=route_result.report,
+            command_id=route_result.command_id,
+            slots=route_result.slots,
+            missing=route_result.missing,
+            selected_rank=route_result.selected_rank,
+            selected_score=route_result.selected_score,
+            selected_reason=normalize_message_text(
+                f"{route_result.selected_reason};"
+                f"query_expansion:{descriptor.capability_query}"
+            ),
+        )
+    return decision, route_result
+
+
+async def resolve_llm_router(
+    message_text: str,
+    knowledge_base: PluginKnowledgeBase,
+    *,
+    session_key: str | None = None,
+    budget_controller: TurnBudgetController | None = None,
+    has_reply: bool = False,
+    command_tools: list[Any] | None = None,
+) -> tuple[LLMRouterDecision, RouteResolveResult | None, RouteAttemptReport]:
+    normalized_message = normalize_message_text(message_text)
+    report = RouteAttemptReport(helper_mode=is_usage_question(normalized_message))
+    if not normalized_message:
+        report.finalize(reason="router_empty")
+        return LLMRouterDecision(action="chat", reason="empty"), None, report
+
+    speech_act = classify_speech_act(
+        normalized_message,
+        **_message_context_flags(normalized_message, has_reply=has_reply),
+    )
+    if _should_force_chat_before_llm(
+        normalized_message,
+        speech_act,
+    ) and not _has_exact_tool_head(normalized_message, knowledge_base, command_tools):
+        decision = LLMRouterDecision(
+            action="chat",
+            confidence=0.82,
+            reason=f"speech_act:{speech_act}",
+        )
+        report.finalize(reason=decision.reason or "speech_act_chat", stage="speech_act")
+        return decision, None, report
+
+    candidate_route = await _resolve_candidate_selection_route(
+        normalized_message,
+        knowledge_base,
+        session_key=session_key,
+        budget_controller=budget_controller,
+        has_reply=has_reply,
+        report=report,
+        command_tools=command_tools,
+        use_reranker=True,
+    )
+    if candidate_route is not None:
+        decision, route_result = candidate_route
+        report.finalize(
+            reason=decision.reason or f"command_selector_{decision.action}",
+            stage=(
+                route_result.stage if route_result is not None else "command_selector"
+            ),
+            plugin_name=route_result.decision.plugin_name if route_result else None,
+            plugin_module=route_result.decision.plugin_module if route_result else None,
+            command=route_result.decision.command if route_result else None,
+        )
+        return decision, route_result, report
+
+    expanded_route = await _resolve_query_expansion_route(
+        normalized_message,
+        knowledge_base,
+        session_key=session_key,
+        budget_controller=budget_controller,
+        has_reply=has_reply,
+        report=report,
+        command_tools=command_tools,
+    )
+    if expanded_route is not None:
+        decision, route_result = expanded_route
+        report.finalize(
+            reason=decision.reason or f"query_expansion_{decision.action}",
+            stage=(
+                route_result.stage if route_result is not None else "query_expansion"
+            ),
+            plugin_name=route_result.decision.plugin_name if route_result else None,
+            plugin_module=route_result.decision.plugin_module if route_result else None,
+            command=route_result.decision.command if route_result else None,
+        )
+        return decision, route_result, report
+
+    report.finalize(reason="no_route_candidate", stage="none")
+    return (
+        LLMRouterDecision(action="chat", reason="no_route_candidate"),
+        None,
+        report,
     )
 
 
 __all__ = [
+    "LLMCommandSelection",
+    "LLMRouterDecision",
     "RouteAttemptReport",
     "RouteResolveResult",
-    "resolve_llm_align_route",
-    "resolve_weak_signal_intent",
-    "probe_shortlist_route",
-    "resolve_shortlist_alignment",
+    "resolve_llm_router",
 ]

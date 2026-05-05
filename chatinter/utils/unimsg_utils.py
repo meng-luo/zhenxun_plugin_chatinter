@@ -140,7 +140,8 @@ def extract_reply_from_message(message: UniMessage | Message) -> str | None:
     if isinstance(message, UniMessage):
         reply_seg = message.get(Reply, 0)
         if reply_seg:
-            return reply_seg.id if hasattr(reply_seg, "id") and reply_seg.id else None
+            reply_id = getattr(reply_seg, "id", None)
+            return str(reply_id) if reply_id else None
         return None
 
     if isinstance(message, Message):

@@ -5,7 +5,7 @@ from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _PLACEHOLDER_PATTERN = re.compile(
-    r"\[@(?:\d{5,20}|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
+    r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
 )
 _STICKY_TOKEN_PATTERN = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
@@ -49,12 +49,19 @@ STRONG_USAGE_WORDS = (
     "怎么触发",
     "如何触发",
     "怎样触发",
+    "怎么发",
+    "如何发",
+    "怎样发",
     "怎么调用",
     "如何调用",
     "怎样调用",
     "怎么做",
     "如何做",
     "怎样做",
+    "规则是什么",
+    "规则是啥",
+    "有什么规则",
+    "规则说明",
 )
 
 WEAK_USAGE_HINTS = (
@@ -65,6 +72,9 @@ WEAK_USAGE_HINTS = (
     "参数",
     "说明",
     "详情",
+    "参数怎么看",
+    "参数怎么",
+    "参数说明",
     "列表",
     "功能",
     "插件",
@@ -153,9 +163,7 @@ EXECUTE_WORDS = (
     "看下",
     "生成",
     "制作",
-    "点歌",
     "播放",
-    "签到",
     "启动",
     "来个",
     "来一张",
@@ -215,9 +223,7 @@ ROUTE_ACTION_WORDS = (
     "设置",
     "生成",
     "制作",
-    "点歌",
     "播放",
-    "签到",
     "启动",
     "来个",
     "做个",
@@ -228,15 +234,28 @@ ROUTE_ACTION_WORDS = (
 ROUTE_NEGATIVE_HINT_WORDS = (
     "不是在让你执行",
     "不是让你执行",
+    "不要执行命令",
+    "不用执行命令",
     "不是让你",
     "不是叫你",
     "不是命令",
+    "不执行命令",
+    "不要执行",
+    "不用执行",
     "别执行",
+    "别调用",
+    "不用调用",
+    "不是让你点歌",
+    "不是要你",
+    "不用发",
+    "不是要发",
     "只是提到",
     "只是说说",
+    "只是说",
     "只是聊",
     "只是问问",
     "只是讨论",
+    "只是在讨论",
     "我在讨论",
     "我在聊",
     "我在想",
@@ -254,6 +273,43 @@ ROUTE_NEGATIVE_HINT_WORDS = (
     "是什么意思",
     "看到有人说",
     "听到有人说",
+)
+
+CHAT_CONTEXT_HINT_WORDS = (
+    "陪我聊",
+    "聊聊",
+    "聊天",
+    "安慰",
+    "不是插件",
+    "不是命令",
+    "不是让你",
+    "不是要你",
+    "这个词",
+    "这个概念",
+    "这种机制",
+    "这件事",
+    "件事",
+    "文化",
+    "原理",
+    "期望怎么算",
+    "概率",
+    "公平吗",
+    "经济学",
+    "模型",
+    "训练",
+    "只想聊",
+    "不想听歌",
+    "为什么",
+    "怎么理解",
+    "什么意思",
+    "如何理解",
+    "架构",
+    "架构上",
+    "怎么设计",
+    "如何设计",
+    "系统设计",
+    "管理系统",
+    "设计方案",
 )
 
 TEMPLATE_ROUTE_HINT_WORDS = (
@@ -309,23 +365,13 @@ KNOWLEDGE_REFRESH_WORDS = (
     "如何用",
     "生成",
     "制作",
-    "点歌",
-    "签到",
     "启动",
     "开关",
 )
 
-ACTION_REWRITES = (
-    ("点一首", "点歌 "),
-    ("点首", "点歌 "),
-    ("来一首", "点歌 "),
-    ("来首", "点歌 "),
-    ("播一首", "点歌 "),
-    ("播首", "点歌 "),
-    ("签个到", "签到"),
-    ("签一下到", "签到"),
-    ("签个", "签到"),
-)
+# 不在全局把自然语言短语改写成具体插件命令，避免插件未安装时污染
+# speech-act / 候选召回。具体命令的自然别名由已安装插件的 schema 派生。
+ACTION_REWRITES: tuple[tuple[str, str], ...] = ()
 
 _TEMPLATE_TAIL_NOISE_WORDS = (
     "表情包",
@@ -379,17 +425,21 @@ _ROUTE_INLINE_NOISE_WORDS = (
     "了",
 )
 
-_ROUTE_CONTEXT_HINT_WORDS = ROUTE_ACTION_WORDS + MEME_TRIGGER_WORDS + (
-    "给",
-    "对",
-    "向",
-    "让",
-    "替",
-    "去",
-    "发送",
-    "先",
-    "再",
-    "一下",
+_ROUTE_CONTEXT_HINT_WORDS = (
+    ROUTE_ACTION_WORDS
+    + MEME_TRIGGER_WORDS
+    + (
+        "给",
+        "对",
+        "向",
+        "让",
+        "替",
+        "去",
+        "发送",
+        "先",
+        "再",
+        "一下",
+    )
 )
 
 
@@ -506,7 +556,10 @@ def _find_canonical_head_boundary(text: str, command: str) -> int | None:
 
     for index in range(1, len(normalized_text) + 1):
         prefix = normalized_text[:index]
-        if compact_command and _clean_route_command_head_text(prefix, compact=True) == compact_command:
+        if (
+            compact_command
+            and _clean_route_command_head_text(prefix, compact=True) == compact_command
+        ):
             return index
         if ascii_command and _compact_ascii_head_text(prefix) == ascii_command:
             return index
@@ -610,8 +663,10 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
 def match_command_head_canonical(text: str, command: str) -> bool:
     strict_text = _clean_route_command_head_text(text, compact=False)
     strict_command = _clean_route_command_head_text(command, compact=False)
-    if strict_text and strict_command and match_command_head(
-        strict_text, strict_command
+    if (
+        strict_text
+        and strict_command
+        and match_command_head(strict_text, strict_command)
     ):
         return True
 
@@ -778,14 +833,14 @@ def parse_command_with_head(
         prefix_payload = _strip_route_inline_noise(
             _PLACEHOLDER_PATTERN.sub(" ", prefix)
         )
-        if has_prefix_hint and not has_argument_hint and _is_generic_question_payload(
-            compact_suffix
+        if (
+            has_prefix_hint
+            and not has_argument_hint
+            and _is_generic_question_payload(compact_suffix)
         ):
             continue
         if has_prefix_hint and (
-            has_argument_hint
-            or not allow_sticky
-            or not normalize_message_text(suffix)
+            has_argument_hint or not allow_sticky or not normalize_message_text(suffix)
         ):
             return RouteCommandMatch(
                 command_head=normalized_command,
@@ -828,7 +883,9 @@ def parse_command_with_head(
                 variant_text=variant,
                 match_mode="canonical",
             )
-        ascii_boundary = _find_canonical_ascii_head_boundary(variant, normalized_command)
+        ascii_boundary = _find_canonical_ascii_head_boundary(
+            variant, normalized_command
+        )
         if ascii_boundary is not None:
             payload = _strip_route_inline_noise(
                 normalize_message_text(variant[ascii_boundary:])
@@ -890,7 +947,9 @@ def is_usage_question(text: str) -> bool:
 
 
 def collect_weak_route_signals(text: str) -> tuple[str, ...]:
-    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    normalized = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(text or ""))
+    )
     if not normalized:
         return ()
     signals: list[str] = []
@@ -910,7 +969,9 @@ def should_try_weak_llm_assist(
     has_reply: bool = False,
     explicit_command: bool = False,
 ) -> bool:
-    normalized = normalize_message_text(normalize_action_phrases(strip_invoke_prefix(text or "")))
+    normalized = normalize_message_text(
+        normalize_action_phrases(strip_invoke_prefix(text or ""))
+    )
     if not normalized:
         return False
     if explicit_command or has_at or has_image or has_reply:
@@ -955,6 +1016,10 @@ def has_negative_route_intent(text: str) -> bool:
     return contains_any(text, ROUTE_NEGATIVE_HINT_WORDS)
 
 
+def has_chat_context_hint(text: str) -> bool:
+    return contains_any(text, CHAT_CONTEXT_HINT_WORDS)
+
+
 def _is_meme_plugin(plugin: PluginInfo) -> bool:
     module_l = plugin.module.lower()
     name_l = plugin.name.lower()
@@ -971,9 +1036,13 @@ def _is_meme_plugin(plugin: PluginInfo) -> bool:
 def _is_template_like_plugin(plugin: PluginInfo) -> bool:
     if _is_meme_plugin(plugin):
         return True
-    command_text = " ".join(normalize_message_text(command) for command in plugin.commands)
+    command_text = " ".join(
+        normalize_message_text(command) for command in plugin.commands
+    )
     usage_text = normalize_message_text(plugin.usage or "")
-    hint_text = f"{plugin.name} {plugin.description} {command_text} {usage_text}".lower()
+    hint_text = (
+        f"{plugin.name} {plugin.description} {command_text} {usage_text}".lower()
+    )
     has_catalog_hint = any(word in hint_text for word in ("搜索", "详情", "列表"))
     has_template_hint = any(
         word in hint_text
@@ -1030,9 +1099,13 @@ def has_template_route_context(
                 else:
                     matched_non_template = True
 
-    if not (has_template_hint or has_placeholder or has_meme_trigger or matched_template):
+    if not (
+        has_template_hint or has_placeholder or has_meme_trigger or matched_template
+    ):
         return False
-    if matched_non_template and not (has_template_hint or has_placeholder or has_meme_trigger):
+    if matched_non_template and not (
+        has_template_hint or has_placeholder or has_meme_trigger
+    ):
         return False
 
     if has_template_hint or has_placeholder or has_meme_trigger:
@@ -1134,11 +1207,12 @@ __all__ = [
     "collect_placeholders",
     "collect_weak_route_signals",
     "contains_any",
+    "has_chat_context_hint",
     "has_negative_route_intent",
     "has_template_route_context",
     "is_usage_question",
-    "match_command_head_canonical",
     "match_command_head",
+    "match_command_head_canonical",
     "match_command_head_fuzzy",
     "match_command_head_or_sticky",
     "normalize_action_phrases",
