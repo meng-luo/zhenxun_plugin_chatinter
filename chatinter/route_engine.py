@@ -466,14 +466,18 @@ def _build_command_candidate_pool(
     expanded_queries: list[str] | None = None,
     limit: int | None = None,
     diversify: bool = True,
+    include_unscored: bool = False,
 ) -> list[CommandCandidate]:
     tools = _ensure_command_tools(knowledge_base, command_tools)
     candidate_limit = limit
     if candidate_limit is None:
-        candidate_limit = max(
-            int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
-            8,
-        )
+        if include_unscored:
+            candidate_limit = len(tools)
+        else:
+            candidate_limit = max(
+                int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
+                8,
+            )
     return build_command_candidates(
         knowledge_base,
         message_text,
@@ -482,6 +486,7 @@ def _build_command_candidate_pool(
         diversify=diversify,
         tools=tools,
         expanded_queries=expanded_queries,
+        include_unscored=include_unscored,
     )
 
 

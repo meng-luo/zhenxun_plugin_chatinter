@@ -397,6 +397,29 @@ def score_command_schema(
     return score, ",".join(reasons)
 
 
+def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema:
+    return PluginCommandSchema(
+        command_id=tool.command_id,
+        head=tool.head,
+        aliases=tool.aliases,
+        description=tool.description,
+        slots=tool.slots,
+        render=tool.render or tool.head,
+        requires=tool.requires,
+        allow_at=tool.allow_at,
+        actor_scope=tool.actor_scope,
+        target_requirement=tool.target_requirement,
+        target_sources=list(tool.target_sources),
+        command_role=tool.command_role,
+        payload_policy=tool.payload_policy,
+        extra_text_policy=tool.extra_text_policy,
+        source=tool.source,
+        confidence=tool.confidence,
+        matcher_key=tool.matcher_key,
+        retrieval_phrases=tool.retrieval_phrases,
+    )
+
+
 def _score_all_tools(
     tools: list[CommandToolSnapshot],
     query: str,
@@ -405,26 +428,7 @@ def _score_all_tools(
 ) -> list[_ScoredCandidate]:
     scored: list[_ScoredCandidate] = []
     for tool in tools:
-        schema = PluginCommandSchema(
-            command_id=tool.command_id,
-            head=tool.head,
-            aliases=tool.aliases,
-            description=tool.description,
-            slots=tool.slots,
-            render=tool.render or tool.head,
-            requires=tool.requires,
-            allow_at=tool.allow_at,
-            actor_scope=tool.actor_scope,
-            target_requirement=tool.target_requirement,
-            target_sources=list(tool.target_sources),
-            command_role=tool.command_role,
-            payload_policy=tool.payload_policy,
-            extra_text_policy=tool.extra_text_policy,
-            source=tool.source,
-            confidence=tool.confidence,
-            matcher_key=tool.matcher_key,
-            retrieval_phrases=tool.retrieval_phrases,
-        )
+        schema = _schema_from_tool_snapshot(tool)
         score, reasons, exact, features = _base_score_tool(
             tool,
             schema,
@@ -595,11 +599,12 @@ def build_command_candidates(
     knowledge_base: PluginKnowledgeBase,
     query: str,
     *,
-    limit: int = 48,
+    limit: int | None = 48,
     session_id: str | None = None,
     diversify: bool = True,
     tools: list[CommandToolSnapshot] | None = None,
     expanded_queries: list[str] | None = None,
+    include_unscored: bool = False,
 ) -> list[CommandCandidate]:
     if tools is None:
         graph = build_capability_graph_snapshot(knowledge_base)
@@ -631,11 +636,30 @@ def build_command_candidates(
             ]
         ranked.extend(query_ranked)
     merged = _merge_ranked_candidates(ranked)
+    max_items = len(tools) if limit is None or int(limit or 0) <= 0 else int(limit)
     selected = _diversify_candidates(
         merged,
-        limit=limit,
+        limit=max_items,
         diversify=diversify,
     )
+    if include_unscored and len(selected) < max_items:
+        seen_ids = {item.schema.command_id for item in selected}
+        for tool in tools:
+            if len(selected) >= max_items:
+                break
+            if tool.command_id in seen_ids:
+                continue
+            selected.append(
+                _ScoredCandidate(
+                    tool=tool,
+                    schema=_schema_from_tool_snapshot(tool),
+                    score=0.0,
+                    reasons=("full_exposure",),
+                    exact_protected=False,
+                    features=_empty_features(),
+                )
+            )
+            seen_ids.add(tool.command_id)
     return [
         CommandCandidate(
             plugin_module=item.tool.plugin_module,

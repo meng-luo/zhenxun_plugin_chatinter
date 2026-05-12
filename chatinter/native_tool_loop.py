@@ -28,12 +28,9 @@ from .route_engine import (
     _build_command_candidate_pool,
 )
 from .route_text import is_usage_question, normalize_message_text
-from .tool_candidate_policy import select_native_tool_candidates
 from .turn_runtime import TurnBudgetController
 
 _NATIVE_STAGE = "native_tool_loop"
-_DEFAULT_NATIVE_TOOL_LIMIT = 8
-_NATIVE_TOOL_FAMILY_LIMIT = 2
 _FINALIZE_TIMEOUT = 12.0
 _NATIVE_TOOL_LOOP_RULES = """
 <chatinter_native_tool_loop>
@@ -144,27 +141,21 @@ async def _run_native_tool_loop(
         knowledge_base,
         session_key=session_key,
         command_tools=command_tools,
-        limit=max(
-            int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
-            _DEFAULT_NATIVE_TOOL_LIMIT,
-        ),
+        limit=None,
+        diversify=False,
+        include_unscored=True,
     )
     if not candidates:
         return None
 
-    policy = select_native_tool_candidates(
-        candidates,
-        limit=max(
-            int(get_config_value("NATIVE_TOOL_LIMIT", _DEFAULT_NATIVE_TOOL_LIMIT) or 0),
-            1,
-        ),
-        family_limit=_NATIVE_TOOL_FAMILY_LIMIT,
-    )
-    native_candidates = policy.candidates
+    native_candidates = candidates
     if not native_candidates:
         return None
 
-    report.note_candidate_policy(reason=policy.reason, limit=policy.limit)
+    report.note_candidate_policy(
+        reason="native_full_exposure",
+        limit=len(native_candidates),
+    )
     report.candidate_total = max(report.candidate_total, len(native_candidates))
     report.note_tool_pool(len(native_candidates))
     report.note_prompt_exposure(native_candidates)

@@ -92,14 +92,6 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="chatinter",
-                key="NATIVE_TOOL_LIMIT",
-                value=8,
-                help="原生 function calling 单轮最多暴露的候选命令数量",
-                default_value=8,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
                 key="NATIVE_TOOL_LOOP_STEPS",
                 value=3,
                 help="原生插件工具执行闭环最大迭代步数",

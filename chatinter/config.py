@@ -58,7 +58,6 @@ DEFAULTS = {
     "MCP_ENDPOINTS": "",
     "REASONING_EFFORT": "MEDIUM",
     "NATIVE_TOOLS_ENABLED": True,
-    "NATIVE_TOOL_LIMIT": 8,
 }
 
 
@@ -123,7 +122,6 @@ def get_config_value(key: str, default: Any = None):
         "AGENT_MAX_TOOL_STEPS",
         "AGENT_TOOL_FAILURE_LIMIT",
         "AGENT_FAILED_ROUND_LIMIT",
-        "NATIVE_TOOL_LIMIT",
     }:
         try:
             return int(raw_value)
