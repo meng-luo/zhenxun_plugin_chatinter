@@ -5,8 +5,10 @@ ChatInter - 聊天响应处理
 """
 
 import asyncio
+from dataclasses import dataclass, field
 import re
 from typing import Any, cast
+import uuid
 
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.onebot.v11 import (
@@ -34,6 +36,7 @@ from .config import (
 from .memory import _chat_memory
 from .prompt_guard import guard_prompt_sections
 from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
+from .reroute_capture import CapturedRerouteOutput, RerouteOutputCapture
 from .turn_runtime import TurnBudgetController
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
@@ -82,6 +85,20 @@ _COMPLEX_QUERY_HINTS = (
     "python",
     "api",
 )
+
+
+@dataclass(frozen=True)
+class RerouteExecutionResult:
+    success: bool
+    command: str
+    trace_id: str
+    outputs: list[CapturedRerouteOutput] = field(default_factory=list)
+    error: str = ""
+    timed_out: bool = False
+
+    @property
+    def observed_text(self) -> str:
+        return "\n".join(item.text for item in self.outputs if item.text).strip()
 
 
 def _is_complex_query(message_text: str) -> bool:
@@ -202,11 +219,34 @@ async def reroute_to_plugin(
     target_modules: set[str] | None = None,
     extra_image_segments: list[MessageSegment] | None = None,
 ) -> bool:
+    result = await reroute_to_plugin_with_result(
+        bot,
+        event,
+        command,
+        target_modules=target_modules,
+        extra_image_segments=extra_image_segments,
+        wait=False,
+    )
+    return result.success
+
+
+async def reroute_to_plugin_with_result(
+    bot: Bot,
+    event: Event,
+    command: str,
+    target_modules: set[str] | None = None,
+    extra_image_segments: list[MessageSegment] | None = None,
+    *,
+    trace_id: str | None = None,
+    wait: bool = True,
+    timeout: float = 10.0,
+) -> RerouteExecutionResult:
+    trace_key = trace_id or uuid.uuid4().hex
+    command_text = command.strip()
     try:
         import time
 
         event_data = event.model_dump()
-        command_text = command.strip()
         bot_self_id = str(getattr(bot, "self_id", "")) or None
         new_message = _build_reroute_message(
             command_text,
@@ -229,7 +269,12 @@ async def reroute_to_plugin(
                 "重路由消息仍包含未解析的 [image] 占位符，"
                 f"取消重投以避免下游插件解析失败：{command_text}"
             )
-            return False
+            return RerouteExecutionResult(
+                success=False,
+                command=command_text,
+                trace_id=trace_key,
+                error="unresolved image placeholder",
+            )
 
         rendered_plain_text = new_message.extract_plain_text()
         event_data["message"] = new_message
@@ -257,9 +302,15 @@ async def reroute_to_plugin(
             new_event = PrivateMessageEvent(**event_data)
         else:
             logger.warning(f"不支持的事件类型：{type(event)}")
-            return False
+            return RerouteExecutionResult(
+                success=False,
+                command=command_text,
+                trace_id=trace_key,
+                error=f"unsupported event type: {type(event)}",
+            )
 
         setattr(new_event, "_ai_triggered", True)
+        setattr(new_event, "_ai_trace_id", trace_key)
         expanded_target_modules = _expand_reroute_target_modules(target_modules)
         if expanded_target_modules:
             setattr(new_event, "_ai_route_modules", frozenset(expanded_target_modules))
@@ -268,15 +319,61 @@ async def reroute_to_plugin(
             setattr(new_event, "_ai_route_heads", frozenset(route_heads))
 
         handle_event = cast(Any, bot.handle_event)
-        task = asyncio.create_task(handle_event(new_event))
+        if wait:
+            with RerouteOutputCapture.activate(trace_key):
+                task = asyncio.create_task(handle_event(new_event))
+        else:
+            task = asyncio.create_task(handle_event(new_event))
         _REROUTE_TASKS.add(task)
         task.add_done_callback(lambda done_task: _REROUTE_TASKS.discard(done_task))
+        if wait:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(float(timeout), 0.5),
+                )
+            except asyncio.TimeoutError:
+                outputs = RerouteOutputCapture.pop_outputs(trace_key)
+                task.add_done_callback(
+                    lambda _done_task: RerouteOutputCapture.pop_outputs(trace_key)
+                )
+                logger.warning(f"消息重路由等待超时：{command_text}")
+                return RerouteExecutionResult(
+                    success=False,
+                    command=command_text,
+                    trace_id=trace_key,
+                    outputs=outputs,
+                    error="reroute timeout",
+                    timed_out=True,
+                )
+            except Exception as exc:
+                outputs = RerouteOutputCapture.pop_outputs(trace_key)
+                logger.warning(f"消息重路由执行异常：{command_text}, error={exc}")
+                return RerouteExecutionResult(
+                    success=False,
+                    command=command_text,
+                    trace_id=trace_key,
+                    outputs=outputs,
+                    error=str(exc),
+                )
+        outputs = RerouteOutputCapture.pop_outputs(trace_key)
         logger.info(f"消息重路由成功：{command_text}")
-        return True
+        return RerouteExecutionResult(
+            success=True,
+            command=command_text,
+            trace_id=trace_key,
+            outputs=outputs,
+        )
 
     except Exception as e:
         logger.error(f"消息重路由失败：{e}")
-        return False
+        return RerouteExecutionResult(
+            success=False,
+            command=command_text,
+            trace_id=trace_key,
+            outputs=RerouteOutputCapture.pop_outputs(trace_key),
+            error=str(e),
+        )
 
 
 def _parse_at_target(token: str) -> str | None:
@@ -514,9 +611,11 @@ def replace_mention_ids_with_names(
 
 
 __all__ = [
+    "RerouteExecutionResult",
     "build_chat_system_prompt",
     "handle_chat_message",
     "normalize_ai_reply_text",
     "replace_mention_ids_with_names",
     "reroute_to_plugin",
+    "reroute_to_plugin_with_result",
 ]

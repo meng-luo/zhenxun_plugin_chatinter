@@ -32,6 +32,8 @@ EXECUTION_REASON_PERMISSION_DENIED = "permission_denied"
 EXECUTION_REASON_PLUGIN_NOT_LOADED = "plugin_not_loaded"
 EXECUTION_REASON_INVALID_COMMAND = "invalid_command"
 EXECUTION_REASON_REROUTE_FAILED = "reroute_failed"
+EXECUTION_REASON_ROUTE_USER_CORRECTED = "route_user_corrected"
+EXECUTION_REASON_ROUTE_CONFIRMED = "route_confirmed"
 EXECUTION_REASON_TIMEOUT = "timeout"
 EXECUTION_REASON_LLM_ERROR = "llm_error"
 EXECUTION_REASON_CANCELLED = "cancelled"
@@ -139,9 +141,16 @@ class ExecutionObserver:
     _records: ClassVar[deque[ExecutionObservation]] = deque(maxlen=400)
     _capacity: ClassVar[int] = 400
     _command_feedback: ClassVar[dict[str, float]] = {}
+    _command_feedback_ts: ClassVar[dict[str, float]] = {}
     _session_command_feedback: ClassVar[dict[str, dict[str, float]]] = {}
+    _session_command_feedback_ts: ClassVar[dict[str, dict[str, float]]] = {}
     _module_feedback: ClassVar[dict[str, float]] = {}
+    _module_feedback_ts: ClassVar[dict[str, float]] = {}
     _reason_feedback: ClassVar[dict[str, dict[str, float]]] = {}
+    _feedback_ttl: ClassVar[float] = 6 * 3600.0
+    _max_command_feedback: ClassVar[int] = 2048
+    _max_session_feedback: ClassVar[int] = 512
+    _max_module_feedback: ClassVar[int] = 1024
 
     @classmethod
     def configure(cls, *, max_records: int | None = None) -> None:
@@ -287,6 +296,8 @@ class ExecutionObserver:
         delta = cls._feedback_delta(observation)
         if not delta:
             return
+        now = time.monotonic()
+        cls._prune_feedback(now)
         if observation.selected_rank > 1 and observation.success:
             delta += min(observation.selected_rank, 8) * 0.08
         if observation.selected_rank == 1 and not observation.success:
@@ -299,14 +310,19 @@ class ExecutionObserver:
             cls._command_feedback[command_id] = clamp(
                 cls._command_feedback.get(command_id, 0.0) + delta
             )
+            cls._command_feedback_ts[command_id] = now
             session_id = normalize_message_text(observation.session_id)
             if session_id:
                 session_bucket = cls._session_command_feedback.setdefault(
                     session_id, {}
                 )
+                session_ts_bucket = cls._session_command_feedback_ts.setdefault(
+                    session_id, {}
+                )
                 session_bucket[command_id] = clamp(
                     session_bucket.get(command_id, 0.0) + delta
                 )
+                session_ts_bucket[command_id] = now
                 if len(session_bucket) > 256:
                     weakest = sorted(
                         session_bucket.items(),
@@ -314,6 +330,7 @@ class ExecutionObserver:
                     )[:32]
                     for key, _ in weakest:
                         session_bucket.pop(key, None)
+                        session_ts_bucket.pop(key, None)
         if plugin_module:
             module_weight = 0.35
             if not command_id and observation.reason in {
@@ -324,6 +341,7 @@ class ExecutionObserver:
             cls._module_feedback[plugin_module] = clamp(
                 cls._module_feedback.get(plugin_module, 0.0) + delta * module_weight
             )
+            cls._module_feedback_ts[plugin_module] = now
         if command_id and observation.reason:
             reason_bucket = cls._reason_feedback.setdefault(observation.reason, {})
             reason_bucket[command_id] = clamp(
@@ -339,6 +357,10 @@ class ExecutionObserver:
     @classmethod
     def _feedback_delta(cls, observation: ExecutionObservation) -> float:
         reason = normalize_message_text(observation.reason)
+        if reason == EXECUTION_REASON_ROUTE_CONFIRMED:
+            return 0.35
+        if reason == EXECUTION_REASON_ROUTE_USER_CORRECTED:
+            return -1.25
         if observation.action == "execute" and observation.success:
             return 1.0
         if observation.action == "usage" and observation.success:
@@ -360,6 +382,7 @@ class ExecutionObserver:
         if reason in {
             EXECUTION_REASON_INVALID_COMMAND,
             EXECUTION_REASON_REROUTE_FAILED,
+            EXECUTION_REASON_ROUTE_USER_CORRECTED,
         }:
             return -1.4
         if reason in {
@@ -441,8 +464,11 @@ class ExecutionObserver:
     def clear(cls) -> None:
         cls._records.clear()
         cls._command_feedback.clear()
+        cls._command_feedback_ts.clear()
         cls._session_command_feedback.clear()
+        cls._session_command_feedback_ts.clear()
         cls._module_feedback.clear()
+        cls._module_feedback_ts.clear()
         cls._reason_feedback.clear()
 
     @classmethod
@@ -454,18 +480,125 @@ class ExecutionObserver:
         plugin_module: str | None = None,
     ) -> float:
         score = 0.0
+        now = time.monotonic()
+        cls._prune_feedback(now)
         normalized_command_id = normalize_message_text(command_id or "")
         normalized_session_id = normalize_message_text(session_id or "")
         normalized_module = normalize_message_text(plugin_module or "")
         if normalized_command_id:
-            score += cls._command_feedback.get(normalized_command_id, 0.0)
+            score += cls._fresh_feedback_value(
+                cls._command_feedback,
+                cls._command_feedback_ts,
+                normalized_command_id,
+                now,
+            )
             if normalized_session_id:
-                score += cls._session_command_feedback.get(
-                    normalized_session_id, {}
-                ).get(normalized_command_id, 0.0)
+                score += cls._fresh_feedback_value(
+                    cls._session_command_feedback.get(normalized_session_id, {}),
+                    cls._session_command_feedback_ts.get(normalized_session_id, {}),
+                    normalized_command_id,
+                    now,
+                )
         if normalized_module:
-            score += cls._module_feedback.get(normalized_module, 0.0)
+            score += cls._fresh_feedback_value(
+                cls._module_feedback,
+                cls._module_feedback_ts,
+                normalized_module,
+                now,
+            )
         return max(min(score, 48.0), -96.0)
+
+    @classmethod
+    def _fresh_feedback_value(
+        cls,
+        values: dict[str, float],
+        timestamps: dict[str, float],
+        key: str,
+        now: float,
+    ) -> float:
+        value = values.get(key, 0.0)
+        if not value:
+            return 0.0
+        updated_at = timestamps.get(key, now)
+        age = max(now - updated_at, 0.0)
+        if age >= cls._feedback_ttl:
+            return 0.0
+        # Keep recent feedback strong, then taper it so stale history does not
+        # permanently bias command selection.
+        freshness = max(0.25, 1.0 - age / cls._feedback_ttl)
+        return value * freshness
+
+    @classmethod
+    def _prune_feedback(cls, now: float) -> None:
+        expired_commands = [
+            key
+            for key, updated_at in cls._command_feedback_ts.items()
+            if now - updated_at > cls._feedback_ttl
+        ]
+        for key in expired_commands:
+            cls._command_feedback.pop(key, None)
+            cls._command_feedback_ts.pop(key, None)
+
+        expired_modules = [
+            key
+            for key, updated_at in cls._module_feedback_ts.items()
+            if now - updated_at > cls._feedback_ttl
+        ]
+        for key in expired_modules:
+            cls._module_feedback.pop(key, None)
+            cls._module_feedback_ts.pop(key, None)
+
+        expired_sessions: list[str] = []
+        for session_id, bucket in list(cls._session_command_feedback.items()):
+            ts_bucket = cls._session_command_feedback_ts.get(session_id, {})
+            expired_keys = [
+                key
+                for key, updated_at in ts_bucket.items()
+                if now - updated_at > cls._feedback_ttl
+            ]
+            for key in expired_keys:
+                bucket.pop(key, None)
+                ts_bucket.pop(key, None)
+            if not bucket:
+                expired_sessions.append(session_id)
+        for session_id in expired_sessions:
+            cls._session_command_feedback.pop(session_id, None)
+            cls._session_command_feedback_ts.pop(session_id, None)
+
+        cls._trim_feedback_map(
+            cls._command_feedback,
+            cls._command_feedback_ts,
+            cls._max_command_feedback,
+        )
+        cls._trim_feedback_map(
+            cls._module_feedback,
+            cls._module_feedback_ts,
+            cls._max_module_feedback,
+        )
+        if len(cls._session_command_feedback) > cls._max_session_feedback:
+            stale_sessions = sorted(
+                cls._session_command_feedback_ts.items(),
+                key=lambda item: max(item[1].values(), default=0.0),
+            )[:64]
+            for session_id, _ in stale_sessions:
+                cls._session_command_feedback.pop(session_id, None)
+                cls._session_command_feedback_ts.pop(session_id, None)
+
+    @staticmethod
+    def _trim_feedback_map(
+        values: dict[str, float],
+        timestamps: dict[str, float],
+        capacity: int,
+    ) -> None:
+        if len(values) <= capacity:
+            return
+        stale = sorted(
+            values,
+            key=lambda key: (timestamps.get(key, 0.0), abs(values.get(key, 0.0))),
+        )[: max(len(values) - capacity, 64)]
+        for key in stale:
+            values.pop(key, None)
+            timestamps.pop(key, None)
 
 
 def start_execution_observation(**kwargs: Any) -> ExecutionFrame:
@@ -544,7 +677,9 @@ __all__ = [
     "EXECUTION_REASON_PERMISSION_DENIED",
     "EXECUTION_REASON_PLUGIN_NOT_LOADED",
     "EXECUTION_REASON_REROUTE_FAILED",
+    "EXECUTION_REASON_ROUTE_CONFIRMED",
     "EXECUTION_REASON_ROUTE_SUCCESS",
+    "EXECUTION_REASON_ROUTE_USER_CORRECTED",
     "EXECUTION_REASON_SUCCESS",
     "EXECUTION_REASON_TIMEOUT",
     "EXECUTION_REASON_USAGE_REPLIED",

@@ -90,6 +90,10 @@ def _schema(
     slots: list[CommandSlotSpec] | None = None,
     render: str | None = None,
     requires: dict[str, bool] | None = None,
+    allow_at: bool | None = None,
+    actor_scope: str = "allow_other",
+    target_requirement: str = "none",
+    target_sources: list[str] | None = None,
     command_role: str = "execute",
     payload_policy: str = "none",
     extra_text_policy: str = "keep",
@@ -131,6 +135,10 @@ def _schema(
             "at": False,
             **dict(requires or {}),
         },
+        allow_at=allow_at,  # type: ignore[arg-type]
+        actor_scope=actor_scope,  # type: ignore[arg-type]
+        target_requirement=target_requirement,  # type: ignore[arg-type]
+        target_sources=list(target_sources or []),  # type: ignore[arg-type]
         command_role=command_role,  # type: ignore[arg-type]
         payload_policy=payload_policy,  # type: ignore[arg-type]
         extra_text_policy=extra_text_policy,  # type: ignore[arg-type]
@@ -336,6 +344,10 @@ def schema_from_capability(
         slots=slots,
         render=render,
         requires=_requires_from_capability(command),
+        allow_at=requirement.allow_at,
+        actor_scope=requirement.actor_scope,
+        target_requirement=requirement.target_requirement,
+        target_sources=list(requirement.target_sources),
         command_role="template" if requirement.image_min > 0 else "execute",
         payload_policy=payload_policy,
         extra_text_policy=extra_text_policy,

@@ -308,6 +308,10 @@ def schema(
     slots: list[CommandSlotSpec] | None = None,
     render: str | None = None,
     requires: dict[str, bool] | None = None,
+    allow_at: bool | None = None,
+    actor_scope: str = "allow_other",
+    target_requirement: str = "none",
+    target_sources: list[str] | None = None,
     command_role: str = "execute",
     payload_policy: str = "none",
     extra_text_policy: str = "keep",
@@ -349,6 +353,10 @@ def schema(
             "at": False,
             **dict(requires or {}),
         },
+        allow_at=allow_at,  # type: ignore[arg-type]
+        actor_scope=actor_scope,  # type: ignore[arg-type]
+        target_requirement=target_requirement,  # type: ignore[arg-type]
+        target_sources=list(target_sources or []),  # type: ignore[arg-type]
         command_role=command_role,  # type: ignore[arg-type]
         payload_policy=payload_policy,  # type: ignore[arg-type]
         extra_text_policy=extra_text_policy,  # type: ignore[arg-type]

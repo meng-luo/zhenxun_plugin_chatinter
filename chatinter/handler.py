@@ -12,6 +12,7 @@ from enum import Enum
 import hashlib
 import re
 import time
+import uuid
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import UniMessage
@@ -31,6 +32,7 @@ from .chat_handler import (
     normalize_ai_reply_text,
     replace_mention_ids_with_names,
     reroute_to_plugin,
+    reroute_to_plugin_with_result,
 )
 from .chat_quality_guard import refine_chat_reply
 from .command_planner import CommandPlanDecision, plan_command
@@ -77,6 +79,8 @@ from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState, get_middleware_manager
 from .models.pydantic_models import PluginKnowledgeBase
+from .native_tool_loop import NativeToolExecutionResult, run_native_tool_loop
+from .native_validator import NativeValidatedRoute
 from .person_registry import (
     PersonProfile,
     get_person_profile,
@@ -98,6 +102,7 @@ from .route_engine import (
     RouteResolveResult,
     resolve_llm_router,
 )
+from .route_feedback import RouteFeedbackStore
 from .route_text import (
     ROUTE_ACTION_WORDS,
     collect_placeholders,
@@ -283,8 +288,6 @@ _GROUP_ACTIVE_RANK_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
 _NICKNAME_RESOLUTION_MEMORY_MAX = 2048
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
-_ROUTE_CONTINUATION_FRAME_TTL = 10 * 60.0
-_ROUTE_CONTINUATION_FRAME_CACHE_MAX = 512
 
 
 @dataclass(frozen=True)
@@ -2542,6 +2545,172 @@ def _apply_route_command_prefixes(command: str, schema) -> str:
     return normalize_message_text(f"{prefixes[0]}{normalized}")
 
 
+async def _execute_native_tool_route(
+    *,
+    bot: Bot,
+    event: Event,
+    trace: StageTrace,
+    validated: NativeValidatedRoute,
+    knowledge_plugins,
+    current_message: str,
+    user_id: str,
+    session_id: str | None,
+    has_reply: bool,
+    extra_image_segments: list | None,
+    route_report: RouteAttemptReport,
+) -> NativeToolExecutionResult:
+    route_result = validated.route_result
+    if route_result is None:
+        return NativeToolExecutionResult(
+            success=False,
+            route_result=None,
+            output={
+                "ok": False,
+                "status": "failed",
+                "error_type": "InvalidRoute",
+                "message": "工具调用没有生成有效插件路由。",
+                "is_retryable": True,
+            },
+            reason="invalid route",
+        )
+
+    planned_image_count = len(_extract_image_tokens(current_message))
+    if extra_image_segments:
+        planned_image_count += len(extra_image_segments)
+    command_plan = _plan_route_command(
+        route_result=route_result,
+        knowledge_plugins=knowledge_plugins,
+        current_message=current_message,
+        has_reply=has_reply,
+        image_count=planned_image_count,
+    )
+    route_result = _apply_command_plan_to_route_result(route_result, command_plan)
+    decision = route_result.decision
+    target_modules = _build_target_modules(route_result, knowledge_plugins)
+    execution_plan = _prepare_route_execution_plan(
+        route_result=route_result,
+        knowledge_plugins=knowledge_plugins,
+        current_message=current_message,
+        user_id=user_id,
+    )
+    if not execution_plan.need_followup and command_plan.action == "clarify":
+        execution_plan = RouteExecutionPlan(
+            command=command_plan.final_command or decision.command,
+            need_followup=True,
+            followup_message=_build_planner_followup_message(command_plan.missing),
+            feedback_reason=_FEEDBACK_REASON_MISSING_PARAMS,
+            image_missing=1
+            if _planner_missing_contains(command_plan.missing, {"image", "图片"})
+            else 0,
+            text_missing=1
+            if _planner_missing_contains(
+                command_plan.missing,
+                {"text", "文本", "文字", "参数", "内容"},
+            )
+            else 0,
+        )
+    if execution_plan.need_followup:
+        return NativeToolExecutionResult(
+            success=False,
+            route_result=route_result,
+            route_command=execution_plan.command or decision.command,
+            output={
+                "ok": False,
+                "status": "failed",
+                "error_type": "MissingContext",
+                "message": execution_plan.followup_message or "缺少必要参数或上下文。",
+                "missing": list(route_result.missing),
+                "is_retryable": True,
+            },
+            display_text=execution_plan.followup_message or "",
+            reason=execution_plan.feedback_reason or "",
+        )
+
+    route_command = execution_plan.command or decision.command
+    execution_frame = start_execution_observation(
+        action="execute",
+        plugin_module=decision.plugin_module,
+        plugin_name=decision.plugin_name,
+        command_id=route_result.command_id,
+        command=route_command,
+        route_stage=route_result.stage,
+        session_id=session_id,
+        message_preview=current_message,
+        selected_rank=route_result.selected_rank,
+        selected_score=route_result.selected_score,
+        selected_reason=route_result.selected_reason,
+        **_route_report_observer_kwargs(route_report),
+    )
+    reroute_result = await reroute_to_plugin_with_result(
+        bot,
+        event,
+        route_command,
+        target_modules=target_modules,
+        extra_image_segments=extra_image_segments,
+        trace_id=f"ci-{uuid.uuid4().hex}",
+        wait=True,
+        timeout=float(get_config_value("NATIVE_REROUTE_TIMEOUT", 10) or 10),
+    )
+    if reroute_result.success:
+        observation = execution_frame.finish(
+            success=True,
+            reason=EXECUTION_REASON_ROUTE_SUCCESS,
+        )
+        feedback_reason = _FEEDBACK_REASON_ROUTE_SUCCESS
+    else:
+        observation = execution_frame.finish(
+            success=False,
+            reason=EXECUTION_REASON_REROUTE_FAILED,
+        )
+        feedback_reason = _FEEDBACK_REASON_REROUTE_FAILED
+    _tag_execution_observation(trace, observation)
+    RouteFeedbackStore.record_route_outcome(
+        session_id=session_id,
+        message_text=current_message,
+        route_result=route_result,
+        route_command=route_command,
+        success=reroute_result.success,
+        reason=observation.reason,
+    )
+    await _record_route_feedback(
+        session_id=session_id,
+        modules=target_modules,
+        reason=feedback_reason,
+        route_message=current_message,
+        route_command=route_command,
+    )
+
+    output_texts = [item.text for item in reroute_result.outputs if item.text]
+    payload = {
+        "ok": reroute_result.success,
+        "status": "success" if reroute_result.success else "failed",
+        "plugin": decision.plugin_name,
+        "plugin_module": decision.plugin_module,
+        "command": route_command,
+        "command_id": route_result.command_id,
+        "trace_id": reroute_result.trace_id,
+        "observed_output": bool(output_texts),
+        "outputs": output_texts[:6],
+        "message": reroute_result.error,
+        "is_retryable": bool(reroute_result.timed_out or reroute_result.error),
+    }
+    display_text = (
+        "插件已执行，已捕获输出。"
+        if reroute_result.success and output_texts
+        else "插件已执行。"
+        if reroute_result.success
+        else reroute_result.error or "插件执行失败。"
+    )
+    return NativeToolExecutionResult(
+        success=reroute_result.success,
+        route_result=route_result,
+        route_command=route_command,
+        output=payload,
+        display_text=display_text,
+        reason=observation.reason,
+    )
+
+
 async def _execute_route_decision(
     *,
     bot: Bot,
@@ -2692,12 +2861,21 @@ async def _execute_route_decision(
         extra_image_segments=extra_image_segments,
     )
     if success:
+        observation = execution_frame.finish(
+            success=True,
+            reason=EXECUTION_REASON_ROUTE_SUCCESS,
+        )
         _tag_execution_observation(
             trace,
-            execution_frame.finish(
-                success=True,
-                reason=EXECUTION_REASON_ROUTE_SUCCESS,
-            ),
+            observation,
+        )
+        RouteFeedbackStore.record_route_outcome(
+            session_id=session_id,
+            message_text=current_message,
+            route_result=route_result,
+            route_command=route_command,
+            success=True,
+            reason=observation.reason,
         )
         trace.set_tag("outcome", "plugin_reroute")
         await _record_route_feedback(
@@ -2719,12 +2897,21 @@ async def _execute_route_decision(
             budget_controller=budget_controller,
         )
     else:
+        observation = execution_frame.finish(
+            success=False,
+            reason=EXECUTION_REASON_REROUTE_FAILED,
+        )
         _tag_execution_observation(
             trace,
-            execution_frame.finish(
-                success=False,
-                reason=EXECUTION_REASON_REROUTE_FAILED,
-            ),
+            observation,
+        )
+        RouteFeedbackStore.record_route_outcome(
+            session_id=session_id,
+            message_text=current_message,
+            route_result=route_result,
+            route_command=route_command,
+            success=False,
+            reason=observation.reason,
         )
         trace.set_tag("outcome", "plugin_reroute_failed")
         await _record_route_feedback(
@@ -2943,6 +3130,10 @@ async def _stage_load_knowledge(
 ) -> None:
     await middleware.dispatch("pre_gate", middleware_state)
     ChatFeedbackStore.inspect_user_followup(
+        session_id=frame.session_key,
+        message_text=frame.raw_message,
+    )
+    RouteFeedbackStore.inspect_user_followup(
         session_id=frame.session_key,
         message_text=frame.raw_message,
     )
@@ -3275,14 +3466,50 @@ async def _stage_select_route(
     frame.route_message = route_message
     frame.stage(PipelineStage.INTENT)
 
-    router_decision, route_result, route_report = await resolve_llm_router(
+    async def _execute_native_route_callback(
+        validated: NativeValidatedRoute,
+        report: RouteAttemptReport,
+    ) -> NativeToolExecutionResult:
+        return await _execute_native_tool_route(
+            bot=bot,
+            event=event,
+            trace=frame.trace,
+            validated=validated,
+            knowledge_plugins=knowledge_base.plugins,
+            current_message=route_message,
+            user_id=frame.user_id,
+            session_id=frame.session_key,
+            has_reply=frame.has_reply,
+            extra_image_segments=frame.reply_image_segments_for_reroute,
+            route_report=report,
+        )
+
+    native_result = await run_native_tool_loop(
         route_message,
         knowledge_base,
         session_key=frame.session_key,
         budget_controller=frame.budget_controller,
         has_reply=frame.has_reply,
         command_tools=command_tools,
+        system_prompt=frame.system_prompt,
+        context_xml=frame.context_xml,
+        execute_route=_execute_native_route_callback,
     )
+    if native_result is not None:
+        router_decision = native_result.decision
+        route_result = native_result.route_result
+        route_report = native_result.report
+        frame.native_direct_reply = native_result.direct_reply
+    else:
+        router_decision, route_result, route_report = await resolve_llm_router(
+            route_message,
+            knowledge_base,
+            session_key=frame.session_key,
+            budget_controller=frame.budget_controller,
+            has_reply=frame.has_reply,
+            command_tools=command_tools,
+        )
+        frame.native_direct_reply = ""
     frame.set_route_result(
         router_decision=router_decision,
         route_result=route_result,
@@ -3476,6 +3703,70 @@ async def _stage_run_chat_fallback(
     )
 
 
+async def _stage_send_native_direct_chat(
+    *,
+    frame: TurnFrame,
+    finalize_callback,
+) -> bool:
+    reply_text = normalize_ai_reply_text(frame.native_direct_reply)
+    reply_text = replace_mention_ids_with_names(reply_text, frame.mention_name_map)
+    if not normalize_message_text(str(reply_text or "")):
+        return False
+
+    chat_execution_frame = start_execution_observation(
+        action="chat",
+        route_stage="native_tools",
+        session_id=frame.session_key,
+        message_preview=frame.current_message,
+        **_route_report_observer_kwargs(frame.route_report),
+    )
+    envelope = TurnChannelEnvelope()
+    frame.update_tags(path="chat", outcome="native_tools_chat")
+    envelope.add(ChannelName.ANALYSIS, "native tools direct chat")
+    envelope.add(ChannelName.FINAL, reply_text)
+    _log_turn_channels(envelope)
+    await _persist_final_only_dialog(
+        envelope=envelope,
+        user_id=frame.user_id,
+        group_id=frame.group_id,
+        nickname=frame.nickname,
+        user_message=frame.uni_msg or frame.current_message,
+        bot_id=frame.bot_id,
+        event_context=frame.event_context,
+        thread_context=frame.thread_context,
+    )
+    frame.stage(PipelineStage.PERSIST)
+    await MessageUtils.build_message(envelope.final).send()
+    frame.stage(PipelineStage.SEND)
+    await finalize_callback(
+        response_text=envelope.final,
+        phase="post_gate:native_tools_chat",
+    )
+    ChatFeedbackStore.record(
+        session_id=frame.session_key,
+        kind="chat_completed",
+        message_text=frame.current_message,
+        reply_text=envelope.final,
+        weight=0.2,
+    )
+    _tag_execution_observation(
+        frame.trace,
+        chat_execution_frame.finish(
+            success=True,
+            reason=EXECUTION_REASON_CHAT_COMPLETED,
+        ),
+    )
+    _finish_trace(
+        trace=frame.trace,
+        user_id=frame.user_id,
+        group_id=frame.group_id,
+        message_preview=frame.current_message,
+        route_report=frame.route_report,
+        budget_controller=frame.budget_controller,
+    )
+    return True
+
+
 async def handle_fallback(
     bot: Bot,
     event: Event,
@@ -3579,6 +3870,16 @@ async def handle_fallback(
         knowledge_base = frame.knowledge_base
         if knowledge_base is None:
             raise RuntimeError("missing plugin knowledge base")
+
+        if (
+            frame.router_decision.action == "chat"
+            and frame.native_direct_reply
+            and await _stage_send_native_direct_chat(
+                frame=frame,
+                finalize_callback=_dispatch_post_gate,
+            )
+        ):
+            return
 
         if frame.router_decision.action == "usage" and frame.route_result is not None:
             await _handle_router_usage_response(

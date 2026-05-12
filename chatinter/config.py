@@ -57,6 +57,8 @@ DEFAULTS = {
     "CUSTOM_PROMPT": "",
     "MCP_ENDPOINTS": "",
     "REASONING_EFFORT": "MEDIUM",
+    "NATIVE_TOOLS_ENABLED": True,
+    "NATIVE_TOOL_LIMIT": 8,
 }
 
 
@@ -99,7 +101,7 @@ def get_config_value(key: str, default: Any = None):
 
     raw_value = Config.get_config(CHATINTER_GROUP, key, default)
 
-    if key in {"ENABLE_FALLBACK", "ENABLE_AGENT_MODE"}:
+    if key in {"ENABLE_FALLBACK", "ENABLE_AGENT_MODE", "NATIVE_TOOLS_ENABLED"}:
         return _parse_bool(raw_value, bool(default))
 
     if key == "INTENT_TIMEOUT":
@@ -121,6 +123,7 @@ def get_config_value(key: str, default: Any = None):
         "AGENT_MAX_TOOL_STEPS",
         "AGENT_TOOL_FAILURE_LIMIT",
         "AGENT_FAILED_ROUND_LIMIT",
+        "NATIVE_TOOL_LIMIT",
     }:
         try:
             return int(raw_value)

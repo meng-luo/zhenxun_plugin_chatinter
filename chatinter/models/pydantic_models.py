@@ -178,6 +178,19 @@ class PluginCommandSchema(BaseModel):
     slots: list[CommandSlotSpec] = Field(default_factory=list, description="参数槽位")
     render: str = Field(description="命令渲染模板，例如：塞红包 {amount} {num}")
     requires: dict[str, bool] = Field(default_factory=dict, description="命令级需求")
+    allow_at: bool | None = Field(default=None, description="@是否可作为目标输入")
+    actor_scope: Literal["self_only", "allow_other"] = Field(
+        default="allow_other",
+        description="执行者范围",
+    )
+    target_requirement: Literal["none", "optional", "required"] = Field(
+        default="none",
+        description="目标参数要求",
+    )
+    target_sources: list[Literal["at", "reply", "nickname", "self"]] = Field(
+        default_factory=list,
+        description="可接受的目标来源",
+    )
     command_role: Literal[
         "execute",
         "helper",
@@ -231,6 +244,19 @@ class CommandToolSnapshot(BaseModel):
     examples: list[str] = Field(default_factory=list, description="示例")
     slots: list[CommandSlotSpec] = Field(default_factory=list, description="参数槽位")
     requires: dict[str, bool] = Field(default_factory=dict, description="命令级需求")
+    allow_at: bool | None = Field(default=None, description="@是否可作为目标输入")
+    actor_scope: Literal["self_only", "allow_other"] = Field(
+        default="allow_other",
+        description="执行者范围",
+    )
+    target_requirement: Literal["none", "optional", "required"] = Field(
+        default="none",
+        description="目标参数要求",
+    )
+    target_sources: list[Literal["at", "reply", "nickname", "self"]] = Field(
+        default_factory=list,
+        description="可接受的目标来源",
+    )
     render: str = Field(default="", description="命令渲染模板")
     payload_policy: Literal[
         "none",

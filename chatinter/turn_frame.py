@@ -68,6 +68,7 @@ class TurnFrame:
     router_decision: Any | None = None
     route_result: Any | None = None
     route_report: Any | None = None
+    native_direct_reply: str = ""
     dialogue_plan: Any | None = None
     mention_name_map: dict[str, str] = field(default_factory=dict)
     mention_profiles: dict[str, dict[str, str]] = field(default_factory=dict)

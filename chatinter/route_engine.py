@@ -543,7 +543,7 @@ def _rerank_to_command_selection(
     )
 
 
-def _fallback_candidate_selection(
+def resolve_local_candidate_selection(
     *,
     message_text: str,
     candidates: list[CommandCandidate],
@@ -573,9 +573,9 @@ def _fallback_candidate_selection(
             reason=f"local_unavailable_usage:{top.reason}",
         )
 
-    # Local execution is only a safety net for classifier outages. Fuzzy or semantic
-    # matches stay in chat unless the user hit an actual command head/alias with a
-    # clear margin. Normal routing decisions belong to the LLM reranker.
+    # Local execution is only a safety net for native/tool classifier outages.
+    # Fuzzy or semantic matches stay in chat unless the user hit an actual
+    # command head/alias with a clear margin.
     if not _is_exact_command_candidate(top):
         return None
     if speech_act in {"casual_chat", "discuss_command"}:
@@ -874,7 +874,7 @@ async def _resolve_candidate_selection_route(
                 reason=f"adapter_fallback:{clarify_route.reason}",
             )
         else:
-            selection = _fallback_candidate_selection(
+            selection = resolve_local_candidate_selection(
                 message_text=message_text,
                 candidates=candidates,
                 has_reply=has_reply,
@@ -1057,4 +1057,5 @@ __all__ = [
     "RouteAttemptReport",
     "RouteResolveResult",
     "resolve_llm_router",
+    "resolve_local_candidate_selection",
 ]
