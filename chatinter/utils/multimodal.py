@@ -150,37 +150,6 @@ async def _process_image_segment(seg: Image) -> LLMContentPart | None:
     return None
 
 
-async def get_image_description(
-    image_parts: list[LLMContentPart],
-    model: str | None = None,
-) -> str | None:
-    """使用 LLM 描述图片内容
-
-    参数:
-        image_parts: 图片内容列表
-        model: 使用的模型
-
-    返回:
-        str | None: 图片描述文本
-    """
-    if not image_parts:
-        return None
-
-    from zhenxun.services.llm import AI
-
-    try:
-        ai = AI()
-        content = [
-            LLMContentPart.text_part("请简要描述这张图片的内容，用中文回复。"),
-            *image_parts,
-        ]
-
-        response = await ai.chat(content, model=model)
-        return response.text
-    except Exception:
-        return None
-
-
 async def extract_images_from_reply_chain(
     reply_images: list[Image],
 ) -> list[LLMContentPart]:
@@ -205,5 +174,4 @@ async def extract_images_from_reply_chain(
 __all__ = [
     "extract_images_from_message",
     "extract_images_from_reply_chain",
-    "get_image_description",
 ]

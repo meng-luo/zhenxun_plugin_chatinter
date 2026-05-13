@@ -65,14 +65,6 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="chatinter",
-                key="ENABLE_AGENT_MODE",
-                value=True,
-                help="是否启用 ChatInter Agent（工具调用）模式",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
                 key="INTENT_TIMEOUT",
                 value=20,
                 help=(
@@ -84,50 +76,10 @@ __plugin_meta__ = PluginMetadata(
             ),
             RegisterConfig(
                 module="chatinter",
-                key="NATIVE_TOOLS_ENABLED",
-                value=True,
-                help="是否优先使用原生 function calling 一轮完成插件选择与参数填充",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="NATIVE_TOOL_LOOP_STEPS",
-                value=3,
-                help="原生插件工具执行闭环最大迭代步数",
-                default_value=3,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
                 key="NATIVE_REROUTE_TIMEOUT",
                 value=10,
                 help="等待插件重路由执行并观测发送输出的超时时间（秒）",
                 default_value=10,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="AGENT_MAX_TOOL_STEPS",
-                value=4,
-                help="Agent 工具调用最大迭代步数（复杂请求会在此基础上自动小幅上调）",
-                default_value=4,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="AGENT_TOOL_FAILURE_LIMIT",
-                value=2,
-                help="单工具连续失败达到阈值后自动熔断禁用",
-                default_value=2,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="AGENT_FAILED_ROUND_LIMIT",
-                value=2,
-                help="连续失败回合阈值，达到后停止工具并直接总结",
-                default_value=2,
                 type=int,
             ),
             RegisterConfig(
@@ -143,17 +95,6 @@ __plugin_meta__ = PluginMetadata(
                 key="CUSTOM_PROMPT",
                 value="",
                 help="ChatInter 自定义系统提示词补充，会追加到系统提示词末尾",
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="MCP_ENDPOINTS",
-                value="",
-                help=(
-                    "MCP 工具服务地址列表，使用英文逗号分隔。"
-                    "示例: http://127.0.0.1:9001,http://127.0.0.1:9002"
-                ),
                 default_value="",
                 type=str,
             ),

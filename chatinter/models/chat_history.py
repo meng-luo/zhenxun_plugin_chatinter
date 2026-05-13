@@ -1,3 +1,5 @@
+import json
+
 from tortoise import fields
 from tortoise.expressions import F
 
@@ -7,8 +9,8 @@ from zhenxun.services.db_context import Model
 class ChatInterChatHistory(Model):
     """ChatInter 聊天历史表
 
-    采用一问一答格式，每条记录包含用户消息和 AI 回复
-    参考：bym_ai.models.bym_chat
+    每条记录保存一次 ChatInter turn 的完整 message timeline。
+    user_message / ai_response 仅作为兼容摘要字段，历史重放优先读取 timeline。
     """
 
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
@@ -24,7 +26,9 @@ class ChatInterChatHistory(Model):
     user_message = fields.TextField()
     """用户消息"""
     ai_response = fields.TextField(null=True)
-    """AI 回复内容"""
+    """AI 回复摘要（兼容旧读取）"""
+    timeline = fields.TextField(default="")
+    """完整 message timeline，JSON 数组"""
     bot_id = fields.CharField(255, null=True)
     """Bot ID"""
     create_time = fields.DatetimeField(auto_now_add=True, index=True)
@@ -35,6 +39,12 @@ class ChatInterChatHistory(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "chatinter_chat_history"
         table_description = "ChatInter 聊天历史表"
+
+    @classmethod
+    async def _run_script(cls):
+        return [
+            "ALTER TABLE chatinter_chat_history ADD COLUMN timeline TEXT DEFAULT '';",
+        ]
 
     @classmethod
     async def get_recent_dialogs(
@@ -80,31 +90,19 @@ class ChatInterChatHistory(Model):
         return list(dialogs)
 
     @classmethod
-    async def add_dialog(
+    async def add_timeline(
         cls,
+        *,
         session_id: str,
         user_id: str,
         nickname: str,
         user_message: str,
-        ai_response: str,
+        timeline: list[dict] | tuple[dict, ...],
+        ai_response: str = "",
         group_id: str | None = None,
         bot_id: str | None = None,
     ) -> "ChatInterChatHistory":
-        """
-        添加一轮对话到数据库（一问一答）
-
-        参数:
-            session_id: 会话标识
-            user_id: 用户 id
-            nickname: 用户昵称
-            user_message: 用户消息
-            ai_response: AI 回复内容
-            group_id: 群组 id（可选）
-            bot_id: Bot ID（可选）
-
-        返回:
-            ChatInterChatHistory: 创建的对话记录
-        """
+        """添加一次完整 ChatInter message timeline。"""
         return await cls.create(
             session_id=session_id,
             user_id=user_id,
@@ -112,63 +110,38 @@ class ChatInterChatHistory(Model):
             nickname=nickname,
             user_message=user_message,
             ai_response=ai_response,
+            timeline=json.dumps(list(timeline), ensure_ascii=False, default=str),
             bot_id=bot_id,
         )
 
-    @classmethod
-    async def add_user_message(
-        cls,
-        session_id: str,
-        user_id: str,
-        nickname: str,
-        user_message: str,
-        group_id: str | None = None,
-        bot_id: str | None = None,
-    ) -> "ChatInterChatHistory":
-        """
-        仅添加用户消息（暂时存储，等待 AI 回复后更新）
+    def get_timeline(self) -> list[dict]:
+        raw = str(self.timeline or "").strip()
+        if raw:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                value = []
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        fallback: list[dict] = []
+        if self.user_message:
+            fallback.append(
+                {
+                    "role": "user",
+                    "kind": "current_user",
+                    "content": str(self.user_message or ""),
+                }
+            )
+        if self.ai_response:
+            fallback.append(
+                {
+                    "role": "assistant",
+                    "kind": "final_output",
+                    "content": str(self.ai_response or ""),
+                }
+            )
+        return fallback
 
-        参数:
-            session_id: 会话标识
-            user_id: 用户 id
-            nickname: 用户昵称
-            user_message: 用户消息
-            group_id: 群组 id（可选）
-            bot_id: Bot ID（可选）
-
-        返回:
-            ChatInterChatHistory: 创建的消息记录
-        """
-        return await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            user_message=user_message,
-            ai_response=None,
-            bot_id=bot_id,
-        )
-
-    @classmethod
-    async def update_ai_response(
-        cls, dialog_id: int, ai_response: str, bot_id: str | None = None
-    ) -> bool:
-        """
-        更新 AI 回复内容
-
-        参数:
-            dialog_id: 对话记录 ID
-            ai_response: AI 回复内容
-            bot_id: Bot ID（可选）
-
-        返回:
-            bool: 是否更新成功
-        """
-        updated = await cls.filter(id=dialog_id).update(
-            ai_response=ai_response,
-            bot_id=bot_id,
-        )
-        return updated > 0
 
     @classmethod
     async def prune_old_dialogs(cls, session_id: str, max_limit: int):

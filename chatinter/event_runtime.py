@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from nonebot import get_driver
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import Uninfo
 
@@ -11,7 +12,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 
 from .plugin_registry import PluginRegistry
-from .route_text import normalize_message_text, should_force_knowledge_refresh
+from .route_text import normalize_message_text
 
 _HANDLED_MESSAGE_IDS: set[str] = set()
 _MAX_HANDLED_CACHE = 1000
@@ -47,8 +48,18 @@ def get_nickname(session: Uninfo) -> str:
 
 
 def resolve_superuser(bot: Bot, user_id: str) -> bool:
-    platform_user = f"{getattr(bot, 'type', '')}:{user_id}"
-    return user_id in BotConfig.superusers or platform_user in BotConfig.superusers
+    platform = str(getattr(bot, "type", "") or "")
+    platform_user = f"{platform}:{user_id}" if platform else user_id
+    driver_superusers = {
+        str(item) for item in getattr(get_driver().config, "superusers", set())
+    }
+    platform_superusers = {str(item) for item in BotConfig.get_superuser(platform)}
+    return (
+        user_id in driver_superusers
+        or platform_user in driver_superusers
+        or user_id in platform_superusers
+        or platform_user in platform_superusers
+    )
 
 
 def event_type_name(event: Event) -> str:
@@ -89,10 +100,7 @@ async def apply_runtime_plugin_overrides(
 
     enable_modules = iter_runtime_plugin_overrides(event, _ENABLE_PLUGINS_ATTR)
     disable_modules = iter_runtime_plugin_overrides(event, _DISABLE_PLUGINS_ATTR)
-    force_refresh = should_force_knowledge_refresh(
-        list(enable_modules | disable_modules)
-    )
-    if not force_refresh:
+    if not enable_modules and not disable_modules:
         return
 
     now = time.monotonic()

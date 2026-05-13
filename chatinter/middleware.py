@@ -16,8 +16,6 @@ MiddlewareStage = Literal[
     "after_route",
     "before_chat",
     "after_chat",
-    "before_agent",
-    "after_agent",
     "post_gate",
     "on_error",
 ]

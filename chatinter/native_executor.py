@@ -21,7 +21,7 @@ from .native_route import (
 )
 from .route_text import normalize_message_text
 
-_NATIVE_EXECUTION_STAGE = "native_tool_loop"
+_NATIVE_EXECUTION_STAGE = "main_request"
 
 
 @dataclass(frozen=True)

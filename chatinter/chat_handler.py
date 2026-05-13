@@ -18,31 +18,13 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.plugin import get_loaded_plugins
-from nonebot_plugin_alconna.uniseg import UniMessage
 
-from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 from zhenxun.services.send_queue import (
     SendObservation,
     observe_send_trace,
     pop_send_observations,
 )
-from zhenxun.services.llm import AI, LLMMessage
-from zhenxun.utils.message import MessageUtils
-
-from .chat_dialogue_planner import ChatDialoguePlan
-from .chat_strategy import build_chat_strategy_prompt
-from .config import (
-    CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
-    USE_SIGN_IN_IMPRESSION,
-    build_reasoning_generation_config,
-    get_config_value,
-    get_model_name,
-)
-from .memory import _chat_memory
-from .prompt_guard import guard_prompt_sections
-from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
-from .turn_runtime import TurnBudgetController
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
@@ -69,27 +51,6 @@ _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN = re.compile(
     r"\[image(?:#\d+)?\]",
     re.IGNORECASE,
 )
-_COMPLEX_QUERY_HINTS = (
-    "代码",
-    "插件",
-    "报错",
-    "错误",
-    "异常",
-    "调试",
-    "排查",
-    "怎么",
-    "如何",
-    "实现",
-    "步骤",
-    "配置",
-    "脚本",
-    "方案",
-    "traceback",
-    "exception",
-    "nonebot",
-    "python",
-    "api",
-)
 
 
 @dataclass(frozen=True)
@@ -104,122 +65,6 @@ class RerouteExecutionResult:
     @property
     def observed_text(self) -> str:
         return "\n".join(item.text for item in self.outputs if item.text).strip()
-
-
-def _is_complex_query(message_text: str) -> bool:
-    normalized = str(message_text or "").strip().lower()
-    if not normalized:
-        return False
-    if "```" in normalized or "\n" in normalized:
-        return True
-    if len(normalized) >= 36:
-        return True
-    return any(hint in normalized for hint in _COMPLEX_QUERY_HINTS)
-
-
-async def handle_chat_message(
-    message: str,
-    user_id: str,
-    group_id: str | None = None,
-    nickname: str = "用户",
-    mention_name_map: dict[str, str] | None = None,
-    session_key: str | None = None,
-    budget_controller: TurnBudgetController | None = None,
-    dialogue_plan: ChatDialoguePlan | None = None,
-    context_xml: str = "",
-    history_messages: list[LLMMessage] | None = None,
-) -> str | UniMessage:
-    chat_style = str(get_config_value("CHAT_STYLE", "") or "")
-
-    system_prompt = await build_chat_system_prompt(
-        user_id=user_id,
-        nickname=nickname,
-        group_id=group_id,
-        chat_style=chat_style,
-        message_text=message,
-        dialogue_plan=dialogue_plan,
-    )
-
-    logger.debug(f"系统提示词：{system_prompt[:500]}...")
-
-    try:
-        guarded = guard_prompt_sections(
-            session_key=session_key or str(group_id or user_id),
-            stage="chat_reply",
-            system_prompt=system_prompt,
-            context_text=context_xml,
-            user_text=message,
-            controller=budget_controller,
-        )
-        user_text = guarded.user_text
-        if guarded.context_text:
-            user_text = (
-                f"{guarded.context_text}\n\n"
-                f"<current_user_message>{guarded.user_text}</current_user_message>"
-            )
-        ai = AI(session_id=f"chatinter-chat:{session_key or group_id or user_id}")
-        response = await ai.generate_internal(
-            [
-                LLMMessage.system(guarded.system_prompt),
-                *list(history_messages or []),
-                LLMMessage.user(user_text),
-            ],
-            model=get_model_name(),
-            config=build_reasoning_generation_config(),
-        )
-
-        reply_text = normalize_ai_reply_text(
-            response.text if response else "抱歉，我现在有点累，稍后再聊吧~"
-        )
-        reply_text = replace_mention_ids_with_names(reply_text, mention_name_map)
-        return reply_text
-
-    except Exception as e:
-        logger.error(f"聊天处理失败：{e}")
-        return MessageUtils.build_failure_message()
-
-
-async def build_chat_system_prompt(
-    user_id: str,
-    nickname: str,
-    group_id: str | None = None,
-    chat_style: str = "",
-    message_text: str = "",
-    dialogue_plan: ChatDialoguePlan | None = None,
-) -> str:
-    if USE_SIGN_IN_IMPRESSION:
-        impression, attitude = await _chat_memory.get_user_impression(user_id)
-    else:
-        impression, attitude = 0.0, "一般"
-
-    is_complex_query = _is_complex_query(message_text) or bool(
-        dialogue_plan and dialogue_plan.is_complex
-    )
-    if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and is_complex_query:
-        length_rule = (
-            "当前问题偏复杂（如代码/排错/实现类），允许使用分点和步骤化说明，"
-            "优先给出可执行结论，不受80字限制。"
-        )
-    else:
-        length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
-
-    base_prompt = build_chat_base_prompt(
-        BotConfig.self_nickname,
-        chat_style,
-        length_rule,
-        strategy_prompt=build_chat_strategy_prompt(dialogue_plan),
-    )
-    group_prompt = f"\n群组 ID：{group_id}" if group_id else ""
-    impression_prompt = (
-        build_user_attitude_prompt(nickname, impression, attitude)
-        if USE_SIGN_IN_IMPRESSION
-        else ""
-    )
-
-    custom_prompt = get_config_value("CUSTOM_PROMPT", "")
-    custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
-
-    return base_prompt + impression_prompt + group_prompt + custom_prompt_text
 
 
 async def reroute_to_plugin(
@@ -622,8 +467,6 @@ def replace_mention_ids_with_names(
 
 __all__ = [
     "RerouteExecutionResult",
-    "build_chat_system_prompt",
-    "handle_chat_message",
     "normalize_ai_reply_text",
     "replace_mention_ids_with_names",
     "reroute_to_plugin",

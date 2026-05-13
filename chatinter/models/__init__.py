@@ -6,6 +6,8 @@ ChatInter - 数据模型
 - Pydantic 模型 (结构化输出)
 """
 
+from zhenxun.models.chat_history import ChatHistory as _ChatHistory  # noqa: F401
+
 # Pydantic 模型（结构化输出）
 from .chat_history import (
     ChatInterChatHistory,

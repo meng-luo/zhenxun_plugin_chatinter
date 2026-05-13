@@ -100,13 +100,6 @@ class ChatMemory:
         self._nickname_ttl = 30 * 60
 
     @staticmethod
-    def _clip_context_line(text: str, limit: int = 140) -> str:
-        normalized = " ".join(str(text or "").split())
-        if len(normalized) <= limit:
-            return normalized
-        return f"{normalized[: max(24, limit - 1)].rstrip()}…"
-
-    @staticmethod
     def _normalize_context_text(text: str) -> str:
         return " ".join(str(text or "").split()).strip()
 
@@ -157,20 +150,6 @@ class ChatMemory:
             f"response_mode={response_mode}",
             "</conversation_focus>",
         ]
-
-    @staticmethod
-    def _strip_non_final_channel_text(text: str) -> str:
-        normalized = str(text or "")
-        if not normalized:
-            return ""
-        # 兼容历史遗留的通道标记，避免 analysis/commentary 污染后续上下文。
-        normalized = re.sub(r"(?i)\[(analysis|commentary)\]\s*", "", normalized)
-        normalized = re.sub(
-            r"(?im)^\s*(analysis|commentary)\s*[:：]\s*",
-            "",
-            normalized,
-        )
-        return normalized.strip()
 
     @staticmethod
     def _extract_http_url(value: object) -> str:
@@ -282,29 +261,31 @@ class ChatMemory:
         """获取用于数据库存储的 session_id"""
         return group_id if group_id else user_id
 
-    async def add_dialog(
+    async def add_timeline(
         self,
         user_id: str,
         group_id: str | None,
         nickname: str,
         user_message: str | UniMessage,
-        ai_response: str | UniMessage,
+        response_summary: str,
+        timeline: list[dict],
         bot_id: str | None = None,
     ) -> ChatInterChatHistory | None:
-        """添加一轮对话到数据库（一问一答）"""
+        """添加一次完整 ChatInter message timeline。"""
         session_id = self.get_session_id(user_id, group_id)
 
         formatted_user_message = uni_to_text_with_tags(user_message)
-        formatted_ai_response = uni_to_text_with_tags(ai_response)
+        formatted_response_summary = uni_to_text_with_tags(response_summary)
 
         async with self._lock:
-            dialog = await ChatInterChatHistory.add_dialog(
+            dialog = await ChatInterChatHistory.add_timeline(
                 session_id=session_id,
                 user_id=user_id,
                 group_id=group_id,
                 nickname=nickname,
                 user_message=formatted_user_message,
-                ai_response=formatted_ai_response,
+                ai_response=formatted_response_summary,
+                timeline=timeline,
                 bot_id=bot_id,
             )
         return dialog
@@ -467,52 +448,6 @@ class ChatMemory:
         )
 
         return system_prompt, context_xml, reply_images, history_messages
-
-    async def build_recent_conversation_recap(
-        self,
-        user_id: str,
-        group_id: str | None,
-        *,
-        limit: int = 4,
-    ) -> str:
-        """生成最近对话的短回顾。
-
-        该路径不调用 LLM，直接从本地历史表抽取最近几轮对话，
-        作为“我们说了些什么”之类问题的固定短回复。
-        """
-        session_id = self.get_session_id(user_id, group_id)
-        recap_limit = max(int(limit or 0), 1)
-        dialogs = await ChatInterChatHistory.get_recent_dialogs(
-            session_id,
-            recap_limit,
-        )
-        if not dialogs:
-            return "最近没有可回顾的聊天记录。"
-
-        lines: list[str] = []
-        for dialog in dialogs[-recap_limit:]:
-            user_text = self._clip_context_line(
-                self._strip_non_final_channel_text(
-                    uni_to_text_with_tags(dialog.user_message)
-                ),
-                36,
-            )
-            ai_text = self._clip_context_line(
-                self._strip_non_final_channel_text(
-                    uni_to_text_with_tags(dialog.ai_response or "")
-                ),
-                36,
-            )
-            if user_text:
-                lines.append(f"你：{user_text}")
-            if ai_text:
-                lines.append(f"我：{ai_text}")
-
-        if not lines:
-            return "最近没有可回顾的聊天记录。"
-
-        lines = lines[-8:]
-        return "最近聊过这些：\n" + "\n".join(lines)
 
     async def _build_current_message_layers(
         self,

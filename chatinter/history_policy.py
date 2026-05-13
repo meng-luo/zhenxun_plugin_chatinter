@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Iterable
 
 from zhenxun.configs.config import BotConfig
@@ -10,10 +11,17 @@ from zhenxun.services.llm import LLMMessage
 from .models.chat_history import ChatInterChatHistory
 from .person_registry import format_person_history_label, get_person_profile
 from .route_text import normalize_message_text
+from .turn_runtime import estimate_text_tokens
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 _HISTORY_MESSAGE_CLIP = 220
 _CHATROOM_LINE_CLIP = 180
+_TURN_HISTORY_TOKEN_BUDGET = 3200
+_MIN_RECENT_TURNS = 3
+_SUMMARY_FETCH_LIMIT = 24
+_SUMMARY_MAX_LINES = 10
+_SUMMARY_USER_CLIP = 96
+_SUMMARY_RESULT_CLIP = 128
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,13 @@ class AstrHistoryPayload:
     chatroom_lines: list[str]
 
 
+@dataclass(frozen=True)
+class _HistoryTurn:
+    messages: list[LLMMessage]
+    summary: str
+    token_cost: int
+
+
 async def build_astr_history_payload(
     *,
     session_id: str,
@@ -39,7 +54,7 @@ async def build_astr_history_payload(
     dialog_limit: int,
     chatroom_limit: int,
 ) -> AstrHistoryPayload:
-    dialog_messages = await _build_dialog_messages(
+    dialog_messages = await _build_turn_managed_dialog_messages(
         session_id=session_id,
         group_id=group_id,
         dialog_limit=dialog_limit,
@@ -54,7 +69,7 @@ async def build_astr_history_payload(
     return AstrHistoryPayload(messages=dialog_messages, chatroom_lines=chatroom_lines)
 
 
-async def _build_dialog_messages(
+async def _build_turn_managed_dialog_messages(
     *,
     session_id: str,
     group_id: str | None,
@@ -64,26 +79,195 @@ async def _build_dialog_messages(
     if limit <= 0:
         return []
 
-    dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, limit)
-    messages: list[LLMMessage] = []
+    fetch_limit = max(limit, min(_SUMMARY_FETCH_LIMIT, limit + _SUMMARY_MAX_LINES))
+    dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
+    turns: list[_HistoryTurn] = []
     for dialog in dialogs:
-        user_text = _clean_history_text(dialog.user_message, _HISTORY_MESSAGE_CLIP)
-        if user_text:
-            sender = await _format_sender(
-                user_id=str(dialog.user_id or ""),
-                group_id=group_id,
-                fallback_name=str(dialog.nickname or ""),
-                bot_id=None,
+        timeline_messages = await _timeline_to_history_messages(
+            dialog,
+            group_id=group_id,
+        )
+        if timeline_messages:
+            turns.append(
+                _HistoryTurn(
+                    messages=timeline_messages,
+                    summary=await _timeline_to_summary_line(
+                        dialog,
+                        group_id=group_id,
+                    ),
+                    token_cost=sum(
+                        _message_token_cost(message) for message in timeline_messages
+                    ),
+                )
             )
-            messages.append(LLMMessage.user(f"{sender}: {user_text}"))
+    if not turns:
+        return []
 
-        assistant_text = _clean_history_text(
-            dialog.ai_response or "",
+    kept_reversed: list[_HistoryTurn] = []
+    omitted: list[_HistoryTurn] = []
+    used_tokens = 0
+    min_recent_turns = min(_MIN_RECENT_TURNS, limit)
+    for turn in reversed(turns):
+        should_keep = (
+            len(kept_reversed) < min_recent_turns
+            or (
+                len(kept_reversed) < limit
+                and used_tokens + turn.token_cost <= _TURN_HISTORY_TOKEN_BUDGET
+            )
+        )
+        if should_keep:
+            kept_reversed.append(turn)
+            used_tokens += turn.token_cost
+        else:
+            omitted.append(turn)
+
+    kept = list(reversed(kept_reversed))
+    messages: list[LLMMessage] = []
+    summary_lines = [
+        turn.summary
+        for turn in reversed(omitted)
+        if turn.summary
+    ][-_SUMMARY_MAX_LINES:]
+    if summary_lines:
+        messages.append(_compressed_summary_message(summary_lines))
+    for turn in kept:
+        messages.extend(turn.messages)
+    return messages
+
+
+async def _timeline_to_history_messages(
+    dialog: ChatInterChatHistory,
+    *,
+    group_id: str | None,
+) -> list[LLMMessage]:
+    timeline = dialog.get_timeline()
+    if not timeline:
+        return []
+    messages: list[LLMMessage] = []
+    sender = await _format_sender(
+        user_id=str(dialog.user_id or ""),
+        group_id=group_id,
+        fallback_name=str(dialog.nickname or ""),
+        bot_id=None,
+    )
+    for item in timeline:
+        role = str(item.get("role", "") or "")
+        kind = str(item.get("kind", "") or "")
+        content = _clean_history_text(
+            _timeline_content(item),
             _HISTORY_MESSAGE_CLIP,
         )
-        if assistant_text:
-            messages.append(LLMMessage.assistant_text_response(assistant_text))
+        if role == "user" and kind == "current_user":
+            if content:
+                messages.append(LLMMessage.user(f"{sender}: {content}"))
+            continue
+        if kind == "tool_call":
+            tool_name = _clean_history_text(item.get("tool_name", ""), 80)
+            arguments = _clean_history_text(
+                _timeline_metadata_text(item, "arguments"),
+                120,
+            )
+            text = f"[tool_call] {tool_name}"
+            if arguments:
+                text += f" {arguments}"
+            messages.append(LLMMessage.assistant_text_response(text))
+            continue
+        if kind == "tool_result":
+            tool_name = _clean_history_text(item.get("tool_name", ""), 80)
+            result_text = content or _clean_history_text(
+                _timeline_metadata_text(item, "output"),
+                _HISTORY_MESSAGE_CLIP,
+            )
+            if result_text:
+                messages.append(
+                    LLMMessage.assistant_text_response(
+                        f"[tool_result] {tool_name}: {result_text}"
+                    )
+                )
+            continue
+        if role == "assistant" and kind == "final_output" and content:
+            messages.append(LLMMessage.assistant_text_response(content))
     return messages
+
+
+async def _timeline_to_summary_line(
+    dialog: ChatInterChatHistory,
+    *,
+    group_id: str | None,
+) -> str:
+    timeline = dialog.get_timeline()
+    if not timeline:
+        return ""
+    sender = await _format_sender(
+        user_id=str(dialog.user_id or ""),
+        group_id=group_id,
+        fallback_name=str(dialog.nickname or ""),
+        bot_id=None,
+    )
+    user_text = ""
+    final_text = ""
+    tool_result_text = ""
+    tool_names: list[str] = []
+    for item in timeline:
+        role = str(item.get("role", "") or "")
+        kind = str(item.get("kind", "") or "")
+        if role == "user" and kind == "current_user" and not user_text:
+            user_text = _clean_history_text(
+                _timeline_content(item),
+                _SUMMARY_USER_CLIP,
+            )
+            continue
+        if kind == "tool_call":
+            tool_name = _clean_history_text(item.get("tool_name", ""), 64)
+            if tool_name and tool_name not in tool_names:
+                tool_names.append(tool_name)
+            continue
+        if role == "assistant" and kind == "final_output" and not final_text:
+            final_text = _clean_history_text(
+                _timeline_content(item),
+                _SUMMARY_RESULT_CLIP,
+            )
+            continue
+        if kind == "tool_result" and not tool_result_text:
+            tool_result_text = _clean_history_text(
+                _timeline_content(item)
+                or _timeline_metadata_text(item, "output"),
+                _SUMMARY_RESULT_CLIP,
+            )
+
+    result_text = final_text or tool_result_text
+    if not user_text and not result_text and not tool_names:
+        return ""
+    parts = [f"speaker={sender}"]
+    if user_text:
+        parts.append(f"user={user_text}")
+    if tool_names:
+        parts.append(f"tools={','.join(tool_names[:4])}")
+    if result_text:
+        parts.append(f"result={result_text}")
+    return " | ".join(parts)
+
+
+def _compressed_summary_message(summary_lines: list[str]) -> LLMMessage:
+    lines = [
+        "<compressed_history_summary>",
+        "policy=older_turns_summarized_recent_turns_kept_verbatim",
+        *summary_lines,
+        "</compressed_history_summary>",
+    ]
+    return LLMMessage.user("\n".join(lines))
+
+
+def _message_token_cost(message: LLMMessage) -> int:
+    content = message.content
+    if isinstance(content, str):
+        return estimate_text_tokens(content)
+    total = 0
+    for part in content:
+        total += estimate_text_tokens(part.text or part.thought_text or "")
+        if part.image_source:
+            total += 48
+    return max(total, 1)
 
 
 async def _build_chatroom_lines(
@@ -182,6 +366,36 @@ def _clean_history_text(value: object, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(24, limit - 1)].rstrip()}…"
+
+
+def _timeline_content(item: dict) -> str:
+    content = item.get("content", "")
+    if content:
+        return str(content)
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        output = metadata.get("output")
+        if isinstance(output, dict):
+            outputs = output.get("outputs")
+            if isinstance(outputs, list):
+                return "\n".join(str(value or "") for value in outputs if value)
+            return str(output.get("message", "") or "")
+    return ""
+
+
+def _timeline_metadata_text(item: dict, key: str) -> str:
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    value = metadata.get(key)
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
 
 
 def _strip_channel_markers(text: str) -> str:

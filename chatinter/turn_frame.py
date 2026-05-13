@@ -23,8 +23,7 @@ class PipelineStage(str, Enum):
     INTENT = "intent"
     ROUTE = "route"
     MEDIA = "media"
-    AGENT_BUDGET = "agent_budget"
-    CHAT_FALLBACK = "chat_fallback"
+    MAIN_REQUEST = "main_request"
     PERSIST = "persist"
     SEND = "send"
     NOTIFY = "notify"
@@ -55,8 +54,6 @@ class TurnFrame:
     context_xml: str = ""
     enriched_context_xml: str = ""
     history_messages: list[LLMMessage] = field(default_factory=list)
-    native_force_pure_chat: bool = False
-    completion_disabled_force_chat: bool = False
     post_gate_dispatched: bool = False
     event_message: Any | None = None
     uni_msg: Any | None = None
@@ -72,7 +69,6 @@ class TurnFrame:
     native_decision: Any | None = None
     route_result: Any | None = None
     route_report: Any | None = None
-    native_direct_reply: str = ""
     dialogue_plan: Any | None = None
     mention_name_map: dict[str, str] = field(default_factory=dict)
     mention_profiles: dict[str, dict[str, str]] = field(default_factory=dict)

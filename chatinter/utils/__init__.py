@@ -11,7 +11,6 @@ from .cache import (
 from .multimodal import (
     extract_images_from_message,
     extract_images_from_reply_chain,
-    get_image_description,
 )
 from .unimsg_utils import (
     extract_reply_from_message,
@@ -24,7 +23,6 @@ __all__ = [
     "extract_images_from_message",
     "extract_images_from_reply_chain",
     "extract_reply_from_message",
-    "get_image_description",
     "get_user_impression_with_cache",
     "remove_reply_segment",
     "uni_to_text_with_tags",

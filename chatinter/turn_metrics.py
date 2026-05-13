@@ -134,7 +134,8 @@ class _RouteObserver:
         recent_failures = [
             asdict(row)
             for row in rows
-            if row.outcome not in {"plugin_reroute", "chat_fallback"}
+            if row.outcome
+            not in {"plugin_reroute", "chat_fallback", "tool_completed", "chat_completed"}
         ][-8:]
         return {
             "total": len(rows),
