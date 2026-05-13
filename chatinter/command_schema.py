@@ -45,6 +45,8 @@ _EMPTY_TEXT_PAYLOAD_WORDS = {
     "一下吧",
     "下吧",
 }
+_COMMAND_PARAM_TOKEN_PATTERN = re.compile(r"\s*[?*+]?\[[^\]]+\]")
+_COMMAND_PARAM_BRACKET_PATTERN = re.compile(r"\s*[?*+]?[<(｟][^>)｠]+[>)｠]")
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,20 @@ def _schema(
         matcher_key=matcher_key,
         retrieval_phrases=phrases,
     )
+
+
+def normalize_schema_command_head(command: str | None) -> str:
+    """Return the executable command head without parameter placeholders."""
+
+    normalized = normalize_message_text(command or "")
+    if not normalized:
+        return ""
+    candidate = _COMMAND_PARAM_TOKEN_PATTERN.split(normalized, maxsplit=1)[0]
+    candidate = _COMMAND_PARAM_BRACKET_PATTERN.split(candidate, maxsplit=1)[0]
+    candidate = normalize_message_text(candidate)
+    if not candidate:
+        return ""
+    return normalize_message_text(candidate.split(" ", 1)[0])
 
 
 def _command_id(module: str, head: str) -> str:
@@ -296,7 +312,8 @@ def schema_from_capability(
     module: str,
     command: CommandCapability,
 ) -> PluginCommandSchema | None:
-    head = normalize_message_text(command.command)
+    raw_command = normalize_message_text(command.command)
+    head = normalize_schema_command_head(raw_command) or raw_command
     if not head:
         return None
     slots: list[CommandSlotSpec] = []
@@ -354,6 +371,7 @@ def schema_from_capability(
         source="matcher",
         confidence=0.68,
         matcher_key=f"{module}:{head}",
+        retrieval_phrases=[raw_command] if raw_command and raw_command != head else [],
     )
 
 
@@ -379,7 +397,7 @@ def build_command_schemas(
 
 def _command_head(command: str | None) -> str:
     normalized = normalize_message_text(command or "")
-    return normalize_message_text(normalized.split(" ", 1)[0]) if normalized else ""
+    return normalize_schema_command_head(normalized)
 
 
 def _command_tail(command: str | None) -> str:
@@ -573,6 +591,16 @@ def select_command_schema(
     ) or bool(slots)
     if not has_hint:
         return None
+
+    normalized_id = normalize_message_text(command_id or "").casefold()
+    if normalized_id:
+        schemas = [
+            schema
+            for schema in schemas
+            if normalize_message_text(schema.command_id).casefold() == normalized_id
+        ]
+        if not schemas:
+            return None
 
     selections = [
         _score_schema(

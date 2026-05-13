@@ -35,6 +35,9 @@ _RRF_K = 60.0
 _FAMILY_SOFT_CAP = 6
 _PLUGIN_SOFT_CAP = 8
 _EXACT_KEEP_LIMIT = 8
+_PLUGIN_DIRECT_EXPOSURE_LIMIT = 10
+_LARGE_PLUGIN_EXPOSURE_LIMIT = 8
+_NATIVE_TOOL_API_HARD_LIMIT = 128
 _CJK_COMMAND_BOUNDARY_CHARS = frozenset(" ，,。.!！？?；;：:/|）)]】}《<>")
 
 
@@ -595,6 +598,126 @@ def _diversify_candidates(
     return selected[:max_items]
 
 
+def _zero_score_tool_candidate(
+    tool: CommandToolSnapshot,
+    *,
+    reason: str,
+) -> _ScoredCandidate:
+    return _ScoredCandidate(
+        tool=tool,
+        schema=_schema_from_tool_snapshot(tool),
+        score=0.0,
+        reasons=(reason,),
+        exact_protected=False,
+        features=_empty_features(),
+    )
+
+
+def _command_candidate_from_scored(item: _ScoredCandidate) -> CommandCandidate:
+    return CommandCandidate(
+        plugin_module=item.tool.plugin_module,
+        plugin_name=item.tool.plugin_name,
+        schema=item.schema,
+        score=item.score,
+        reason=",".join(item.reasons),
+        family=item.tool.family,
+        tool=item.tool,
+        reasons=item.reasons,
+        exact_protected=item.exact_protected,
+        features=item.features,
+    )
+
+
+def _append_unique_scored_candidate(
+    selected: list[_ScoredCandidate],
+    seen_ids: set[str],
+    item: _ScoredCandidate,
+) -> None:
+    command_id = item.schema.command_id
+    if command_id in seen_ids:
+        return
+    selected.append(item)
+    seen_ids.add(command_id)
+
+
+def _trim_for_native_tool_api_limit(
+    candidates: list[_ScoredCandidate],
+) -> list[_ScoredCandidate]:
+    if len(candidates) <= _NATIVE_TOOL_API_HARD_LIMIT:
+        return candidates
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.exact_protected,
+            item.score,
+            item.reasons != ("plugin_full_exposure",),
+            item.schema.command_role in {"catalog", "helper", "random"},
+            -len(item.schema.head),
+            item.tool.plugin_module,
+        ),
+        reverse=True,
+    )
+    return ranked[:_NATIVE_TOOL_API_HARD_LIMIT]
+
+
+def build_plugin_limited_command_candidates(
+    knowledge_base: PluginKnowledgeBase,
+    query: str,
+    *,
+    session_id: str | None = None,
+    tools: list[CommandToolSnapshot] | None = None,
+) -> list[CommandCandidate]:
+    """Build native-tool candidates with per-plugin exposure limits.
+
+    Plugins with few commands are exposed directly. Large command families first
+    go through local text retrieval, so providers with a 128-tool limit will not
+    receive hundreds of near-duplicate command tools from one plugin.
+    """
+
+    if tools is None:
+        graph = build_capability_graph_snapshot(knowledge_base)
+        tools = build_command_tool_snapshots(graph)
+
+    grouped: dict[str, list[CommandToolSnapshot]] = {}
+    for tool in tools:
+        group_key = tool.plugin_module or tool.plugin_name or tool.command_id
+        grouped.setdefault(group_key, []).append(tool)
+
+    selected: list[_ScoredCandidate] = []
+    seen_ids: set[str] = set()
+
+    for plugin_tools in grouped.values():
+        if len(plugin_tools) <= _PLUGIN_DIRECT_EXPOSURE_LIMIT:
+            scored_by_id = {
+                item.schema.command_id: item
+                for item in _merge_ranked_candidates(
+                    _score_all_tools(
+                        plugin_tools,
+                        query,
+                        session_id=session_id,
+                    )
+                )
+            }
+            for tool in plugin_tools:
+                item = scored_by_id.get(tool.command_id) or _zero_score_tool_candidate(
+                    tool,
+                    reason="plugin_full_exposure",
+                )
+                _append_unique_scored_candidate(selected, seen_ids, item)
+            continue
+
+        ranked = _merge_ranked_candidates(
+            _score_all_tools(plugin_tools, query, session_id=session_id)
+        )
+        for item in ranked[:_LARGE_PLUGIN_EXPOSURE_LIMIT]:
+            _append_unique_scored_candidate(selected, seen_ids, item)
+
+    return [
+        _command_candidate_from_scored(item)
+        for item in _trim_for_native_tool_api_limit(selected)
+    ]
+
+
 def build_command_candidates(
     knowledge_base: PluginKnowledgeBase,
     query: str,
@@ -634,21 +757,7 @@ def build_command_candidates(
                 )
             )
             seen_ids.add(tool.command_id)
-    return [
-        CommandCandidate(
-            plugin_module=item.tool.plugin_module,
-            plugin_name=item.tool.plugin_name,
-            schema=item.schema,
-            score=item.score,
-            reason=",".join(item.reasons),
-            family=item.tool.family,
-            tool=item.tool,
-            reasons=item.reasons,
-            exact_protected=item.exact_protected,
-            features=item.features,
-        )
-        for item in selected
-    ]
+    return [_command_candidate_from_scored(item) for item in selected]
 
 
 def group_candidates_by_module(
@@ -786,6 +895,7 @@ __all__ = [
     "CommandCandidate",
     "build_candidate_snapshots",
     "build_command_candidates",
+    "build_plugin_limited_command_candidates",
     "dump_candidate_for_prompt",
     "dump_schema_for_prompt",
     "find_schema_in_candidates",

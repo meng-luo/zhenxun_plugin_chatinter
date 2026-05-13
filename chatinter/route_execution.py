@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from typing import Any, cast
 
 from nonebot.adapters import Event
 
 from .command_planner import CommandPlanDecision, plan_command
+from .command_schema import normalize_schema_command_head
 from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
+)
+from .feedback_keys import (
     FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
 )
 from .models.pydantic_models import PluginKnowledgeBase
@@ -33,6 +37,7 @@ from .skill_registry import (
     _extract_schema_argument_tokens,
 )
 
+
 @dataclass(frozen=True)
 class RouteExecutionPlan:
     command: str
@@ -42,6 +47,28 @@ class RouteExecutionPlan:
     image_missing: int = 0
     text_missing: int = 0
     allow_at: bool | None = None
+
+
+@dataclass(frozen=True)
+class RouteCommandSchemaView:
+    command_id: str = ""
+    command: str = ""
+    aliases: tuple[str, ...] = ()
+    prefixes: tuple[str, ...] = ()
+    params: tuple[str, ...] = ()
+    text_min: int = 0
+    text_max: int | None = None
+    image_min: int = 0
+    image_max: int | None = None
+    allow_at: bool | None = None
+    actor_scope: str = "allow_other"
+    target_requirement: str = "none"
+    target_sources: tuple[str, ...] = ()
+    requires_reply: bool = False
+    requires_private: bool = False
+    requires_to_me: bool = False
+    allow_sticky_arg: bool = False
+    access_level: str = "public"
 
 
 _SELF_ONLY_ACTION_KEYWORDS = ("\u7b7e\u5230", "\u6253\u5361", "\u8865\u7b7e")
@@ -159,20 +186,161 @@ def _build_target_modules(
 
 
 def _normalize_head(command_text: str) -> str:
-    normalized = normalize_message_text(command_text or "")
-    if not normalized:
-        return ""
-    return normalize_message_text(normalized.split(" ", 1)[0])
+    return normalize_schema_command_head(command_text)
 
 
 def _iter_meta_aliases(meta) -> set[str]:
     aliases = getattr(meta, "aliases", None) or []
     values: set[str] = set()
     for alias in aliases:
-        normalized = normalize_message_text(str(alias or ""))
+        normalized = normalize_schema_command_head(str(alias or ""))
         if normalized:
             values.add(normalized)
     return values
+
+
+def _schema_command_head(schema) -> str:
+    return normalize_schema_command_head(
+        str(
+            getattr(schema, "command", None)
+            or getattr(schema, "head", None)
+            or ""
+        )
+    )
+
+
+def _view_from_command_meta(meta) -> RouteCommandSchemaView:
+    return RouteCommandSchemaView(
+        command_id=normalize_message_text(str(getattr(meta, "command_id", "") or "")),
+        command=_schema_command_head(meta),
+        aliases=tuple(
+            alias
+            for alias in (
+                normalize_schema_command_head(str(item or ""))
+                for item in (getattr(meta, "aliases", None) or [])
+            )
+            if alias
+        ),
+        prefixes=tuple(
+            normalize_message_text(str(item or ""))
+            for item in (getattr(meta, "prefixes", None) or [])
+            if normalize_message_text(str(item or ""))
+        ),
+        params=tuple(
+            normalize_message_text(str(item or ""))
+            for item in (getattr(meta, "params", None) or [])
+            if normalize_message_text(str(item or ""))
+        ),
+        text_min=max(int(getattr(meta, "text_min", 0) or 0), 0),
+        text_max=getattr(meta, "text_max", None),
+        image_min=max(int(getattr(meta, "image_min", 0) or 0), 0),
+        image_max=getattr(meta, "image_max", None),
+        allow_at=getattr(meta, "allow_at", None),
+        actor_scope=str(getattr(meta, "actor_scope", "") or "allow_other"),
+        target_requirement=str(
+            getattr(meta, "target_requirement", "") or "none"
+        ),
+        target_sources=tuple(
+            normalize_message_text(str(item or ""))
+            for item in (getattr(meta, "target_sources", None) or [])
+            if normalize_message_text(str(item or ""))
+        ),
+        requires_reply=bool(getattr(meta, "requires_reply", False)),
+        requires_private=bool(getattr(meta, "requires_private", False)),
+        requires_to_me=bool(getattr(meta, "requires_to_me", False)),
+        allow_sticky_arg=bool(getattr(meta, "allow_sticky_arg", False)),
+        access_level=str(getattr(meta, "access_level", "") or "public"),
+    )
+
+
+def _view_from_plugin_command_schema(schema) -> RouteCommandSchemaView:
+    requires = getattr(schema, "requires", None) or {}
+    slots = list(getattr(schema, "slots", None) or [])
+    params = tuple(
+        normalize_message_text(str(getattr(slot, "name", "") or ""))
+        for slot in slots
+        if normalize_message_text(str(getattr(slot, "name", "") or ""))
+    )
+    return RouteCommandSchemaView(
+        command_id=normalize_message_text(str(getattr(schema, "command_id", "") or "")),
+        command=_schema_command_head(schema),
+        aliases=tuple(
+            alias
+            for alias in (
+                normalize_schema_command_head(str(item or ""))
+                for item in (getattr(schema, "aliases", None) or [])
+            )
+            if alias
+        ),
+        params=params,
+        text_min=0 if params else int(bool(requires.get("text"))),
+        image_min=int(bool(requires.get("image"))),
+        allow_at=getattr(schema, "allow_at", None),
+        actor_scope=str(getattr(schema, "actor_scope", "") or "allow_other"),
+        target_requirement=str(
+            getattr(schema, "target_requirement", "") or "none"
+        ),
+        target_sources=tuple(
+            normalize_message_text(str(item or ""))
+            for item in (getattr(schema, "target_sources", None) or [])
+            if normalize_message_text(str(item or ""))
+        ),
+        requires_reply=bool(requires.get("reply")),
+        requires_private=bool(requires.get("private")),
+        requires_to_me=bool(requires.get("to_me")),
+        allow_sticky_arg=False,
+        access_level="public",
+    )
+
+
+def _build_reference_schema_views(
+    candidate_plugins,
+) -> list[RouteCommandSchemaView]:
+    if not candidate_plugins:
+        return []
+    knowledge_base = PluginKnowledgeBase(
+        plugins=list(candidate_plugins),
+        user_role="普通用户",
+    )
+    views: list[RouteCommandSchemaView] = []
+    for reference in PluginRegistry.build_plugin_references(knowledge_base):
+        for schema in reference.command_schemas:
+            views.append(_view_from_plugin_command_schema(schema))
+    return views
+
+
+def _is_exact_command_head_match(head: str, schema: RouteCommandSchemaView) -> bool:
+    normalized = normalize_schema_command_head(head).casefold()
+    if not normalized:
+        return False
+    values = [schema.command, *schema.aliases]
+    return any(normalized == value.casefold() for value in values if value)
+
+
+def _is_safe_fuzzy_command_head_match(
+    head: str,
+    schema: RouteCommandSchemaView,
+) -> bool:
+    normalized = normalize_schema_command_head(head)
+    if not normalized:
+        return False
+    for value in [schema.command, *schema.aliases]:
+        candidate = normalize_schema_command_head(value)
+        if not candidate or candidate == normalized:
+            continue
+        # Avoid weak shared-noun matches such as “塞红包” -> “开红包”.
+        if (
+            len(normalized) >= 2
+            and len(candidate) >= 2
+            and normalized[0] == candidate[0]
+            and (normalized.startswith(candidate) or candidate.startswith(normalized))
+        ):
+            return True
+        if re.search(r"[0-9A-Za-z_]", normalized + candidate) and (
+            match_command_head_canonical(normalized, candidate)
+        ):
+            return True
+    return False
 
 
 def _is_public_command_meta(meta) -> bool:
@@ -198,32 +366,43 @@ def _find_route_command_schema(route_result: NativeRouteResult, knowledge_plugin
     candidate_plugins = exact_module_plugins or [
         plugin for plugin in knowledge_plugins if plugin.name == decision.plugin_name
     ]
+    reference_views = _build_reference_schema_views(candidate_plugins)
+    if command_id:
+        for schema in reference_views:
+            if schema.command_id.casefold() == command_id:
+                return schema
     for plugin in candidate_plugins:
-        if command_id:
-            for meta in plugin.command_meta:
-                meta_id = normalize_message_text(
-                    str(getattr(meta, "command_id", "") or "")
-                ).casefold()
-                if meta_id and meta_id == command_id:
-                    return meta
+        meta_views = [
+            _view_from_command_meta(meta)
+            for meta in plugin.command_meta
+            if _is_public_command_meta(meta)
+        ]
         plugin_aliases = {
             _normalize_head(alias).casefold()
             for alias in (getattr(plugin, "aliases", None) or [])
             if _normalize_head(alias)
         }
+        for schema in meta_views:
+            if _is_exact_command_head_match(head, schema):
+                return schema
+        if head.casefold() in plugin_aliases and len(meta_views) == 1:
+            return meta_views[0]
+    for schema in reference_views:
+        if _is_exact_command_head_match(head, schema):
+            return schema
+    # Once a native command_id exists, do not fuzzy-select a sibling command.
+    if command_id:
+        return None
+    for plugin in candidate_plugins:
         for meta in plugin.command_meta:
             if not _is_public_command_meta(meta):
                 continue
-            command_head = normalize_message_text(getattr(meta, "command", ""))
-            if not command_head:
-                continue
-            if match_command_head_canonical(head, command_head) or any(
-                match_command_head_canonical(head, alias)
-                for alias in _iter_meta_aliases(meta)
-            ):
-                return meta
-        if head in plugin_aliases and len(plugin.command_meta) == 1:
-            return plugin.command_meta[0]
+            schema = _view_from_command_meta(meta)
+            if _is_safe_fuzzy_command_head_match(head, schema):
+                return schema
+    for schema in reference_views:
+        if _is_safe_fuzzy_command_head_match(head, schema):
+            return schema
     return None
 
 
@@ -699,7 +878,7 @@ def _prepare_route_execution_plan(
             command = _append_unique_tokens(command, merged_tokens)
         return RouteExecutionPlan(command=command)
 
-    schema_head = _normalize_head(getattr(schema, "command", ""))
+    schema_head = _schema_command_head(schema)
     command_head = _normalize_head(command)
     if schema_head and command_head and schema_head != command_head:
         tail = normalize_message_text(command[len(command_head) :].strip())
@@ -721,7 +900,7 @@ def _prepare_route_execution_plan(
             and token not in payload_tokens
             and token not in existing_payload_tokens
         )
-    schema_tokens = _extract_schema_argument_tokens(current_message, schema)
+    schema_tokens = _extract_schema_argument_tokens(current_message, cast(Any, schema))
     for token in schema_tokens:
         if (
             token
@@ -963,8 +1142,8 @@ __all__ = [
     "extract_image_tokens",
     "extract_reply_sender_id",
     "has_adapter_context_hint",
-    "planner_missing_contains",
     "plan_route_command",
+    "planner_missing_contains",
     "prepare_route_execution_plan",
     "select_adapter_policy_for_message",
 ]

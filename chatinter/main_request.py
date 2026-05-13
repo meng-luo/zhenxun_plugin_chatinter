@@ -1,7 +1,7 @@
 """Unified ChatInter main request runner.
 
 Each turn has exactly one main LLM request:
-system + history messages + current user message + full command tools.
+system + history messages + current user message + plugin-limited command tools.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .chat_dialogue_planner import ChatDialoguePlan
 from .chat_strategy import build_chat_strategy_prompt
+from .command_index import build_plugin_limited_command_candidates
 from .config import build_reasoning_generation_config, get_config_value, get_model_name
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_command_tools import build_native_command_tools
@@ -33,7 +34,6 @@ from .native_route import (
     NativeRouteDecision,
     NativeRouteReport,
     NativeRouteResult,
-    build_native_command_candidate_pool,
 )
 from .route_text import is_usage_question, normalize_message_text
 from .turn_runtime import TurnBudgetController, estimate_text_tokens
@@ -43,7 +43,8 @@ _MAIN_REQUEST_RULES = """
 <chatinter_main_request>
 你正在处理群聊消息：可以直接聊天，也可以调用候选插件工具。
 候选工具是真实插件命令；调用工具会执行插件。
-每个工具已暴露完整 schema；只根据工具 description 和参数 schema 选择工具并填写参数，不要猜 schema 外参数。
+每个工具已暴露完整 schema；只根据工具 description 和参数 schema
+选择工具并填写参数，不要猜 schema 外参数。
 用户明确要执行插件能力、查询插件用法，或自然语言需求明显对应插件时才调用工具。
 普通闲聊、玩梗、讨论命令概念、候选工具不匹配、目标不清时，不要调用工具，直接自然回复或简短说明需要的信息。
 如果决定调用工具，本轮不会再进行第二次模型请求；请一次性选准工具并填好参数。
@@ -197,18 +198,15 @@ async def _run_main_request(
     report: NativeRouteReport,
 ) -> MainRequestResult:
     timeline = [_user_timeline_item(message_text)]
-    candidates = build_native_command_candidate_pool(
-        message_text,
+    candidates = build_plugin_limited_command_candidates(
         knowledge_base,
-        session_key=session_key,
-        command_tools=command_tools,
-        limit=None,
-        diversify=False,
-        include_unscored=True,
+        message_text,
+        session_id=session_key,
+        tools=cast(Any, command_tools),
     )
 
     report.note_candidate_policy(
-        reason="main_request_full_schema_exposure",
+        reason="main_request_plugin_limited_exposure",
         limit=len(candidates),
     )
     report.candidate_total = max(report.candidate_total, len(candidates))
@@ -473,7 +471,10 @@ def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
     )
 
 
-def _tool_result_timeline_item(tool_call, tool_result: ToolResult) -> MainRequestTimelineItem:
+def _tool_result_timeline_item(
+    tool_call,
+    tool_result: ToolResult,
+) -> MainRequestTimelineItem:
     output = tool_result.output
     content = ""
     if isinstance(output, dict):
