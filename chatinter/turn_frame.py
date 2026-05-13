@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from zhenxun.services.llm import LLMMessage
 
 from .middleware import TurnMiddlewareState
 from .trace import StageTrace
@@ -51,7 +54,8 @@ class TurnFrame:
     system_prompt: str = ""
     context_xml: str = ""
     enriched_context_xml: str = ""
-    router_force_pure_chat: bool = False
+    history_messages: list[LLMMessage] = field(default_factory=list)
+    native_force_pure_chat: bool = False
     completion_disabled_force_chat: bool = False
     post_gate_dispatched: bool = False
     event_message: Any | None = None
@@ -65,7 +69,7 @@ class TurnFrame:
     selection_context: Any | None = None
     command_tools: list[Any] = field(default_factory=list)
     intent_profile: Any | None = None
-    router_decision: Any | None = None
+    native_decision: Any | None = None
     route_result: Any | None = None
     route_report: Any | None = None
     native_direct_reply: str = ""
@@ -165,20 +169,22 @@ class TurnFrame:
         system_prompt: str,
         context_xml: str,
         reply_images_data: list[Any],
+        history_messages: list[LLMMessage] | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.context_xml = context_xml
         self.enriched_context_xml = context_xml
         self.reply_images_data = list(reply_images_data or [])
+        self.history_messages = list(history_messages or [])
 
-    def set_route_result(
+    def set_native_route(
         self,
         *,
-        router_decision: Any,
+        native_decision: Any,
         route_result: Any | None,
         route_report: Any | None,
     ) -> None:
-        self.router_decision = router_decision
+        self.native_decision = native_decision
         self.route_result = route_result
         self.route_report = route_report
 

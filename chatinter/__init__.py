@@ -102,7 +102,7 @@ __plugin_meta__ = PluginMetadata(
                 module="chatinter",
                 key="NATIVE_REROUTE_TIMEOUT",
                 value=10,
-                help="等待插件重路由执行并捕获输出的超时时间（秒）",
+                help="等待插件重路由执行并观测发送输出的超时时间（秒）",
                 default_value=10,
                 type=int,
             ),

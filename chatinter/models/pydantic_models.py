@@ -139,7 +139,7 @@ class PluginCapability(BaseModel):
 
 
 class PluginReference(BaseModel):
-    """Router / Planner 使用的插件引用卡"""
+    """Native tools / Planner 使用的插件引用卡"""
 
     module: str = Field(description="插件模块名")
     name: str = Field(description="插件名称")
@@ -349,11 +349,6 @@ class CommandCandidateSnapshot(BaseModel):
         default_factory=CommandCandidateFeatures,
         description="候选可解释特征",
     )
-    prompt_level: Literal["full", "compact", "name_only"] = Field(
-        default="full",
-        description="进入提示词时的暴露层级",
-    )
-
 
 class CapabilityGraphSnapshot(BaseModel):
     """一次插件能力图快照"""

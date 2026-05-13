@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
+from collections.abc import Iterable
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
 from .command_index import CommandCandidate
-from .models.pydantic_models import CommandSlotSpec
+from .models.pydantic_models import (
+    CommandSlotSpec,
+    CommandToolSnapshot,
+    PluginCommandSchema,
+)
 from .route_text import normalize_message_text
 
 _TOOL_NAME_PREFIX = "ci_cmd_"
 _TOOL_NAME_DIGEST_SIZE = 5
-_DESCRIPTION_MAX_LEN = 900
 
 
 @dataclass(frozen=True)
@@ -29,7 +32,7 @@ class NativeCommandToolBinding:
 
 
 class NativeCommandTool:
-    """A no-op executable used to expose one command as one native tool."""
+    """Executable wrapper exposing one plugin command as one native tool."""
 
     def __init__(self, binding: NativeCommandToolBinding):
         self.binding = binding
@@ -39,25 +42,44 @@ class NativeCommandTool:
         return ToolDefinition(
             name=self.binding.tool_name,
             description=_build_tool_description(self.binding.candidate),
-            parameters=_build_parameters(schema.slots),
+            parameters=_build_parameters(
+                schema,
+                snapshot=self.binding.candidate.tool,
+            ),
         )
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        _ = context
-        return ToolResult(
-            output={
-                "command_id": self.binding.command_id,
-                "slots": kwargs,
-            },
-            display_content=f"selected {self.binding.command_id}",
-        )
+        executor = _resolve_native_executor(context)
+        if executor is None:
+            return ToolResult(
+                output={
+                    "ok": False,
+                    "status": "failed",
+                    "error_type": "ExecutionContextMissing",
+                    "message": "Native command execution context is missing.",
+                    "is_retryable": False,
+                },
+                display_content=f"{self.binding.command_id} 缺少执行上下文",
+            )
+        try:
+            return await executor.execute_tool(binding=self.binding, raw_slots=kwargs)
+        except Exception as exc:
+            return ToolResult(
+                output={
+                    "ok": False,
+                    "status": "failed",
+                    "error_type": "ExecutionError",
+                    "message": str(exc),
+                    "is_retryable": False,
+                },
+                display_content=f"{self.binding.command_id} 执行失败",
+            )
 
 
 def build_native_command_tools(
     candidates: list[CommandCandidate],
-) -> tuple[list[NativeCommandTool], dict[str, NativeCommandToolBinding]]:
+) -> list[NativeCommandTool]:
     tools: list[NativeCommandTool] = []
-    bindings: dict[str, NativeCommandToolBinding] = {}
     seen_command_ids: set[str] = set()
 
     for candidate in candidates:
@@ -71,33 +93,8 @@ def build_native_command_tools(
             candidate=candidate,
         )
         tools.append(NativeCommandTool(binding))
-        bindings[tool_name] = binding
 
-    return tools, bindings
-
-
-def parse_native_tool_arguments(tool_call: Any) -> dict[str, Any]:
-    function = getattr(tool_call, "function", None)
-    raw_arguments = getattr(function, "arguments", None)
-    if isinstance(raw_arguments, dict):
-        return {
-            str(key): value
-            for key, value in raw_arguments.items()
-            if normalize_message_text(str(key or ""))
-        }
-    if not isinstance(raw_arguments, str) or not raw_arguments.strip():
-        return {}
-    try:
-        payload = json.loads(raw_arguments)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        str(key): value
-        for key, value in payload.items()
-        if normalize_message_text(str(key or ""))
-    }
+    return tools
 
 
 def _safe_tool_name(command_id: str) -> str:
@@ -108,17 +105,50 @@ def _safe_tool_name(command_id: str) -> str:
     return f"{_TOOL_NAME_PREFIX}{digest}"
 
 
+def _resolve_native_executor(context: Any | None) -> Any | None:
+    extra = getattr(context, "extra", None)
+    if not isinstance(extra, dict):
+        return None
+    executor = extra.get("native_command_context")
+    if executor is None or not hasattr(executor, "execute_tool"):
+        return None
+    return executor
+
+
 def _build_tool_description(candidate: CommandCandidate) -> str:
     schema = candidate.schema
+    snapshot = candidate.tool
     parts = [
-        f"插件: {candidate.plugin_name}",
-        f"命令: {schema.head}",
-        f"用途: {schema.description or candidate.reason or schema.head}",
+        "ChatInter command tool. 调用此工具会真实触发对应 NoneBot 插件命令。",
+        f"plugin_name: {candidate.plugin_name}",
+        f"plugin_module: {candidate.plugin_module}",
+        f"command_id: {schema.command_id}",
+        f"head: {schema.head}",
+        f"render: {schema.render}",
+        f"role: {schema.command_role}",
+        f"payload_policy: {schema.payload_policy}",
+        f"extra_text_policy: {schema.extra_text_policy}",
+        f"source: {schema.source}",
+        f"confidence: {schema.confidence:.2f}",
+        f"local_recall_reason: {candidate.reason}",
     ]
+    description = schema.description or getattr(snapshot, "capability_text", "")
+    if description:
+        parts.append(f"description: {description}")
+    if snapshot is not None and snapshot.usage:
+        parts.append(f"usage: {snapshot.usage}")
+    if snapshot is not None and snapshot.capability_text:
+        parts.append(f"capability: {snapshot.capability_text}")
+    if snapshot is not None and snapshot.task_verbs:
+        parts.append("task_verbs: " + _join_values(snapshot.task_verbs))
+    if snapshot is not None and snapshot.input_requirements:
+        parts.append("input_requirements: " + _join_values(snapshot.input_requirements))
+    if snapshot is not None and snapshot.examples:
+        parts.append("examples: " + _join_values(snapshot.examples))
     if schema.aliases:
-        parts.append("别名: " + " / ".join(schema.aliases[:8]))
+        parts.append("aliases: " + _join_values(schema.aliases))
     if schema.retrieval_phrases:
-        parts.append("可响应说法: " + " / ".join(schema.retrieval_phrases[:8]))
+        parts.append("retrieval_phrases: " + _join_values(schema.retrieval_phrases))
     if schema.requires:
         requires = [
             key
@@ -126,7 +156,7 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
             if required and normalize_message_text(key)
         ]
         if requires:
-            parts.append("上下文需求: " + " / ".join(requires))
+            parts.append("requires_context: " + _join_values(requires))
     target_requirement = normalize_message_text(
         str(getattr(schema, "target_requirement", "") or "")
     )
@@ -136,43 +166,61 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
         if normalize_message_text(str(item or ""))
     ]
     if target_requirement and target_requirement != "none":
-        parts.append(f"目标要求: {target_requirement}")
+        parts.append(f"target_requirement: {target_requirement}")
     if target_sources:
-        parts.append("目标来源: " + " / ".join(target_sources))
+        parts.append("target_sources: " + _join_values(target_sources))
     if getattr(schema, "allow_at", None):
-        parts.append("允许使用 @ 或 [@user_id] 作为目标。")
-    if schema.command_role and schema.command_role != "execute":
-        parts.append(f"命令类型: {schema.command_role}")
+        parts.append("allow_at: true，允许使用 @ 或 [@user_id] 作为目标。")
+    if schema.actor_scope:
+        parts.append(f"actor_scope: {schema.actor_scope}")
+    if schema.slots:
+        parts.append(
+            "slots: "
+            + _join_values(
+                _slot_signature(slot)
+                for slot in schema.slots
+                if normalize_message_text(slot.name)
+            )
+        )
     parts.append(
-        "只在用户明确要执行该功能或查询该功能用法时调用；"
-        "普通闲聊、讨论命令概念、缺少必要上下文时不要调用。"
+        "Call policy: 只有用户明确要执行该功能、查询该功能用法，或自然语言需求"
+        "明显对应该命令时才调用。普通闲聊、讨论命令概念、候选不匹配时不要调用。"
     )
-    description = "\n".join(parts)
-    return description[:_DESCRIPTION_MAX_LEN]
+    return "\n".join(part for part in parts if normalize_message_text(part))
 
 
-def _build_parameters(slots: list[CommandSlotSpec]) -> dict[str, Any]:
+def _build_parameters(
+    schema: PluginCommandSchema,
+    *,
+    snapshot: CommandToolSnapshot | None,
+) -> dict[str, Any]:
     properties: dict[str, dict[str, Any]] = {}
     required: list[str] = []
     seen: set[str] = set()
-    for slot in slots:
+    for slot in schema.slots:
         name = normalize_message_text(slot.name)
         if not name or name in seen:
             continue
         seen.add(name)
-        properties[name] = _slot_to_property(slot)
+        properties[name] = _slot_to_property(slot, schema=schema, snapshot=snapshot)
         # OpenAI strict function schemas require every object property to appear
         # in `required`. Optional command slots therefore accept null explicitly.
         required.append(name)
     return {
         "type": "object",
+        "description": _build_parameter_root_description(schema, snapshot=snapshot),
         "properties": properties,
         "required": required,
         "additionalProperties": False,
     }
 
 
-def _slot_to_property(slot: CommandSlotSpec) -> dict[str, Any]:
+def _slot_to_property(
+    slot: CommandSlotSpec,
+    *,
+    schema: PluginCommandSchema,
+    snapshot: CommandToolSnapshot | None,
+) -> dict[str, Any]:
     json_type = {
         "int": "integer",
         "float": "number",
@@ -186,13 +234,25 @@ def _slot_to_property(slot: CommandSlotSpec) -> dict[str, Any]:
     description_parts = [
         slot.description or slot.name,
         "必填" if slot.required else "可选；未提供时传 null",
+        f"slot_type={slot.type}",
+        f"command_id={schema.command_id}",
     ]
     if slot.aliases:
-        description_parts.append("别名: " + " / ".join(slot.aliases[:6]))
+        description_parts.append("aliases: " + _join_values(slot.aliases))
     if slot.default is not None:
         description_parts.append(f"默认: {slot.default}")
-    if slot.type in {"at", "image"}:
-        description_parts.append("使用已有占位符，例如 [@user_id] 或 [image#1]")
+    if slot.type == "at":
+        description_parts.append(
+            "目标用户请使用已有 [@user_id] 占位符；不要臆造陌生用户 ID。"
+        )
+    if slot.type == "image":
+        description_parts.append(
+            "图片请使用已有 [image#1] 占位符；没有图片上下文时传 null。"
+        )
+    if snapshot is not None and snapshot.input_requirements:
+        description_parts.append(
+            "input_requirements: " + _join_values(snapshot.input_requirements)
+        )
     return {
         "type": schema_type,
         "description": "；".join(
@@ -201,9 +261,56 @@ def _slot_to_property(slot: CommandSlotSpec) -> dict[str, Any]:
     }
 
 
+def _build_parameter_root_description(
+    schema: PluginCommandSchema,
+    *,
+    snapshot: CommandToolSnapshot | None,
+) -> str:
+    parts = [
+        f"Full command argument schema for {schema.command_id}.",
+        f"head={schema.head}",
+        f"render={schema.render}",
+        f"role={schema.command_role}",
+        f"payload_policy={schema.payload_policy}",
+    ]
+    true_requires = [
+        key for key, value in (schema.requires or {}).items() if bool(value)
+    ]
+    if true_requires:
+        parts.append("requires=" + _join_values(true_requires))
+    if schema.target_requirement != "none":
+        parts.append(f"target_requirement={schema.target_requirement}")
+    if schema.target_sources:
+        parts.append("target_sources=" + _join_values(schema.target_sources))
+    if snapshot is not None and snapshot.capability_text:
+        parts.append(f"capability={snapshot.capability_text}")
+    return "；".join(parts)
+
+
+def _slot_signature(slot: CommandSlotSpec) -> str:
+    parts = [
+        slot.name,
+        slot.type,
+        "required" if slot.required else "optional",
+    ]
+    if slot.aliases:
+        parts.append("aliases=" + ",".join(slot.aliases))
+    if slot.description:
+        parts.append(slot.description)
+    return "(" + ";".join(normalize_message_text(part) for part in parts if part) + ")"
+
+
+def _join_values(values: Iterable[object]) -> str:
+    result: list[str] = []
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        if text and text not in result:
+            result.append(text)
+    return " / ".join(result)
+
+
 __all__ = [
     "NativeCommandTool",
     "NativeCommandToolBinding",
     "build_native_command_tools",
-    "parse_native_tool_arguments",
 ]

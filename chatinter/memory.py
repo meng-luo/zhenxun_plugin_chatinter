@@ -1,20 +1,19 @@
 """
 ChatInter - 聊天记忆管理
 
-实现 3 层上下文结构：
+实现 Astr 风格请求上下文：
 1. System: 系统设定
-2. Context: 语境层（XML 标签包裹）
+2. History: 最近多轮对话作为独立 role messages 注入
+3. Context: 语境层（XML 标签包裹）
    - <qq_context>: QQ 上下文元数据
    - <context_layers>: 回复链追溯 + 群聊历史
-   - <history>: 群聊历史记录
-3. Current: 当前用户消息
+   - <chatroom_history>: 群聊最近消息背景
+4. Current: 当前用户消息
 
 使用 UniMessage 统一处理消息。
 """
 
 import asyncio
-from collections import Counter
-import json
 import re
 import time
 from typing import Protocol, cast
@@ -22,39 +21,21 @@ from typing import Protocol, cast
 from nonebot.adapters import Bot, Event, Message
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
 from nonebot_plugin_alconna.uniseg.tools import reply_fetch
-from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import BotConfig
-from zhenxun.models.chat_history import ChatHistory
-from zhenxun.services import generate_structured, logger
+from zhenxun.services import logger
+from zhenxun.services.llm import LLMMessage
 
 from .chat_memory_store import ChatMemoryStore
 from .config import (
     CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
-    CONTEXT_PREFIX_SIZE,
-    CONTEXT_RELEVANCE_MIN_QUERY_TOKENS,
-    CONTEXT_RELEVANCE_SAMPLE_LIMIT,
-    CONTEXT_RELEVANCE_THRESHOLD,
-    ENABLE_CONTEXT_RELEVANCE_GATE,
-    GROUP_BACKGROUND_FETCH_MULTIPLIER,
-    GROUP_BACKGROUND_MIN_SCORE,
-    GROUP_BACKGROUND_RELEVANT_LIMIT,
-    HISTORY_RECALL_CANDIDATE_LIMIT,
-    HISTORY_RECALL_LIMIT,
-    HISTORY_RECALL_MIN_SCORE,
-    HISTORY_SELECTOR_CANDIDATE_LIMIT,
-    HISTORY_SELECTOR_ENABLED,
-    HISTORY_SELECTOR_MIN_CANDIDATES,
-    HISTORY_SELECTOR_TIMEOUT,
     MAX_REPLY_LAYERS,
     SESSION_CONTEXT_LIMIT,
     USE_SIGN_IN_IMPRESSION,
     get_config_value,
-    get_model_name,
 )
 from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
-from .person_registry import format_person_history_label, get_person_profile
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .route_text import normalize_message_text
 from .utils.cache import get_user_impression_with_cache
@@ -65,8 +46,6 @@ from .utils.unimsg_utils import (
 )
 
 _CONTEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,8}", re.IGNORECASE)
-_LOW_VALUE_ONLY_SYMBOLS = re.compile(r"^[\W_]+$", re.UNICODE)
-_COMMAND_LIKE_PREFIX = ("/", ".", "!", "。", "！")
 _CONTEXT_STOPWORDS = {
     "这个",
     "那个",
@@ -110,40 +89,6 @@ class DialogueContextPack(Protocol):
     def to_context_xml(self) -> str: ...
 
 
-_FOLLOWUP_QUERY_HINTS = (
-    "然后",
-    "接着",
-    "继续",
-    "再来",
-    "再说",
-    "展开",
-    "详细",
-    "具体",
-    "这个",
-    "那个",
-    "它",
-    "他",
-    "她",
-    "刚才",
-    "上面",
-    "上一个",
-    "前面",
-)
-_MEMORY_SELECTOR_PROMPT = """
-你是对话记忆筛选器。给你当前用户问题和若干历史记忆摘要，
-请只选择“对当前回答明确有帮助”的历史条目 ID，最多 {limit} 条。
-规则：
-1) 不确定就不要选。
-2) 优先选择包含约束、偏好、长期事实、当前任务延续线索的条目。
-3) 跳过仅寒暄、无关闲聊、重复信息。
-只返回 JSON，不要解释。
-""".strip()
-
-
-class _HistorySelectionResult(BaseModel):
-    selected_ids: list[int] = Field(default_factory=list)
-
-
 class ChatMemory:
     """聊天记忆管理"""
 
@@ -153,8 +98,6 @@ class ChatMemory:
         self._user_nickname_cache: dict[str, str] = {}
         self._nickname_cache_time: dict[str, float] = {}
         self._nickname_ttl = 30 * 60
-        self._compression_fetch_factor = 3
-        self._compression_summary_cap = 12
 
     @staticmethod
     def _clip_context_line(text: str, limit: int = 140) -> str:
@@ -179,55 +122,6 @@ class ChatMemory:
         ]
 
     @classmethod
-    def _similarity_score(cls, query_tokens: list[str], text: str) -> float:
-        if not query_tokens:
-            return 0.0
-        text_tokens = cls._tokenize_context_text(text)
-        if not text_tokens:
-            return 0.0
-
-        query_counter = Counter(query_tokens)
-        text_counter = Counter(text_tokens)
-        overlap = sum(
-            min(count, text_counter.get(token, 0))
-            for token, count in query_counter.items()
-        )
-        if overlap <= 0:
-            return 0.0
-
-        precision = overlap / max(sum(text_counter.values()), 1)
-        recall = overlap / max(sum(query_counter.values()), 1)
-        if precision + recall <= 0:
-            base_score = 0.0
-        else:
-            base_score = 2 * precision * recall / (precision + recall)
-
-        query_text = "".join(query_tokens)
-        normalized_text = cls._normalize_context_text(text).lower()
-        phrase_bonus = 0.0
-        if len(query_text) >= 4 and query_text in normalized_text:
-            phrase_bonus = 0.12
-        return min(base_score + phrase_bonus, 1.0)
-
-    @classmethod
-    def _is_low_value_background_message(cls, text: str) -> bool:
-        normalized = cls._normalize_context_text(text)
-        if not normalized:
-            return True
-        if len(normalized) <= 1:
-            return True
-        if normalized.startswith(_COMMAND_LIKE_PREFIX):
-            return True
-        if (
-            normalized.lower().startswith(("http://", "https://"))
-            and len(normalized) <= 64
-        ):
-            return True
-        if _LOW_VALUE_ONLY_SYMBOLS.fullmatch(normalized):
-            return True
-        return False
-
-    @classmethod
     def _is_complex_query(cls, text: str) -> bool:
         normalized = cls._normalize_context_text(text).lower()
         if not normalized:
@@ -237,195 +131,6 @@ class ChatMemory:
         if len(normalized) >= 36:
             return True
         return any(hint in normalized for hint in _COMPLEX_QUERY_HINTS)
-
-    @classmethod
-    def _is_followup_query(cls, text: str) -> bool:
-        normalized = cls._normalize_context_text(text).lower()
-        if not normalized:
-            return False
-        if len(normalized) <= 4:
-            return any(hint in normalized for hint in _FOLLOWUP_QUERY_HINTS)
-        if len(normalized) <= 10 and any(
-            hint in normalized for hint in _FOLLOWUP_QUERY_HINTS
-        ):
-            return True
-        return normalized.startswith(("那", "再", "继续", "然后"))
-
-    def _build_dialog_manifest_item(
-        self,
-        *,
-        dialog: ChatInterChatHistory,
-        lexical_score: float,
-    ) -> str:
-        timestamp = (
-            dialog.create_time.strftime("%m-%d %H:%M:%S")
-            if dialog.create_time
-            else "??:??:??"
-        )
-        user_msg = self._clip_context_line(
-            self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dialog.user_message)
-            ),
-            72,
-        )
-        ai_msg = self._clip_context_line(
-            self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dialog.ai_response or "")
-            ),
-            72,
-        )
-        return (
-            f"- id={int(dialog.id or 0)} | t={timestamp} | score={lexical_score:.3f} | "
-            f"user={json.dumps(user_msg, ensure_ascii=False)} | "
-            f"assistant={json.dumps(ai_msg, ensure_ascii=False)}"
-        )
-
-    async def _select_relevant_history_by_manifest(
-        self,
-        *,
-        query_text: str,
-        candidates: list[tuple[float, ChatInterChatHistory]],
-        recall_limit: int,
-    ) -> list[int]:
-        if not HISTORY_SELECTOR_ENABLED:
-            return []
-        if recall_limit <= 0 or not candidates:
-            return []
-
-        min_candidates = max(
-            int(HISTORY_SELECTOR_MIN_CANDIDATES),
-            recall_limit + 1,
-        )
-        if len(candidates) < min_candidates:
-            return []
-
-        selector_limit = max(
-            int(HISTORY_SELECTOR_CANDIDATE_LIMIT),
-            recall_limit,
-        )
-        sorted_candidates = sorted(
-            candidates,
-            key=lambda item: (item[0], int(item[1].id or 0)),
-            reverse=True,
-        )[:selector_limit]
-        if len(sorted_candidates) < min_candidates:
-            return []
-
-        manifest_lines = [
-            self._build_dialog_manifest_item(dialog=dialog, lexical_score=score)
-            for score, dialog in sorted_candidates
-        ]
-        prompt = (
-            f"当前问题:\n{self._normalize_context_text(query_text)}\n\n"
-            "候选历史记忆:\n"
-            f"{chr(10).join(manifest_lines)}\n\n"
-            '返回格式：{"selected_ids": [id...]}'
-        )
-        timeout = max(int(HISTORY_SELECTOR_TIMEOUT), 2)
-        model_name = get_model_name()
-
-        try:
-            result = await generate_structured(
-                prompt,
-                _HistorySelectionResult,
-                model=model_name,
-                instruction=_MEMORY_SELECTOR_PROMPT.format(limit=recall_limit),
-                timeout=float(timeout),
-            )
-        except Exception as exc:
-            logger.debug(f"history selector LLM failed, fallback lexical: {exc}")
-            return []
-
-        valid_ids = {int(dialog.id or 0) for _, dialog in sorted_candidates}
-        deduped_ids: list[int] = []
-        for item in getattr(result, "selected_ids", []) or []:
-            try:
-                dialog_id = int(item)
-            except Exception:
-                continue
-            if dialog_id not in valid_ids or dialog_id in deduped_ids:
-                continue
-            deduped_ids.append(dialog_id)
-            if len(deduped_ids) >= recall_limit:
-                break
-
-        if deduped_ids:
-            logger.debug(
-                "history selector hit: "
-                f"selected={deduped_ids} candidates={len(sorted_candidates)}"
-            )
-        return deduped_ids
-
-    async def _should_isolate_context(
-        self,
-        *,
-        session_id: str,
-        group_id: str | None,
-        current_message_text: str,
-    ) -> tuple[bool, str]:
-        if not ENABLE_CONTEXT_RELEVANCE_GATE:
-            return False, "disabled"
-
-        normalized_query = self._normalize_context_text(current_message_text)
-        if not normalized_query:
-            return False, "empty_query"
-
-        if self._is_followup_query(normalized_query):
-            return False, "followup_query"
-
-        query_tokens = self._tokenize_context_text(normalized_query)
-        min_query_tokens = max(
-            int(CONTEXT_RELEVANCE_MIN_QUERY_TOKENS),
-            1,
-        )
-        if len(query_tokens) < min_query_tokens:
-            return False, "insufficient_query_tokens"
-
-        sample_limit = max(int(CONTEXT_RELEVANCE_SAMPLE_LIMIT), 4)
-        threshold = float(CONTEXT_RELEVANCE_THRESHOLD)
-
-        sample_texts: list[str] = []
-        dialogs = await ChatInterChatHistory.get_recent_dialogs(
-            session_id,
-            sample_limit,
-        )
-        for dialog in dialogs:
-            user_text = self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dialog.user_message)
-            )
-            ai_text = self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dialog.ai_response or "")
-            )
-            merged = self._normalize_context_text(f"{user_text} {ai_text}")
-            if merged:
-                sample_texts.append(merged)
-
-        if group_id:
-            group_msgs = (
-                await ChatHistory.filter(group_id=group_id)
-                .order_by("-create_time", "-id")
-                .limit(sample_limit)
-            )
-            for msg in group_msgs:
-                text = self._normalize_context_text(
-                    uni_to_text_with_tags(msg.plain_text or msg.text or "")
-                )
-                if not text or self._is_low_value_background_message(text):
-                    continue
-                sample_texts.append(text)
-
-        if not sample_texts:
-            return False, "no_samples"
-
-        max_score = 0.0
-        for text in sample_texts:
-            score = self._similarity_score(query_tokens, text)
-            if score > max_score:
-                max_score = score
-
-        if max_score < threshold:
-            return True, f"max_score={max_score:.3f}<threshold={threshold:.3f}"
-        return False, f"max_score={max_score:.3f}"
 
     def _build_conversation_focus(
         self,
@@ -532,28 +237,6 @@ class ChatMemory:
             return Image(path=path_text)
         return None
 
-    def _summarize_old_dialogs(self, dialogs: list["ChatInterChatHistory"]) -> str:
-        if not dialogs:
-            return ""
-
-        token_pattern = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
-        all_text = " ".join(
-            (
-                f"{uni_to_text_with_tags(item.user_message)} "
-                f"{uni_to_text_with_tags(item.ai_response or '')}"
-            )
-            for item in dialogs[-self._compression_summary_cap :]
-        )
-        tokens = [
-            token.lower()
-            for token in token_pattern.findall(all_text.lower())
-            if token and token not in {"一个", "这个", "那个", "然后", "就是", "功能"}
-        ]
-        topics = ", ".join(word for word, _ in Counter(tokens).most_common(6))
-        if not topics:
-            topics = "无明显主题"
-        return f"更早{len(dialogs)}轮对话摘要: 主要主题[{topics}]"
-
     def _is_nickname_cached(self, user_id: str) -> bool:
         """检查昵称是否在缓存中且未过期"""
         if user_id not in self._user_nickname_cache:
@@ -590,37 +273,6 @@ class ChatMemory:
                     return nick
 
         return None
-
-    async def _preload_nicknames_for_group(
-        self, user_ids: set[str], group_id: str | None
-    ):
-        """批量预加载群成员昵称
-
-        参数:
-            user_ids: 需要获取昵称的用户 ID 集合
-            group_id: 群组 ID
-        """
-        if not group_id:
-            return
-
-        user_ids_to_fetch = {
-            uid for uid in user_ids if not self._is_nickname_cached(uid)
-        }
-
-        if not user_ids_to_fetch:
-            return
-
-        from zhenxun.models.group_member_info import GroupInfoUser
-
-        members = await GroupInfoUser.filter(
-            group_id=group_id, user_id__in=list(user_ids_to_fetch)
-        ).all()
-
-        for member in members:
-            nick = str(getattr(member, "nickname", "") or member.user_name or "")
-            if nick:
-                self._user_nickname_cache[member.user_id] = nick
-                self._nickname_cache_time[member.user_id] = time.time()
 
     def set_bot_nickname(self, nickname: str):
         """设置 bot 昵称"""
@@ -667,8 +319,8 @@ class ChatMemory:
         bot_id: str | None = None,
         event: Event | None = None,
         dialogue_context: DialogueContextPack | None = None,
-    ) -> tuple[str, str, list[Image]]:
-        """构建完整的上下文（System + Context + Current）
+    ) -> tuple[str, str, list[Image], list[LLMMessage]]:
+        """构建完整的上下文（System + Context + Current + History Messages）
 
         参数:
             user_id: 用户 ID
@@ -680,13 +332,15 @@ class ChatMemory:
             event: Event 实例（用于获取回复 ID）
 
         返回:
-            tuple: (system_prompt, context_xml, reply_images)
+            tuple: (system_prompt, context_xml, reply_images, history_messages)
             - system_prompt: 系统提示词
             - context_xml: XML 格式的上下文
             - reply_images: 回复链中的图片 Image Segment 列表（用于多模态处理）
+            - history_messages: Astr 风格的独立 role 历史消息
         """
         lines: list[str] = []
         reply_images: list[Image] = []
+        history_messages: list[LLMMessage] = []
         current_message_text = ""
 
         try:
@@ -745,72 +399,43 @@ class ChatMemory:
         addressee_user_id = str(getattr(addressee, "target_user_id", "") or "")
 
         session_id = self.get_session_id(user_id, group_id)
-        isolate_context, isolate_reason = await self._should_isolate_context(
-            session_id=session_id,
-            group_id=group_id,
-            current_message_text=current_message_text,
+        from .history_policy import (
+            append_chatroom_history_context,
+            build_astr_history_payload,
         )
-        if isolate_context:
-            logger.debug(
-                "ChatInter 上下文门控命中，按单轮对话处理: "
-                f"session={session_id}, reason={isolate_reason}"
-            )
-            lines.extend(
-                [
-                    "<context_mode>",
-                    "mode=single_turn",
-                    f"reason={isolate_reason}",
-                    "</context_mode>",
-                ]
-            )
 
-        # 2. 对话历史（来自 ChatInterChatHistory）
-        if not isolate_context:
-            history_context_lines = await self._build_history_context(
-                user_id,
-                group_id,
-                current_message_text=current_message_text,
-                thread_id=thread_id or None,
-            )
-            if history_context_lines:
-                lines.append("<history_context>")
-                lines.extend(history_context_lines)
-                lines.append("</history_context>")
+        history_payload = await build_astr_history_payload(
+            session_id=session_id,
+            user_id=user_id,
+            current_message_text=current_message_text,
+            group_id=group_id,
+            bot_id=bot_id,
+            dialog_limit=min(max(int(SESSION_CONTEXT_LIMIT), 1), 12),
+            chatroom_limit=min(max(int(SESSION_CONTEXT_LIMIT), 1), 16),
+        )
+        history_messages = list(history_payload.messages)
+        append_chatroom_history_context(lines, history_payload.chatroom_lines)
 
-        # 3. 群聊背景（最近 5 条群消息，来自 ChatHistory）
-        if not isolate_context:
-            group_background_lines = await self._build_group_background_xml(
-                group_id,
-                bot_id,
-                current_message_text=current_message_text,
-                thread_user_ids=thread_user_ids,
-            )
-            if group_background_lines:
-                lines.append("<history>")
-                lines.extend(group_background_lines)
-                lines.append("</history>")
-
-        if not isolate_context:
-            memory_lines = await ChatMemoryStore.recall(
+        memory_lines = await ChatMemoryStore.recall(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            query=current_message_text,
+            recall_context=MemoryRecallContext.build(
                 session_id=session_id,
                 user_id=user_id,
                 group_id=group_id,
+                thread_id=thread_id or None,
+                topic_key=str(getattr(thread, "topic_key", "") or ""),
+                participants=thread_user_ids,
+                addressee_user_id=addressee_user_id or None,
                 query=current_message_text,
-                recall_context=MemoryRecallContext.build(
-                    session_id=session_id,
-                    user_id=user_id,
-                    group_id=group_id,
-                    thread_id=thread_id or None,
-                    topic_key=str(getattr(thread, "topic_key", "") or ""),
-                    participants=thread_user_ids,
-                    addressee_user_id=addressee_user_id or None,
-                    query=current_message_text,
-                ),
-            )
-            if memory_lines:
-                lines.append("<long_term_memory>")
-                lines.extend(memory_lines)
-                lines.append("</long_term_memory>")
+            ),
+        )
+        if memory_lines:
+            lines.append("<long_term_memory>")
+            lines.extend(memory_lines)
+            lines.append("</long_term_memory>")
 
         # 4. 当前消息层（Layer 0 + 回复链追溯）
         (
@@ -841,7 +466,7 @@ class ChatMemory:
             current_message_text=current_message_text,
         )
 
-        return system_prompt, context_xml, reply_images
+        return system_prompt, context_xml, reply_images, history_messages
 
     async def build_recent_conversation_recap(
         self,
@@ -1094,345 +719,6 @@ class ChatMemory:
                         break
 
         return lines, reply_images
-
-    async def _build_history_context(
-        self,
-        user_id: str,
-        group_id: str | None,
-        current_message_text: str = "",
-        thread_id: str | None = None,
-    ) -> list[str]:
-        """构建对话历史 XML（来自 ChatInterChatHistory）
-
-        格式：[MM-DD HH:MM:SS][发送者]: 内容
-
-        参数:
-            user_id: 用户 ID
-            group_id: 群组 ID
-            nickname: 当前用户昵称
-            bot_id: Bot ID
-
-        返回:
-            list[str]: XML 行列表
-        """
-        max_context = max(int(SESSION_CONTEXT_LIMIT), 1)
-        session_id = self.get_session_id(user_id, group_id)
-        recall_candidate_limit = max(
-            int(HISTORY_RECALL_CANDIDATE_LIMIT),
-            max_context,
-        )
-        fetch_limit = max(
-            max_context * self._compression_fetch_factor,
-            recall_candidate_limit,
-        )
-        thread_dialogs = await self._load_thread_dialogs(
-            thread_id=thread_id,
-            group_id=group_id,
-            limit=max_context,
-        )
-        thread_dialog_ids = {int(dialog.id or 0) for dialog in thread_dialogs}
-        dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
-        if thread_dialog_ids:
-            dialogs = [
-                dialog
-                for dialog in dialogs
-                if int(dialog.id or 0) not in thread_dialog_ids
-            ]
-
-        if not dialogs and not thread_dialogs:
-            return []
-
-        history_summary = ""
-        recalled_dialogs: list[ChatInterChatHistory] = []
-        query_tokens = self._tokenize_context_text(current_message_text)
-        recall_limit = max(int(HISTORY_RECALL_LIMIT), 0)
-        recall_min_score = float(HISTORY_RECALL_MIN_SCORE)
-        if len(dialogs) > max_context:
-            old_dialogs = dialogs[:-max_context]
-            dialogs = dialogs[-max_context:]
-            history_summary = self._summarize_old_dialogs(old_dialogs)
-            if old_dialogs and query_tokens and recall_limit > 0:
-                recall_candidates: list[tuple[float, ChatInterChatHistory]] = []
-                for dialog in old_dialogs:
-                    merged_text = self._strip_non_final_channel_text(
-                        f"{uni_to_text_with_tags(dialog.user_message)} "
-                        f"{uni_to_text_with_tags(dialog.ai_response or '')}"
-                    )
-                    score = self._similarity_score(query_tokens, merged_text)
-                    if score >= recall_min_score:
-                        recall_candidates.append((score, dialog))
-                recall_candidates.sort(
-                    key=lambda item: (item[0], int(item[1].id or 0)),
-                    reverse=True,
-                )
-                lexical_selected_ids = [
-                    int(dialog.id or 0)
-                    for _, dialog in recall_candidates[:recall_limit]
-                    if int(dialog.id or 0) > 0
-                ]
-                selected_ids = set(lexical_selected_ids)
-                llm_selected_ids = await self._select_relevant_history_by_manifest(
-                    query_text=current_message_text,
-                    candidates=recall_candidates,
-                    recall_limit=recall_limit,
-                )
-                selected_ids.update(llm_selected_ids)
-                recalled_dialogs = [
-                    dialog
-                    for dialog in old_dialogs
-                    if int(dialog.id or 0) in selected_ids
-                ]
-                if len(recalled_dialogs) > recall_limit:
-                    recalled_dialogs = recalled_dialogs[-recall_limit:]
-                recalled_dialogs.sort(key=lambda item: int(item.id or 0))
-
-        if group_id:
-            display_dialogs = [*thread_dialogs, *dialogs, *recalled_dialogs]
-            user_ids_to_fetch = {
-                dlg.user_id
-                for dlg in display_dialogs
-                if not self._is_nickname_cached(dlg.user_id)
-            }
-            await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
-
-        history_lines: list[str] = []
-        if thread_dialogs:
-            history_lines.append(f"当前话题历史({len(thread_dialogs)}条):")
-            for dlg in thread_dialogs:
-                history_lines.extend(
-                    await self._format_dialog_history_lines(dlg, group_id)
-                )
-        if history_summary:
-            history_lines.append(history_summary)
-        if recalled_dialogs:
-            history_lines.append(f"相关历史记忆({len(recalled_dialogs)}条):")
-            for dlg in recalled_dialogs:
-                history_lines.extend(
-                    await self._format_dialog_history_lines(dlg, group_id, limit=120)
-                )
-
-        for dlg in dialogs:
-            history_lines.extend(await self._format_dialog_history_lines(dlg, group_id))
-
-        return history_lines
-
-    async def _load_thread_dialogs(
-        self,
-        *,
-        thread_id: str | None,
-        group_id: str | None,
-        limit: int,
-    ) -> list[ChatInterChatHistory]:
-        if not thread_id:
-            return []
-        try:
-            from .thread_store import get_recent_thread_dialog_ids
-
-            dialog_ids = await get_recent_thread_dialog_ids(
-                thread_id=thread_id,
-                group_id=group_id,
-                limit=limit,
-            )
-        except Exception:
-            return []
-        if not dialog_ids:
-            return []
-        try:
-            rows = await ChatInterChatHistory.filter(id__in=dialog_ids).all()
-        except Exception:
-            return []
-        by_id = {int(row.id or 0): row for row in rows}
-        return [by_id[item] for item in dialog_ids if item in by_id]
-
-    async def _format_dialog_history_lines(
-        self,
-        dlg: ChatInterChatHistory,
-        group_id: str | None,
-        *,
-        limit: int = 0,
-    ) -> list[str]:
-        timestamp = (
-            dlg.create_time.strftime("%m-%d %H:%M:%S")
-            if dlg.create_time
-            else "??:??:??"
-        )
-        sender = await self._format_history_sender(
-            user_id=str(dlg.user_id or ""),
-            group_id=group_id,
-            fallback_name=str(dlg.nickname or ""),
-            bot_id=None,
-        )
-
-        user_msg = self._strip_non_final_channel_text(
-            uni_to_text_with_tags(dlg.user_message)
-        )
-        if limit > 0:
-            user_msg = self._clip_context_line(user_msg, limit)
-        lines = [f"[{timestamp}] {sender}: {user_msg}"]
-
-        if dlg.ai_response:
-            ai_sender = f"[{self._bot_nickname or BotConfig.self_nickname}]"
-            ai_msg = self._strip_non_final_channel_text(
-                uni_to_text_with_tags(dlg.ai_response)
-            )
-            if limit > 0:
-                ai_msg = self._clip_context_line(ai_msg, limit)
-            lines.append(f"[{timestamp}] {ai_sender}: {ai_msg}")
-        return lines
-
-    async def _format_history_sender(
-        self,
-        *,
-        user_id: str,
-        group_id: str | None,
-        fallback_name: str = "",
-        bot_id: str | None = None,
-    ) -> str:
-        if bot_id and user_id == bot_id:
-            bot_name = self._bot_nickname or BotConfig.self_nickname
-            return f"[name={bot_name}; user_id={user_id}]"
-        if not group_id:
-            name = normalize_message_text(fallback_name) or user_id
-            return f"[name={name}; user_id={user_id}]"
-        cached_nick = self._user_nickname_cache.get(user_id, "")
-        profile = await get_person_profile(
-            user_id=user_id,
-            group_id=group_id,
-            fallback_name=cached_nick or fallback_name,
-        )
-        return format_person_history_label(
-            profile,
-            fallback_name=cached_nick or fallback_name,
-        )
-
-    async def _build_group_background_xml(
-        self,
-        group_id: str | None,
-        bot_id: str | None = None,
-        current_message_text: str = "",
-        thread_user_ids: tuple[str, ...] = (),
-    ) -> list[str]:
-        """构建群聊背景 XML（最近群消息，来自 ChatHistory）
-
-        格式：[时间][发送者]: 内容
-
-        参数:
-            group_id: 群组 ID
-            bot_id: Bot ID
-            thread_user_ids: 当前话题参与者，召回时提高这些人的消息权重
-
-        返回:
-            list[str]: XML 行列表
-        """
-        lines: list[str] = []
-        prefix_size = max(int(CONTEXT_PREFIX_SIZE), 1)
-        fetch_multiplier = max(
-            int(GROUP_BACKGROUND_FETCH_MULTIPLIER),
-            1,
-        )
-        relevant_limit = max(
-            int(GROUP_BACKGROUND_RELEVANT_LIMIT),
-            0,
-        )
-        relevant_min_score = float(GROUP_BACKGROUND_MIN_SCORE)
-
-        if not group_id:
-            return lines
-
-        fetch_limit = max(prefix_size, prefix_size * fetch_multiplier)
-        chat_history_msgs = (
-            await ChatHistory.filter(group_id=group_id)
-            .order_by("-create_time", "-id")
-            .limit(fetch_limit)
-        )
-        chat_history_msgs = list(reversed(chat_history_msgs))
-
-        if not chat_history_msgs:
-            return lines
-
-        query_tokens = self._tokenize_context_text(current_message_text)
-        thread_user_id_set = {
-            str(item).strip() for item in thread_user_ids if str(item).strip()
-        }
-        user_ids_to_fetch = set()
-        for msg in chat_history_msgs:
-            is_bot_msg = bot_id and msg.user_id == bot_id
-            if not is_bot_msg and not self._is_nickname_cached(msg.user_id):
-                user_ids_to_fetch.add(msg.user_id)
-
-        await self._preload_nicknames_for_group(user_ids_to_fetch, group_id)
-
-        scored_msgs: list[tuple[ChatHistory, str, float]] = []
-        for msg in chat_history_msgs:
-            content = uni_to_text_with_tags(msg.plain_text or msg.text or "")
-            content = content or "(空消息)"
-            if self._is_low_value_background_message(content):
-                continue
-            score = (
-                self._similarity_score(query_tokens, content) if query_tokens else 0.0
-            )
-            if str(msg.user_id or "") in thread_user_id_set:
-                score += 0.22
-            scored_msgs.append((msg, content, score))
-
-        if not scored_msgs:
-            return lines
-
-        baseline_keep = max(prefix_size - relevant_limit, 1)
-        selected: list[tuple[ChatHistory, str, float]] = []
-        selected_ids: set[int] = set()
-        for item in scored_msgs[-baseline_keep:]:
-            selected.append(item)
-            selected_ids.add(int(item[0].id))
-
-        if query_tokens and relevant_limit > 0:
-            related_candidates = [
-                item
-                for item in scored_msgs
-                if int(item[0].id) not in selected_ids and item[2] >= relevant_min_score
-            ]
-            related_candidates.sort(
-                key=lambda item: (item[2], int(item[0].id)),
-                reverse=True,
-            )
-            for item in related_candidates[:relevant_limit]:
-                selected.append(item)
-                selected_ids.add(int(item[0].id))
-        elif thread_user_id_set and relevant_limit > 0:
-            thread_candidates = [
-                item
-                for item in scored_msgs
-                if int(item[0].id) not in selected_ids
-                and str(item[0].user_id or "") in thread_user_id_set
-            ]
-            thread_candidates.sort(
-                key=lambda item: (item[2], int(item[0].id)),
-                reverse=True,
-            )
-            for item in thread_candidates[:relevant_limit]:
-                selected.append(item)
-                selected_ids.add(int(item[0].id))
-
-        selected.sort(key=lambda item: int(item[0].id))
-        if len(selected) > prefix_size:
-            selected = selected[-prefix_size:]
-
-        for msg, content, _score in selected:
-            if msg.create_time:
-                timestamp = msg.create_time.strftime("%m-%d %H:%M:%S")
-            else:
-                timestamp = "??:??:??"
-            is_bot_msg = bot_id and msg.user_id == bot_id
-            sender = await self._format_history_sender(
-                user_id=str(msg.user_id or ""),
-                group_id=group_id,
-                fallback_name=self._user_nickname_cache.get(msg.user_id, ""),
-                bot_id=bot_id if is_bot_msg else None,
-            )
-
-            lines.append(f"[{timestamp}] {sender}: {content}")
-
-        return lines
 
     def _build_system_prompt(
         self,

@@ -5,11 +5,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import re
-from typing import Literal
 
 from .capability_graph import build_capability_graph_snapshot
 from .command_schema import find_command_schema
-from .execution_observer import get_command_feedback_score
+from .feedback import get_command_feedback_score
 from .models.pydantic_models import (
     CommandCandidateFeatures,
     CommandCandidateSnapshot,
@@ -47,6 +46,7 @@ class CommandCandidate:
     score: float
     reason: str
     family: str = "general"
+    tool: CommandToolSnapshot | None = None
     reasons: tuple[str, ...] = ()
     exact_protected: bool = False
     features: CommandCandidateFeatures | None = None
@@ -603,38 +603,12 @@ def build_command_candidates(
     session_id: str | None = None,
     diversify: bool = True,
     tools: list[CommandToolSnapshot] | None = None,
-    expanded_queries: list[str] | None = None,
     include_unscored: bool = False,
 ) -> list[CommandCandidate]:
     if tools is None:
         graph = build_capability_graph_snapshot(knowledge_base)
         tools = build_command_tool_snapshots(graph)
-    queries: list[str] = []
-    for value in [query, *(expanded_queries or [])]:
-        normalized = normalize_message_text(value)
-        if normalized and normalized not in queries:
-            queries.append(normalized)
-    if not queries:
-        queries = [query]
-    ranked: list[_ScoredCandidate] = []
-    for index, item_query in enumerate(queries):
-        query_ranked = _score_all_tools(tools, item_query, session_id=session_id)
-        if index > 0:
-            query_ranked = [
-                _ScoredCandidate(
-                    tool=item.tool,
-                    schema=item.schema,
-                    score=item.score * max(0.86 - index * 0.04, 0.66),
-                    reasons=(
-                        *item.reasons,
-                        f"query_expansion_{index}",
-                    ),
-                    exact_protected=item.exact_protected,
-                    features=item.features,
-                )
-                for item in query_ranked
-            ]
-        ranked.extend(query_ranked)
+    ranked = _score_all_tools(tools, query, session_id=session_id)
     merged = _merge_ranked_candidates(ranked)
     max_items = len(tools) if limit is None or int(limit or 0) <= 0 else int(limit)
     selected = _diversify_candidates(
@@ -668,6 +642,7 @@ def build_command_candidates(
             score=item.score,
             reason=",".join(item.reasons),
             family=item.tool.family,
+            tool=item.tool,
             reasons=item.reasons,
             exact_protected=item.exact_protected,
             features=item.features,
@@ -685,19 +660,22 @@ def group_candidates_by_module(
     return grouped
 
 
-def dump_schema_for_prompt(
-    schema: PluginCommandSchema,
-    *,
-    compact: bool = False,
-) -> dict[str, object]:
+def dump_schema_for_prompt(schema: PluginCommandSchema) -> dict[str, object]:
     payload: dict[str, object] = {
         "command_id": schema.command_id,
         "head": schema.head,
         "role": schema.command_role,
         "payload_policy": schema.payload_policy,
+        "extra_text_policy": schema.extra_text_policy,
+        "actor_scope": schema.actor_scope,
+        "target_requirement": schema.target_requirement,
+        "target_sources": list(schema.target_sources),
+        "allow_at": schema.allow_at,
+        "source": schema.source,
+        "confidence": schema.confidence,
     }
     if schema.aliases:
-        payload["aliases"] = schema.aliases[: 4 if compact else 10]
+        payload["aliases"] = list(schema.aliases)
     if schema.description:
         payload["description"] = schema.description
     true_requires = {
@@ -705,12 +683,6 @@ def dump_schema_for_prompt(
     }
     if true_requires:
         payload["requires"] = true_requires
-    if compact:
-        return payload
-
-    payload["extra_text_policy"] = schema.extra_text_policy
-    payload["source"] = schema.source
-    payload["confidence"] = schema.confidence
     if schema.slots:
         payload["slots"] = [
             {
@@ -720,27 +692,16 @@ def dump_schema_for_prompt(
                     "type": slot.type,
                     "required": slot.required or None,
                     "default": slot.default,
-                    "aliases": slot.aliases[:5] or None,
+                    "aliases": list(slot.aliases) or None,
                     "description": slot.description or None,
                 }.items()
                 if value is not None
             }
-            for slot in schema.slots[:4]
+            for slot in schema.slots
         ]
     if schema.render and schema.render != schema.head:
         payload["render"] = schema.render
     return payload
-
-
-def _prompt_level_for_candidate(
-    index: int,
-    candidate: CommandCandidate,
-) -> Literal["full", "compact", "name_only"]:
-    if candidate.exact_protected or index <= 8:
-        return "full"
-    if index <= 24:
-        return "compact"
-    return "name_only"
 
 
 def dump_candidate_for_prompt(
@@ -748,14 +709,12 @@ def dump_candidate_for_prompt(
     *,
     index: int,
 ) -> dict[str, object]:
-    level = _prompt_level_for_candidate(index, candidate)
     payload: dict[str, object] = {
         "rank": index,
         "score": round(candidate.score, 2),
         "family": candidate.family,
         "reason": candidate.reason,
         "exact_protected": candidate.exact_protected or None,
-        "prompt_level": level,
         "plugin_module": candidate.plugin_module,
         "plugin_name": candidate.plugin_name,
         "command_id": candidate.schema.command_id,
@@ -777,16 +736,7 @@ def dump_candidate_for_prompt(
     }
     if feature_payload:
         payload["features"] = feature_payload
-    if level == "name_only":
-        if candidate.schema.description:
-            payload["description"] = candidate.schema.description[:80]
-        return payload
-    payload.update(
-        dump_schema_for_prompt(
-            candidate.schema,
-            compact=level == "compact",
-        )
-    )
+    payload.update(dump_schema_for_prompt(candidate.schema))
     return payload
 
 
@@ -817,7 +767,6 @@ def build_candidate_snapshots(
                 source=schema.source,
                 confidence=schema.confidence,
                 features=candidate.features or _empty_features(),
-                prompt_level=_prompt_level_for_candidate(index, candidate),
             )
         )
     return snapshots

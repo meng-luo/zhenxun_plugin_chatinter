@@ -1,8 +1,8 @@
 """
 ChatInter 命令规划器。
 
-Router 负责判断意图；CommandPlanner 负责把 Router 结果整理成可执行命令，
-并用 PluginReference 做轻量约束校验。真正的插件权限和执行仍交给原链路。
+Native tool loop 负责选择工具；CommandPlanner 负责把工具结果整理成可执行命令，
+并用 PluginReference 做轻量约束校验。真正的插件权限和执行仍交给原插件链路。
 """
 
 from __future__ import annotations

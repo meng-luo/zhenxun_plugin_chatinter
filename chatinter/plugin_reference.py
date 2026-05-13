@@ -1,7 +1,7 @@
 """
 ChatInter 插件引用视图。
 
-CapabilityGraph 是完整结构；PluginReference 是 Router / Planner 可直接使用的
+CapabilityGraph 是完整结构；PluginReference 是 Native tools / Planner 可直接使用的
 轻量视图，避免在提示词中塞入过多无关字段。
 """
 
@@ -121,7 +121,7 @@ def _capability_text(
         "动作:" + "/".join(task_verbs) if task_verbs else "",
         "输入:" + "/".join(input_requirements) if input_requirements else "",
     ]
-    return normalize_message_text("；".join(part for part in parts if part))[:180]
+    return normalize_message_text("；".join(part for part in parts if part))
 
 
 def _schema_signature(
@@ -198,8 +198,6 @@ def build_plugin_reference(plugin: PluginCapability) -> PluginReference:
     does = normalize_message_text(plugin.description or "")
     if does == "暂无描述" and plugin.usage:
         does = normalize_message_text(plugin.usage)
-    if len(does) > 96:
-        does = does[:96].rstrip() + "..."
 
     command_schemas = build_command_schemas(plugin.module, plugin.commands)
     if command_schemas:

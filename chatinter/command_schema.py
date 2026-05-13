@@ -267,7 +267,7 @@ def _command_description(command: CommandCapability, head: str) -> str:
     parts: list[str] = []
     examples = [
         normalize_message_text(example)
-        for example in command.examples[:2]
+        for example in command.examples
         if normalize_message_text(example)
     ]
     if examples:
@@ -275,7 +275,7 @@ def _command_description(command: CommandCapability, head: str) -> str:
     requirement = command.requirement
     requirement_parts: list[str] = []
     if requirement.params:
-        requirement_parts.append("参数: " + " ".join(requirement.params[:4]))
+        requirement_parts.append("参数: " + " ".join(requirement.params))
     if requirement.text_min > 0:
         requirement_parts.append(f"至少{requirement.text_min}段文本")
     if requirement.image_min > 0:
@@ -289,7 +289,7 @@ def _command_description(command: CommandCapability, head: str) -> str:
     if not parts:
         parts.append(f"执行“{head}”命令")
     description = "；".join(parts)
-    return description[:120].rstrip()
+    return description.rstrip()
 
 
 def schema_from_capability(
@@ -313,7 +313,7 @@ def schema_from_capability(
     ]
     if not raw_params and requirement.text_min > 0:
         raw_params = ["text"]
-    for index, slot_name in enumerate(raw_params[:4]):
+    for index, slot_name in enumerate(raw_params):
         slot_type = _slot_type_from_name(slot_name)
         slots.append(
             _slot(

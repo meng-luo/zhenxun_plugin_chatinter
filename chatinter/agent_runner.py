@@ -623,6 +623,7 @@ async def run_chatinter_agent(
     system_prompt: str,
     context_xml: str,
     message_text: str,
+    history_messages: list[LLMMessage] | None = None,
     image_parts: list[LLMContentPart] | None = None,
     budget_controller: TurnBudgetController | None = None,
 ) -> LLMResponse:
@@ -681,6 +682,7 @@ async def run_chatinter_agent(
         reasoning_config = build_reasoning_generation_config()
         messages: list[LLMMessage] = [
             LLMMessage.system(guarded_prompt.system_prompt),
+            *list(history_messages or []),
             LLMMessage.user(user_content),
         ]
 
@@ -800,6 +802,7 @@ async def run_chatinter_agent(
                 stage=f"subagent:{handoff_decision.role}",
                 request_messages=[
                     LLMMessage.system(subagent_prompt.system_prompt),
+                    *list(history_messages or []),
                     LLMMessage.user(subagent_prompt.user_text),
                 ],
                 request_timeout=max(min(timeout, 10), _AGENT_MIN_TIMEOUT),

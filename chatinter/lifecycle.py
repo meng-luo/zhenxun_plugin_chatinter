@@ -29,14 +29,12 @@ LifecycleStage = Literal[
 _TOKEN_BUDGET = 2200
 _SYSTEM_PROMPT_BUDGET = 800
 _SECTION_TRIM_ORDER = (
-    "history",
-    "history_context",
+    "chatroom_history",
     "retrieval_knowledge",
     "current_message_layers",
 )
 _HARD_DROP_ORDER = (
-    "history",
-    "history_context",
+    "chatroom_history",
     "retrieval_knowledge",
 )
 _SMALL_SECTION_TOKEN_THRESHOLD = 48
@@ -133,8 +131,15 @@ def _compose_sections(sections: dict[str, list[str]]) -> str:
     ordered = []
     for tag in (
         "qq_context",
-        "history_context",
-        "history",
+        "event_context",
+        "turn_identity",
+        "speaker_profile",
+        "relevant_people",
+        "addressee",
+        "thread_context",
+        "conversation_focus",
+        "chatroom_history",
+        "long_term_memory",
         "current_message_layers",
         "user_state",
         "retrieval_knowledge",
@@ -145,8 +150,15 @@ def _compose_sections(sections: dict[str, list[str]]) -> str:
     for tag, section in sections.items():
         if tag in {
             "qq_context",
-            "history_context",
-            "history",
+            "event_context",
+            "turn_identity",
+            "speaker_profile",
+            "relevant_people",
+            "addressee",
+            "thread_context",
+            "conversation_focus",
+            "chatroom_history",
+            "long_term_memory",
             "current_message_layers",
             "user_state",
             "retrieval_knowledge",

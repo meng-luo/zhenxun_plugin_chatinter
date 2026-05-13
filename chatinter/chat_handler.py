@@ -21,7 +21,13 @@ from nonebot.plugin import get_loaded_plugins
 from nonebot_plugin_alconna.uniseg import UniMessage
 
 from zhenxun.configs.config import BotConfig
-from zhenxun.services import chat, logger
+from zhenxun.services import logger
+from zhenxun.services.send_queue import (
+    SendObservation,
+    observe_send_trace,
+    pop_send_observations,
+)
+from zhenxun.services.llm import AI, LLMMessage
 from zhenxun.utils.message import MessageUtils
 
 from .chat_dialogue_planner import ChatDialoguePlan
@@ -36,7 +42,6 @@ from .config import (
 from .memory import _chat_memory
 from .prompt_guard import guard_prompt_sections
 from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
-from .reroute_capture import CapturedRerouteOutput, RerouteOutputCapture
 from .turn_runtime import TurnBudgetController
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
@@ -92,7 +97,7 @@ class RerouteExecutionResult:
     success: bool
     command: str
     trace_id: str
-    outputs: list[CapturedRerouteOutput] = field(default_factory=list)
+    outputs: list[SendObservation] = field(default_factory=list)
     error: str = ""
     timed_out: bool = False
 
@@ -122,6 +127,7 @@ async def handle_chat_message(
     budget_controller: TurnBudgetController | None = None,
     dialogue_plan: ChatDialoguePlan | None = None,
     context_xml: str = "",
+    history_messages: list[LLMMessage] | None = None,
 ) -> str | UniMessage:
     chat_style = str(get_config_value("CHAT_STYLE", "") or "")
 
@@ -151,9 +157,13 @@ async def handle_chat_message(
                 f"{guarded.context_text}\n\n"
                 f"<current_user_message>{guarded.user_text}</current_user_message>"
             )
-        response = await chat(
-            message=user_text,
-            instruction=guarded.system_prompt,
+        ai = AI(session_id=f"chatinter-chat:{session_key or group_id or user_id}")
+        response = await ai.generate_internal(
+            [
+                LLMMessage.system(guarded.system_prompt),
+                *list(history_messages or []),
+                LLMMessage.user(user_text),
+            ],
             model=get_model_name(),
             config=build_reasoning_generation_config(),
         )
@@ -320,7 +330,7 @@ async def reroute_to_plugin_with_result(
 
         handle_event = cast(Any, bot.handle_event)
         if wait:
-            with RerouteOutputCapture.activate(trace_key):
+            with observe_send_trace(trace_key):
                 task = asyncio.create_task(handle_event(new_event))
         else:
             task = asyncio.create_task(handle_event(new_event))
@@ -333,9 +343,9 @@ async def reroute_to_plugin_with_result(
                     timeout=max(float(timeout), 0.5),
                 )
             except asyncio.TimeoutError:
-                outputs = RerouteOutputCapture.pop_outputs(trace_key)
+                outputs = pop_send_observations(trace_key)
                 task.add_done_callback(
-                    lambda _done_task: RerouteOutputCapture.pop_outputs(trace_key)
+                    lambda _done_task: pop_send_observations(trace_key)
                 )
                 logger.warning(f"消息重路由等待超时：{command_text}")
                 return RerouteExecutionResult(
@@ -347,7 +357,7 @@ async def reroute_to_plugin_with_result(
                     timed_out=True,
                 )
             except Exception as exc:
-                outputs = RerouteOutputCapture.pop_outputs(trace_key)
+                outputs = pop_send_observations(trace_key)
                 logger.warning(f"消息重路由执行异常：{command_text}, error={exc}")
                 return RerouteExecutionResult(
                     success=False,
@@ -356,7 +366,7 @@ async def reroute_to_plugin_with_result(
                     outputs=outputs,
                     error=str(exc),
                 )
-        outputs = RerouteOutputCapture.pop_outputs(trace_key)
+        outputs = pop_send_observations(trace_key)
         logger.info(f"消息重路由成功：{command_text}")
         return RerouteExecutionResult(
             success=True,
@@ -371,7 +381,7 @@ async def reroute_to_plugin_with_result(
             success=False,
             command=command_text,
             trace_id=trace_key,
-            outputs=RerouteOutputCapture.pop_outputs(trace_key),
+            outputs=pop_send_observations(trace_key),
             error=str(e),
         )
 
