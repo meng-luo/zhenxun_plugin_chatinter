@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 import uuid
-from typing import TYPE_CHECKING, Any
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import UniMessage
@@ -29,6 +29,7 @@ from .chat_handler import (
 )
 from .config import get_config_value, get_model_name
 from .context_packer import DialogueContextPack
+from .event_context import ChatInterEventContext, build_event_context
 from .event_runtime import (
     apply_runtime_plugin_overrides,
     event_adapter_name,
@@ -39,7 +40,6 @@ from .event_runtime import (
     mark_as_handled,
     resolve_superuser,
 )
-from .event_context import ChatInterEventContext, build_event_context
 from .execution_observer import (
     EXECUTION_REASON_CANCELLED,
     EXECUTION_REASON_ERROR,
@@ -49,6 +49,7 @@ from .execution_observer import (
     record_execution_observation,
     start_execution_observation,
 )
+from .feedback import FeedbackStore
 from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
 )
@@ -58,17 +59,17 @@ from .feedback_keys import (
 from .feedback_keys import (
     FEEDBACK_REASON_ROUTE_SUCCESS as _FEEDBACK_REASON_ROUTE_SUCCESS,
 )
-from .feedback_keys import (
-    FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
-)
-from .feedback import FeedbackStore
 from .intent_classifier import classify_message_intent
 from .intervention_router import InterventionDecision, decide_intervention
-from .memory import _chat_memory
 from .main_request import MainRequestResult, run_chatinter_main_request
+from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState, get_middleware_manager
 from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
+from .native_route import (
+    NativeRouteDecision,
+    NativeRouteReport,
+)
 from .person_registry import (
     PersonProfile,
     get_person_profile,
@@ -79,17 +80,6 @@ from .plugin_registry import (
     PluginRegistry,
     PluginSelectionContext,
     get_user_plugin_knowledge,
-)
-from .native_route import (
-    NativeRouteDecision,
-    NativeRouteReport,
-)
-from .route_text import (
-    ROUTE_ACTION_WORDS,
-    contains_any,
-    is_usage_question,
-    normalize_message_text,
-    should_force_knowledge_refresh,
 )
 from .route_execution import (
     RouteExecutionPlan,
@@ -102,10 +92,17 @@ from .route_execution import (
     extract_at_tokens,
     extract_image_tokens,
     extract_reply_sender_id,
-    planner_missing_contains,
     plan_route_command,
+    planner_missing_contains,
     prepare_route_execution_plan,
     select_adapter_policy_for_message,
+)
+from .route_text import (
+    ROUTE_ACTION_WORDS,
+    contains_any,
+    is_usage_question,
+    normalize_message_text,
+    should_force_knowledge_refresh,
 )
 from .target_context import (
     append_mention_context_xml,
@@ -131,7 +128,7 @@ from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
 
 if TYPE_CHECKING:
-    from zhenxun.services.llm import LLMMessage
+    pass
 
 _INTENT_REFRESH_PUNCTUATION = ("。", "！", "？", "；", ";")
 _KNOWLEDGE_REFRESH_COOLDOWN = 30.0
@@ -452,13 +449,24 @@ async def _execute_native_tool_route(
             reason="invalid route",
         )
 
-    planned_image_count = len(extract_image_tokens(current_message))
+    task_frame = validated.task_frame
+    task_message = (
+        task_frame.effective_text
+        if task_frame is not None and task_frame.effective_text
+        else current_message
+    )
+    task_image_tokens = extract_image_tokens(task_message)
+    planned_image_count = len(task_image_tokens)
+    if task_message != current_message:
+        for token in extract_image_tokens(current_message):
+            planned_image_count += 0 if token in task_image_tokens else 1
     if extra_image_segments:
         planned_image_count += len(extra_image_segments)
     command_plan = plan_route_command(
         route_result=route_result,
         knowledge_plugins=knowledge_plugins,
-        current_message=current_message,
+        current_message=task_message,
+        ambient_message=current_message,
         has_reply=has_reply,
         image_count=planned_image_count,
     )
@@ -468,7 +476,8 @@ async def _execute_native_tool_route(
     execution_plan = prepare_route_execution_plan(
         route_result=route_result,
         knowledge_plugins=knowledge_plugins,
-        current_message=current_message,
+        current_message=task_message,
+        ambient_message=current_message,
         user_id=user_id,
     )
     if not execution_plan.need_followup and command_plan.action == "clarify":
@@ -513,7 +522,7 @@ async def _execute_native_tool_route(
         command=route_command,
         route_stage=route_result.stage,
         session_id=session_id,
-        message_preview=current_message,
+        message_preview=task_message,
         selected_rank=route_result.selected_rank,
         selected_score=route_result.selected_score,
         selected_reason=route_result.selected_reason,
@@ -544,7 +553,7 @@ async def _execute_native_tool_route(
     _tag_execution_observation(trace, observation)
     await FeedbackStore.record_plugin_outcome(
         session_id=session_id,
-        message_text=current_message,
+        message_text=task_message,
         route_result=route_result,
         modules=target_modules,
         route_command=route_command,
@@ -1121,7 +1130,7 @@ async def _stage_run_main_request(
 
     reply_text = main_result.output.final_text
     if not normalize_message_text(reply_text):
-        reply_text = "\u6211\u6682\u65f6\u6ca1\u60f3\u597d\u600e\u4e48\u56de\u7b54\u4f60\u3002"
+        reply_text = "我暂时没想好怎么回答你。"
 
     chat_execution_frame = start_execution_observation(
         action="chat",

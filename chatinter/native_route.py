@@ -48,6 +48,14 @@ def _action_for_schema(
 
 
 def _has_payload_for_schema(schema: Any, message_text: str) -> bool:
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    ).lower()
+    extra_text_policy = normalize_message_text(
+        str(getattr(schema, "extra_text_policy", "") or "")
+    ).lower()
+    if payload_policy in {"none", "image_only"} or extra_text_policy == "discard":
+        return False
     normalized = normalize_message_text(message_text)
     if not normalized:
         return False

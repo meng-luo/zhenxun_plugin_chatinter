@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
-from collections.abc import Iterable
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
@@ -16,6 +16,7 @@ from .models.pydantic_models import (
     PluginCommandSchema,
 )
 from .route_text import normalize_message_text
+from .task_frame import TASK_TEXT_FIELD
 
 _TOOL_NAME_PREFIX = "ci_cmd_"
 _TOOL_NAME_DIGEST_SIZE = 5
@@ -186,6 +187,10 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
         "Call policy: 只有用户明确要执行该功能、查询该功能用法，或自然语言需求"
         "明显对应该命令时才调用。普通闲聊、讨论命令概念、候选不匹配时不要调用。"
     )
+    parts.append(
+        "Multi-task policy: 如果用户一句话里有多个任务，调用本工具时 task_text "
+        "只能包含本命令负责的子任务，不要带上前后其他命令。"
+    )
     return "\n".join(part for part in parts if normalize_message_text(part))
 
 
@@ -194,8 +199,16 @@ def _build_parameters(
     *,
     snapshot: CommandToolSnapshot | None,
 ) -> dict[str, Any]:
-    properties: dict[str, dict[str, Any]] = {}
-    required: list[str] = []
+    properties: dict[str, dict[str, Any]] = {
+        TASK_TEXT_FIELD: {
+            "type": ["string", "null"],
+            "description": (
+                "当前工具调用对应的用户子任务原文。多任务消息必须只填写本工具"
+                "负责的片段，例如“看一下我的信息”，不要包含其他任务。"
+            ),
+        }
+    }
+    required: list[str] = [TASK_TEXT_FIELD]
     seen: set[str] = set()
     for slot in schema.slots:
         name = normalize_message_text(slot.name)

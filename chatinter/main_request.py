@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import isawaitable
 import json
+import re
 import time
 from typing import Any, cast
 
@@ -45,6 +46,9 @@ _MAIN_REQUEST_RULES = """
 候选工具是真实插件命令；调用工具会执行插件。
 每个工具已暴露完整 schema；只根据工具 description 和参数 schema
 选择工具并填写参数，不要猜 schema 外参数。
+每次工具调用必须填写 task_text：它是该工具负责的用户子任务原文。
+如果一句话里有多个任务，请把每个工具调用的 task_text 拆成互不重叠的短片段；
+不要把“然后/再/最后/顺便”等后续任务塞进前一个工具。
 用户明确要执行插件能力、查询插件用法，或自然语言需求明显对应插件时才调用工具。
 普通闲聊、玩梗、讨论命令概念、候选工具不匹配、目标不清时，不要调用工具，直接自然回复或简短说明需要的信息。
 如果决定调用工具，本轮不会再进行第二次模型请求；请一次性选准工具并填好参数。
@@ -275,9 +279,14 @@ async def _run_main_request(
     report.tool_choice_count += len(tool_calls)
     tool_results: list[ToolResult] = []
     for tool_call in tool_calls:
-        timeline.append(_tool_call_timeline_item(tool_call))
-        resolved_call, tool_result = await invoker.execute_tool_call(
+        isolated_tool_call = _isolate_tool_call_task_text(
             tool_call,
+            tool_map=tool_map,
+            full_message=message_text,
+        )
+        timeline.append(_tool_call_timeline_item(isolated_tool_call))
+        resolved_call, tool_result = await invoker.execute_tool_call(
+            isolated_tool_call,
             tool_map,
             run_context,
         )
@@ -461,6 +470,59 @@ def _tool_call_timeline_item(tool_call) -> MainRequestTimelineItem:
         tool_name=str(tool_call.function.name or ""),
         metadata={"arguments": _parse_tool_arguments(tool_call.function.arguments)},
     )
+
+
+def _isolate_tool_call_task_text(
+    tool_call,
+    *,
+    tool_map: dict[str, ToolExecutable],
+    full_message: str,
+):
+    from .task_frame import TASK_TEXT_FIELD, isolate_task_text
+
+    tool_name = str(getattr(tool_call.function, "name", "") or "")
+    executable = tool_map.get(tool_name)
+    binding = getattr(executable, "binding", None)
+    candidate = getattr(binding, "candidate", None)
+    schema = getattr(candidate, "schema", None)
+    if schema is None:
+        return tool_call
+
+    arguments = _parse_tool_arguments(str(tool_call.function.arguments or ""))
+    if not isinstance(arguments, dict):
+        return tool_call
+
+    raw_task = arguments.get(TASK_TEXT_FIELD)
+    if isinstance(raw_task, str) and raw_task.strip():
+        task_text = isolate_task_text(raw_task)
+    elif not schema.slots:
+        task_text = isolate_task_text(
+            _select_task_fragment_for_command(full_message, schema.head)
+            or full_message,
+            command_text=schema.head,
+        )
+    else:
+        task_text = ""
+
+    arguments[TASK_TEXT_FIELD] = task_text or None
+    tool_call.function.arguments = json.dumps(arguments, ensure_ascii=False)
+    return tool_call
+
+
+def _select_task_fragment_for_command(message_text: str, command_head: str) -> str:
+    from .task_frame import isolate_task_text
+
+    command = normalize_message_text(command_head)
+    if not command:
+        return ""
+    splitter = re.compile(
+        r"(?:，|,|。|；|;|\s)+(?:然后|接着|再|最后|顺便|并且|以及|还有|同时)\s*"
+    )
+    for part in splitter.split(normalize_message_text(message_text)):
+        fragment = isolate_task_text(part)
+        if command and command in fragment:
+            return fragment
+    return ""
 
 
 def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:

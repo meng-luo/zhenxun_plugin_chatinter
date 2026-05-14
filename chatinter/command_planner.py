@@ -188,6 +188,7 @@ def plan_command(
     arguments_text: str = "",
     references: list[PluginReference] | None = None,
     current_message: str = "",
+    ambient_message: str = "",
     has_reply: bool = False,
     image_count: int = 0,
     confidence: float = 0.0,
@@ -221,6 +222,7 @@ def plan_command(
             final_command or command or "",
             current_message,
         )
+    ambient_context = normalize_message_text(ambient_message or current_message)
     schema = None
     if reference is not None:
         selection = select_command_schema(
@@ -275,7 +277,7 @@ def plan_command(
     missing_items = [*list(missing or []), *schema_missing]
     if reference is not None:
         requires = (schema.requires if schema is not None else reference.requires) or {}
-        context_text = f"{current_message} {final_command}"
+        context_text = f"{ambient_context} {current_message} {final_command}"
         image_satisfied = _has_image_context(context_text, image_count) or (
             requires.get("at") and _has_at_context(context_text)
         )

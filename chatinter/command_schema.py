@@ -739,7 +739,7 @@ def _fill_slots_from_payload(
     payload_tokens = [token for token in argument_payload.split(" ") if token]
     token_index = 0
     for slot in schema.slots:
-        if slot.name in merged or slot.type == "text":
+        if slot.name in merged or slot.type in {"text", "at", "image"}:
             continue
         if token_index >= len(payload_tokens):
             break
@@ -777,6 +777,16 @@ def _fill_link_slots_from_message(
         return
 
 
+def _schema_allows_tail_payload(schema: PluginCommandSchema) -> bool:
+    policy = normalize_message_text(str(schema.payload_policy or "")).lower()
+    extra_policy = normalize_message_text(str(schema.extra_text_policy or "")).lower()
+    if policy in {"none", "image_only"} or extra_policy == "discard":
+        return False
+    if (schema.requires or {}).get("text"):
+        return True
+    return any(slot.type not in {"at", "image"} for slot in schema.slots)
+
+
 def complete_slots(
     schema: PluginCommandSchema,
     *,
@@ -799,9 +809,10 @@ def complete_slots(
     merged.update(
         inferred,
     )
-    _fill_link_slots_from_message(merged, schema, message_text)
+    if _schema_allows_tail_payload(schema):
+        _fill_link_slots_from_message(merged, schema, message_text)
     argument_payload = normalize_message_text(arguments_text)
-    if not argument_payload:
+    if not argument_payload and _schema_allows_tail_payload(schema):
         argument_payload = _extract_command_tail_payload(schema, message_text)
     if argument_payload:
         _fill_slots_from_payload(merged, schema, argument_payload)

@@ -19,7 +19,8 @@ from .native_route import (
     NativeSlotValue,
     candidate_selection_to_native_route,
 )
-from .route_text import normalize_message_text
+from .route_text import collect_placeholders, normalize_message_text
+from .task_frame import TaskFrame, pop_task_text
 
 _NATIVE_EXECUTION_STAGE = "main_request"
 
@@ -29,6 +30,7 @@ class NativeValidatedRoute:
     decision: NativeRouteDecision
     route_result: NativeRouteResult | None
     reason: str
+    task_frame: TaskFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class NativeCommandExecutionContext:
     route_executor: ExecuteNativeRoute
     message_text: str
     executions: list[NativeToolExecutionResult] = field(default_factory=list)
+    task_count: int = 0
 
     async def execute_tool(
         self,
@@ -90,7 +93,28 @@ class NativeCommandExecutionContext:
         raw_slots: dict[str, Any],
     ) -> NativeValidatedRoute | None:
         candidate = binding.candidate
-        slots = normalize_native_tool_slots(candidate.schema.slots, raw_slots)
+        task_text, plugin_raw_slots = pop_task_text(raw_slots)
+        slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
+        self.task_count += 1
+        fallback_text = normalize_message_text(candidate.schema.head)
+        if not task_text and not candidate.schema.slots:
+            task_text = fallback_text
+        effective_fallback_text = (
+            fallback_text or normalize_message_text(candidate.schema.head)
+        )
+        task_frame = TaskFrame(
+            task_index=self.task_count,
+            command_id=binding.command_id,
+            plugin_module=candidate.plugin_module,
+            task_text=task_text,
+            fallback_text=effective_fallback_text,
+            slots=dict(slots),
+            ambient_message=self.message_text,
+        )
+        route_message_text = _merge_ambient_context_tokens(
+            task_frame.effective_text,
+            self.message_text,
+        )
         selection = NativeCommandSelection(
             action="execute",
             command_id=binding.command_id,
@@ -105,7 +129,7 @@ class NativeCommandExecutionContext:
         route = candidate_selection_to_native_route(
             selection=selection,
             candidates=self.candidates,
-            message_text=self.message_text,
+            message_text=route_message_text,
             stage=_NATIVE_EXECUTION_STAGE,
             has_reply=self.has_reply,
         )
@@ -116,6 +140,7 @@ class NativeCommandExecutionContext:
             decision=decision,
             route_result=route_result,
             reason=selection.reason,
+            task_frame=task_frame,
         )
 
     def _finalize_report(
@@ -157,6 +182,20 @@ def normalize_native_tool_slots(
             continue
         normalized_slots[slot.name] = coerced
     return normalized_slots
+
+
+def _merge_ambient_context_tokens(task_text: str, ambient_text: str) -> str:
+    """Expose media/@ context to validators without leaking other task text."""
+
+    text = normalize_message_text(task_text)
+    placeholders = [
+        token
+        for token in collect_placeholders(ambient_text)
+        if token not in collect_placeholders(text)
+    ]
+    if not placeholders:
+        return text
+    return normalize_message_text(f"{text} {' '.join(placeholders)}")
 
 
 def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:

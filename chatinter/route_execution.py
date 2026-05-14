@@ -837,6 +837,14 @@ def _clamp_command_text_tokens(command: str, text_max_raw) -> str:
 
 
 def _schema_accepts_text_payload(schema) -> bool:
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    ).lower()
+    extra_text_policy = normalize_message_text(
+        str(getattr(schema, "extra_text_policy", "") or "")
+    ).lower()
+    if payload_policy in {"none", "image_only"} or extra_text_policy == "discard":
+        return False
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
     if text_min > 0:
         return True
@@ -854,8 +862,11 @@ def _prepare_route_execution_plan(
     route_result: NativeRouteResult,
     knowledge_plugins,
     current_message: str,
+    ambient_message: str = "",
     user_id: str,
 ) -> RouteExecutionPlan:
+    task_message = normalize_message_text(current_message or "")
+    ambient_message = normalize_message_text(ambient_message or task_message)
     command = normalize_message_text(route_result.decision.command or "")
     if not command:
         return RouteExecutionPlan(command="")
@@ -869,10 +880,18 @@ def _prepare_route_execution_plan(
             return RouteExecutionPlan(command=command)
         if not _is_image_related_route(route_result):
             return RouteExecutionPlan(command=command)
-        merged_at = _extract_at_tokens(current_message)
-        if not merged_at and _contains_self_reference(current_message):
+        merged_at = _extract_at_tokens(task_message) or _extract_at_tokens(
+            ambient_message
+        )
+        if (
+            not merged_at
+            and _contains_self_reference(task_message or ambient_message)
+        ):
             merged_at.append(f"[@{user_id}]")
-        merged_images = _extract_image_tokens(current_message)
+        merged_images = _extract_image_tokens(task_message)
+        for token in _extract_image_tokens(ambient_message):
+            if token not in merged_images:
+                merged_images.append(token)
         merged_tokens = [*merged_at, *merged_images]
         if merged_tokens:
             command = _append_unique_tokens(command, merged_tokens)
@@ -890,7 +909,7 @@ def _prepare_route_execution_plan(
 
     existing_payload_tokens = set(_extract_command_payload_tokens(command))
     payload_tokens: list[str] = []
-    explicit_value = normalize_message_text(_extract_explicit_value(current_message))
+    explicit_value = normalize_message_text(_extract_explicit_value(task_message))
     accepts_text_payload = _schema_accepts_text_payload(schema)
     if explicit_value and accepts_text_payload:
         payload_tokens.extend(
@@ -900,7 +919,7 @@ def _prepare_route_execution_plan(
             and token not in payload_tokens
             and token not in existing_payload_tokens
         )
-    schema_tokens = _extract_schema_argument_tokens(current_message, cast(Any, schema))
+    schema_tokens = _extract_schema_argument_tokens(task_message, cast(Any, schema))
     for token in schema_tokens:
         if (
             token
@@ -912,7 +931,7 @@ def _prepare_route_execution_plan(
         parsed_payload = ""
         try:
             parsed = parse_command_with_head(
-                current_message,
+                task_message,
                 schema_head or command_head,
                 allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
                 max_prefix_len=16,
@@ -952,12 +971,18 @@ def _prepare_route_execution_plan(
         if disallowed_at:
             command = _remove_tokens_from_command(command, disallowed_at)
     command_images = _extract_image_tokens(command)
-    message_images = _extract_image_tokens(current_message)
+    message_images = _extract_image_tokens(task_message)
+    for token in _extract_image_tokens(ambient_message):
+        if token not in message_images:
+            message_images.append(token)
 
     merged_at: list[str] = []
     if allow_at:
         merged_at = command_at[:]
-        for token in _extract_at_tokens(current_message):
+        context_at_tokens = _extract_at_tokens(task_message)
+        if not context_at_tokens:
+            context_at_tokens = _extract_at_tokens(ambient_message)
+        for token in context_at_tokens:
             if token not in merged_at:
                 merged_at.append(token)
         if target_requirement == "none" and merged_at:
@@ -972,13 +997,13 @@ def _prepare_route_execution_plan(
         image_min > 0
         and allow_at
         and not merged_at
-        and _contains_self_reference(current_message)
+        and _contains_self_reference(task_message or ambient_message)
     ):
         self_at = f"[@{user_id}]"
         merged_at.append(self_at)
 
     if target_requirement == "required" and not (merged_at or merged_images):
-        if allow_at and _contains_self_reference(current_message):
+        if allow_at and _contains_self_reference(task_message or ambient_message):
             merged_at.append(f"[@{user_id}]")
         else:
             return RouteExecutionPlan(
@@ -1026,6 +1051,7 @@ def _plan_route_command(
     route_result: NativeRouteResult,
     knowledge_plugins,
     current_message: str,
+    ambient_message: str = "",
     has_reply: bool,
     image_count: int,
 ) -> CommandPlanDecision:
@@ -1044,6 +1070,7 @@ def _plan_route_command(
         slots=route_result.slots,
         references=references,
         current_message=current_message,
+        ambient_message=ambient_message,
         has_reply=has_reply,
         image_count=image_count,
         reason=f"route_stage:{route_result.stage}",
