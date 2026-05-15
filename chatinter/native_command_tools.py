@@ -10,6 +10,7 @@ from typing import Any
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
 from .command_index import CommandCandidate
+from .command_observation import build_command_observation
 from .models.pydantic_models import (
     CommandSlotSpec,
     CommandToolSnapshot,
@@ -53,26 +54,28 @@ class NativeCommandTool:
         executor = _resolve_native_executor(context)
         if executor is None:
             return ToolResult(
-                output={
-                    "ok": False,
-                    "status": "failed",
-                    "error_type": "ExecutionContextMissing",
-                    "message": "Native command execution context is missing.",
-                    "is_retryable": False,
-                },
+                output=build_command_observation(
+                    ok=False,
+                    command_id=self.binding.command_id,
+                    rendered_command=self.binding.candidate.schema.head,
+                    matched_plugin=self.binding.candidate.plugin_name,
+                    error="Native command execution context is missing.",
+                    plugin_module=self.binding.candidate.plugin_module,
+                ),
                 display_content=f"{self.binding.command_id} 缺少执行上下文",
             )
         try:
             return await executor.execute_tool(binding=self.binding, raw_slots=kwargs)
         except Exception as exc:
             return ToolResult(
-                output={
-                    "ok": False,
-                    "status": "failed",
-                    "error_type": "ExecutionError",
-                    "message": str(exc),
-                    "is_retryable": False,
-                },
+                output=build_command_observation(
+                    ok=False,
+                    command_id=self.binding.command_id,
+                    rendered_command=self.binding.candidate.schema.head,
+                    matched_plugin=self.binding.candidate.plugin_name,
+                    error=str(exc),
+                    plugin_module=self.binding.candidate.plugin_module,
+                ),
                 display_content=f"{self.binding.command_id} 执行失败",
             )
 

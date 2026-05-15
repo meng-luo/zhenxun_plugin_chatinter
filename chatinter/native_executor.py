@@ -9,6 +9,7 @@ from typing import Any
 from zhenxun.services.llm.types.models import ToolResult
 
 from .command_index import CommandCandidate
+from .command_observation import build_command_observation
 from .models.pydantic_models import CommandSlotSpec
 from .native_command_tools import NativeCommandToolBinding
 from .native_route import (
@@ -68,13 +69,17 @@ class NativeCommandExecutionContext:
         validated = self._validate_tool_call(binding=binding, raw_slots=raw_slots)
         if validated is None:
             return ToolResult(
-                output={
-                    "ok": False,
-                    "status": "failed",
-                    "error_type": "InvalidToolCall",
-                    "message": "工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
-                    "is_retryable": True,
-                },
+                output=build_command_observation(
+                    ok=False,
+                    command_id=binding.command_id,
+                    rendered_command=binding.candidate.schema.head,
+                    matched_plugin=binding.candidate.plugin_name,
+                    task_text="",
+                    ambient_message=self.message_text,
+                    error="工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
+                    retryable=True,
+                    plugin_module=binding.candidate.plugin_module,
+                ),
                 display_content="工具调用校验失败",
             )
 
@@ -99,8 +104,8 @@ class NativeCommandExecutionContext:
         fallback_text = normalize_message_text(candidate.schema.head)
         if not task_text and not candidate.schema.slots:
             task_text = fallback_text
-        effective_fallback_text = (
-            fallback_text or normalize_message_text(candidate.schema.head)
+        effective_fallback_text = fallback_text or normalize_message_text(
+            candidate.schema.head
         )
         task_frame = TaskFrame(
             task_index=self.task_count,

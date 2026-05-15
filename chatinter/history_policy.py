@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import json
-from typing import Iterable
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
@@ -108,12 +108,9 @@ async def _build_turn_managed_dialog_messages(
     used_tokens = 0
     min_recent_turns = min(_MIN_RECENT_TURNS, limit)
     for turn in reversed(turns):
-        should_keep = (
-            len(kept_reversed) < min_recent_turns
-            or (
-                len(kept_reversed) < limit
-                and used_tokens + turn.token_cost <= _TURN_HISTORY_TOKEN_BUDGET
-            )
+        should_keep = len(kept_reversed) < min_recent_turns or (
+            len(kept_reversed) < limit
+            and used_tokens + turn.token_cost <= _TURN_HISTORY_TOKEN_BUDGET
         )
         if should_keep:
             kept_reversed.append(turn)
@@ -123,11 +120,9 @@ async def _build_turn_managed_dialog_messages(
 
     kept = list(reversed(kept_reversed))
     messages: list[LLMMessage] = []
-    summary_lines = [
-        turn.summary
-        for turn in reversed(omitted)
-        if turn.summary
-    ][-_SUMMARY_MAX_LINES:]
+    summary_lines = [turn.summary for turn in reversed(omitted) if turn.summary][
+        -_SUMMARY_MAX_LINES:
+    ]
     if summary_lines:
         messages.append(_compressed_summary_message(summary_lines))
     for turn in kept:
@@ -230,8 +225,7 @@ async def _timeline_to_summary_line(
             continue
         if kind == "tool_result" and not tool_result_text:
             tool_result_text = _clean_history_text(
-                _timeline_content(item)
-                or _timeline_metadata_text(item, "output"),
+                _timeline_content(item) or _timeline_metadata_text(item, "output"),
                 _SUMMARY_RESULT_CLIP,
             )
 
@@ -376,10 +370,12 @@ def _timeline_content(item: dict) -> str:
     if isinstance(metadata, dict):
         output = metadata.get("output")
         if isinstance(output, dict):
-            outputs = output.get("outputs")
-            if isinstance(outputs, list):
-                return "\n".join(str(value or "") for value in outputs if value)
-            return str(output.get("message", "") or "")
+            messages_sent = output.get("messages_sent")
+            if isinstance(messages_sent, list):
+                return "\n".join(str(value or "") for value in messages_sent if value)
+            return str(
+                output.get("remaining_task_hint", "") or output.get("error", "") or ""
+            )
     return ""
 
 

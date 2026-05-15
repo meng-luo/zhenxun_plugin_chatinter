@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 import uuid
 
 from nonebot.adapters import Bot, Event
@@ -27,6 +27,7 @@ from .chat_handler import (
     replace_mention_ids_with_names,
     reroute_to_plugin_with_result,
 )
+from .command_observation import build_command_observation
 from .config import get_config_value, get_model_name
 from .context_packer import DialogueContextPack
 from .event_context import ChatInterEventContext, build_event_context
@@ -49,15 +50,15 @@ from .execution_observer import (
     record_execution_observation,
     start_execution_observation,
 )
-from .feedback import FeedbackStore
-from .feedback_keys import (
-    FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
-)
+from .feedback import FeedbackKind, FeedbackStore
 from .feedback_keys import (
     FEEDBACK_REASON_REROUTE_FAILED as _FEEDBACK_REASON_REROUTE_FAILED,
 )
 from .feedback_keys import (
     FEEDBACK_REASON_ROUTE_SUCCESS as _FEEDBACK_REASON_ROUTE_SUCCESS,
+)
+from .feedback_keys import (
+    FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
 )
 from .intent_classifier import classify_message_intent
 from .intervention_router import InterventionDecision, decide_intervention
@@ -82,9 +83,6 @@ from .plugin_registry import (
     get_user_plugin_knowledge,
 )
 from .route_execution import (
-    RouteExecutionPlan,
-    apply_command_plan_to_route_result,
-    build_planner_followup_message,
     build_reply_image_segments_for_reroute,
     build_route_message_with_explicit_context,
     build_target_modules,
@@ -92,8 +90,6 @@ from .route_execution import (
     extract_at_tokens,
     extract_image_tokens,
     extract_reply_sender_id,
-    plan_route_command,
-    planner_missing_contains,
     prepare_route_execution_plan,
     select_adapter_policy_for_message,
 )
@@ -108,11 +104,11 @@ from .target_context import (
     append_mention_context_xml,
     build_mention_name_map,
     build_mention_profiles,
-    enrich_route_message_with_fuzzy_target,
     extract_pending_entities,
     needs_target_for_route,
     remember_target_resolution,
 )
+from .target_resolver import resolve_execution_target, resolve_pre_route_target
 from .thread_resolver import ThreadContext, resolve_thread_context
 from .thread_store import record_thread_message
 from .trace import StageTrace
@@ -197,8 +193,6 @@ _GROUP_ACTIVE_RANK_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
 _NICKNAME_RESOLUTION_MEMORY_MAX = 2048
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
-
-
 
 
 async def _persist_message_timeline(
@@ -348,8 +342,6 @@ async def _build_dialogue_context_pack(
     return pack, speaker_profile, addressee, thread, intervention
 
 
-
-
 def _finish_trace(
     *,
     trace: StageTrace,
@@ -418,8 +410,6 @@ def _append_route_notice(context_xml: str, notice: str) -> str:
     return f"{context_xml}\n{section}".strip()
 
 
-
-
 async def _execute_native_tool_route(
     *,
     bot: Bot,
@@ -429,23 +419,31 @@ async def _execute_native_tool_route(
     knowledge_plugins,
     current_message: str,
     user_id: str,
+    group_id: str | None,
     session_id: str | None,
     has_reply: bool,
     extra_image_segments: list | None,
     route_report: NativeRouteReport,
+    mention_profiles: dict[str, dict[str, str]] | None = None,
 ) -> NativeToolExecutionResult:
     route_result = validated.route_result
     if route_result is None:
         return NativeToolExecutionResult(
             success=False,
             route_result=None,
-            output={
-                "ok": False,
-                "status": "failed",
-                "error_type": "InvalidRoute",
-                "message": "工具调用没有生成有效插件路由。",
-                "is_retryable": True,
-            },
+            output=build_command_observation(
+                ok=False,
+                command_id=validated.decision.command_id,
+                rendered_command=validated.decision.command,
+                matched_plugin=validated.decision.plugin_name,
+                task_text=validated.task_frame.effective_text
+                if validated.task_frame is not None
+                else current_message,
+                ambient_message=current_message,
+                error="工具调用没有生成有效插件路由。",
+                retryable=True,
+                plugin_module=validated.decision.plugin_module or "",
+            ),
             reason="invalid route",
         )
 
@@ -455,22 +453,36 @@ async def _execute_native_tool_route(
         if task_frame is not None and task_frame.effective_text
         else current_message
     )
-    task_image_tokens = extract_image_tokens(task_message)
-    planned_image_count = len(task_image_tokens)
-    if task_message != current_message:
-        for token in extract_image_tokens(current_message):
-            planned_image_count += 0 if token in task_image_tokens else 1
-    if extra_image_segments:
-        planned_image_count += len(extra_image_segments)
-    command_plan = plan_route_command(
+    target_resolution = await resolve_execution_target(
+        group_id=group_id,
         route_result=route_result,
         knowledge_plugins=knowledge_plugins,
-        current_message=task_message,
+        task_message=task_message,
         ambient_message=current_message,
-        has_reply=has_reply,
-        image_count=planned_image_count,
+        mention_profiles=mention_profiles,
     )
-    route_result = apply_command_plan_to_route_result(route_result, command_plan)
+    if target_resolution.blocked:
+        return NativeToolExecutionResult(
+            success=False,
+            route_result=route_result,
+            route_command=route_result.decision.command,
+            output=build_command_observation(
+                ok=False,
+                command_id=route_result.command_id,
+                rendered_command=route_result.decision.command,
+                matched_plugin=route_result.decision.plugin_name,
+                task_text=task_message,
+                ambient_message=current_message,
+                error=target_resolution.prompt,
+                missing=["target"],
+                retryable=True,
+                plugin_module=route_result.decision.plugin_module,
+            ),
+            display_text=target_resolution.prompt,
+            reason=_FEEDBACK_REASON_TARGET_REQUIRED,
+        )
+    if target_resolution.resolved:
+        task_message = target_resolution.message_text
     decision = route_result.decision
     target_modules = build_target_modules(route_result, knowledge_plugins)
     execution_plan = prepare_route_execution_plan(
@@ -480,35 +492,23 @@ async def _execute_native_tool_route(
         ambient_message=current_message,
         user_id=user_id,
     )
-    if not execution_plan.need_followup and command_plan.action == "clarify":
-        execution_plan = RouteExecutionPlan(
-            command=command_plan.final_command or decision.command,
-            need_followup=True,
-            followup_message=build_planner_followup_message(command_plan.missing),
-            feedback_reason=_FEEDBACK_REASON_MISSING_PARAMS,
-            image_missing=1
-            if planner_missing_contains(command_plan.missing, {"image", "图片"})
-            else 0,
-            text_missing=1
-            if planner_missing_contains(
-                command_plan.missing,
-                {"text", "文本", "文字", "参数", "内容"},
-            )
-            else 0,
-        )
     if execution_plan.need_followup:
         return NativeToolExecutionResult(
             success=False,
             route_result=route_result,
             route_command=execution_plan.command or decision.command,
-            output={
-                "ok": False,
-                "status": "failed",
-                "error_type": "MissingContext",
-                "message": execution_plan.followup_message or "缺少必要参数或上下文。",
-                "missing": list(route_result.missing),
-                "is_retryable": True,
-            },
+            output=build_command_observation(
+                ok=False,
+                command_id=route_result.command_id,
+                rendered_command=execution_plan.command or decision.command,
+                matched_plugin=decision.plugin_name,
+                task_text=task_message,
+                ambient_message=current_message,
+                error=execution_plan.followup_message or "缺少必要参数或上下文。",
+                missing=list(route_result.missing),
+                retryable=True,
+                plugin_module=decision.plugin_module,
+            ),
             display_text=execution_plan.followup_message or "",
             reason=execution_plan.feedback_reason or "",
         )
@@ -562,19 +562,19 @@ async def _execute_native_tool_route(
     )
 
     output_texts = [item.text for item in reroute_result.outputs if item.text]
-    payload = {
-        "ok": reroute_result.success,
-        "status": "success" if reroute_result.success else "failed",
-        "plugin": decision.plugin_name,
-        "plugin_module": decision.plugin_module,
-        "command": route_command,
-        "command_id": route_result.command_id,
-        "trace_id": reroute_result.trace_id,
-        "observed_output": bool(output_texts),
-        "outputs": output_texts[:6],
-        "message": reroute_result.error,
-        "is_retryable": bool(reroute_result.timed_out or reroute_result.error),
-    }
+    payload = build_command_observation(
+        ok=reroute_result.success,
+        command_id=route_result.command_id,
+        rendered_command=route_command,
+        matched_plugin=decision.plugin_name,
+        messages_sent=output_texts,
+        task_text=task_message,
+        ambient_message=current_message,
+        trace_id=reroute_result.trace_id,
+        error=reroute_result.error or "",
+        retryable=bool(reroute_result.timed_out or reroute_result.error),
+        plugin_module=decision.plugin_module,
+    )
     display_text = (
         "插件已执行，已观测到发送输出。"
         if reroute_result.success and output_texts
@@ -770,11 +770,7 @@ async def _stage_prepare_route_context(
         reply_sender_id=reply_sender_id,
         target_policy=pre_route_target_policy,
     )
-    (
-        route_message,
-        mention_profiles,
-        fuzzy_prompt,
-    ) = await enrich_route_message_with_fuzzy_target(
+    target_resolution = await resolve_pre_route_target(
         group_id=frame.group_id,
         original_message=frame.current_message,
         route_message=route_message_base,
@@ -782,6 +778,10 @@ async def _stage_prepare_route_context(
         target_policy=pre_route_target_policy,
         command_heads=command_heads,
     )
+    route_message = target_resolution.message_text
+    mention_profiles = target_resolution.mention_profiles
+    fuzzy_prompt = target_resolution.prompt
+    frame.set_tag("target_resolution", target_resolution.status)
     frame.route_message = route_message
     frame.mention_profiles = mention_profiles
     frame.mention_name_map = build_mention_name_map(mention_profiles)
@@ -1033,10 +1033,12 @@ async def _stage_run_main_request(
             knowledge_plugins=knowledge_base.plugins,
             current_message=frame.route_message or frame.current_message,
             user_id=frame.user_id,
+            group_id=frame.group_id,
             session_id=frame.session_key,
             has_reply=frame.has_reply,
             extra_image_segments=frame.reply_image_segments_for_reroute,
             route_report=report,
+            mention_profiles=frame.mention_profiles,
         )
 
     async def _route_completed_callback(main_result) -> None:
@@ -1161,7 +1163,7 @@ async def _stage_run_main_request(
     if main_result.output.record_chat_feedback:
         FeedbackStore.record_chat(
             session_id=frame.session_key,
-            kind=main_result.output.feedback_kind,
+            kind=cast(FeedbackKind, main_result.output.feedback_kind),
             message_text=frame.current_message,
             reply_text=envelope.final,
             weight=0.2,

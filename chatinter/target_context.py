@@ -17,7 +17,12 @@ from .route_execution import (
     extract_image_tokens,
     has_adapter_context_hint,
 )
-from .route_text import contains_any, normalize_message_text, parse_command_with_head
+from .route_text import (
+    contains_any,
+    normalize_message_text,
+    parse_command_with_head,
+    strip_invoke_prefix,
+)
 
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@([^\]\s]+)\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[\u7684\uff0c,\u3002.!！？?]))"
@@ -88,6 +93,17 @@ _IDENTITY_PENDING_PATTERNS = (
 _NON_SELF_TARGET_PATTERN = re.compile(
     r"(?:\u7ed9|\u5e2e|\u66ff|\u8ba9|\u53eb|\u558a|\u8bf7)"
     r"(?!\u6211|\u81ea\u5df1|\u672c\u4eba)"
+)
+_TARGET_HINT_LEADING_NOISE_PATTERN = re.compile(
+    r"^(?:"
+    r"给|帮|替|让|叫|喊|请|把|将|用|拿|"
+    r"做个|做一个|做一张|做|制作一个|制作一张|制作|"
+    r"整一个|整一张|整|弄一个|弄一张|弄|来个|来一个|来一张|来"
+    r")+"
+)
+_TARGET_HINT_TRAILING_NOISE_PATTERN = re.compile(
+    r"(?:的)?(?:表情包?|梗图|头像|图片|照片|图|"
+    r"一下|一把|一个|一张|个|张)+$"
 )
 _GROUP_MEMBER_PROFILE_CACHE_TTL = 90.0
 _GROUP_MEMBER_PROFILE_CACHE_MAX = 256
@@ -189,6 +205,31 @@ def _build_alias_keys(*names: str) -> tuple[str, ...]:
     return tuple(sorted(keys, key=len, reverse=True))
 
 
+def _clean_fuzzy_target_hint(candidate: str) -> str:
+    text = normalize_message_text(candidate)
+    if not text:
+        return ""
+    previous = ""
+    while text and text != previous:
+        previous = text
+        text = normalize_message_text(strip_invoke_prefix(text))
+        text = normalize_message_text(_TARGET_HINT_LEADING_NOISE_PATTERN.sub("", text))
+        text = normalize_message_text(_TARGET_HINT_TRAILING_NOISE_PATTERN.sub("", text))
+        text = text.strip(" 的：:,，。.!！？?")
+    if not text:
+        return ""
+    if text in _SELF_REF_HINTS:
+        return ""
+    normalized = _normalize_alias_key(text)
+    if normalized in {"", "wo", "ziji"}:
+        return ""
+    if len(normalized) < 2 or len(normalized) > 16:
+        return ""
+    if _is_technical_request_like(text):
+        return ""
+    return text
+
+
 def _extract_fuzzy_target_hint(
     message_text: str,
     command_heads: set[str] | None = None,
@@ -198,7 +239,9 @@ def _extract_fuzzy_target_hint(
         return ""
     match = _FUZZY_TARGET_HINT_PATTERN.search(normalized)
     if match:
-        return normalize_message_text(match.group("name") or "")
+        candidate = _clean_fuzzy_target_hint(match.group("name") or "")
+        if candidate:
+            return candidate
 
     if command_heads:
         for head in sorted(command_heads, key=len, reverse=True):
@@ -212,35 +255,25 @@ def _extract_fuzzy_target_hint(
             )
             if parsed is None:
                 continue
+            for raw_part in (parsed.prefix_text, parsed.payload_text):
+                candidate = _clean_fuzzy_target_hint(raw_part)
+                if candidate:
+                    return candidate
             tail = normalize_message_text(parsed.payload_text or parsed.prefix_text)
             tail = re.sub(r"^(?:给|帮|替|让|叫|喊|请|把|将)+", "", tail).strip()
             tail = re.sub(r"(?:做|整|弄|来|发|签|点|查|看|问|生成|制作).*$", "", tail)
             tail = tail.strip(" 的：:,，。.!！？?")
             if not tail:
                 continue
-            candidate = normalize_message_text(tail.split(" ", 1)[0])
-            if _normalize_alias_key(candidate) in {"", "wo", "ziji"}:
-                continue
-            if candidate in _SELF_REF_HINTS:
-                continue
-            normalized_candidate = _normalize_alias_key(candidate)
-            if len(normalized_candidate) > 16:
-                continue
-            if _is_technical_request_like(candidate):
-                continue
-            if len(normalized_candidate) >= 2:
+            candidate = _clean_fuzzy_target_hint(tail.split(" ", 1)[0])
+            if candidate:
                 return candidate
 
     if contains_any(normalized, _TARGET_REQUIRED_ACTION_HINTS):
         suffix_match = _FUZZY_TARGET_SUFFIX_PATTERN.search(normalized)
         if suffix_match:
-            candidate = normalize_message_text(suffix_match.group("name") or "")
-            normalized_candidate = _normalize_alias_key(candidate)
-            if len(normalized_candidate) > 16:
-                return ""
-            if _is_technical_request_like(candidate):
-                return ""
-            if len(normalized_candidate) >= 2:
+            candidate = _clean_fuzzy_target_hint(suffix_match.group("name") or "")
+            if candidate:
                 return candidate
     return ""
 
@@ -553,6 +586,12 @@ def _resolve_fuzzy_trigger_strength(
         target_policy=policy,
     ):
         return "strong"
+    if command_heads and has_adapter_context_hint(normalized_original, policy):
+        # Command-aware media/action requests often omit explicit "帮/给" words,
+        # e.g. "做个番茄的敲表情".  Treat a clean nickname hint plus a known
+        # target-capable command head as enough signal to try nickname lookup.
+        if _extract_fuzzy_target_hint(normalized_route, command_heads):
+            return "weak"
     if command_heads:
         for head in sorted(command_heads, key=len, reverse=True):
             if head and parse_command_with_head(

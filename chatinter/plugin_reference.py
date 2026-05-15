@@ -83,7 +83,10 @@ def _infer_task_verbs(
 def _input_requirements(schema: PluginCommandSchema) -> list[str]:
     requirements: list[str] = []
     requires = schema.requires or {}
-    if requires.get("text") or schema.payload_policy in {"text", "slots", "free_tail"}:
+    has_text_slot = any(slot.type == "text" for slot in schema.slots)
+    if requires.get("text") or schema.payload_policy in {"text", "free_tail"}:
+        _append_unique(requirements, "文本")
+    elif schema.payload_policy == "slots" and has_text_slot:
         _append_unique(requirements, "文本")
     if requires.get("image") or schema.payload_policy in {
         "image_only",

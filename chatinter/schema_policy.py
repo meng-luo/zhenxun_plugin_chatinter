@@ -66,7 +66,14 @@ def resolve_command_target_policy(
         target_requirement = "none"
     allow_at_raw = getattr(schema, "allow_at", None)
     allow_at = allow_at_raw is True or (
-        allow_at_raw is not False and _AT_SOURCE in target_sources
+        allow_at_raw is not False
+        and (
+            _AT_SOURCE in target_sources
+            or (
+                adapter.allow_at_as_target
+                and (adapter.media_related or target_requirement != "none")
+            )
+        )
     )
     if actor_scope == _SELF_ONLY_SCOPE:
         allow_at = False

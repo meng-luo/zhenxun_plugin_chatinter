@@ -173,19 +173,10 @@ def _command_id(module: str, head: str) -> str:
 
 def _requires_from_capability(command: CommandCapability) -> dict[str, bool]:
     requirement = command.requirement
-    params = [
-        normalize_message_text(str(param or "")).lower()
-        for param in requirement.params
-        if normalize_message_text(str(param or ""))
-    ]
-    internal_media_params = {"meme_params", "img", "image", "images", "图片"}
-    params_require_text = bool(params) and not (
-        requirement.text_min <= 0
-        and requirement.image_min > 0
-        and all(param in internal_media_params for param in params)
-    )
     return {
-        "text": bool(requirement.text_min > 0 or params_require_text),
+        # `requires` is a hard execution gate. Optional slots (for example
+        # `我的信息 ?[at]` or `随机小猪 [数量]`) must not become required text.
+        "text": bool(requirement.text_min > 0),
         "image": bool(requirement.image_min > 0),
         "reply": bool(requirement.requires_reply),
         "private": bool(requirement.requires_private),

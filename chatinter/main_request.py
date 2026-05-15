@@ -1,7 +1,7 @@
 """Unified ChatInter main request runner.
 
-Each turn has exactly one main LLM request:
-system + history messages + current user message + plugin-limited command tools.
+This module prepares the turn prompt and command tools, then delegates the
+model/tool loop to ``agent_runtime``.
 """
 
 from __future__ import annotations
@@ -9,23 +9,25 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import isawaitable
-import json
-import re
 import time
 from typing import Any, cast
 
 from zhenxun.services import logger
-from zhenxun.services.llm import AI, LLMContentPart, LLMMessage
-from zhenxun.services.llm.tools import RunContext, ToolInvoker
+from zhenxun.services.llm import LLMContentPart, LLMMessage
+from zhenxun.services.llm.tools import RunContext
 from zhenxun.services.llm.types.models import ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
+from .agent_runtime import AgentRuntime, AgentRuntimeTimelineItem
 from .chat_dialogue_planner import ChatDialoguePlan
 from .chat_strategy import build_chat_strategy_prompt
-from .command_index import build_plugin_limited_command_candidates
+from .command_catalog_tool import (
+    COMMAND_CATALOG_TOOL_NAME,
+    CommandCatalogState,
+    CommandCatalogTool,
+)
 from .config import build_reasoning_generation_config, get_config_value, get_model_name
 from .models.pydantic_models import PluginKnowledgeBase
-from .native_command_tools import build_native_command_tools
 from .native_executor import (
     ExecuteNativeRoute,
     NativeCommandExecutionContext,
@@ -37,21 +39,29 @@ from .native_route import (
     NativeRouteResult,
 )
 from .route_text import is_usage_question, normalize_message_text
-from .turn_runtime import TurnBudgetController, estimate_text_tokens
+from .tool_retriever import CommandToolRetriever
+from .turn_runtime import TurnBudgetController
 
 _MAIN_STAGE = "main_request"
 _MAIN_REQUEST_RULES = """
 <chatinter_main_request>
 你正在处理群聊消息：可以直接聊天，也可以调用候选插件工具。
 候选工具是真实插件命令；调用工具会执行插件。
-每个工具已暴露完整 schema；只根据工具 description 和参数 schema
+命令不会一次性全部暴露。你需要插件能力但当前没有对应命令 schema 时，
+先调用 retrieve_plugin_commands 检索能力；检索结果会把相关命令 schema
+注入下一轮工具列表，然后再调用真实命令工具执行。
+每个注入后的命令工具已暴露完整 schema；只根据工具 description 和参数 schema
 选择工具并填写参数，不要猜 schema 外参数。
 每次工具调用必须填写 task_text：它是该工具负责的用户子任务原文。
 如果一句话里有多个任务，请把每个工具调用的 task_text 拆成互不重叠的短片段；
 不要把“然后/再/最后/顺便”等后续任务塞进前一个工具。
 用户明确要执行插件能力、查询插件用法，或自然语言需求明显对应插件时才调用工具。
 普通闲聊、玩梗、讨论命令概念、候选工具不匹配、目标不清时，不要调用工具，直接自然回复或简短说明需要的信息。
-如果决定调用工具，本轮不会再进行第二次模型请求；请一次性选准工具并填好参数。
+retrieve_plugin_commands 只负责发现能力，不代表插件任务已经完成。
+真实命令工具返回的是 Observation：如果 need_continue=true，请优先根据
+remaining_task_hint 继续检索或调用后续工具；不要把它当作最终回复。
+你会在工具执行后继续看到工具结果；如果原始消息还有未完成的子任务，请继续调用后续工具。
+所有子任务都已完成或不需要工具时，再给出最终回复。
 </chatinter_main_request>
 """.strip()
 
@@ -201,23 +211,21 @@ async def _run_main_request(
     route_executor: ExecuteNativeRoute,
     report: NativeRouteReport,
 ) -> MainRequestResult:
-    timeline = [_user_timeline_item(message_text)]
-    candidates = build_plugin_limited_command_candidates(
+    retriever = CommandToolRetriever(
         knowledge_base,
-        message_text,
         session_id=session_key,
         tools=cast(Any, command_tools),
     )
+    catalog_state = CommandCatalogState(retriever=retriever)
 
     report.note_candidate_policy(
-        reason="main_request_plugin_limited_exposure",
-        limit=len(candidates),
+        reason="main_request_catalog_retrieval",
+        limit=retriever.total_commands,
     )
-    report.candidate_total = max(report.candidate_total, len(candidates))
-    report.note_tool_pool(len(candidates))
-    report.note_prompt_exposure(candidates)
+    report.candidate_total = max(report.candidate_total, retriever.total_commands)
+    report.note_tool_pool(1)
 
-    tools = build_native_command_tools(candidates) if candidates else []
+    catalog_tool = CommandCatalogTool(catalog_state)
     system_prompt_text = _build_system_prompt(system_prompt, dialogue_plan)
     user_text = message_text
     if context_xml:
@@ -237,16 +245,11 @@ async def _run_main_request(
         *list(history_messages or []),
         LLMMessage.user(user_content),
     ]
-    if budget_controller is not None:
-        budget_controller.record_prompt_use(
-            estimated_tokens=_estimate_prompt_tokens(messages),
-        )
-    ai = AI(session_id=f"chatinter-main:{session_key or 'global'}")
     tool_map: dict[str, ToolExecutable] = {
-        tool.binding.tool_name: cast(ToolExecutable, tool) for tool in tools
+        COMMAND_CATALOG_TOOL_NAME: cast(ToolExecutable, catalog_tool),
     }
     command_context = NativeCommandExecutionContext(
-        candidates=candidates,
+        candidates=[],
         has_reply=has_reply,
         report=report,
         route_executor=route_executor,
@@ -254,49 +257,40 @@ async def _run_main_request(
     )
     run_context = RunContext(
         session_id=session_key,
-        extra={"native_command_context": command_context},
+        extra={
+            "native_command_context": command_context,
+            "command_catalog_state": catalog_state,
+        },
     )
-    invoker = ToolInvoker()
-
-    response = await ai.generate_internal(
-        messages,
-        model=get_model_name(),
-        config=build_reasoning_generation_config(),
-        tools=tool_map or None,
-        tool_choice="auto" if tool_map else None,
+    runtime = AgentRuntime(
+        session_key=session_key,
+        messages=messages,
+        tool_map=tool_map,
+        run_context=run_context,
+        message_text=message_text,
+        model_name=get_model_name(),
+        generation_config=build_reasoning_generation_config(),
         timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
+        budget_controller=budget_controller,
     )
-    tool_calls = list(response.tool_calls or [])
-    if not tool_calls:
-        return _finish_text_response(
-            report=report,
-            executions=command_context.executions,
-            text=str(response.text or ""),
-            reason="main_request:direct_chat",
-            timeline=timeline,
+    agent_result = await runtime.run()
+    timeline = _convert_runtime_timeline(agent_result.timeline)
+    if catalog_state.candidates:
+        report.note_prompt_exposure(catalog_state.candidates)
+        report.tool_candidates = max(
+            report.tool_candidates,
+            catalog_state.injected_count,
         )
-
-    report.tool_choice_count += len(tool_calls)
-    tool_results: list[ToolResult] = []
-    for tool_call in tool_calls:
-        isolated_tool_call = _isolate_tool_call_task_text(
-            tool_call,
-            tool_map=tool_map,
-            full_message=message_text,
-        )
-        timeline.append(_tool_call_timeline_item(isolated_tool_call))
-        resolved_call, tool_result = await invoker.execute_tool_call(
-            isolated_tool_call,
-            tool_map,
-            run_context,
-        )
-        tool_results.append(tool_result)
-        timeline.append(_tool_result_timeline_item(resolved_call, tool_result))
-    return _finish_tool_response(
+    report.tool_choice_count += sum(
+        1 for item in agent_result.timeline if item.kind == "tool_call"
+    )
+    return _finish_agent_response(
         report=report,
         executions=command_context.executions,
-        tool_results=tool_results,
+        tool_results=list(agent_result.tool_results),
         timeline=timeline,
+        final_text=agent_result.final_text,
+        stop_reason=agent_result.stop_reason,
     )
 
 
@@ -352,27 +346,49 @@ def _fallback_result(
     )
 
 
-def _finish_tool_response(
+def _finish_agent_response(
     *,
     report: NativeRouteReport,
     executions: list[NativeToolExecutionResult],
     tool_results: list[ToolResult],
     timeline: list[MainRequestTimelineItem],
+    final_text: str,
+    stop_reason: str,
 ) -> MainRequestResult:
+    if not executions:
+        return _finish_text_response(
+            report=report,
+            executions=executions,
+            text=final_text,
+            reason=f"main_request:{stop_reason}",
+            timeline=timeline,
+        )
+
     if report.final_reason == "init":
-        report.finalize(reason="main_request:tool_called", stage=_MAIN_STAGE)
-    reply = _tool_execution_reply(executions, tool_results)
-    memory_text = _tool_memory_text(executions, tool_results) or reply
+        report.finalize(reason="main_request:tool_loop_completed", stage=_MAIN_STAGE)
+    command_tool_results = [
+        result for result in tool_results if not _is_catalog_tool_result(result)
+    ]
+    reply = normalize_message_text(final_text) or _tool_execution_reply(
+        executions,
+        command_tool_results,
+    )
+    memory_text = _tool_memory_text(executions, command_tool_results)
+    if reply:
+        memory_text = "\n".join(
+            item for item in [memory_text, reply] if normalize_message_text(item)
+        )
+    memory_text = memory_text or reply
     return MainRequestResult(
         decision=NativeRouteDecision(
             action="chat",
             confidence=0.9 if executions else 0.35,
-            reason="main_request:tool_called",
+            reason=f"main_request:{stop_reason}",
         ),
         route_result=_first_route(executions),
         report=report,
         executions=tuple(executions),
-        tool_results=tuple(tool_results),
+        tool_results=tuple(command_tool_results),
         timeline=tuple(timeline),
         output=MainRequestOutput(
             final_text=reply,
@@ -386,6 +402,11 @@ def _finish_tool_response(
             else "reroute_failed",
         ),
     )
+
+
+def _is_catalog_tool_result(result: ToolResult) -> bool:
+    output = result.output if isinstance(result.output, dict) else {}
+    return output.get("status") == "retrieved"
 
 
 async def _finalize_result(
@@ -406,15 +427,12 @@ async def _finalize_result(
     final_text = normalize_message_text(output.final_text)
     if not final_text:
         final_text = (
-            _fallback_final_reply(list(result.executions))
-            or "我暂时没想好怎么回答你。"
+            _fallback_final_reply(list(result.executions)) or "我暂时没想好怎么回答你。"
         )
     if reply_hook is not None:
         maybe_reply = reply_hook(final_text)
         final_text = (
-            await maybe_reply
-            if isawaitable(maybe_reply)
-            else str(maybe_reply or "")
+            await maybe_reply if isawaitable(maybe_reply) else str(maybe_reply or "")
         )
     final_text = normalize_message_text(final_text)
     if not final_text:
@@ -459,70 +477,8 @@ def _fallback_final_reply(executions: list[NativeToolExecutionResult]) -> str:
         return latest.display_text
     if success_count:
         return "处理好了。"
-    message = str(latest.output.get("message", "") or latest.reason or "").strip()
+    message = str(latest.output.get("error", "") or latest.reason or "").strip()
     return message or "这个暂时没处理成功。"
-
-
-def _tool_call_timeline_item(tool_call) -> MainRequestTimelineItem:
-    return MainRequestTimelineItem(
-        role="assistant",
-        kind="tool_call",
-        tool_name=str(tool_call.function.name or ""),
-        metadata={"arguments": _parse_tool_arguments(tool_call.function.arguments)},
-    )
-
-
-def _isolate_tool_call_task_text(
-    tool_call,
-    *,
-    tool_map: dict[str, ToolExecutable],
-    full_message: str,
-):
-    from .task_frame import TASK_TEXT_FIELD, isolate_task_text
-
-    tool_name = str(getattr(tool_call.function, "name", "") or "")
-    executable = tool_map.get(tool_name)
-    binding = getattr(executable, "binding", None)
-    candidate = getattr(binding, "candidate", None)
-    schema = getattr(candidate, "schema", None)
-    if schema is None:
-        return tool_call
-
-    arguments = _parse_tool_arguments(str(tool_call.function.arguments or ""))
-    if not isinstance(arguments, dict):
-        return tool_call
-
-    raw_task = arguments.get(TASK_TEXT_FIELD)
-    if isinstance(raw_task, str) and raw_task.strip():
-        task_text = isolate_task_text(raw_task)
-    elif not schema.slots:
-        task_text = isolate_task_text(
-            _select_task_fragment_for_command(full_message, schema.head)
-            or full_message,
-            command_text=schema.head,
-        )
-    else:
-        task_text = ""
-
-    arguments[TASK_TEXT_FIELD] = task_text or None
-    tool_call.function.arguments = json.dumps(arguments, ensure_ascii=False)
-    return tool_call
-
-
-def _select_task_fragment_for_command(message_text: str, command_head: str) -> str:
-    from .task_frame import isolate_task_text
-
-    command = normalize_message_text(command_head)
-    if not command:
-        return ""
-    splitter = re.compile(
-        r"(?:，|,|。|；|;|\s)+(?:然后|接着|再|最后|顺便|并且|以及|还有|同时)\s*"
-    )
-    for part in splitter.split(normalize_message_text(message_text)):
-        fragment = isolate_task_text(part)
-        if command and command in fragment:
-            return fragment
-    return ""
 
 
 def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
@@ -533,42 +489,19 @@ def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
     )
 
 
-def _tool_result_timeline_item(
-    tool_call,
-    tool_result: ToolResult,
-) -> MainRequestTimelineItem:
-    output = tool_result.output
-    content = ""
-    if isinstance(output, dict):
-        outputs = output.get("outputs")
-        if isinstance(outputs, list):
-            content = "\n".join(
-                normalize_message_text(str(item or ""))
-                for item in outputs[:6]
-                if normalize_message_text(str(item or ""))
-            )
-        if not content:
-            content = normalize_message_text(str(output.get("message", "") or ""))
-    if not content:
-        content = normalize_message_text(str(tool_result.display_content or ""))
-    return MainRequestTimelineItem(
-        role="tool",
-        kind="tool_result",
-        content=content,
-        tool_name=str(tool_call.function.name or ""),
-        metadata={"output": output},
-    )
-
-
-def _parse_tool_arguments(arguments: str) -> dict[str, Any] | str:
-    text = str(arguments or "").strip()
-    if not text:
-        return {}
-    try:
-        value = json.loads(text)
-    except Exception:
-        return text
-    return value if isinstance(value, dict) else {"value": value}
+def _convert_runtime_timeline(
+    items: tuple[AgentRuntimeTimelineItem, ...],
+) -> list[MainRequestTimelineItem]:
+    return [
+        MainRequestTimelineItem(
+            role=item.role,
+            kind=item.kind,
+            content=item.content,
+            tool_name=item.tool_name,
+            metadata=dict(item.metadata),
+        )
+        for item in items
+    ]
 
 
 def _with_final_timeline(
@@ -597,24 +530,28 @@ def _tool_memory_text(
     lines: list[str] = []
     for execution in executions:
         output = execution.output if isinstance(execution.output, dict) else {}
-        outputs = output.get("outputs")
-        if isinstance(outputs, list):
-            for item in outputs[:4]:
+        messages_sent = output.get("messages_sent")
+        if isinstance(messages_sent, list):
+            for item in messages_sent[:4]:
                 text = normalize_message_text(str(item or ""))
                 if text:
                     lines.append(text)
         message = normalize_message_text(
-            str(output.get("message", "") or execution.display_text or "")
+            str(output.get("error", "") or execution.display_text or "")
         )
         if message:
             lines.append(message)
     for result in tool_results:
         output = result.output if isinstance(result.output, dict) else {}
-        message = normalize_message_text(
-            str(output.get("message", "") or result.display_content or "")
-        )
-        if message:
-            lines.append(message)
+        messages_sent = output.get("messages_sent")
+        if isinstance(messages_sent, list):
+            for item in messages_sent[:4]:
+                text = normalize_message_text(str(item or ""))
+                if text:
+                    lines.append(text)
+        error = normalize_message_text(str(output.get("error", "") or ""))
+        if error:
+            lines.append(error)
     return "\n".join(dict.fromkeys(lines))
 
 
@@ -623,19 +560,14 @@ def _tool_execution_reply(
     tool_results: list[ToolResult],
 ) -> str:
     if executions:
-        successful_outputs = [
+        successful_observations = [
             item
             for item in executions
-            if item.success
-            and (
-                bool(item.output.get("observed_output"))
-                or bool(item.output.get("outputs"))
-            )
+            if item.success and bool(item.output.get("messages_sent"))
         ]
-        if (
-            successful_outputs
-            and len(successful_outputs) == len(executions) == len(tool_results)
-        ):
+        if successful_observations and len(successful_observations) == len(
+            executions
+        ) == len(tool_results):
             return ""
         messages = [
             normalize_message_text(item.display_text or item.reason)
@@ -648,11 +580,16 @@ def _tool_execution_reply(
 
     for result in tool_results:
         output = result.output if isinstance(result.output, dict) else {}
-        message = normalize_message_text(
-            str(output.get("message", "") or result.display_content or "")
-        )
-        if message:
-            return message
+        messages_sent = output.get("messages_sent")
+        if isinstance(messages_sent, list):
+            message = normalize_message_text(
+                "\n".join(str(item or "") for item in messages_sent if item)
+            )
+            if message:
+                return message
+        error = normalize_message_text(str(output.get("error", "") or ""))
+        if error:
+            return error
     return "工具调用没有成功执行，请换个说法再试。"
 
 
@@ -666,20 +603,6 @@ def _build_system_prompt(
         parts.append(strategy_prompt)
     parts.append(_MAIN_REQUEST_RULES)
     return "\n\n".join(part for part in parts if part)
-
-
-def _estimate_prompt_tokens(messages: list[LLMMessage]) -> int:
-    total = 0
-    for message in messages:
-        content = message.content
-        if isinstance(content, str):
-            total += estimate_text_tokens(content)
-            continue
-        for part in content:
-            total += estimate_text_tokens(part.text or part.thought_text or "")
-            if part.image_source:
-                total += 48
-    return total
 
 
 __all__ = [

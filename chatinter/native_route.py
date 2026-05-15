@@ -1,4 +1,10 @@
-"""Native tool route data structures and local validation helpers."""
+"""Native tool-call route validation.
+
+The LLM chooses a concrete command tool.  This module only validates that call
+against the selected command schema and renders the final NoneBot command.
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
@@ -6,153 +12,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .capability_graph import build_capability_graph_snapshot
-from .command_index import (
-    CommandCandidate,
-    build_command_candidates,
-)
+from .command_index import CommandCandidate
 from .command_schema import complete_slots, render_command
-from .config import get_config_value
-from .models.pydantic_models import PluginKnowledgeBase
-from .plugin_reference import build_command_tool_snapshots
-from .route_text import (
-    normalize_message_text,
-)
+from .route_text import normalize_message_text
 from .skill_registry import SkillRouteDecision
-from .speech_act import classify_speech_act
 
 _AT_PLACEHOLDER_PATTERN = re.compile(r"\[@[^\]\s]+\]")
 _AT_INLINE_PATTERN = re.compile(r"@\d{5,20}")
 _IMAGE_PLACEHOLDER_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _ROUTE_TRACE_SAMPLE_LIMIT = 12
-
-
-def _action_for_schema(
-    *,
-    schema: Any,
-    speech_act: str,
-    missing: list[str] | tuple[str, ...],
-) -> Literal["chat", "execute", "usage", "clarify"]:
-    role = normalize_message_text(getattr(schema, "command_role", "") or "").lower()
-    if speech_act == "ask_usage" or role == "usage":
-        return "usage"
-    if role == "template" and missing:
-        requires = getattr(schema, "requires", {}) or {}
-        context_missing = {"image", "reply", "at", "context", "target"}
-        if requires.get("image") or requires.get("reply") or requires.get("at"):
-            if set(missing).issubset(context_missing):
-                return "execute"
-    if missing:
-        return "clarify"
-    return "execute"
-
-
-def _has_payload_for_schema(schema: Any, message_text: str) -> bool:
-    payload_policy = normalize_message_text(
-        str(getattr(schema, "payload_policy", "") or "")
-    ).lower()
-    extra_text_policy = normalize_message_text(
-        str(getattr(schema, "extra_text_policy", "") or "")
-    ).lower()
-    if payload_policy in {"none", "image_only"} or extra_text_policy == "discard":
-        return False
-    normalized = normalize_message_text(message_text)
-    if not normalized:
-        return False
-    values = [
-        normalize_message_text(getattr(schema, "head", "") or ""),
-        *[
-            normalize_message_text(alias)
-            for alias in getattr(schema, "aliases", []) or []
-            if normalize_message_text(alias)
-        ],
-    ]
-    text = normalized
-    for value in values:
-        if value and value in text:
-            text = text.replace(value, " ", 1)
-    text = _AT_PLACEHOLDER_PATTERN.sub(" ", text)
-    text = _IMAGE_PLACEHOLDER_PATTERN.sub(" ", text)
-    for noise in (
-        "帮我",
-        "给我",
-        "请",
-        "麻烦",
-        "做",
-        "做个",
-        "做一张",
-        "来张",
-        "来一张",
-        "用",
-        "让",
-        "写",
-        "内容是",
-        "文字是",
-        "牌子写",
-        "一句",
-        "一段",
-        "这个",
-        "这张",
-        "表情",
-        "表情包",
-        "梗图",
-        "图片",
-        "：",
-        ":",
-        "，",
-        ",",
-    ):
-        text = text.replace(noise, " ")
-    return bool(normalize_message_text(text))
-
-
-def _payload_slot_items(schema: Any, message_text: str) -> list["NativeSlotValue"]:
-    if not _has_payload_for_schema(schema, message_text):
-        return []
-    slots = list(getattr(schema, "slots", []) or [])
-    target = next(
-        (
-            slot
-            for slot in slots
-            if getattr(slot, "type", "") == "text"
-            and bool(getattr(slot, "required", False))
-        ),
-        None,
-    )
-    if target is None:
-        return []
-    normalized = normalize_message_text(message_text)
-    head = normalize_message_text(getattr(schema, "head", "") or "")
-    payload = normalized
-    aliases = [
-        normalize_message_text(alias)
-        for alias in getattr(schema, "aliases", []) or []
-        if normalize_message_text(alias)
-    ]
-    for marker in [head, *aliases]:
-        if marker and marker in payload:
-            before, _sep, after = payload.partition(marker)
-            payload = after or before
-            break
-    for prefix in (
-        "做一句",
-        "做一段",
-        "说",
-        "写",
-        "内容是",
-        "文字是",
-        "牌子写",
-        "：",
-        ":",
-        "，",
-        ",",
-        "一下",
-    ):
-        payload = payload.replace(prefix, " ")
-    payload = normalize_message_text(payload)
-    if not payload:
-        return []
-    return [NativeSlotValue(name=str(getattr(target, "name", "")), value=payload)]
 
 
 @dataclass(frozen=True)
@@ -233,6 +101,158 @@ class NativeSlotValue(BaseModel):
     value: str = Field(default="", description="槽位值，统一以字符串填写")
 
 
+class NativeRouteDecision(BaseModel):
+    action: Literal["chat", "execute", "usage", "clarify"] = Field(
+        default="chat",
+        description="chat=普通对话；execute=执行插件；usage=查询用法；clarify=需要补充信息",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    plugin_module: str | None = Field(default=None, description="插件模块")
+    plugin_name: str | None = Field(default=None, description="插件名称")
+    command_id: str | None = Field(default=None, description="命令 schema ID")
+    command: str | None = Field(default=None, description="渲染后的插件命令")
+    slots: list[NativeSlotValue] = Field(default_factory=list)
+    arguments_text: str = ""
+    missing: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, value: Any) -> list[NativeSlotValue]:
+        return _slots_to_items(value)
+
+
+class NativeCommandSelection(BaseModel):
+    action: Literal["chat", "execute", "usage", "clarify"] = Field(default="chat")
+    command_id: str | None = None
+    slots: list[NativeSlotValue] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, value: Any) -> list[NativeSlotValue]:
+        return _slots_to_items(value)
+
+
+def candidate_selection_to_native_route(
+    *,
+    selection: NativeCommandSelection,
+    candidates: list[CommandCandidate],
+    message_text: str,
+    stage: str,
+    has_reply: bool = False,
+) -> tuple[NativeRouteDecision, NativeRouteResult | None] | None:
+    if selection.action == "chat":
+        return (
+            NativeRouteDecision(
+                action="chat",
+                confidence=selection.confidence,
+                reason=selection.reason or f"{stage}:chat",
+            ),
+            None,
+        )
+
+    command_id = normalize_message_text(selection.command_id or "")
+    if not command_id:
+        return None
+    candidate = _find_candidate(candidates, command_id=command_id)
+    if candidate is None:
+        return None
+
+    schema = candidate.schema
+    slots = _slots_to_dict(selection.slots)
+    missing: list[str] = list(selection.missing or [])
+    if selection.action == "usage":
+        action: Literal["usage", "execute", "clarify"] = "usage"
+        rendered = normalize_message_text(schema.head)
+        slots = {}
+    else:
+        slots, schema_missing = complete_slots(
+            schema,
+            slots=slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+        rendered, render_missing = render_command(
+            schema,
+            slots=slots,
+            message_text=message_text,
+            arguments_text="",
+        )
+        missing.extend(schema_missing)
+        missing.extend(render_missing)
+        missing.extend(_missing_context(schema, message_text, has_reply=has_reply))
+        missing = list(dict.fromkeys(item for item in missing if item))
+        action = "clarify" if selection.action == "clarify" or missing else "execute"
+
+    command = rendered or normalize_message_text(schema.head)
+    decision = NativeRouteDecision(
+        action=action,
+        confidence=selection.confidence,
+        plugin_module=candidate.plugin_module,
+        plugin_name=candidate.plugin_name,
+        command_id=schema.command_id,
+        command=command,
+        slots=[] if action == "usage" else _slots_to_items(slots),
+        missing=[] if action == "usage" else missing,
+        reason=selection.reason or f"{stage}:{candidate.reason}",
+    )
+    return decision, NativeRouteResult(
+        decision=SkillRouteDecision(
+            plugin_name=candidate.plugin_name,
+            plugin_module=candidate.plugin_module,
+            command=command,
+            source=stage,
+            skill_kind=stage,
+        ),
+        stage=stage,
+        command_id=schema.command_id,
+        slots=_slots_to_dict(decision.slots),
+        missing=tuple(decision.missing),
+        selected_rank=next(
+            (
+                index
+                for index, item in enumerate(candidates, 1)
+                if item.schema.command_id == schema.command_id
+            ),
+            0,
+        ),
+        selected_score=candidate.score,
+        selected_reason=candidate.reason,
+    )
+
+
+def _find_candidate(
+    candidates: list[CommandCandidate],
+    *,
+    command_id: str,
+) -> CommandCandidate | None:
+    for candidate in candidates:
+        if normalize_message_text(candidate.schema.command_id) == command_id:
+            return candidate
+    return None
+
+
+def _missing_context(schema: Any, message_text: str, *, has_reply: bool) -> list[str]:
+    requires = getattr(schema, "requires", {}) or {}
+    missing: list[str] = []
+    has_image = bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text))
+    has_at = bool(
+        _AT_PLACEHOLDER_PATTERN.search(message_text)
+        or _AT_INLINE_PATTERN.search(message_text)
+    )
+    image_satisfied = has_image or (requires.get("at") and has_at)
+    if requires.get("image") and not image_satisfied:
+        missing.append("image")
+    if requires.get("reply") and not has_reply:
+        missing.append("reply")
+    if requires.get("at") and not has_at and not (requires.get("image") and has_image):
+        missing.append("at")
+    return missing
+
+
 def _slots_to_items(value: Any) -> list[NativeSlotValue]:
     if not value:
         return []
@@ -267,287 +287,11 @@ def _slots_to_dict(value: Any) -> dict[str, str]:
     return result
 
 
-class NativeRouteDecision(BaseModel):
-    action: Literal["chat", "execute", "usage", "clarify"] = Field(
-        default="chat",
-        description="chat=普通对话；execute=执行插件；usage=查询用法；clarify=需要补充信息",
-    )
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    plugin_module: str | None = Field(default=None, description="必须来自 plugin_cards")
-    plugin_name: str | None = Field(default=None, description="插件名称，可选")
-    command_id: str | None = Field(default=None, description="优先使用的命令 schema ID")
-    command: str | None = Field(default=None, description="插件命令头")
-    slots: list[NativeSlotValue] = Field(
-        default_factory=list,
-        description="命令槽位列表，格式为 [{name,value}]，不要使用任意对象键",
-    )
-    arguments_text: str = Field(default="", description="命令后的自然语言参数")
-    missing: list[str] = Field(default_factory=list, description="缺失信息")
-    reason: str | None = Field(default=None, description="简短原因")
-
-    @field_validator("slots", mode="before")
-    @classmethod
-    def _validate_slots(cls, value: Any) -> list[NativeSlotValue]:
-        return _slots_to_items(value)
-
-
-class NativeCommandSelection(BaseModel):
-    action: Literal["chat", "execute", "usage", "clarify"] = Field(
-        default="chat",
-        description="chat=普通对话；execute=执行候选命令；usage=查询候选命令用法；clarify=需要补充信息",
-    )
-    command_id: str | None = Field(
-        default=None,
-        description="必须来自 candidates.command_id；chat 时为空",
-    )
-    slots: list[NativeSlotValue] = Field(
-        default_factory=list,
-        description=(
-            "按候选 schema 填写的槽位列表，格式为 [{name,value}]，"
-            "不要臆造 schema 之外的槽位"
-        ),
-    )
-    missing: list[str] = Field(
-        default_factory=list,
-        description="缺失的必填槽位或上下文，例如 text/image/reply/target",
-    )
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    reason: str = Field(default="", description="简短选择理由")
-
-    @field_validator("slots", mode="before")
-    @classmethod
-    def _validate_slots(cls, value: Any) -> list[NativeSlotValue]:
-        return _slots_to_items(value)
-
-
-def _message_context_flags(
-    message_text: str, *, has_reply: bool = False
-) -> dict[str, bool]:
-    return {
-        "has_image": bool(_IMAGE_PLACEHOLDER_PATTERN.search(message_text)),
-        "has_at": bool(
-            _AT_PLACEHOLDER_PATTERN.search(message_text)
-            or _AT_INLINE_PATTERN.search(message_text)
-        ),
-        "has_reply": has_reply,
-    }
-
-
-def _ensure_command_tools(
-    knowledge_base: PluginKnowledgeBase,
-    command_tools: list[Any] | None,
-) -> list[Any]:
-    if command_tools:
-        return list(command_tools)
-    graph = build_capability_graph_snapshot(knowledge_base)
-    return list(build_command_tool_snapshots(graph))
-
-
-def build_native_command_candidate_pool(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    *,
-    session_key: str | None = None,
-    command_tools: list[Any] | None = None,
-    limit: int | None = None,
-    diversify: bool = True,
-    include_unscored: bool = False,
-) -> list[CommandCandidate]:
-    tools = _ensure_command_tools(knowledge_base, command_tools)
-    candidate_limit = limit
-    if candidate_limit is None:
-        if include_unscored:
-            candidate_limit = len(tools)
-        else:
-            candidate_limit = max(
-                int(get_config_value("ROUTE_COMMAND_CANDIDATE_LIMIT", 32) or 32),
-                8,
-            )
-    return build_command_candidates(
-        knowledge_base,
-        message_text,
-        limit=candidate_limit,
-        session_id=session_key,
-        diversify=diversify,
-        tools=tools,
-        include_unscored=include_unscored,
-    )
-
-
-def _selection_matches_command_context(
-    *,
-    selection: NativeCommandSelection,
-    candidate: CommandCandidate,
-    message_text: str,
-    has_reply: bool,
-) -> tuple[bool, str]:
-    if selection.action == "usage":
-        return True, ""
-    requires = candidate.schema.requires or {}
-    flags = _message_context_flags(message_text, has_reply=has_reply)
-    image_satisfied = flags["has_image"] or (requires.get("at") and flags["has_at"])
-    if requires.get("image") and not image_satisfied:
-        return False, "missing image context"
-    if requires.get("reply") and not flags["has_reply"]:
-        return False, "missing reply context"
-    if (
-        requires.get("at")
-        and not flags["has_at"]
-        and not (requires.get("image") and flags["has_image"])
-    ):
-        return False, "missing at context"
-    return True, ""
-
-
-def candidate_selection_to_native_route(
-    *,
-    selection: NativeCommandSelection,
-    candidates: list[CommandCandidate],
-    message_text: str,
-    stage: str,
-    has_reply: bool = False,
-) -> tuple[NativeRouteDecision, NativeRouteResult | None] | None:
-    if selection.action == "chat":
-        return (
-            NativeRouteDecision(
-                action="chat",
-                confidence=selection.confidence,
-                reason=selection.reason or f"{stage}:chat",
-            ),
-            None,
-        )
-
-    command_id = normalize_message_text(selection.command_id or "")
-    if not command_id:
-        return None
-    candidate = next(
-        (
-            item
-            for item in candidates
-            if normalize_message_text(item.schema.command_id) == command_id
-        ),
-        None,
-    )
-    if candidate is None:
-        return None
-    context_ok, context_reason = _selection_matches_command_context(
-        selection=selection,
-        candidate=candidate,
-        message_text=message_text,
-        has_reply=has_reply,
-    )
-    if not context_ok:
-        missing_name = context_reason.rsplit(" ", 1)[-1] or "context"
-        selection = NativeCommandSelection(
-            action="clarify",
-            command_id=candidate.schema.command_id,
-            slots=_slots_to_items(selection.slots),
-            missing=[*selection.missing, missing_name],
-            confidence=min(selection.confidence, 0.82),
-            reason=f"{selection.reason};validator:{context_reason}",
-        )
-
-    schema = candidate.schema
-    route_slots = _slots_to_dict(selection.slots)
-    if not route_slots:
-        route_slots.update(_slots_to_dict(_payload_slot_items(schema, message_text)))
-    if selection.action == "usage":
-        rendered = schema.head
-        schema_missing: list[str] | tuple[str, ...] = ()
-        route_slots = {}
-    else:
-        route_slots, schema_missing = complete_slots(
-            schema,
-            slots=route_slots,
-            message_text=message_text,
-            arguments_text="",
-        )
-        if schema_missing and _has_payload_for_schema(schema, message_text):
-            schema_missing = []
-        rendered, schema_missing = render_command(
-            schema,
-            slots=route_slots,
-            message_text=message_text,
-            arguments_text="",
-        )
-        if schema_missing and _has_payload_for_schema(schema, message_text):
-            schema_missing = []
-    missing = [*selection.missing, *list(schema_missing)]
-    action = _action_for_schema(
-        schema=schema,
-        speech_act=classify_speech_act(
-            message_text,
-            **_message_context_flags(message_text, has_reply=has_reply),
-        ),
-        missing=missing,
-    )
-    if selection.action == "clarify":
-        action = "clarify"
-    elif selection.action == "usage":
-        action = "usage"
-    if action == "execute" and missing:
-        action = "clarify"
-    if (
-        action == "clarify"
-        and selection.action == "execute"
-        and getattr(schema, "command_role", "") == "template"
-        and (getattr(schema, "requires", {}) or {}).get("image")
-    ):
-        context_missing = {"image", "reply", "at", "context", "target"}
-        if (
-            set(missing).issubset(context_missing)
-            and _message_context_flags(
-                message_text,
-                has_reply=has_reply,
-            )["has_image"]
-        ):
-            action = "execute"
-            missing = []
-
-    command = schema.head if action == "usage" else rendered or schema.head
-    decision = NativeRouteDecision(
-        action=action,
-        confidence=selection.confidence,
-        plugin_module=candidate.plugin_module,
-        plugin_name=candidate.plugin_name,
-        command_id=schema.command_id,
-        command=command,
-        slots=[] if action == "usage" else _slots_to_items(route_slots),
-        missing=[] if action == "usage" else missing,
-        reason=selection.reason or f"{stage}:{candidate.reason}",
-    )
-    native_route = NativeRouteResult(
-        decision=SkillRouteDecision(
-            plugin_name=candidate.plugin_name,
-            plugin_module=candidate.plugin_module,
-            command=command,
-            source=stage,
-            skill_kind=stage,
-        ),
-        stage=stage,
-        command_id=schema.command_id,
-        slots=_slots_to_dict(decision.slots),
-        missing=tuple(decision.missing),
-        selected_rank=next(
-            (
-                index
-                for index, item in enumerate(candidates, 1)
-                if item.schema.command_id == schema.command_id
-            ),
-            0,
-        ),
-        selected_score=candidate.score,
-        selected_reason=candidate.reason,
-    )
-    return decision, native_route
-
-
 __all__ = [
     "NativeCommandSelection",
     "NativeRouteDecision",
     "NativeRouteReport",
     "NativeRouteResult",
     "NativeSlotValue",
-    "build_native_command_candidate_pool",
     "candidate_selection_to_native_route",
 ]

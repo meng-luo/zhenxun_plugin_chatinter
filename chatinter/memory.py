@@ -37,7 +37,6 @@ from .config import (
 from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
-from .route_text import normalize_message_text
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
     extract_reply_from_message,

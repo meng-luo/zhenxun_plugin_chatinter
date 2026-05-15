@@ -1,14 +1,12 @@
-"""Route planning and command execution helpers for ChatInter."""
+"""Safe command execution helpers for ChatInter."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, cast
 
 from nonebot.adapters import Event
 
-from .command_planner import CommandPlanDecision, plan_command
 from .command_schema import normalize_schema_command_head
 from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
@@ -28,14 +26,8 @@ from .route_text import (
     match_command_head_canonical,
     normalize_action_phrases,
     normalize_message_text,
-    parse_command_with_head,
 )
 from .schema_policy import resolve_command_target_policy
-from .skill_registry import (
-    SkillRouteDecision,
-    _extract_explicit_value,
-    _extract_schema_argument_tokens,
-)
 
 
 @dataclass(frozen=True)
@@ -174,6 +166,7 @@ def _has_adapter_context_hint(
         return False
     return contains_any(normalize_message_text(message_text or ""), hints)
 
+
 def _build_target_modules(
     decision: NativeRouteResult,
     selection_plugins,
@@ -201,11 +194,7 @@ def _iter_meta_aliases(meta) -> set[str]:
 
 def _schema_command_head(schema) -> str:
     return normalize_schema_command_head(
-        str(
-            getattr(schema, "command", None)
-            or getattr(schema, "head", None)
-            or ""
-        )
+        str(getattr(schema, "command", None) or getattr(schema, "head", None) or "")
     )
 
 
@@ -237,9 +226,7 @@ def _view_from_command_meta(meta) -> RouteCommandSchemaView:
         image_max=getattr(meta, "image_max", None),
         allow_at=getattr(meta, "allow_at", None),
         actor_scope=str(getattr(meta, "actor_scope", "") or "allow_other"),
-        target_requirement=str(
-            getattr(meta, "target_requirement", "") or "none"
-        ),
+        target_requirement=str(getattr(meta, "target_requirement", "") or "none"),
         target_sources=tuple(
             normalize_message_text(str(item or ""))
             for item in (getattr(meta, "target_sources", None) or [])
@@ -277,9 +264,7 @@ def _view_from_plugin_command_schema(schema) -> RouteCommandSchemaView:
         image_min=int(bool(requires.get("image"))),
         allow_at=getattr(schema, "allow_at", None),
         actor_scope=str(getattr(schema, "actor_scope", "") or "allow_other"),
-        target_requirement=str(
-            getattr(schema, "target_requirement", "") or "none"
-        ),
+        target_requirement=str(getattr(schema, "target_requirement", "") or "none"),
         target_sources=tuple(
             normalize_message_text(str(item or ""))
             for item in (getattr(schema, "target_sources", None) or [])
@@ -489,13 +474,24 @@ def _build_route_message_with_explicit_context(
     at_tokens = _extract_at_tokens(normalized)
     image_tokens = _extract_image_tokens(normalized)
     enriched = normalized
+    policy_accepts_target = (
+        policy.allow_at_as_target
+        or policy.allow_image_as_target
+        or policy.allow_reply_image_as_target
+        or policy.require_target_for_third_person
+    )
 
-    if not at_tokens and _contains_strong_self_reference(normalized):
+    if (
+        policy_accepts_target
+        and not at_tokens
+        and _contains_strong_self_reference(normalized)
+    ):
         enriched = normalize_message_text(f"{enriched} [@{user_id}]")
         at_tokens.append(f"[@{user_id}]")
 
     if (
-        not at_tokens
+        policy_accepts_target
+        and not at_tokens
         and reply_sender_id
         and _contains_third_person_reference(normalized)
     ):
@@ -690,28 +686,6 @@ def _build_followup_message(
     return f"这个命令{joined}，请重新发送完整命令。"
 
 
-def _build_planner_followup_message(missing: list[str]) -> str:
-    labels: list[str] = []
-    for item in missing:
-        normalized = normalize_message_text(item).lower()
-        if normalized in {"text", "文本", "文字", "参数", "内容"}:
-            label = "要处理的文字"
-        elif normalized in {"image", "图片", "图", "照片"}:
-            label = "图片"
-        elif normalized in {"reply", "回复", "引用"}:
-            label = "回复上下文"
-        else:
-            label = item
-        if label and label not in labels:
-            labels.append(label)
-    joined = "、".join(labels) if labels else "必要参数"
-    return f"这个命令还需要{joined}，请补充后我再帮你执行。"
-
-
-def _planner_missing_contains(missing: list[str], names: set[str]) -> bool:
-    return any(normalize_message_text(item).lower() in names for item in missing)
-
-
 def _build_target_required_message(schema) -> str:
     sources = {
         normalize_message_text(str(item or "")).lower()
@@ -766,22 +740,6 @@ def _append_unique_tokens(command: str, tokens: list[str]) -> str:
     return normalize_message_text(f"{normalized_command} {' '.join(merged)}")
 
 
-def _extract_command_payload_tokens(command: str) -> list[str]:
-    normalized_command = normalize_message_text(command or "")
-    if not normalized_command:
-        return []
-    parts = normalized_command.split(" ", 1)
-    if len(parts) < 2:
-        return []
-    tokens: list[str] = []
-    for raw_token in parts[1].split(" "):
-        token = normalize_message_text(raw_token)
-        if not token:
-            continue
-        tokens.append(token)
-    return tokens
-
-
 def _remove_tokens_from_command(command: str, tokens: list[str]) -> str:
     normalized_command = normalize_message_text(command or "")
     if not normalized_command or not tokens:
@@ -799,62 +757,6 @@ def _remove_tokens_from_command(command: str, tokens: list[str]) -> str:
     if payload:
         return normalize_message_text(f"{head} {' '.join(payload)}")
     return head
-
-
-def _clamp_command_text_tokens(command: str, text_max_raw) -> str:
-    normalized_command = normalize_message_text(command or "")
-    if not normalized_command:
-        return normalized_command
-    if text_max_raw is None:
-        return normalized_command
-    try:
-        text_max = int(text_max_raw)
-    except Exception:
-        return normalized_command
-    text_max = max(text_max, 0)
-
-    parts = normalized_command.split(" ", 1)
-    command_head = parts[0]
-    if len(parts) < 2:
-        return command_head
-
-    kept_tokens: list[str] = []
-    text_count = 0
-    for raw_token in parts[1].split(" "):
-        token = normalize_message_text(raw_token)
-        if not token:
-            continue
-        if _PLACEHOLDER_SEGMENT_PATTERN.fullmatch(token):
-            kept_tokens.append(token)
-            continue
-        if text_count < text_max:
-            kept_tokens.append(token)
-            text_count += 1
-
-    if kept_tokens:
-        return normalize_message_text(f"{command_head} {' '.join(kept_tokens)}")
-    return command_head
-
-
-def _schema_accepts_text_payload(schema) -> bool:
-    payload_policy = normalize_message_text(
-        str(getattr(schema, "payload_policy", "") or "")
-    ).lower()
-    extra_text_policy = normalize_message_text(
-        str(getattr(schema, "extra_text_policy", "") or "")
-    ).lower()
-    if payload_policy in {"none", "image_only"} or extra_text_policy == "discard":
-        return False
-    text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
-    if text_min > 0:
-        return True
-    text_max = getattr(schema, "text_max", None)
-    if text_max is not None:
-        try:
-            return int(text_max) > 0
-        except Exception:
-            return False
-    return bool(getattr(schema, "params", None))
 
 
 def _prepare_route_execution_plan(
@@ -883,10 +785,7 @@ def _prepare_route_execution_plan(
         merged_at = _extract_at_tokens(task_message) or _extract_at_tokens(
             ambient_message
         )
-        if (
-            not merged_at
-            and _contains_self_reference(task_message or ambient_message)
-        ):
+        if not merged_at and _contains_self_reference(task_message or ambient_message):
             merged_at.append(f"[@{user_id}]")
         merged_images = _extract_image_tokens(task_message)
         for token in _extract_image_tokens(ambient_message):
@@ -906,54 +805,6 @@ def _prepare_route_execution_plan(
             if tail
             else schema_head
         )
-
-    existing_payload_tokens = set(_extract_command_payload_tokens(command))
-    payload_tokens: list[str] = []
-    explicit_value = normalize_message_text(_extract_explicit_value(task_message))
-    accepts_text_payload = _schema_accepts_text_payload(schema)
-    if explicit_value and accepts_text_payload:
-        payload_tokens.extend(
-            token
-            for token in explicit_value.split(" ")
-            if token
-            and token not in payload_tokens
-            and token not in existing_payload_tokens
-        )
-    schema_tokens = _extract_schema_argument_tokens(task_message, cast(Any, schema))
-    for token in schema_tokens:
-        if (
-            token
-            and token not in payload_tokens
-            and token not in existing_payload_tokens
-        ):
-            payload_tokens.append(token)
-    if not payload_tokens and accepts_text_payload:
-        parsed_payload = ""
-        try:
-            parsed = parse_command_with_head(
-                task_message,
-                schema_head or command_head,
-                allow_sticky=bool(getattr(schema, "allow_sticky_arg", False)),
-                max_prefix_len=16,
-            )
-            parsed_payload = normalize_message_text(
-                (parsed.payload_text if parsed else "") or ""
-            )
-        except Exception:
-            parsed_payload = ""
-        if parsed_payload:
-            for token in parsed_payload.split(" "):
-                if (
-                    token
-                    and token not in payload_tokens
-                    and token not in existing_payload_tokens
-                ):
-                    payload_tokens.append(token)
-    if payload_tokens:
-        command = _append_unique_tokens(command, payload_tokens)
-
-    if not getattr(schema, "params", None):
-        command = _clamp_command_text_tokens(command, getattr(schema, "text_max", None))
 
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
@@ -1046,81 +897,6 @@ def _prepare_route_execution_plan(
     return RouteExecutionPlan(command=_apply_route_command_prefixes(command, schema))
 
 
-def _plan_route_command(
-    *,
-    route_result: NativeRouteResult,
-    knowledge_plugins,
-    current_message: str,
-    ambient_message: str = "",
-    has_reply: bool,
-    image_count: int,
-) -> CommandPlanDecision:
-    knowledge_base = PluginKnowledgeBase(
-        plugins=list(knowledge_plugins),
-        user_role="普通用户",
-    )
-    references = PluginRegistry.build_plugin_references(knowledge_base)
-    decision = route_result.decision
-    return plan_command(
-        action="execute",
-        plugin_module=decision.plugin_module,
-        plugin_name=decision.plugin_name,
-        command=decision.command,
-        command_id=route_result.command_id,
-        slots=route_result.slots,
-        references=references,
-        current_message=current_message,
-        ambient_message=ambient_message,
-        has_reply=has_reply,
-        image_count=image_count,
-        reason=f"route_stage:{route_result.stage}",
-    )
-
-
-def _apply_command_plan_to_route_result(
-    route_result: NativeRouteResult,
-    command_plan: CommandPlanDecision,
-) -> NativeRouteResult:
-    final_command = normalize_message_text(command_plan.final_command or "")
-    final_command = final_command or normalize_message_text(
-        route_result.decision.command
-    )
-    merged_slots = {**route_result.slots, **dict(command_plan.slots or {})}
-    command_id = command_plan.command_id or route_result.command_id
-    missing = tuple(command_plan.missing or route_result.missing)
-    if not final_command and (
-        command_id == route_result.command_id
-        and merged_slots == route_result.slots
-        and missing == route_result.missing
-    ):
-        return route_result
-    decision = route_result.decision
-    if (
-        normalize_message_text(decision.command) == final_command
-        and command_id == route_result.command_id
-        and merged_slots == route_result.slots
-        and missing == route_result.missing
-    ):
-        return route_result
-    return NativeRouteResult(
-        decision=SkillRouteDecision(
-            plugin_name=decision.plugin_name,
-            plugin_module=decision.plugin_module,
-            command=final_command,
-            source=decision.source,
-            skill_kind=decision.skill_kind,
-        ),
-        stage=route_result.stage,
-        report=route_result.report,
-        command_id=command_id,
-        slots=merged_slots,
-        missing=missing,
-        selected_rank=route_result.selected_rank,
-        selected_score=route_result.selected_score,
-        selected_reason=route_result.selected_reason,
-    )
-
-
 def _apply_route_command_prefixes(command: str, schema) -> str:
     normalized = normalize_message_text(command)
     if not normalized or schema is None:
@@ -1149,16 +925,11 @@ build_route_message_with_explicit_context = _build_route_message_with_explicit_c
 select_adapter_policy_for_message = _select_adapter_policy_for_message
 build_reply_image_segments_for_reroute = _build_reply_image_segments_for_reroute
 contains_self_reference = _contains_self_reference
-build_planner_followup_message = _build_planner_followup_message
-planner_missing_contains = _planner_missing_contains
 prepare_route_execution_plan = _prepare_route_execution_plan
-plan_route_command = _plan_route_command
-apply_command_plan_to_route_result = _apply_command_plan_to_route_result
+find_route_command_schema = _find_route_command_schema
 
 __all__ = [
     "RouteExecutionPlan",
-    "apply_command_plan_to_route_result",
-    "build_planner_followup_message",
     "build_reply_image_segments_for_reroute",
     "build_route_message_with_explicit_context",
     "build_target_modules",
@@ -1168,9 +939,8 @@ __all__ = [
     "extract_at_tokens",
     "extract_image_tokens",
     "extract_reply_sender_id",
+    "find_route_command_schema",
     "has_adapter_context_hint",
-    "plan_route_command",
-    "planner_missing_contains",
     "prepare_route_execution_plan",
     "select_adapter_policy_for_message",
 ]
