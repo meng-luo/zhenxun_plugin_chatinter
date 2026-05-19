@@ -2,24 +2,16 @@
 
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, Any
-
 from ..models.pydantic_models import CommandCapability, PluginCommandSchema
-from ..route_text import contains_any, has_chat_context_hint, normalize_message_text
+from ..route_text import normalize_message_text
 from . import (
-    AdapterClarifyRoute,
     AdapterNotificationPolicy,
-    AdapterScoreHint,
     AdapterTargetPolicy,
     PluginCommandAdapter,
     register_adapter,
     schema,
     slot,
 )
-
-if TYPE_CHECKING:
-    from ..command_index import CommandCandidate
 
 _CANONICAL_ALIAS_MAP: dict[str, str] = {
     "摸摸": "摸",
@@ -103,25 +95,6 @@ def _is_shadowed_meme_head(value: str) -> bool:
     normalized = normalize_message_text(value)
     canonical = _CANONICAL_ALIAS_MAP.get(normalized)
     return bool(canonical and canonical != normalized)
-
-
-def _split_text_parts(raw: str, *, max_parts: int) -> list[str]:
-    text = normalize_message_text(raw)
-    if not text:
-        return []
-    text = re.sub(r"^(?:文字|内容|文本)(?:是|为)?\s*", "", text)
-    text = re.sub(r"^(?:四格|四段|四句)\s*", "", text)
-    parts = [
-        normalize_message_text(part)
-        for part in re.split(r"\s*[，,、/|；;]\s*|\s{2,}", text)
-        if normalize_message_text(part)
-    ]
-    if len(parts) >= max_parts:
-        return parts[:max_parts]
-    spaced = [part for part in text.split(" ") if part]
-    if len(spaced) >= max_parts:
-        return spaced[:max_parts]
-    return parts
 
 
 def _schema_from_capability(
@@ -231,217 +204,6 @@ def _build_meme_schemas(
     return schemas
 
 
-def _meme_slot_extractor(command_id: str, source: str) -> dict[str, Any]:
-    normalized_id = normalize_message_text(command_id)
-    text = normalize_message_text(source)
-    if normalized_id.endswith((".吃", ".拍")) and re.search(
-        r"\[image(?:#\d+)?\]",
-        text,
-        re.IGNORECASE,
-    ):
-        if normalized_id.endswith(".吃") and "吃" in text:
-            return {"image": "[image]"}
-        if normalized_id.endswith(".拍") and "拍" in text:
-            return {"image": "[image]"}
-    if normalized_id == "memes.search":
-        patterns = (
-            r"(?:查找|搜索|找|搜|查)(?:一下)?\s*(?P<keyword>.+?)(?:相关)?(?:的)?表情",
-            r"表情搜索\s*(?P<keyword>.+)",
-        )
-    elif normalized_id == "memes.info":
-        patterns = (
-            r"(?:查|看|了解)(?:一下)?\s*(?P<keyword>.+?)(?:这个)?表情(?:怎么用|详情|用法)?",
-            r"表情详情\s*(?P<keyword>.+)",
-        )
-    else:
-        if normalized_id.endswith(".王境泽"):
-            if "王境泽" not in text:
-                return {}
-            match = re.search(r"(?:文字|内容|台词)(?:是|为)?\s*(?P<text>.+)", text)
-            source_text = match.group("text") if match else text
-            parts = _split_text_parts(source_text, max_parts=4)
-            if len(parts) >= 4:
-                return {
-                    "文本1": parts[0],
-                    "文本2": parts[1],
-                    "文本3": parts[2],
-                    "文本4": parts[3],
-                }
-        if normalized_id.endswith(".5000兆"):
-            if "5000" not in text and not ("上" in text and "下" in text):
-                return {}
-            match = re.search(
-                r"上(?:面|方)?(?:写|文字是)?\s*(?P<top>.+?)"
-                r"\s*下(?:面|方)?(?:写|文字是)?\s*(?P<bottom>.+)",
-                text,
-            )
-            if match:
-                return {
-                    "上文字": normalize_message_text(match.group("top")),
-                    "下文字": normalize_message_text(match.group("bottom")),
-                }
-            parts = _split_text_parts(text, max_parts=2)
-            if len(parts) >= 2:
-                return {"上文字": parts[0], "下文字": parts[1]}
-        return {}
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if not match:
-            continue
-        keyword = normalize_message_text(match.group("keyword"))
-        keyword = re.sub(r"(?:这个|的|怎么用|用法|详情)$", "", keyword).strip()
-        if keyword:
-            return {"keyword": keyword}
-    return {}
-
-
-def _meme_score_hints(
-    schema_value: PluginCommandSchema,
-    lowered_query: str,
-    _stripped_lowered_query: str,
-) -> list[AdapterScoreHint]:
-    command_id = schema_value.command_id
-    hints: list[AdapterScoreHint] = []
-    if command_id == "memes.list" and any(
-        token in lowered_query for token in ("表情", "表情包", "梗图")
-    ):
-        if any(token in lowered_query for token in ("列表", "有哪些", "有什么")):
-            hints.append(AdapterScoreHint(180.0, "meme_catalog_intent"))
-        elif any(
-            token in lowered_query
-            for token in ("没说模板", "没选模板", "不知道模板", "哪个模板", "什么模板")
-        ):
-            hints.append(AdapterScoreHint(180.0, "meme_template_missing"))
-        elif any(
-            token in lowered_query for token in ("做", "制作", "生成", "来个", "来张")
-        ):
-            hints.append(AdapterScoreHint(80.0, "meme_catalog_intent"))
-    if command_id == "memes.list" and any(
-        token in lowered_query for token in ("随便", "随机")
-    ):
-        hints.append(AdapterScoreHint(-160.0, "meme_catalog_random_penalty"))
-    if (
-        command_id == "memes.random"
-        and any(token in lowered_query for token in ("随机", "随便"))
-        and any(token in lowered_query for token in ("图", "表情", "梗图"))
-    ):
-        hints.append(AdapterScoreHint(260.0, "meme_random_intent"))
-    if command_id.endswith(".小天使") and any(
-        token in lowered_query for token in ("天使", "天使头像")
-    ):
-        hints.append(AdapterScoreHint(280.0, "meme_semantic_template"))
-    if schema_value.command_role == "template" and any(
-        token in lowered_query for token in ("表情", "表情包", "梗图", "头像")
-    ):
-        hints.append(AdapterScoreHint(38.0, "template"))
-    if command_id == "memes.search" and any(
-        token in lowered_query for token in ("相关表情", "找一下", "搜一下", "搜索")
-    ):
-        hints.append(AdapterScoreHint(260.0, "meme_search_intent"))
-    if command_id == "memes.info" and any(
-        token in lowered_query
-        for token in ("怎么用", "用法", "详情", "参数怎么看", "参数怎么", "参数")
-    ):
-        hints.append(AdapterScoreHint(220.0, "meme_info_intent"))
-    if command_id == "memes.info" and any(
-        token in lowered_query for token in ("表情详情", "表情用法", "表情参数")
-    ):
-        hints.append(AdapterScoreHint(360.0, "meme_info_head_intent"))
-    return hints
-
-
-def _is_generic_meme_creation_request(
-    message_text: str,
-    candidates: list["CommandCandidate"],
-) -> bool:
-    normalized = normalize_message_text(message_text).casefold()
-    if not normalized:
-        return False
-    if has_chat_context_hint(normalized):
-        return False
-    if contains_any(
-        normalized,
-        (
-            "表情管理系统",
-            "表情包系统",
-            "架构",
-            "怎么设计",
-            "如何设计",
-            "系统设计",
-            "设计方案",
-        ),
-    ):
-        return False
-    meme_candidates = [item for item in candidates if item.family == "meme"]
-    if not meme_candidates:
-        return False
-    if any(token in normalized for token in ("随机", "随便")):
-        return False
-    if any(
-        normalize_message_text(phrase).casefold() in normalized
-        for candidate in meme_candidates
-        if candidate.schema.command_role == "template"
-        for phrase in [candidate.schema.head, *candidate.schema.aliases]
-        if normalize_message_text(phrase)
-    ):
-        return False
-    if not any(token in normalized for token in ("表情", "表情包", "梗图", "头像")):
-        return False
-    if not any(
-        token in normalized
-        for token in ("做", "制作", "生成", "整", "来个", "来一个", "来张", "来一张")
-    ):
-        return False
-    if any(
-        candidate.schema.command_id == "memes.list"
-        and candidate.reason == "meme_template_missing"
-        for candidate in meme_candidates
-    ):
-        return True
-    for candidate in meme_candidates:
-        schema_value = candidate.schema
-        if schema_value.command_role not in {"template", "random"}:
-            continue
-        phrases = [schema_value.head, *schema_value.aliases]
-        if any(
-            normalize_message_text(phrase).casefold()
-            and normalize_message_text(phrase).casefold() in normalized
-            for phrase in phrases
-        ):
-            return False
-    return True
-
-
-def _pick_meme_clarify_candidate(
-    candidates: list["CommandCandidate"],
-) -> "CommandCandidate | None":
-    meme_candidates = [item for item in candidates if item.family == "meme"]
-    for candidate in candidates:
-        if candidate.schema.command_id == "memes.list":
-            return candidate
-    for candidate in meme_candidates:
-        if candidate.schema.command_role in {"catalog", "helper"}:
-            return candidate
-    return meme_candidates[0] if meme_candidates else None
-
-
-def _meme_clarify_route(
-    message_text: str,
-    candidates: list["CommandCandidate"],
-) -> AdapterClarifyRoute | None:
-    if not _is_generic_meme_creation_request(message_text, candidates):
-        return None
-    candidate = _pick_meme_clarify_candidate(candidates)
-    if candidate is None:
-        return None
-    return AdapterClarifyRoute(
-        command_id=candidate.schema.command_id,
-        missing=("具体表情模板",),
-        confidence=0.86,
-        reason="generic_meme_template_missing",
-    )
-
-
 register_adapter(
     PluginCommandAdapter(
         module_suffixes=("nonebot_plugin_memes",),
@@ -466,17 +228,5 @@ register_adapter(
             default_templates=_NOTIFY_TEMPLATES,
             helper_templates=_HELPER_NOTIFY_TEMPLATES,
         ),
-        slot_extractors={
-            "memes.search": _meme_slot_extractor,
-            "memes.info": _meme_slot_extractor,
-        },
-        slot_extractor_prefixes=("nonebot_plugin_memes.",),
-        slot_extractor=lambda command_id, source: _meme_slot_extractor(
-            command_id, source
-        )
-        if command_id.startswith("nonebot_plugin_memes.")
-        else {},
-        score_hints=_meme_score_hints,
-        clarify_route=_meme_clarify_route,
     )
 )

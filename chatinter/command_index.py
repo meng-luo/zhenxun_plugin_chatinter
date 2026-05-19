@@ -1,4 +1,8 @@
-"""Command-level candidate index for ChatInter routing."""
+"""Recall-only command candidate index for ChatInter.
+
+This module ranks candidates to keep the prompt small.  It must not be treated
+as the final command selector; executable schema choice belongs to the LLM.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,6 @@ from dataclasses import dataclass
 import re
 
 from .capability_graph import build_capability_graph_snapshot
-from .command_schema import find_command_schema
 from .feedback import get_command_feedback_score
 from .models.pydantic_models import (
     CommandCandidateFeatures,
@@ -16,7 +19,6 @@ from .models.pydantic_models import (
     PluginCommandSchema,
     PluginKnowledgeBase,
 )
-from .plugin_adapters import collect_score_hints, extract_adapter_slots
 from .plugin_reference import build_command_tool_snapshots
 from .route_text import (
     match_command_head,
@@ -28,9 +30,8 @@ from .route_text import (
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
 _IMAGE_PATTERN = re.compile(r"\[image(?:#\d+)?\]", re.IGNORECASE)
 _AT_PATTERN = re.compile(r"\[@(?:[^\]\s]+|所有人)\]|@\d{5,20}", re.IGNORECASE)
-_EXACT_BOOST = 420.0
-_ALIAS_BOOST = 380.0
-_SLOT_BOOST = 190.0
+_EXACT_BOOST = 180.0
+_ALIAS_BOOST = 160.0
 _RRF_K = 60.0
 _FAMILY_SOFT_CAP = 6
 _PLUGIN_SOFT_CAP = 8
@@ -78,16 +79,8 @@ def _reason_feature_deltas(reason: str) -> dict[str, float]:
         "helper_langs",
         "random",
         "template",
-        "meme_search_intent",
-        "meme_info_intent",
-        "meme_catalog_intent",
-        "meme_template_missing",
-        "about_intent",
-        "abbr_intent",
     }:
         return {"semantic_score": 1.0}
-    if reason == "slot_signal":
-        return {"slot_score": _SLOT_BOOST}
     if reason in {"image_signal", "image_policy", "at_signal", "reply_signal"}:
         return {"context_score": 1.0}
     if reason == "feedback":
@@ -329,18 +322,6 @@ def _base_score_tool(
     if role == "random" and "随机" in lowered:
         score += 100.0
         reasons.append("random")
-    for hint in collect_score_hints(
-        schema,
-        lowered_query=lowered,
-        stripped_lowered_query=stripped_lowered,
-        plugin_module=plugin_module,
-    ):
-        score += hint.score
-        reasons.append(hint.reason)
-    if extract_adapter_slots(schema.command_id, normalized):
-        score += _SLOT_BOOST
-        reasons.append("slot_signal")
-
     feedback_score = get_command_feedback_score(
         command_id=schema.command_id,
         session_id=session_id,
@@ -357,44 +338,6 @@ def _base_score_tool(
         feedback_score=feedback_score,
     )
     return score, deduped_reasons, exact_protected, features
-
-
-def score_command_schema(
-    schema: PluginCommandSchema,
-    query: str,
-    *,
-    plugin_name: str = "",
-    plugin_module: str = "",
-    session_id: str | None = None,
-) -> tuple[float, str]:
-    tool = CommandToolSnapshot(
-        command_id=schema.command_id,
-        plugin_module=plugin_module,
-        plugin_name=plugin_name,
-        head=schema.head,
-        aliases=list(schema.aliases),
-        description=schema.description,
-        slots=list(schema.slots),
-        requires=dict(schema.requires or {}),
-        allow_at=schema.allow_at,
-        actor_scope=schema.actor_scope,
-        target_requirement=schema.target_requirement,
-        target_sources=list(schema.target_sources),
-        render=schema.render,
-        payload_policy=schema.payload_policy,
-        extra_text_policy=schema.extra_text_policy,
-        command_role=schema.command_role,
-        retrieval_phrases=list(schema.retrieval_phrases),
-    )
-    score, reasons, _exact, _features = _base_score_tool(
-        tool,
-        schema,
-        query,
-        plugin_name=plugin_name,
-        plugin_module=plugin_module,
-        session_id=session_id,
-    )
-    return score, ",".join(reasons)
 
 
 def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema:
@@ -795,24 +738,12 @@ def build_candidate_snapshots(
     return snapshots
 
 
-def find_schema_in_candidates(
-    candidates: list[CommandCandidate],
-    *,
-    command_id: str | None = None,
-    command: str | None = None,
-) -> PluginCommandSchema | None:
-    schemas = [candidate.schema for candidate in candidates]
-    return find_command_schema(schemas, command_id=command_id, command=command)
-
-
 __all__ = [
     "CommandCandidate",
     "build_candidate_snapshots",
     "build_command_candidates",
     "dump_candidate_for_prompt",
     "dump_schema_for_prompt",
-    "find_schema_in_candidates",
     "group_candidates_by_module",
     "retrieve_command_candidates",
-    "score_command_schema",
 ]

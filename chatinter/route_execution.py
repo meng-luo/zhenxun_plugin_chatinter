@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from typing import Any
 
 from nonebot.adapters import Event
 
 from .command_schema import normalize_schema_command_head
+from .command_observation import build_command_observation
 from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
 )
@@ -23,7 +25,6 @@ from .route_text import (
     collect_placeholders,
     contains_any,
     is_usage_question,
-    match_command_head_canonical,
     normalize_action_phrases,
     normalize_message_text,
 )
@@ -61,6 +62,67 @@ class RouteCommandSchemaView:
     requires_to_me: bool = False
     allow_sticky_arg: bool = False
     access_level: str = "public"
+
+
+def build_route_observation(
+    *,
+    route_result: NativeRouteResult,
+    ok: bool,
+    route_command: str = "",
+    task_text: str = "",
+    ambient_message: str = "",
+    messages_sent: list[str] | tuple[str, ...] | None = None,
+    artifacts: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    trace_id: str = "",
+    error: str = "",
+    missing: list[str] | tuple[str, ...] | None = None,
+    retryable: bool = False,
+    remaining_task_hint: str | None = None,
+) -> dict[str, Any]:
+    """Build the standard observation for a concrete route execution."""
+
+    decision = route_result.decision
+    return build_command_observation(
+        ok=ok,
+        command_id=route_result.command_id,
+        rendered_command=route_command or decision.command,
+        matched_plugin=decision.plugin_name,
+        messages_sent=messages_sent,
+        artifacts=artifacts,
+        task_text=task_text,
+        ambient_message=ambient_message,
+        trace_id=trace_id,
+        error=error,
+        missing=missing,
+        retryable=retryable,
+        plugin_module=decision.plugin_module,
+        remaining_task_hint=remaining_task_hint,
+    )
+
+
+def build_invalid_route_observation(
+    *,
+    decision,
+    task_text: str,
+    ambient_message: str,
+    error: str,
+    retryable: bool = True,
+    missing: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Build the standard observation when route validation produced no route."""
+
+    return build_command_observation(
+        ok=False,
+        command_id=getattr(decision, "command_id", "") or "",
+        rendered_command=getattr(decision, "command", "") or "",
+        matched_plugin=getattr(decision, "plugin_name", "") or "",
+        task_text=task_text,
+        ambient_message=ambient_message,
+        error=error,
+        missing=missing,
+        retryable=retryable,
+        plugin_module=getattr(decision, "plugin_module", "") or "",
+    )
 
 
 _SELF_ONLY_ACTION_KEYWORDS = ("\u7b7e\u5230", "\u6253\u5361", "\u8865\u7b7e")
@@ -182,16 +244,6 @@ def _normalize_head(command_text: str) -> str:
     return normalize_schema_command_head(command_text)
 
 
-def _iter_meta_aliases(meta) -> set[str]:
-    aliases = getattr(meta, "aliases", None) or []
-    values: set[str] = set()
-    for alias in aliases:
-        normalized = normalize_schema_command_head(str(alias or ""))
-        if normalized:
-            values.add(normalized)
-    return values
-
-
 def _schema_command_head(schema) -> str:
     return normalize_schema_command_head(
         str(getattr(schema, "command", None) or getattr(schema, "head", None) or "")
@@ -302,32 +354,6 @@ def _is_exact_command_head_match(head: str, schema: RouteCommandSchemaView) -> b
     return any(normalized == value.casefold() for value in values if value)
 
 
-def _is_safe_fuzzy_command_head_match(
-    head: str,
-    schema: RouteCommandSchemaView,
-) -> bool:
-    normalized = normalize_schema_command_head(head)
-    if not normalized:
-        return False
-    for value in [schema.command, *schema.aliases]:
-        candidate = normalize_schema_command_head(value)
-        if not candidate or candidate == normalized:
-            continue
-        # Avoid weak shared-noun matches such as “塞红包” -> “开红包”.
-        if (
-            len(normalized) >= 2
-            and len(candidate) >= 2
-            and normalized[0] == candidate[0]
-            and (normalized.startswith(candidate) or candidate.startswith(normalized))
-        ):
-            return True
-        if re.search(r"[0-9A-Za-z_]", normalized + candidate) and (
-            match_command_head_canonical(normalized, candidate)
-        ):
-            return True
-    return False
-
-
 def _is_public_command_meta(meta) -> bool:
     return (
         normalize_message_text(
@@ -356,37 +382,25 @@ def _find_route_command_schema(route_result: NativeRouteResult, knowledge_plugin
         for schema in reference_views:
             if schema.command_id.casefold() == command_id:
                 return schema
+        for plugin in candidate_plugins:
+            for meta in plugin.command_meta:
+                if not _is_public_command_meta(meta):
+                    continue
+                schema = _view_from_command_meta(meta)
+                if schema.command_id.casefold() == command_id:
+                    return schema
+        return None
     for plugin in candidate_plugins:
         meta_views = [
             _view_from_command_meta(meta)
             for meta in plugin.command_meta
             if _is_public_command_meta(meta)
         ]
-        plugin_aliases = {
-            _normalize_head(alias).casefold()
-            for alias in (getattr(plugin, "aliases", None) or [])
-            if _normalize_head(alias)
-        }
         for schema in meta_views:
             if _is_exact_command_head_match(head, schema):
                 return schema
-        if head.casefold() in plugin_aliases and len(meta_views) == 1:
-            return meta_views[0]
     for schema in reference_views:
         if _is_exact_command_head_match(head, schema):
-            return schema
-    # Once a native command_id exists, do not fuzzy-select a sibling command.
-    if command_id:
-        return None
-    for plugin in candidate_plugins:
-        for meta in plugin.command_meta:
-            if not _is_public_command_meta(meta):
-                continue
-            schema = _view_from_command_meta(meta)
-            if _is_safe_fuzzy_command_head_match(head, schema):
-                return schema
-    for schema in reference_views:
-        if _is_safe_fuzzy_command_head_match(head, schema):
             return schema
     return None
 
@@ -930,7 +944,9 @@ find_route_command_schema = _find_route_command_schema
 
 __all__ = [
     "RouteExecutionPlan",
+    "build_invalid_route_observation",
     "build_reply_image_segments_for_reroute",
+    "build_route_observation",
     "build_route_message_with_explicit_context",
     "build_target_modules",
     "collect_target_capable_command_heads",

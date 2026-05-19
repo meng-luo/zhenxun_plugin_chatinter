@@ -660,47 +660,6 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
     return edits <= 1
 
 
-def match_command_head_canonical(text: str, command: str) -> bool:
-    strict_text = _clean_route_command_head_text(text, compact=False)
-    strict_command = _clean_route_command_head_text(command, compact=False)
-    if (
-        strict_text
-        and strict_command
-        and match_command_head(strict_text, strict_command)
-    ):
-        return True
-
-    compact_text = _clean_route_command_head_text(text, compact=True)
-    compact_command = _clean_route_command_head_text(command, compact=True)
-    if not compact_text or not compact_command:
-        ascii_text = _compact_ascii_head_text(text)
-        ascii_command = _compact_ascii_head_text(command)
-        if not ascii_text or not ascii_command:
-            return False
-        if ascii_text == ascii_command:
-            return True
-        return match_command_head_or_sticky(
-            ascii_text,
-            ascii_command,
-            allow_sticky=True,
-        )
-    if compact_text == compact_command:
-        return True
-    if not _has_ascii_alnum(strict_command):
-        if match_command_head_or_sticky(
-            compact_text,
-            compact_command,
-            allow_sticky=True,
-        ):
-            return True
-        ascii_text = _compact_ascii_head_text(text)
-        ascii_command = _compact_ascii_head_text(command)
-        if ascii_text and ascii_command and ascii_text == ascii_command:
-            return True
-        return _find_short_noise_head_boundary(text, command) is not None
-    return False
-
-
 def strip_invoke_prefix(text: str) -> str:
     stripped = normalize_message_text(text)
     while stripped:
@@ -1212,7 +1171,6 @@ __all__ = [
     "has_template_route_context",
     "is_usage_question",
     "match_command_head",
-    "match_command_head_canonical",
     "match_command_head_fuzzy",
     "match_command_head_or_sticky",
     "normalize_action_phrases",

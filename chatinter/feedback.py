@@ -26,7 +26,7 @@ from .feedback_keys import (
 )
 from .route_text import normalize_message_text
 
-FeedbackDomain = Literal["chat", "plugin", "followup"]
+FeedbackDomain = Literal["chat", "plugin", "followup", "runtime"]
 FeedbackKind = Literal[
     "chat_completed",
     "chat_rewritten",
@@ -43,6 +43,7 @@ FeedbackKind = Literal[
     "direct_target_required",
     "route_user_corrected",
     "route_confirmed",
+    "runtime_guardrail",
 ]
 
 _CORRECTION_HINTS = (
@@ -289,6 +290,59 @@ class FeedbackStore:
             kind=kind,
             weight=float(weight or 0.0),
         )
+        cls._prune(now)
+
+    @classmethod
+    def record_runtime_guardrail(
+        cls,
+        *,
+        session_id: str | None,
+        reason: str,
+        severity: str,
+        message_text: str = "",
+        command_id: str = "",
+        tool_name: str = "",
+        weight: float = -0.12,
+    ) -> None:
+        """Record runtime loop protection in the same bounded feedback store."""
+
+        normalized_session = normalize_message_text(session_id or "")
+        if not normalized_session:
+            return
+        now = time.monotonic()
+        normalized_command_id = normalize_message_text(command_id)
+        normalized_tool = normalize_message_text(tool_name)
+        normalized_reason = normalize_message_text(reason) or "runtime_guardrail"
+        normalized_severity = normalize_message_text(severity) or "light"
+        cls._records.append(
+            FeedbackRecord(
+                timestamp=now,
+                domain="runtime",
+                session_id=normalized_session,
+                kind="runtime_guardrail",
+                message_preview=normalize_message_text(message_text)[:120],
+                command_id=normalized_command_id,
+                command=normalized_tool,
+                route_stage=f"runtime_guardrail:{normalized_severity}",
+                success=False,
+                weight=float(weight or 0.0),
+            )
+        )
+        if normalized_command_id:
+            delta = _clamp_command_feedback(float(weight or 0.0))
+            cls._command_feedback[normalized_command_id] = _clamp_command_feedback(
+                cls._command_feedback.get(normalized_command_id, 0.0) + delta
+            )
+            cls._command_feedback_ts[normalized_command_id] = now
+            reason_bucket = cls._reason_feedback.setdefault(normalized_reason, {})
+            reason_bucket[normalized_command_id] = _clamp_command_feedback(
+                reason_bucket.get(normalized_command_id, 0.0) + delta
+            )
+        if normalized_tool and not normalized_command_id:
+            reason_bucket = cls._reason_feedback.setdefault(normalized_reason, {})
+            reason_bucket[normalized_tool] = _clamp_command_feedback(
+                reason_bucket.get(normalized_tool, 0.0) + float(weight or 0.0)
+            )
         cls._prune(now)
 
     @classmethod

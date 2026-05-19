@@ -134,7 +134,8 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
         f"extra_text_policy: {schema.extra_text_policy}",
         f"source: {schema.source}",
         f"confidence: {schema.confidence:.2f}",
-        f"local_recall_reason: {candidate.reason}",
+        f"recall_signal: {candidate.reason}",
+        "recall_policy: 本工具来自能力检索候选；rank/score 不是执行决策。",
     ]
     description = schema.description or getattr(snapshot, "capability_text", "")
     if description:
@@ -191,8 +192,8 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
         "明显对应该命令时才调用。普通闲聊、讨论命令概念、候选不匹配时不要调用。"
     )
     parts.append(
-        "Multi-task policy: 如果用户一句话里有多个任务，调用本工具时 task_text "
-        "只能包含本命令负责的子任务，不要带上前后其他命令。"
+        "Multi-task policy: task_text 是模型对本次工具调用负责内容的标注；"
+        "不要把无关任务写进同一个工具调用。无法明确标注时可传 null。"
     )
     return "\n".join(part for part in parts if normalize_message_text(part))
 
@@ -206,13 +207,21 @@ def _build_parameters(
         TASK_TEXT_FIELD: {
             "type": ["string", "null"],
             "description": (
-                "当前工具调用对应的用户子任务原文。多任务消息必须只填写本工具"
-                "负责的片段，例如“看一下我的信息”，不要包含其他任务。"
+                "当前工具调用对应的用户任务标注。多工具场景建议只填写本工具"
+                "负责的内容；无法明确标注时传 null。"
             ),
+        },
+        "target_hint": {
+            "type": ["string", "null"],
+            "description": _target_hint_description(schema),
+        },
+        "payload_hint": {
+            "type": ["string", "null"],
+            "description": _payload_hint_description(schema),
         }
     }
-    required: list[str] = [TASK_TEXT_FIELD]
-    seen: set[str] = set()
+    required: list[str] = [TASK_TEXT_FIELD, "target_hint", "payload_hint"]
+    seen: set[str] = {TASK_TEXT_FIELD, "target_hint", "payload_hint"}
     for slot in schema.slots:
         name = normalize_message_text(slot.name)
         if not name or name in seen:
@@ -288,6 +297,7 @@ def _build_parameter_root_description(
         f"render={schema.render}",
         f"role={schema.command_role}",
         f"payload_policy={schema.payload_policy}",
+        f"extra_text_policy={schema.extra_text_policy}",
     ]
     true_requires = [
         key for key, value in (schema.requires or {}).items() if bool(value)
@@ -301,6 +311,30 @@ def _build_parameter_root_description(
     if snapshot is not None and snapshot.capability_text:
         parts.append(f"capability={snapshot.capability_text}")
     return "；".join(parts)
+
+
+def _target_hint_description(schema: PluginCommandSchema) -> str:
+    parts = [
+        "目标策略提示，不直接作为插件参数渲染；用于说明本次调用的目标来源。",
+        f"target_requirement={schema.target_requirement}",
+        f"actor_scope={schema.actor_scope}",
+    ]
+    if schema.target_sources:
+        parts.append("target_sources=" + _join_values(schema.target_sources))
+    if schema.allow_at is not None:
+        parts.append(f"allow_at={schema.allow_at}")
+    return "；".join(parts)
+
+
+def _payload_hint_description(schema: PluginCommandSchema) -> str:
+    return "；".join(
+        [
+            "负载策略提示，不直接作为插件参数渲染；用于说明文本/图片/尾巴如何提供。",
+            f"payload_policy={schema.payload_policy}",
+            f"extra_text_policy={schema.extra_text_policy}",
+            "图片上下文请用 [image#N]，目标用户请用 [@user_id]。",
+        ]
+    )
 
 
 def _slot_signature(slot: CommandSlotSpec) -> str:

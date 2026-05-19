@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolResult
@@ -68,22 +68,31 @@ class NativeCommandExecutionContext:
     ) -> ToolResult:
         validated = self._validate_tool_call(binding=binding, raw_slots=raw_slots)
         if validated is None:
-            return ToolResult(
-                output=build_command_observation(
-                    ok=False,
-                    command_id=binding.command_id,
-                    rendered_command=binding.candidate.schema.head,
-                    matched_plugin=binding.candidate.plugin_name,
-                    task_text="",
-                    ambient_message=self.message_text,
-                    error="工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
-                    retryable=True,
-                    plugin_module=binding.candidate.plugin_module,
-                ),
+            task_text, _slots = pop_task_text(raw_slots)
+            return _failure_tool_result(
+                binding=binding,
+                task_text=task_text,
+                ambient_message=self.message_text,
+                error="工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
                 display_content="工具调用校验失败",
+                retryable=True,
             )
 
-        execution = await self.route_executor(validated, self.report)
+        try:
+            execution = await self.route_executor(validated, self.report)
+        except Exception as exc:
+            execution = _execution_failure_from_exception(
+                binding=binding,
+                validated=validated,
+                ambient_message=self.message_text,
+                exc=exc,
+            )
+        execution = _ensure_execution_observation(
+            binding=binding,
+            execution=execution,
+            validated=validated,
+            ambient_message=self.message_text,
+        )
         self.executions.append(execution)
         self._finalize_report(validated=validated, execution=execution)
         return ToolResult(
@@ -102,8 +111,6 @@ class NativeCommandExecutionContext:
         slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
         self.task_count += 1
         fallback_text = normalize_message_text(candidate.schema.head)
-        if not task_text and not candidate.schema.slots:
-            task_text = fallback_text
         effective_fallback_text = fallback_text or normalize_message_text(
             candidate.schema.head
         )
@@ -134,6 +141,7 @@ class NativeCommandExecutionContext:
         route = candidate_selection_to_native_route(
             selection=selection,
             candidates=self.candidates,
+            candidate=candidate,
             message_text=route_message_text,
             stage=_NATIVE_EXECUTION_STAGE,
             has_reply=self.has_reply,
@@ -234,6 +242,141 @@ def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
             return None
 
     return normalize_message_text(text)
+
+
+def _failure_tool_result(
+    *,
+    binding: NativeCommandToolBinding,
+    task_text: str,
+    ambient_message: str,
+    error: str,
+    display_content: str,
+    retryable: bool,
+    missing: list[str] | tuple[str, ...] | None = None,
+) -> ToolResult:
+    return ToolResult(
+        output=build_command_observation(
+            ok=False,
+            command_id=binding.command_id,
+            rendered_command=binding.candidate.schema.head,
+            matched_plugin=binding.candidate.plugin_name,
+            task_text=task_text,
+            ambient_message=ambient_message,
+            error=error,
+            missing=missing,
+            retryable=retryable,
+            plugin_module=binding.candidate.plugin_module,
+        ),
+        display_content=display_content,
+    )
+
+
+def _execution_failure_from_exception(
+    *,
+    binding: NativeCommandToolBinding,
+    validated: NativeValidatedRoute,
+    ambient_message: str,
+    exc: Exception,
+) -> NativeToolExecutionResult:
+    task_text = (
+        validated.task_frame.effective_text
+        if validated.task_frame is not None
+        else ""
+    )
+    route_result = validated.route_result
+    rendered = (
+        route_result.decision.command
+        if route_result is not None
+        else binding.candidate.schema.head
+    )
+    return NativeToolExecutionResult(
+        success=False,
+        route_result=route_result,
+        route_command=rendered,
+        output=build_command_observation(
+            ok=False,
+            command_id=binding.command_id,
+            rendered_command=rendered,
+            matched_plugin=binding.candidate.plugin_name,
+            task_text=task_text,
+            ambient_message=ambient_message,
+            error=f"插件执行链路异常：{type(exc).__name__}: {exc}",
+            retryable=False,
+            plugin_module=binding.candidate.plugin_module,
+        ),
+        display_text="插件执行链路异常。",
+        reason="route_executor_exception",
+    )
+
+
+def _ensure_execution_observation(
+    *,
+    binding: NativeCommandToolBinding,
+    execution: NativeToolExecutionResult,
+    validated: NativeValidatedRoute,
+    ambient_message: str,
+) -> NativeToolExecutionResult:
+    if _is_standard_observation(execution.output):
+        return execution
+    route_result = execution.route_result
+    task_text = (
+        validated.task_frame.effective_text
+        if validated.task_frame is not None
+        else ""
+    )
+    rendered = (
+        execution.route_command
+        or (route_result.decision.command if route_result is not None else "")
+        or binding.candidate.schema.head
+    )
+    plugin_name = (
+        route_result.decision.plugin_name
+        if route_result is not None
+        else binding.candidate.plugin_name
+    )
+    plugin_module = (
+        route_result.decision.plugin_module
+        if route_result is not None
+        else binding.candidate.plugin_module
+    )
+    error = ""
+    if not execution.success:
+        output = execution.output if isinstance(execution.output, dict) else {}
+        error = normalize_message_text(
+            str(output.get("error", ""))
+            or execution.display_text
+            or execution.reason
+            or "插件执行失败。"
+        )
+    return replace(
+        execution,
+        output=build_command_observation(
+            ok=execution.success,
+            command_id=binding.command_id,
+            rendered_command=rendered,
+            matched_plugin=plugin_name,
+            task_text=task_text,
+            ambient_message=ambient_message,
+            error=error,
+            retryable=not execution.success,
+            plugin_module=plugin_module,
+        ),
+    )
+
+
+def _is_standard_observation(output: dict[str, Any]) -> bool:
+    required_keys = {
+        "ok",
+        "command_id",
+        "rendered_command",
+        "matched_plugin",
+        "task_text",
+        "messages_sent",
+        "error",
+        "retryable",
+        "need_continue",
+    }
+    return isinstance(output, dict) and required_keys.issubset(output.keys())
 
 
 __all__ = [

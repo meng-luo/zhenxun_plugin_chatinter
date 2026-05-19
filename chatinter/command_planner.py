@@ -11,7 +11,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .command_schema import complete_slots, render_command, select_command_schema
+from .command_schema import complete_slots, render_command
+from .models.pydantic_models import PluginCommandSchema
 from .models.pydantic_models import PluginReference
 from .route_text import normalize_message_text
 
@@ -48,9 +49,10 @@ def plan_command(
     missing: list[str] | None = None,
     reason: str | None = None,
 ) -> CommandPlanDecision:
-    _ = (ambient_message, has_reply, image_count)
+    _ = (ambient_message, has_reply, image_count, current_message)
     normalized_command = normalize_message_text(command or "")
     normalized_args = normalize_message_text(arguments_text)
+    normalized_id = normalize_message_text(command_id or "")
     selected_slots = dict(slots or {})
     missing_items = list(missing or [])
 
@@ -59,7 +61,7 @@ def plan_command(
             action=action,
             plugin_module=plugin_module,
             plugin_name=plugin_name,
-            command_id=command_id,
+            command_id=normalized_id or command_id,
             command_head=_command_head(normalized_command),
             slots=selected_slots,
             arguments_text=normalized_args,
@@ -69,34 +71,54 @@ def plan_command(
             reason=reason or action,
         )
 
+    if not normalized_id:
+        return CommandPlanDecision(
+            action="clarify",
+            plugin_module=plugin_module,
+            plugin_name=plugin_name,
+            command_id=None,
+            command_head=_command_head(normalized_command),
+            slots=selected_slots,
+            arguments_text=normalized_args,
+            final_command=None,
+            missing=["command_id"],
+            confidence=min(confidence, 0.2),
+            reason="missing_command_id",
+        )
+
     schema = _select_schema(
         references=list(references or []),
         plugin_module=plugin_module,
         plugin_name=plugin_name,
-        command_id=command_id,
-        command=normalized_command,
-        message_text=current_message,
-        arguments_text=normalized_args,
-        slots=selected_slots,
-        action=action,
+        command_id=normalized_id,
     )
-    if schema is not None:
-        selected_slots, schema_missing = complete_slots(
-            schema,
+    if schema is None:
+        return CommandPlanDecision(
+            action="clarify",
+            plugin_module=plugin_module,
+            plugin_name=plugin_name,
+            command_id=normalized_id,
+            command_head=_command_head(normalized_command),
             slots=selected_slots,
-            message_text=current_message,
             arguments_text=normalized_args,
+            final_command=None,
+            missing=["command_schema"],
+            confidence=min(confidence, 0.2),
+            reason="schema_not_found",
         )
-        rendered, render_missing = render_command(
-            schema,
-            slots=selected_slots,
-            message_text=current_message,
-            arguments_text=normalized_args,
-        )
-        normalized_command = rendered or normalized_command or schema.head
-        command_id = schema.command_id
-        missing_items.extend(schema_missing)
-        missing_items.extend(render_missing)
+
+    selected_slots, schema_missing = complete_slots(
+        schema,
+        slots=selected_slots,
+    )
+    rendered, render_missing = render_command(
+        schema,
+        slots=selected_slots,
+    )
+    normalized_command = rendered or schema.head
+    command_id = schema.command_id
+    missing_items.extend(schema_missing)
+    missing_items.extend(render_missing)
 
     missing_items = list(dict.fromkeys(item for item in missing_items if item))
     planned_action: Literal["execute", "clarify"] = (
@@ -122,13 +144,8 @@ def _select_schema(
     references: list[PluginReference],
     plugin_module: str | None,
     plugin_name: str | None,
-    command_id: str | None,
-    command: str,
-    message_text: str,
-    arguments_text: str,
-    slots: dict[str, object],
-    action: str,
-):
+    command_id: str,
+) -> PluginCommandSchema | None:
     reference = _find_reference(
         references,
         plugin_module=plugin_module,
@@ -136,16 +153,11 @@ def _select_schema(
     )
     if reference is None:
         return None
-    selection = select_command_schema(
-        reference.command_schemas,
-        command_id=command_id,
-        command=command,
-        message_text=message_text,
-        arguments_text=arguments_text,
-        slots=slots,
-        action=action,
-    )
-    return selection.schema if selection is not None else None
+    normalized_id = normalize_message_text(command_id).casefold()
+    for schema in reference.command_schemas:
+        if normalize_message_text(schema.command_id).casefold() == normalized_id:
+            return schema
+    return None
 
 
 def _find_reference(

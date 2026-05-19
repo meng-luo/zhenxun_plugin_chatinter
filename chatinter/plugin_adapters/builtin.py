@@ -2,210 +2,8 @@
 
 from __future__ import annotations
 
-import re
-from typing import Any
-
-from ..models.pydantic_models import PluginCommandSchema
 from ..route_text import normalize_message_text
-from ..slot_extractors import parse_int_token
-from . import AdapterScoreHint, PluginCommandAdapter, register_adapter, schema, slot
-
-NUMBER_TEXT = r"\d+|[零〇一二两俩三四五六七八九十百千]+"
-
-
-def _extract_number(pattern: str, text: str, group: str) -> int | None:
-    match = re.search(pattern, text, re.IGNORECASE)
-    if not match:
-        return None
-    return parse_int_token(match.group(group))
-
-
-def _split_options(raw: str) -> str:
-    options = normalize_message_text(raw)
-    if not options:
-        return ""
-    options = re.sub(r"[、，,/|]+", " ", options)
-    options = re.sub(r"\s*(?:和|或|还是)\s*", " ", options)
-    options = normalize_message_text(options)
-    if " " not in options and "茶" in options:
-        tea_items = re.findall(r"[^茶\s]{1,3}茶", options)
-        if len(tea_items) >= 2 and "".join(tea_items) == options:
-            return " ".join(tea_items)
-    if " " not in options and len(options) >= 4 and len(options) % 2 == 0:
-        return " ".join(
-            options[index : index + 2] for index in range(0, len(options), 2)
-        )
-    if " " not in options and len(options) <= 8:
-        return " ".join(options)
-    return options
-
-
-def _extract_redbag_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    slots: dict[str, Any] = {}
-    amount = _extract_number(
-        rf"总额\s*(?P<amount>{NUMBER_TEXT})",
-        text,
-        "amount",
-    )
-    num = _extract_number(
-        rf"分\s*(?P<num>{NUMBER_TEXT})\s*[份个]",
-        text,
-        "num",
-    )
-    if num is None:
-        num = _extract_number(
-            rf"(?P<num>{NUMBER_TEXT})\s*(?:个人|人)\s*领",
-            text,
-            "num",
-        )
-    if amount is not None:
-        slots["amount"] = amount
-    if num is not None:
-        slots["num"] = num
-
-    patterns = (
-        rf"(?P<num>{NUMBER_TEXT})\s*[个份]\s*(?P<amount>{NUMBER_TEXT})\s*金币",
-        rf"(?P<num>{NUMBER_TEXT})\s*[个份]\s*红包.*?(?P<amount>{NUMBER_TEXT})\s*金币",
-        rf"(?P<amount>{NUMBER_TEXT})\s*金币.*?(?P<num>{NUMBER_TEXT})\s*[个份]\s*红包",
-        rf"(?P<amount>{NUMBER_TEXT})\s*金币\s*红包\s*(?P<num>{NUMBER_TEXT})\s*[个份]",
-        rf"(?P<amount>{NUMBER_TEXT})\s*金币.*?(?P<num>{NUMBER_TEXT})\s*[个份]",
-        rf"红包.*?(?P<amount>{NUMBER_TEXT})\s*金币.*?(?P<num>{NUMBER_TEXT})\s*[个份]",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        parsed_num = parse_int_token(match.group("num"))
-        parsed_amount = parse_int_token(match.group("amount"))
-        if parsed_num is not None:
-            slots["num"] = parsed_num
-        if parsed_amount is not None:
-            slots["amount"] = parsed_amount
-
-    if "num" not in slots:
-        num_only = _extract_number(
-            rf"(?P<num>{NUMBER_TEXT})\s*[个份]\s*红包",
-            text,
-            "num",
-        )
-        if num_only is not None:
-            slots["num"] = num_only
-
-    if "amount" not in slots:
-        amount = _extract_number(rf"(?P<amount>{NUMBER_TEXT})\s*金币", text, "amount")
-        if amount is not None:
-            slots["amount"] = amount
-    return slots
-
-
-def _extract_translate_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    if text in {"帮我翻译一下", "翻译一下", "翻译一下吧", "翻译吧"}:
-        return {}
-    if any(
-        token in text for token in ("支持哪些语言", "支持什么语言", "翻译语种", "语种")
-    ):
-        return {}
-    for pattern in (
-        r"把\s*(?P<text>.+?)\s*翻(?:译)?(?:一下)?(?:成(?:中文|英文|日文|韩文))?",
-        r"把\s*(?P<text>.+?)\s*翻(?:译)?成(?:中文|英文|日文|韩文)",
-        r"用中文说一下\s*(?P<text>.+)",
-        r"翻译一下\s*(?P<text>.+)",
-        r"翻译\s*(?P<text>.+)",
-    ):
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = normalize_message_text(match.group("text"))
-            if value and value not in {"吧", "一下", "一下吧"}:
-                return {"text": value}
-    return {}
-
-
-def _extract_roll_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    patterns = (
-        r"从\s*(?P<options>.+?)\s*(?:里|中|里面)?\s*(?:选|挑|决定)",
-        r"帮我从\s*(?P<options>.+?)\s*(?:里|中|里面)?\s*(?:选|挑|决定)",
-        r"(?:帮我)?(?:决定|选|挑)\s*(?P<options>.+)",
-        r"二选一\s*(?P<options>.+)",
-        r"(?P<options>.+?)\s*(?:里|中|里面)?\s*(?:选一个|挑一个|二选一)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if not match:
-            continue
-        options = _split_options(match.group("options"))
-        if options:
-            return {"options": options}
-    return {}
-
-
-def _extract_nbnhhsh_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    patterns = (
-        r"(?P<text>[0-9A-Za-z_]{2,16})\s*(?:是)?(?:什么|啥|哪个)?缩写",
-        r"(?:nbnhhsh|能不能好好说话|解释(?:一下)?缩写|缩写)\s*(?P<text>[0-9A-Za-z_]{2,16})",
-        r"(?P<text>[0-9A-Za-z_]{2,16}).{0,4}(?:展开|啥意思|什么意思|是什么意思)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return {"text": match.group("text")}
-    return {}
-
-
-def _extract_word_bank_slots(message_text: str) -> dict[str, Any]:
-    text = normalize_message_text(message_text)
-    for pattern in (
-        r"(?:问题是|问题为)\s*(?P<q>.+?)\s*(?:回答是|回答为|答案是|答案为)\s*(?P<a>.+)",
-        r"(?:添加问答|添加词条|问答添加|加个词条)\s*(?P<text>.+)",
-    ):
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        if "text" in match.groupdict():
-            value = normalize_message_text(match.group("text"))
-        else:
-            question = normalize_message_text(match.group("q"))
-            answer = normalize_message_text(match.group("a"))
-            value = f"{question}={answer}" if question and answer else ""
-        if value:
-            return {"text": value}
-    return {}
-
-
-def _same_command(command_id: str):
-    def extractor(_command_id: str, source: str) -> dict[str, Any]:
-        if command_id == "gold_redbag.send":
-            return _extract_redbag_slots(source)
-        if command_id == "translate.text":
-            return _extract_translate_slots(source)
-        if command_id == "roll.choose":
-            return _extract_roll_slots(source)
-        if command_id == "nbnhhsh.expand":
-            return _extract_nbnhhsh_slots(source)
-        if command_id == "word_bank.add":
-            return _extract_word_bank_slots(source)
-        return {}
-
-    return extractor
-
-
-def _simple_text_extractor(patterns: tuple[str, ...]):
-    def extractor(_command_id: str, source: str) -> dict[str, Any]:
-        text = normalize_message_text(source)
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if not match:
-                continue
-            group_name = "target" if "target" in match.groupdict() else "text"
-            value = normalize_message_text(match.group(group_name))
-            if value:
-                return {group_name: value}
-        return {}
-
-    return extractor
+from . import PluginCommandAdapter, register_adapter, schema, slot
 
 
 def _aliases_for(head: str, values: tuple[str, ...]) -> list[str]:
@@ -285,51 +83,6 @@ def _poetry_semantic_aliases(
     )
 
 
-def _builtin_score_hints(
-    schema_value: PluginCommandSchema,
-    lowered_query: str,
-    _stripped_lowered_query: str,
-) -> list[AdapterScoreHint]:
-    command_id = schema_value.command_id
-    hints: list[AdapterScoreHint] = []
-    if (
-        command_id == "about.info"
-        and any(token in lowered_query for token in ("真寻", "小真寻", "bot", "机器人"))
-        and any(token in lowered_query for token in ("信息", "介绍", "了解", "项目"))
-    ):
-        hints.append(AdapterScoreHint(120.0, "about_intent"))
-    if command_id == "nbnhhsh.expand" and re.search(
-        r"[0-9A-Za-z_]{2,}\s*(?:是)?(?:什么|啥|哪个)?缩写",
-        lowered_query,
-        re.IGNORECASE,
-    ):
-        hints.append(AdapterScoreHint(120.0, "abbr_intent"))
-    if command_id == "gold_redbag.return" and any(
-        token in lowered_query
-        for token in ("退回", "退还", "没领完", "没抢完", "没抢完的红包退")
-    ):
-        hints.append(AdapterScoreHint(260.0, "redbag_return_intent"))
-    if command_id == "gold_redbag.open" and any(
-        token in lowered_query for token in ("没领完", "没抢完", "退回", "退还")
-    ):
-        hints.append(AdapterScoreHint(-260.0, "redbag_open_penalty"))
-    if command_id == "gold_redbag.send" and any(
-        token in lowered_query
-        for token in ("发个金币红包", "金币红包", "发红包", "总额", "个人领", "人领")
-    ):
-        hints.append(AdapterScoreHint(160.0, "redbag_send_intent"))
-    if command_id == "gold_redbag.open" and any(
-        token in lowered_query for token in ("总额", "个人领", "人领")
-    ):
-        hints.append(AdapterScoreHint(-220.0, "redbag_open_send_penalty"))
-    lang_query_tokens = ("支持哪些", "哪些语言", "语种", "支持什么语言")
-    if schema_value.requires.get("text") and any(
-        token in lowered_query for token in lang_query_tokens
-    ):
-        hints.append(AdapterScoreHint(-360.0, "text_lang_penalty"))
-    return hints
-
-
 register_adapter(
     PluginCommandAdapter(
         modules=("zhenxun.plugins.sign_in",),
@@ -354,7 +107,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={"word_bank.add": _same_command("word_bank.add")},
     )
 )
 
@@ -387,13 +139,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={
-            "music.play": _simple_text_extractor(
-                (
-                    r"(?:点歌|搜歌|音乐|点一首歌|点首歌|播一首歌|播首歌|来一首歌|放一首歌|给我放一首)\s*(?P<text>.+)",
-                )
-            )
-        },
     )
 )
 
@@ -452,8 +197,6 @@ register_adapter(
                 extra_text_policy="discard",
             ),
         ),
-        slot_extractors={"gold_redbag.send": _same_command("gold_redbag.send")},
-        score_hints=_builtin_score_hints,
     )
 )
 
@@ -511,7 +254,6 @@ register_adapter(
                 extra_text_policy="discard",
             ),
         ),
-        slot_extractors={"roll.choose": _same_command("roll.choose")},
     )
 )
 
@@ -562,11 +304,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={
-            "cover.bilibili": _simple_text_extractor(
-                (r"(?P<target>https?://\S+|BV[0-9A-Za-z]+|av\d+|cv\d+)",)
-            )
-        },
     )
 )
 
@@ -587,11 +324,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={
-            "parse_bilibili.video": _simple_text_extractor(
-                (r"(?P<target>https?://\S+|BV[0-9A-Za-z]+|av\d+)",)
-            )
-        },
     )
 )
 
@@ -627,8 +359,6 @@ register_adapter(
                 extra_text_policy="discard",
             ),
         ),
-        slot_extractors={"translate.text": _same_command("translate.text")},
-        score_hints=_builtin_score_hints,
     )
 )
 
@@ -648,16 +378,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={
-            "luxun.say": _simple_text_extractor(
-                (
-                    r"鲁迅风格(?:写一句|写一段|说)?\s*(?P<text>.+)",
-                    r"文字是\s*(?P<text>.+)",
-                    r"内容是\s*(?P<text>.+)",
-                    r"说\s*(?P<text>.+)",
-                )
-            )
-        },
     )
 )
 
@@ -668,7 +388,15 @@ register_adapter(
             schema(
                 "nbnhhsh.expand",
                 "能不能好好说话",
-                aliases=["nbnhhsh", "解释缩写", "缩写是什么意思"],
+                aliases=[
+                    "nbnhhsh",
+                    "解释缩写",
+                    "缩写是什么意思",
+                    "什么意思",
+                    "是什么意思",
+                    "啥意思",
+                    "说清楚",
+                ],
                 description="解释网络缩写",
                 slots=[slot("text", "text", required=True, aliases=["缩写", "文本"])],
                 render="能不能好好说话 {text}",
@@ -677,8 +405,6 @@ register_adapter(
                 extra_text_policy="slot_only",
             ),
         ),
-        slot_extractors={"nbnhhsh.expand": _same_command("nbnhhsh.expand")},
-        score_hints=_builtin_score_hints,
     )
 )
 
@@ -777,6 +503,5 @@ register_adapter(
                 extra_text_policy="discard",
             ),
         ),
-        score_hints=_builtin_score_hints,
     )
 )

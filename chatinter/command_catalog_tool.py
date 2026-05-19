@@ -8,13 +8,13 @@ from typing import Any, cast
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
-from .command_index import CommandCandidate, dump_candidate_for_prompt
+from .command_index import CommandCandidate
 from .native_command_tools import build_native_command_tools
 from .route_text import normalize_message_text
 from .tool_retriever import CommandToolRetriever
 
 COMMAND_CATALOG_TOOL_NAME = "retrieve_plugin_commands"
-_DEFAULT_COMMAND_TOOL_CAP = 96
+_DEFAULT_COMMAND_TOOL_CAP = 119
 
 
 @dataclass
@@ -25,6 +25,9 @@ class CommandCatalogState:
     _tool_map: dict[str, ToolExecutable] = field(default_factory=dict)
     _command_order: list[str] = field(default_factory=list)
     retrieve_count: int = 0
+    last_query: str = ""
+    last_retrieved: int = 0
+    last_injected: int = 0
 
     @property
     def candidates(self) -> list[CommandCandidate]:
@@ -74,7 +77,7 @@ class CommandCatalogState:
 
 
 class CommandCatalogTool:
-    """Retrieve relevant commands, then inject their executable schemas."""
+    """Retrieve relevant command capabilities, then inject executable schemas."""
 
     def __init__(self, state: CommandCatalogState):
         self.state = state
@@ -83,9 +86,10 @@ class CommandCatalogTool:
         return ToolDefinition(
             name=COMMAND_CATALOG_TOOL_NAME,
             description=(
-                "检索真寻插件命令能力。用户可能需要插件能力，但当前还没有对应"
-                "命令 schema 时，先调用此工具。工具返回后，相关命令会作为"
-                "可执行 function tools 注入下一轮模型请求。"
+                "检索真寻插件命令能力。它只做候选召回，不替你决定要执行哪个"
+                "命令。仅当当前已暴露的命令工具没有合适 schema、但用户可能"
+                "需要插件能力时，才调用此工具补查长尾能力；返回后再根据注入"
+                "的完整 schema 选择具体工具。"
             ),
             parameters={
                 "type": "object",
@@ -118,26 +122,39 @@ class CommandCatalogTool:
         self.state.retrieve_count += 1
         candidates = list(result.candidates)
         injected_tools = self.state.inject(candidates)
+        self.state.last_query = result.query
+        self.state.last_retrieved = len(candidates)
+        self.state.last_injected = len(injected_tools)
         _sync_native_context_candidates(context, self.state.candidates)
 
+        guardrail_hint = _guardrail_hint(
+            retrieved=len(candidates),
+            active_tools=self.state.injected_count,
+        )
         payload = {
             "ok": True,
-            "status": "retrieved",
+            "status": "capability_candidates_retrieved",
             "query": result.query,
             "retrieved": len(candidates),
             "total_commands": result.total_commands,
             "injected_command_tools": len(injected_tools),
             "active_command_tools": self.state.injected_count,
+            "selection_policy": (
+                "local_recall_only; rank/score/reason 只用于缩小候选，"
+                "最终是否执行、执行哪个命令必须由模型结合完整 schema 判断。"
+            ),
             "commands": [
-                _candidate_payload(candidate, index=index)
-                for index, candidate in enumerate(candidates, 1)
+                _candidate_payload(result.capability_payloads, index=index)
+                for index in range(1, len(candidates) + 1)
             ],
             "next_step": (
-                "如果这些命令中有合适的工具，请在下一步调用对应命令工具；"
-                "如果没有合适命令，可以换查询词再次调用 retrieve_plugin_commands，"
-                "或直接聊天说明没有合适插件。"
+                "如果新注入的命令工具与用户子任务匹配，可以在下一步调用对应"
+                "工具；如果没有合适命令，可以换查询词再次检索，或直接聊天"
+                "说明没有合适插件。不要因为 rank 靠前就执行。"
             ),
         }
+        if guardrail_hint:
+            payload["guardrail_hint"] = guardrail_hint
         return ToolResult(
             output=payload,
             display_content=(
@@ -147,10 +164,27 @@ class CommandCatalogTool:
         )
 
 
-def _candidate_payload(candidate: CommandCandidate, *, index: int) -> dict[str, Any]:
-    payload = dump_candidate_for_prompt(candidate, index=index)
+def _candidate_payload(
+    payloads: tuple[dict[str, Any], ...],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    payload = dict(payloads[index - 1]) if index - 1 < len(payloads) else {}
     payload["tool_injected"] = True
     return payload
+
+
+def _guardrail_hint(*, retrieved: int, active_tools: int) -> str:
+    if retrieved <= 0:
+        return (
+            "catalog_no_result: 如果换查询词后仍无结果，应直接回复没有合适插件。"
+        )
+    if active_tools >= 72:
+        return (
+            "catalog_over_injected: 当前已注入较多命令，应优先选择已有工具，"
+            "不要继续扩大检索。"
+        )
+    return ""
 
 
 def _context_message_text(context: Any | None) -> str:

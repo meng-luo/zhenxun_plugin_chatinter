@@ -1,15 +1,15 @@
 """Plugin-specific ChatInter adapters.
 
-The generic router should stay focused on command schemas, scoring and planning.
+The generic router should stay focused on command schemas, recall and validation.
 Adapters keep unavoidable plugin-specific knowledge in one place: schema overrides,
-slot extractors, scoring hints and clarification policy.
+slot extractors, target policy and notification policy.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..models.pydantic_models import (
     CommandCapability,
@@ -17,23 +17,6 @@ from ..models.pydantic_models import (
     PluginCommandSchema,
 )
 from ..route_text import normalize_message_text
-
-if TYPE_CHECKING:
-    from ..command_index import CommandCandidate
-
-
-@dataclass(frozen=True)
-class AdapterScoreHint:
-    score: float
-    reason: str
-
-
-@dataclass(frozen=True)
-class AdapterClarifyRoute:
-    command_id: str
-    missing: tuple[str, ...]
-    confidence: float
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -56,13 +39,8 @@ class AdapterNotificationPolicy:
     helper_templates: tuple[str, ...] = ()
 
 
-SlotExtractor = Callable[[str, str], dict[str, Any]]
 SchemaBuilder = Callable[[str, list[CommandCapability]], list[PluginCommandSchema]]
 SemanticAliasProvider = Callable[[str, str, bool], list[str]]
-ScoreHintProvider = Callable[[PluginCommandSchema, str, str], list[AdapterScoreHint]]
-ClarifyRouteResolver = Callable[
-    [str, list["CommandCandidate"]], AdapterClarifyRoute | None
-]
 
 
 @dataclass(frozen=True)
@@ -75,11 +53,6 @@ class PluginCommandAdapter:
     semantic_aliases: SemanticAliasProvider | None = None
     target_policy: AdapterTargetPolicy | None = None
     notification_policy: AdapterNotificationPolicy | None = None
-    slot_extractors: dict[str, SlotExtractor] | None = None
-    slot_extractor_prefixes: tuple[str, ...] = ()
-    slot_extractor: SlotExtractor | None = None
-    score_hints: ScoreHintProvider | None = None
-    clarify_route: ClarifyRouteResolver | None = None
 
 
 _ADAPTERS: list[PluginCommandAdapter] = []
@@ -103,28 +76,13 @@ def get_adapter_for_module(module: str) -> PluginCommandAdapter | None:
     return None
 
 
-def get_adapter_for_command_id(command_id: str) -> PluginCommandAdapter | None:
-    command_key = normalize_message_text(command_id)
-    if not command_key:
-        return None
-    for adapter in _ADAPTERS:
-        if adapter.slot_extractors and command_key in adapter.slot_extractors:
-            return adapter
-        if adapter.slot_extractor is not None and any(
-            command_key.startswith(prefix) for prefix in adapter.slot_extractor_prefixes
-        ):
-            return adapter
-    return None
-
-
 def get_adapter_for_route(
     *,
     plugin_module: str = "",
     command_id: str = "",
 ) -> PluginCommandAdapter | None:
-    return get_adapter_for_module(plugin_module) or get_adapter_for_command_id(
-        command_id
-    )
+    _ = command_id
+    return get_adapter_for_module(plugin_module)
 
 
 def build_adapter_schemas(
@@ -174,9 +132,8 @@ def command_family_from_adapter(
     *,
     plugin_module: str,
 ) -> str | None:
-    adapter = get_adapter_for_module(plugin_module) or get_adapter_for_command_id(
-        schema.command_id
-    )
+    _ = schema
+    adapter = get_adapter_for_module(plugin_module)
     return adapter.family if adapter is not None else None
 
 
@@ -228,56 +185,6 @@ def get_adapter_notification_policy(
     if adapter is None:
         return None
     return adapter.notification_policy
-
-
-def extract_adapter_slots(
-    command_id: str,
-    message_text: str,
-    arguments_text: str = "",
-) -> dict[str, Any]:
-    command_key = normalize_message_text(command_id)
-    source = normalize_message_text(message_text)
-    if not source and arguments_text:
-        source = normalize_message_text(arguments_text)
-    adapter = get_adapter_for_command_id(command_key)
-    if adapter is None or not adapter.slot_extractors:
-        if adapter is not None and adapter.slot_extractor is not None:
-            return adapter.slot_extractor(command_key, source)
-        return {}
-    extractor = adapter.slot_extractors.get(command_key)
-    if extractor is not None:
-        return extractor(command_key, source)
-    if adapter.slot_extractor is not None:
-        return adapter.slot_extractor(command_key, source)
-    return {}
-
-
-def collect_score_hints(
-    schema: PluginCommandSchema,
-    *,
-    lowered_query: str,
-    stripped_lowered_query: str,
-    plugin_module: str,
-) -> list[AdapterScoreHint]:
-    hints: list[AdapterScoreHint] = []
-    for adapter in iter_adapters():
-        if adapter.score_hints is None:
-            continue
-        hints.extend(adapter.score_hints(schema, lowered_query, stripped_lowered_query))
-    return hints
-
-
-def resolve_adapter_clarify_route(
-    message_text: str,
-    candidates: list["CommandCandidate"],
-) -> AdapterClarifyRoute | None:
-    for adapter in iter_adapters():
-        if adapter.clarify_route is None:
-            continue
-        result = adapter.clarify_route(message_text, candidates)
-        if result is not None:
-            return result
-    return None
 
 
 def slot(
@@ -368,17 +275,12 @@ def schema(
 
 
 __all__ = [
-    "AdapterClarifyRoute",
     "AdapterNotificationPolicy",
-    "AdapterScoreHint",
     "AdapterTargetPolicy",
     "PluginCommandAdapter",
     "build_adapter_schemas",
-    "collect_score_hints",
     "command_family_from_adapter",
     "derive_adapter_semantic_aliases",
-    "extract_adapter_slots",
-    "get_adapter_for_command_id",
     "get_adapter_for_module",
     "get_adapter_for_route",
     "get_adapter_notification_policy",
@@ -386,7 +288,6 @@ __all__ = [
     "get_adapter_target_policy_for_schema",
     "iter_adapters",
     "register_adapter",
-    "resolve_adapter_clarify_route",
     "schema",
     "slot",
 ]

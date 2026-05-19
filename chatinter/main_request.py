@@ -11,16 +11,16 @@ from dataclasses import dataclass, field, replace
 from inspect import isawaitable
 import time
 from typing import Any, cast
+import uuid
 
 from zhenxun.services import logger
-from zhenxun.services.llm import LLMContentPart, LLMMessage
+from zhenxun.services.llm import LLMMessage
 from zhenxun.services.llm.tools import RunContext
 from zhenxun.services.llm.types.models import ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
-from .agent_runtime import AgentRuntime, AgentRuntimeTimelineItem
-from .chat_dialogue_planner import ChatDialoguePlan
-from .chat_strategy import build_chat_strategy_prompt
+from .agent_runtime import AgentRuntime
+from .agent_state import AgentRunState, AgentRuntimeResult, AgentRuntimeTimelineItem
 from .command_catalog_tool import (
     COMMAND_CATALOG_TOOL_NAME,
     CommandCatalogState,
@@ -39,33 +39,15 @@ from .native_route import (
     NativeRouteResult,
 )
 from .route_text import is_usage_question, normalize_message_text
+from .soft_tool_policy import filter_soft_candidates
+from .superuser_agent import build_superuser_agent_tools
+from .tool_intent_gate import ToolIntentGate, ToolIntentGateResult
 from .tool_retriever import CommandToolRetriever
 from .turn_runtime import TurnBudgetController
 
 _MAIN_STAGE = "main_request"
-_MAIN_REQUEST_RULES = """
-<chatinter_main_request>
-你正在处理群聊消息：可以直接聊天，也可以调用候选插件工具。
-候选工具是真实插件命令；调用工具会执行插件。
-命令不会一次性全部暴露。你需要插件能力但当前没有对应命令 schema 时，
-先调用 retrieve_plugin_commands 检索能力；检索结果会把相关命令 schema
-注入下一轮工具列表，然后再调用真实命令工具执行。
-每个注入后的命令工具已暴露完整 schema；只根据工具 description 和参数 schema
-选择工具并填写参数，不要猜 schema 外参数。
-每次工具调用必须填写 task_text：它是该工具负责的用户子任务原文。
-如果一句话里有多个任务，请把每个工具调用的 task_text 拆成互不重叠的短片段；
-不要把“然后/再/最后/顺便”等后续任务塞进前一个工具。
-用户明确要执行插件能力、查询插件用法，或自然语言需求明显对应插件时才调用工具。
-普通闲聊、玩梗、讨论命令概念、候选工具不匹配、目标不清时，不要调用工具，直接自然回复或简短说明需要的信息。
-retrieve_plugin_commands 只负责发现能力，不代表插件任务已经完成。
-真实命令工具返回的是 Observation：如果 need_continue=true，请优先根据
-remaining_task_hint 继续检索或调用后续工具；不要把它当作最终回复。
-你会在工具执行后继续看到工具结果；如果原始消息还有未完成的子任务，请继续调用后续工具。
-所有子任务都已完成或不需要工具时，再给出最终回复。
-</chatinter_main_request>
-""".strip()
-
-
+_TOOL_INTENT_GATE_STAGE = "tool_intent_gate"
+_MAX_REQUEST_TOOL_COUNT = 120
 MainRequestRouteHook = Callable[["MainRequestResult"], Awaitable[None] | None]
 MainRequestReplyHook = Callable[[str], Awaitable[str] | str]
 
@@ -119,6 +101,14 @@ class MainRequestResult:
         return any(item.route_result is not None for item in self.executions)
 
 
+@dataclass(frozen=True)
+class ToolObligationDecision:
+    obligation: str
+    reason: str
+    required_tool_names: tuple[str, ...] = ()
+    gate_result: ToolIntentGateResult | None = None
+
+
 async def run_chatinter_main_request(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
@@ -127,14 +117,13 @@ async def run_chatinter_main_request(
     budget_controller: TurnBudgetController | None,
     has_reply: bool,
     command_tools: list[Any] | None,
-    system_prompt: str,
-    context_xml: str,
-    history_messages: list[LLMMessage] | None,
-    image_parts: list[LLMContentPart] | None,
-    dialogue_plan: ChatDialoguePlan | None,
+    messages: list[LLMMessage],
     route_executor: ExecuteNativeRoute,
     route_completed_hook: MainRequestRouteHook | None = None,
     reply_hook: MainRequestReplyHook | None = None,
+    enable_plugin_tools: bool = True,
+    initial_command_exposure: bool = False,
+    enable_agent_tools: bool = False,
 ) -> MainRequestResult:
     normalized_message = normalize_message_text(message_text)
     report = NativeRouteReport(helper_mode=is_usage_question(normalized_message))
@@ -162,13 +151,12 @@ async def run_chatinter_main_request(
             budget_controller=budget_controller,
             has_reply=has_reply,
             command_tools=command_tools,
-            system_prompt=system_prompt,
-            context_xml=context_xml,
-            history_messages=history_messages,
-            image_parts=image_parts,
-            dialogue_plan=dialogue_plan,
+            messages=messages,
             route_executor=route_executor,
             report=report,
+            enable_plugin_tools=enable_plugin_tools,
+            initial_command_exposure=initial_command_exposure,
+            enable_agent_tools=enable_agent_tools,
         )
         return await _finalize_result(
             result,
@@ -203,51 +191,43 @@ async def _run_main_request(
     budget_controller: TurnBudgetController | None,
     has_reply: bool,
     command_tools: list[Any] | None,
-    system_prompt: str,
-    context_xml: str,
-    history_messages: list[LLMMessage] | None,
-    image_parts: list[LLMContentPart] | None,
-    dialogue_plan: ChatDialoguePlan | None,
+    messages: list[LLMMessage],
     route_executor: ExecuteNativeRoute,
     report: NativeRouteReport,
+    enable_plugin_tools: bool,
+    initial_command_exposure: bool,
+    enable_agent_tools: bool,
 ) -> MainRequestResult:
     retriever = CommandToolRetriever(
         knowledge_base,
         session_id=session_key,
         tools=cast(Any, command_tools),
     )
-    catalog_state = CommandCatalogState(retriever=retriever)
+    agent_tools = build_superuser_agent_tools() if enable_agent_tools else {}
+    base_tool_count = len(agent_tools) + (1 if enable_plugin_tools else 0)
+    command_tool_capacity = max(1, _MAX_REQUEST_TOOL_COUNT - base_tool_count)
+    catalog_state = CommandCatalogState(
+        retriever=retriever,
+        max_command_tools=command_tool_capacity,
+    )
 
     report.note_candidate_policy(
-        reason="main_request_catalog_retrieval",
-        limit=retriever.total_commands,
+        reason="main_request_catalog_retrieval"
+        if enable_plugin_tools
+        else "plugin_tools_disabled",
+        limit=retriever.total_commands if enable_plugin_tools else 0,
     )
-    report.candidate_total = max(report.candidate_total, retriever.total_commands)
-    report.note_tool_pool(1)
+    if enable_plugin_tools:
+        report.candidate_total = max(report.candidate_total, retriever.total_commands)
+    report.note_tool_pool(1 if enable_plugin_tools else 0)
 
-    catalog_tool = CommandCatalogTool(catalog_state)
-    system_prompt_text = _build_system_prompt(system_prompt, dialogue_plan)
-    user_text = message_text
-    if context_xml:
-        user_text = (
-            f"{context_xml}\n\n"
-            f"<current_user_message>{message_text}</current_user_message>"
-        )
-
-    user_content: str | list[LLMContentPart]
-    if image_parts:
-        user_content = [LLMContentPart.text_part(user_text), *image_parts]
-    else:
-        user_content = user_text
-
-    messages = [
-        LLMMessage.system(system_prompt_text),
-        *list(history_messages or []),
-        LLMMessage.user(user_content),
-    ]
-    tool_map: dict[str, ToolExecutable] = {
-        COMMAND_CATALOG_TOOL_NAME: cast(ToolExecutable, catalog_tool),
-    }
+    tool_map: dict[str, ToolExecutable] = {}
+    if enable_plugin_tools:
+        catalog_tool = CommandCatalogTool(catalog_state)
+        tool_map[COMMAND_CATALOG_TOOL_NAME] = cast(ToolExecutable, catalog_tool)
+    tool_map.update(agent_tools)
+    if tool_map:
+        report.note_tool_pool(len(tool_map))
     command_context = NativeCommandExecutionContext(
         candidates=[],
         has_reply=has_reply,
@@ -255,17 +235,66 @@ async def _run_main_request(
         route_executor=route_executor,
         message_text=message_text,
     )
+    if enable_plugin_tools and initial_command_exposure:
+        initial_result = retriever.initial_command_exposure(
+            message_text,
+            max_total=command_tool_capacity,
+        )
+        catalog_state.inject(list(initial_result.candidates))
+        command_context.candidates = catalog_state.candidates
+        tool_map.update(catalog_state.tool_map)
+        report.note_prompt_exposure(catalog_state.candidates)
+        report.tool_candidates = max(
+            report.tool_candidates,
+            catalog_state.injected_count,
+        )
+        report.note_tool_pool(len(tool_map))
+        report.note_candidate_policy(
+            reason="initial_grouped_command_exposure",
+            limit=catalog_state.injected_count,
+        )
+    trace_id = uuid.uuid4().hex[:12]
+    obligation_decision = await _resolve_tool_obligation(
+        message_text=message_text,
+        enable_plugin_tools=enable_plugin_tools,
+        enable_agent_tools=enable_agent_tools,
+        candidates=catalog_state.candidates,
+        tool_map=tool_map,
+        trace_id=trace_id,
+        model_name=get_model_name(),
+        generation_config=build_reasoning_generation_config(),
+        timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
+        budget_controller=budget_controller,
+    )
     run_context = RunContext(
         session_id=session_key,
         extra={
             "native_command_context": command_context,
             "command_catalog_state": catalog_state,
+            "actor_user_id": session_key or "",
+            "agent_mode": "superuser_agent" if enable_agent_tools else "chatinter",
+            "enable_agent_tools": enable_agent_tools,
         },
     )
-    runtime = AgentRuntime(
+    state = AgentRunState.create(
+        trace_id=trace_id,
         session_key=session_key,
         messages=messages,
         tool_map=tool_map,
+        current_message=message_text,
+        max_steps=8 if enable_agent_tools else 5,
+        budget_controller=budget_controller,
+        tool_obligation=obligation_decision.obligation,
+        tool_obligation_reason=obligation_decision.reason,
+        required_tool_names=obligation_decision.required_tool_names,
+    )
+    state.append_timeline(
+        role="system",
+        kind="tool_intent_gate",
+        metadata=_tool_obligation_metadata(obligation_decision),
+    )
+    runtime = AgentRuntime(
+        state=state,
         run_context=run_context,
         message_text=message_text,
         model_name=get_model_name(),
@@ -284,40 +313,11 @@ async def _run_main_request(
     report.tool_choice_count += sum(
         1 for item in agent_result.timeline if item.kind == "tool_call"
     )
-    return _finish_agent_response(
+    return _result_from_agent_runtime(
         report=report,
         executions=command_context.executions,
-        tool_results=list(agent_result.tool_results),
+        agent_result=agent_result,
         timeline=timeline,
-        final_text=agent_result.final_text,
-        stop_reason=agent_result.stop_reason,
-    )
-
-
-def _finish_text_response(
-    *,
-    report: NativeRouteReport,
-    executions: list[NativeToolExecutionResult],
-    text: str,
-    reason: str,
-    timeline: list[MainRequestTimelineItem],
-) -> MainRequestResult:
-    reply = normalize_message_text(text)
-    if not reply:
-        reply = _fallback_final_reply(executions) or "我暂时没想好怎么回答你。"
-    decision = NativeRouteDecision(
-        action="chat",
-        confidence=0.9 if executions else 0.84,
-        reason=reason,
-    )
-    report.finalize(reason=reason, stage=_MAIN_STAGE)
-    return MainRequestResult(
-        decision=decision,
-        route_result=_first_route(executions),
-        report=report,
-        executions=tuple(executions),
-        timeline=tuple(timeline),
-        output=MainRequestOutput(final_text=reply, memory_text=reply),
     )
 
 
@@ -346,44 +346,42 @@ def _fallback_result(
     )
 
 
-def _finish_agent_response(
+def _result_from_agent_runtime(
     *,
     report: NativeRouteReport,
     executions: list[NativeToolExecutionResult],
-    tool_results: list[ToolResult],
+    agent_result: AgentRuntimeResult,
     timeline: list[MainRequestTimelineItem],
-    final_text: str,
-    stop_reason: str,
 ) -> MainRequestResult:
-    if not executions:
-        return _finish_text_response(
-            report=report,
-            executions=executions,
-            text=final_text,
-            reason=f"main_request:{stop_reason}",
-            timeline=timeline,
-        )
-
+    stop_reason = agent_result.stop_reason
+    reason = f"main_request:{stop_reason}"
     if report.final_reason == "init":
-        report.finalize(reason="main_request:tool_loop_completed", stage=_MAIN_STAGE)
-    command_tool_results = [
-        result for result in tool_results if not _is_catalog_tool_result(result)
-    ]
-    reply = normalize_message_text(final_text) or _tool_execution_reply(
-        executions,
-        command_tool_results,
-    )
-    memory_text = _tool_memory_text(executions, command_tool_results)
-    if reply:
-        memory_text = "\n".join(
-            item for item in [memory_text, reply] if normalize_message_text(item)
+        first_route = _first_route(executions)
+        report.finalize(
+            reason=reason,
+            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
+            plugin_name=first_route.decision.plugin_name
+            if first_route is not None
+            else None,
+            plugin_module=first_route.decision.plugin_module
+            if first_route is not None
+            else None,
+            command=first_route.decision.command if first_route is not None else None,
         )
-    memory_text = memory_text or reply
+    command_tool_results = [
+        result
+        for result in agent_result.tool_results
+        if not _is_catalog_tool_result(result)
+    ]
+    final_text = normalize_message_text(agent_result.final_text)
+    should_send = bool(final_text)
+    memory_text = _timeline_memory_text(timeline, fallback=final_text)
+    handled_by_tools = bool(executions or command_tool_results)
     return MainRequestResult(
         decision=NativeRouteDecision(
             action="chat",
-            confidence=0.9 if executions else 0.35,
-            reason=f"main_request:{stop_reason}",
+            confidence=0.9 if handled_by_tools else 0.84,
+            reason=reason,
         ),
         route_result=_first_route(executions),
         report=report,
@@ -391,22 +389,27 @@ def _finish_agent_response(
         tool_results=tuple(command_tool_results),
         timeline=tuple(timeline),
         output=MainRequestOutput(
-            final_text=reply,
+            final_text=final_text,
             memory_text=memory_text,
-            should_send=bool(reply),
-            outcome="tool_completed",
-            feedback_kind="tool_completed",
-            record_chat_feedback=False,
+            should_send=should_send,
+            outcome="tool_completed" if handled_by_tools else "chat_completed",
+            feedback_kind="tool_completed" if handled_by_tools else "chat_completed",
+            record_chat_feedback=not handled_by_tools,
             observation_reason="route_success"
             if any(item.success for item in executions)
-            else "reroute_failed",
+            else "reroute_failed"
+            if handled_by_tools
+            else "chat_completed",
         ),
     )
 
 
 def _is_catalog_tool_result(result: ToolResult) -> bool:
     output = result.output if isinstance(result.output, dict) else {}
-    return output.get("status") == "retrieved"
+    return output.get("status") in {
+        "retrieved",
+        "capability_candidates_retrieved",
+    }
 
 
 async def _finalize_result(
@@ -437,19 +440,18 @@ async def _finalize_result(
     final_text = normalize_message_text(final_text)
     if not final_text:
         final_text = "我暂时没想好怎么回答你。"
-    memory_text = (
-        normalize_message_text(output.memory_text)
-        if result.handled_by_tools
-        else final_text
+    final_timeline = _with_final_timeline(
+        result.timeline,
+        final_text=final_text,
+        should_send=True,
     )
-    memory_text = memory_text or final_text
+    memory_text = normalize_message_text(output.memory_text) or _timeline_memory_text(
+        list(final_timeline),
+        fallback=final_text,
+    )
     return replace(
         result,
-        timeline=_with_final_timeline(
-            result.timeline,
-            final_text=final_text,
-            should_send=True,
-        ),
+        timeline=final_timeline,
         output=replace(
             output,
             final_text=final_text,
@@ -479,6 +481,81 @@ def _fallback_final_reply(executions: list[NativeToolExecutionResult]) -> str:
         return "处理好了。"
     message = str(latest.output.get("error", "") or latest.reason or "").strip()
     return message or "这个暂时没处理成功。"
+
+
+def _timeline_memory_text(
+    timeline: list[MainRequestTimelineItem] | tuple[MainRequestTimelineItem, ...],
+    *,
+    fallback: str = "",
+) -> str:
+    lines: list[str] = []
+    for item in timeline:
+        text = _timeline_item_summary(item)
+        if text:
+            lines.append(text)
+    if fallback:
+        lines.append(normalize_message_text(f"assistant: {fallback}"))
+    return "\n".join(dict.fromkeys(line for line in lines if line))[:4000]
+
+
+def _timeline_item_summary(item: MainRequestTimelineItem) -> str:
+    role = normalize_message_text(item.role)
+    kind = normalize_message_text(item.kind)
+    prefix = f"{role}/{kind}".strip("/")
+    if item.tool_name:
+        prefix = f"{prefix}:{normalize_message_text(item.tool_name)}"
+    content = normalize_message_text(item.content)
+    if not content:
+        output = item.metadata.get("output") if isinstance(item.metadata, dict) else None
+        content = _compact_output_summary(output)
+    if not content:
+        arguments = (
+            item.metadata.get("arguments") if isinstance(item.metadata, dict) else None
+        )
+        content = _compact_output_summary(arguments)
+    if not content:
+        return ""
+    return f"{prefix}: {content}"[:800]
+
+
+def _compact_output_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return normalize_message_text(str(value or ""))[:500]
+    parts: list[str] = []
+    for key in (
+        "status",
+        "ok",
+        "command_id",
+        "rendered_command",
+        "matched_plugin",
+        "task_text",
+        "error",
+        "remaining_task_hint",
+    ):
+        item = value.get(key)
+        if item not in ("", [], {}, None):
+            parts.append(f"{key}={normalize_message_text(str(item))}")
+    messages = value.get("messages_sent")
+    if isinstance(messages, list) and messages:
+        parts.append(
+            "messages_sent="
+            + " | ".join(
+                normalize_message_text(str(message or ""))
+                for message in messages[:3]
+                if normalize_message_text(str(message or ""))
+            )
+        )
+    artifacts = value.get("artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        summaries = [
+            normalize_message_text(str(item.get("summary", "") or ""))
+            for item in artifacts[:3]
+            if isinstance(item, dict)
+            and normalize_message_text(str(item.get("summary", "") or ""))
+        ]
+        if summaries:
+            parts.append("artifacts=" + " | ".join(summaries))
+    return "；".join(parts)[:500]
 
 
 def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
@@ -523,86 +600,165 @@ def _with_final_timeline(
     )
 
 
-def _tool_memory_text(
-    executions: list[NativeToolExecutionResult],
-    tool_results: list[ToolResult],
-) -> str:
-    lines: list[str] = []
-    for execution in executions:
-        output = execution.output if isinstance(execution.output, dict) else {}
-        messages_sent = output.get("messages_sent")
-        if isinstance(messages_sent, list):
-            for item in messages_sent[:4]:
-                text = normalize_message_text(str(item or ""))
-                if text:
-                    lines.append(text)
-        message = normalize_message_text(
-            str(output.get("error", "") or execution.display_text or "")
+async def _resolve_tool_obligation(
+    *,
+    message_text: str,
+    enable_plugin_tools: bool,
+    enable_agent_tools: bool,
+    candidates: list[Any],
+    tool_map: dict[str, ToolExecutable],
+    trace_id: str,
+    model_name: str | None,
+    generation_config: Any,
+    timeout: float,
+    budget_controller: TurnBudgetController | None,
+) -> ToolObligationDecision:
+    if not tool_map:
+        return ToolObligationDecision(obligation="none", reason="no_tools")
+    if enable_agent_tools:
+        return ToolObligationDecision(
+            obligation="auto",
+            reason="superuser_agent_tools_available",
         )
-        if message:
-            lines.append(message)
-    for result in tool_results:
-        output = result.output if isinstance(result.output, dict) else {}
-        messages_sent = output.get("messages_sent")
-        if isinstance(messages_sent, list):
-            for item in messages_sent[:4]:
-                text = normalize_message_text(str(item or ""))
-                if text:
-                    lines.append(text)
-        error = normalize_message_text(str(output.get("error", "") or ""))
-        if error:
-            lines.append(error)
-    return "\n".join(dict.fromkeys(lines))
+    if not enable_plugin_tools:
+        return ToolObligationDecision(
+            obligation="none",
+            reason="plugin_tools_disabled",
+        )
+    command_tools = _command_tool_names(tool_map)
+    if not command_tools:
+        return ToolObligationDecision(obligation="auto", reason="catalog_only")
+    if not candidates:
+        return ToolObligationDecision(
+            obligation="none",
+            reason="no_command_candidates",
+        )
 
+    if budget_controller is not None and not budget_controller.allow_classifier(
+        _TOOL_INTENT_GATE_STAGE
+    ):
+        return ToolObligationDecision(
+            obligation="auto",
+            reason="tool_intent_gate_budget_exhausted",
+        )
 
-def _tool_execution_reply(
-    executions: list[NativeToolExecutionResult],
-    tool_results: list[ToolResult],
-) -> str:
-    if executions:
-        successful_observations = [
-            item
-            for item in executions
-            if item.success and bool(item.output.get("messages_sent"))
-        ]
-        if successful_observations and len(successful_observations) == len(
-            executions
-        ) == len(tool_results):
-            return ""
-        messages = [
-            normalize_message_text(item.display_text or item.reason)
-            for item in executions
-            if normalize_message_text(item.display_text or item.reason)
-        ]
-        if messages:
-            return "\n".join(dict.fromkeys(messages))
-        return _fallback_final_reply(executions)
+    started = time.perf_counter()
+    gate = ToolIntentGate(
+        trace_id=trace_id,
+        model_name=model_name,
+        generation_config=generation_config,
+        timeout=timeout,
+    )
+    result = await gate.judge(
+        message_text=message_text,
+        candidates=candidates,
+        command_tool_count=len(command_tools),
+    )
+    if budget_controller is not None:
+        budget_controller.record_classifier(
+            _TOOL_INTENT_GATE_STAGE,
+            time.perf_counter() - started,
+        )
 
-    for result in tool_results:
-        output = result.output if isinstance(result.output, dict) else {}
-        messages_sent = output.get("messages_sent")
-        if isinstance(messages_sent, list):
-            message = normalize_message_text(
-                "\n".join(str(item or "") for item in messages_sent if item)
+    required_tool_names: tuple[str, ...] = ()
+    if result.intent == "chat":
+        obligation = "none"
+    elif result.intent == "plugin_required":
+        command_id_filter = {
+            normalize_message_text(str(command_id or ""))
+            for command_id in (
+                result.required_command_ids or result.allowed_command_ids
             )
-            if message:
-                return message
-        error = normalize_message_text(str(output.get("error", "") or ""))
-        if error:
-            return error
-    return "工具调用没有成功执行，请换个说法再试。"
+            if normalize_message_text(str(command_id or ""))
+        }
+        if not command_id_filter:
+            allowed_soft_candidates = filter_soft_candidates(message_text, candidates)
+            command_id_filter = {
+                normalize_message_text(
+                    str(getattr(getattr(candidate, "schema", None), "command_id", ""))
+                )
+                for candidate in allowed_soft_candidates
+                if normalize_message_text(
+                    str(getattr(getattr(candidate, "schema", None), "command_id", ""))
+                )
+            }
+        obligation = "required"
+        required_tool_names = _tool_names_for_command_ids(
+            tool_map,
+            tuple(command_id_filter),
+        )
+        if not required_tool_names:
+            obligation = "auto"
+    else:
+        obligation = "auto"
+
+    return ToolObligationDecision(
+        obligation=obligation,
+        reason=_gate_obligation_reason(result),
+        required_tool_names=required_tool_names,
+        gate_result=result,
+    )
 
 
-def _build_system_prompt(
-    base_prompt: str,
-    dialogue_plan: ChatDialoguePlan | None,
-) -> str:
-    parts = [normalize_message_text(base_prompt)]
-    strategy_prompt = build_chat_strategy_prompt(dialogue_plan)
-    if strategy_prompt:
-        parts.append(strategy_prompt)
-    parts.append(_MAIN_REQUEST_RULES)
-    return "\n\n".join(part for part in parts if part)
+def _command_tool_names(tool_map: dict[str, ToolExecutable]) -> tuple[str, ...]:
+    names: list[str] = []
+    for name, tool in tool_map.items():
+        binding = getattr(tool, "binding", None)
+        command_id = normalize_message_text(str(getattr(binding, "command_id", "")))
+        if command_id:
+            names.append(normalize_message_text(name))
+    return tuple(name for name in names if name)
+
+
+def _tool_names_for_command_ids(
+    tool_map: dict[str, ToolExecutable],
+    command_ids: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    wanted = {
+        normalize_message_text(str(command_id or ""))
+        for command_id in command_ids
+        if normalize_message_text(str(command_id or ""))
+    }
+    if not wanted:
+        return ()
+    names: list[str] = []
+    for name, tool in tool_map.items():
+        binding = getattr(tool, "binding", None)
+        command_id = normalize_message_text(str(getattr(binding, "command_id", "")))
+        if command_id and command_id in wanted:
+            names.append(normalize_message_text(name))
+    return tuple(name for name in names if name)
+
+
+def _gate_obligation_reason(result: ToolIntentGateResult) -> str:
+    return normalize_message_text(
+        "tool_intent_gate:"
+        f"{result.intent}:confidence={float(result.confidence or 0.0):.2f}:"
+        f"{result.reason or 'no_reason'}"
+    )
+
+
+def _tool_obligation_metadata(
+    decision: ToolObligationDecision,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "tool_obligation": decision.obligation,
+        "tool_obligation_reason": decision.reason,
+        "required_tool_names": list(decision.required_tool_names),
+    }
+    result = decision.gate_result
+    if result is not None:
+        metadata.update(
+            {
+                "gate_intent": result.intent,
+                "gate_confidence": result.confidence,
+                "gate_reason": result.reason,
+                "required_command_ids": list(result.required_command_ids),
+                "allowed_command_ids": list(result.allowed_command_ids),
+                "needs_real_execution": result.needs_real_execution,
+            }
+        )
+    return metadata
 
 
 __all__ = [

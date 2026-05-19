@@ -31,9 +31,15 @@ from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
 from .memory import _chat_memory
+from .native_tail_collector import (
+    resolve_native_tail_route_modules,
+    schedule_native_tail_followup,
+)
 from .plugin_registry import PluginRegistry
 from .reflection_observer import get_reflection_observer_snapshot
+from .scenario_router import resolve_chatinter_scenario
 from .turn_metrics import render_route_observer_summary
+from .turn_queue import get_turn_queue
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()
@@ -131,6 +137,16 @@ _fallback_matcher = on_message(
     rule=to_me(),
 )
 
+_turn_followup_matcher = on_message(
+    priority=998,
+    block=False,
+)
+
+_native_tail_collector_matcher = on_message(
+    priority=4,
+    block=False,
+)
+
 
 def _is_private_text_only_message(
     event: Event,
@@ -154,6 +170,69 @@ def _is_private_text_only_message(
     return has_text
 
 
+def _state_plain_text(state: T_State) -> str | None:
+    state_plain_text = state.get("_zx_plain_text")
+    return state_plain_text if isinstance(state_plain_text, str) else None
+
+
+def _event_route_modules(state: T_State) -> set[str] | None:
+    route_modules = state.get("_zx_route_modules")
+    return route_modules if isinstance(route_modules, set) else None
+
+
+def _resolve_entry_scenario(
+    *,
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    raw_message: str,
+    route_modules: set[str] | None,
+):
+    user_id = str(session.user.id)
+    group_id = str(session.group.id) if session.group else None
+    return resolve_chatinter_scenario(
+        bot=bot,
+        event=event,
+        raw_message=raw_message,
+        user_id=user_id,
+        group_id=group_id,
+        route_modules=route_modules,
+    )
+
+
+def _extract_raw_message(
+    event: Event,
+    msg: UniMsg,
+    state_plain_text: str | None,
+) -> str | None:
+    try:
+        event_message = event.get_message()
+    except Exception:
+        event_message = None
+    if not _is_private_text_only_message(event, event_message):
+        logger.debug("ChatInter 私聊仅文本策略：忽略非文本消息")
+        return None
+
+    try:
+        tagged_message = (
+            uni_to_text_with_tags(event_message)
+            if event_message is not None
+            else uni_to_text_with_tags(msg)
+        )
+        raw_message = tagged_message or state_plain_text or str(msg)
+    except Exception as e:
+        logger.error(f"获取消息内容失败：{e}")
+        return None
+
+    if not isinstance(raw_message, str):
+        raw_message = str(raw_message)
+    raw_message = raw_message.strip()
+    if not raw_message:
+        logger.debug("消息为空，跳过处理")
+        return None
+    return raw_message
+
+
 @_fallback_matcher.handle()
 async def _handle_fallback(
     bot: Bot,
@@ -169,50 +248,117 @@ async def _handle_fallback(
     if getattr(event, "_ai_triggered", False):
         return
 
-    state_plain_text = state.get("_zx_plain_text")
-    if not isinstance(state_plain_text, str):
-        state_plain_text = None
-
-    try:
-        event_message = event.get_message()
-    except Exception:
-        event_message = None
-    if not _is_private_text_only_message(event, event_message):
-        logger.debug("ChatInter 私聊仅文本策略：忽略非文本消息")
+    state_plain_text = _state_plain_text(state)
+    raw_message = _extract_raw_message(event, msg, state_plain_text)
+    if raw_message is None:
         return
 
-    try:
-        tagged_message = (
-            uni_to_text_with_tags(event_message)
-            if event_message is not None
-            else uni_to_text_with_tags(msg)
-        )
-        raw_message = tagged_message or state_plain_text or str(msg)
-    except Exception as e:
-        logger.error(f"获取消息内容失败：{e}")
+    route_modules = _event_route_modules(state)
+    if route_modules:
+        logger.debug("event already has route modules, skip ChatInter fallback")
         return
-
-    if not isinstance(raw_message, str):
-        raw_message = str(raw_message)
-
-    raw_message = raw_message.strip()
-    if not raw_message:
-        logger.debug("消息为空，跳过处理")
+    scenario = _resolve_entry_scenario(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+        route_modules=route_modules,
+    )
+    if not scenario.should_handle:
+        logger.debug(f"ChatInter scenario skip: {scenario.reason}")
         return
-
-    logger.info(f"[ChatInter] 收到消息：{raw_message[:50]}...")
-    route_modules = state.get("_zx_route_modules")
-    if not isinstance(route_modules, set):
-        route_modules = None
-    await handle_fallback(
-        bot,
-        event,
-        session,
-        raw_message,
-        msg,
+    accepted = await get_turn_queue().submit(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+        message=msg,
         route_modules=route_modules,
         cached_plain_text=state_plain_text,
+        processor=handle_fallback,
     )
+    if accepted:
+        logger.info(f"[ChatInter] 收到消息：{raw_message[:50]}...")
+
+
+@_turn_followup_matcher.handle()
+async def _handle_turn_followup(
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    msg: UniMsg,
+    state: T_State,
+):
+    """Non-blocking collector for short follow-up messages in an active turn."""
+
+    if getattr(event, "_ai_triggered", False) or bool(getattr(event, "to_me", False)):
+        return
+    route_modules = _event_route_modules(state)
+    if route_modules:
+        return
+    state_plain_text = _state_plain_text(state)
+    raw_message = _extract_raw_message(event, msg, state_plain_text)
+    if raw_message is None:
+        return
+    scenario = _resolve_entry_scenario(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+        route_modules=route_modules,
+    )
+    if not scenario.should_handle:
+        return
+    accepted = await get_turn_queue().submit(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+        message=msg,
+        route_modules=None,
+        cached_plain_text=state_plain_text,
+        processor=handle_fallback,
+    )
+    if accepted:
+        logger.debug(f"[ChatInter] 收到连续 turn 补充：{raw_message[:50]}...")
+
+
+@_native_tail_collector_matcher.handle()
+async def _handle_native_tail_collector(
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    msg: UniMsg,
+    state: T_State,
+):
+    """Collect native-command messages that contain independent follow-up tasks."""
+
+    if getattr(event, "_ai_triggered", False):
+        return
+    route_modules = _event_route_modules(state)
+    state_plain_text = _state_plain_text(state)
+    raw_message = _extract_raw_message(event, msg, state_plain_text)
+    if raw_message is None:
+        return
+    if not route_modules:
+        route_modules = resolve_native_tail_route_modules(raw_message)
+    if not route_modules:
+        return
+    scheduled = schedule_native_tail_followup(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+        message=msg,
+        route_modules=route_modules,
+        cached_plain_text=state_plain_text,
+        processor=handle_fallback,
+    )
+    if scheduled:
+        logger.debug(
+            "[ChatInter] 原生命令后续任务旁路收集已挂起："
+            f"{raw_message[:80]}..."
+        )
 
 
 _reset_matcher = on_alconna(

@@ -6,7 +6,6 @@ command_id + slots，再确定性渲染回原命令文本。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import re
 from typing import Any
 
@@ -18,50 +17,11 @@ from .models.pydantic_models import (
 from .plugin_adapters import (
     build_adapter_schemas,
     derive_adapter_semantic_aliases,
-    extract_adapter_slots,
 )
-from .route_text import normalize_message_text, parse_command_with_head
+from .route_text import normalize_message_text
 
-_TEXT_PLACEHOLDER_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][0-9A-Za-z_]*)\}")
-_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
-_URL_PAYLOAD_PATTERN = re.compile(
-    r"https?://\S+|(?:BV|AV|av)[0-9A-Za-z]+",
-    re.IGNORECASE,
-)
-_TEXT_TAIL_PREFIX_PATTERN = re.compile(
-    r"^(?:这句话|这段话|这句|内容|文本|参数|链接|地址|是|为|叫|名称|名字|"
-    r"：|:|-|，|,|。)+"
-)
-_EMPTY_TEXT_PAYLOAD_WORDS = {
-    "一下",
-    "一下子",
-    "一下下",
-    "看看",
-    "看下",
-    "帮我",
-    "请",
-    "麻烦",
-    "吧",
-    "一下吧",
-    "下吧",
-}
 _COMMAND_PARAM_TOKEN_PATTERN = re.compile(r"\s*[?*+]?\[[^\]]+\]")
 _COMMAND_PARAM_BRACKET_PATTERN = re.compile(r"\s*[?*+]?[<(｟][^>)｠]+[>)｠]")
-
-
-@dataclass(frozen=True)
-class CommandSchemaSelection:
-    """A scored schema choice.
-
-    The selector keeps command choice deterministic when several schemas share the
-    same head, while still accepting LLM-provided command_id as the strongest hint.
-    """
-
-    schema: PluginCommandSchema
-    score: float
-    reason: str
-    slots: dict[str, Any] = field(default_factory=dict)
-    missing: tuple[str, ...] = ()
 
 
 def _slot(
@@ -386,398 +346,6 @@ def build_command_schemas(
     return schemas
 
 
-def _command_head(command: str | None) -> str:
-    normalized = normalize_message_text(command or "")
-    return normalize_schema_command_head(normalized)
-
-
-def _command_tail(command: str | None) -> str:
-    normalized = normalize_message_text(command or "")
-    if not normalized or " " not in normalized:
-        return ""
-    return normalize_message_text(normalized.split(" ", 1)[1])
-
-
-def _tokenize(text: str) -> set[str]:
-    return {
-        token.casefold()
-        for token in _TOKEN_PATTERN.findall(normalize_message_text(text))
-        if token
-    }
-
-
-def _schema_phrases(schema: PluginCommandSchema) -> list[str]:
-    values = [
-        schema.command_id,
-        schema.head,
-        *schema.aliases,
-        schema.description,
-        *schema.retrieval_phrases,
-    ]
-    for slot in schema.slots:
-        values.extend([slot.name, slot.description, *slot.aliases])
-    result: list[str] = []
-    for value in values:
-        text = normalize_message_text(value)
-        if text and text not in result:
-            result.append(text)
-    return result
-
-
-def _schema_render_slots(schema: PluginCommandSchema) -> set[str]:
-    return {
-        normalize_message_text(match.group("name"))
-        for match in _TEXT_PLACEHOLDER_PATTERN.finditer(schema.render or "")
-        if normalize_message_text(match.group("name"))
-    }
-
-
-def _message_has_text_payload(text: str) -> bool:
-    normalized = normalize_message_text(text)
-    if not normalized:
-        return False
-    if re.search(r"\d", normalized):
-        return True
-    if len(normalized) >= 4:
-        return True
-    return bool(_tokenize(normalized))
-
-
-def _score_schema(
-    schema: PluginCommandSchema,
-    *,
-    command_id: str | None,
-    command: str | None,
-    message_text: str,
-    arguments_text: str,
-    slots: dict[str, Any] | None,
-    action: str | None,
-) -> CommandSchemaSelection:
-    normalized_id = normalize_message_text(command_id or "").casefold()
-    schema_id = normalize_message_text(schema.command_id).casefold()
-    command_text = normalize_message_text(command or "")
-    command_head = _command_head(command_text).casefold()
-    command_tail = _command_tail(command_text)
-    message = normalize_message_text(" ".join([message_text, arguments_text]))
-    message_fold = message.casefold()
-    action_text = normalize_message_text(action or "").casefold()
-    score = 0.0
-    reasons: list[str] = []
-
-    if normalized_id:
-        if normalized_id == schema_id:
-            score += 1000.0
-            reasons.append("command_id")
-        else:
-            score -= 24.0
-
-    head = normalize_message_text(schema.head).casefold()
-    aliases = [
-        normalize_message_text(alias).casefold()
-        for alias in schema.aliases
-        if normalize_message_text(alias)
-    ]
-    if command_head:
-        if command_head == head:
-            score += 420.0
-            reasons.append("head")
-        elif command_head in aliases:
-            score += 380.0
-            reasons.append("alias_head")
-        elif head and command_text.casefold().startswith(head):
-            score += 260.0
-            reasons.append("head_prefix")
-        elif any(
-            alias and command_text.casefold().startswith(alias) for alias in aliases
-        ):
-            score += 220.0
-            reasons.append("alias_prefix")
-
-    if message_fold:
-        for alias in aliases:
-            if alias and alias in message_fold:
-                score += 130.0 + min(len(alias), 16)
-                reasons.append("message_alias")
-        if head and head in message_fold:
-            score += 84.0 + min(len(head), 12)
-            reasons.append("message_head")
-
-        message_tokens = _tokenize(message)
-        phrase_tokens: set[str] = set()
-        for phrase in _schema_phrases(schema):
-            phrase_tokens.update(_tokenize(phrase))
-        overlap = len(message_tokens & phrase_tokens)
-        if overlap:
-            score += min(overlap * 10.0, 60.0)
-            reasons.append("token_overlap")
-
-    completed_slots, missing = complete_slots(
-        schema,
-        slots=slots,
-        message_text=message_text,
-        arguments_text=arguments_text or command_tail,
-    )
-    provided_slot_names = {
-        normalize_message_text(str(name or ""))
-        for name, value in dict(slots or {}).items()
-        if normalize_message_text(str(name or "")) and value is not None
-    }
-    schema_slot_names = {normalize_message_text(slot.name) for slot in schema.slots}
-    matched_provided = len(provided_slot_names & schema_slot_names)
-    if matched_provided:
-        score += matched_provided * 72.0
-        reasons.append("slots")
-
-    render_slots = _schema_render_slots(schema)
-    completed_render_slots = {
-        name
-        for name in render_slots
-        if name in completed_slots and completed_slots.get(name) is not None
-    }
-    if completed_render_slots:
-        score += len(completed_render_slots) * 28.0
-        reasons.append("completed_slots")
-
-    if missing:
-        penalty = 18.0 if action_text == "clarify" else 86.0
-        score -= len(missing) * penalty
-        reasons.append("missing")
-
-    requires = schema.requires or {}
-    has_payload = _message_has_text_payload(
-        " ".join([command_tail, arguments_text, message_text])
-    )
-    if requires.get("text") and has_payload:
-        score += 18.0
-    elif not requires.get("text") and command_tail:
-        score -= 16.0
-
-    if not schema.slots and not requires.get("text") and action_text == "execute":
-        score += 3.0
-
-    return CommandSchemaSelection(
-        schema=schema,
-        score=score,
-        reason=",".join(dict.fromkeys(reasons)) or "fallback",
-        slots=completed_slots,
-        missing=tuple(missing),
-    )
-
-
-def select_command_schema(
-    schemas: list[PluginCommandSchema],
-    *,
-    command_id: str | None = None,
-    command: str | None = None,
-    message_text: str = "",
-    arguments_text: str = "",
-    slots: dict[str, Any] | None = None,
-    action: str | None = None,
-) -> CommandSchemaSelection | None:
-    if not schemas:
-        return None
-    has_hint = any(
-        normalize_message_text(value or "")
-        for value in (command_id, command, message_text, arguments_text)
-    ) or bool(slots)
-    if not has_hint:
-        return None
-
-    normalized_id = normalize_message_text(command_id or "").casefold()
-    if normalized_id:
-        schemas = [
-            schema
-            for schema in schemas
-            if normalize_message_text(schema.command_id).casefold() == normalized_id
-        ]
-        if not schemas:
-            return None
-
-    selections = [
-        _score_schema(
-            schema,
-            command_id=command_id,
-            command=command,
-            message_text=message_text,
-            arguments_text=arguments_text,
-            slots=slots,
-            action=action,
-        )
-        for schema in schemas
-    ]
-    selections.sort(
-        key=lambda item: (
-            item.score,
-            -len(item.missing),
-            len(item.schema.slots),
-            -len(item.schema.head),
-        ),
-        reverse=True,
-    )
-    best = selections[0]
-    if best.score <= 0:
-        return None
-    return best
-
-
-def find_command_schema(
-    schemas: list[PluginCommandSchema],
-    *,
-    command_id: str | None = None,
-    command: str | None = None,
-) -> PluginCommandSchema | None:
-    selection = select_command_schema(
-        schemas,
-        command_id=command_id,
-        command=command,
-    )
-    return selection.schema if selection is not None else None
-
-
-def _infer_adapter_slots(
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> dict[str, Any]:
-    command_id = normalize_message_text(schema.command_id)
-    if not command_id:
-        return {}
-    return extract_adapter_slots(command_id, message_text)
-
-
-def _clean_text_payload(value: str) -> str:
-    payload = normalize_message_text(value)
-    while payload:
-        cleaned = normalize_message_text(_TEXT_TAIL_PREFIX_PATTERN.sub("", payload))
-        if cleaned == payload:
-            break
-        payload = cleaned
-    return payload
-
-
-def _clean_head_payload(raw_payload: str, head: str) -> str:
-    payload = normalize_message_text(raw_payload)
-    if not payload:
-        return ""
-    head_text = normalize_message_text(head)
-    if head_text and payload.startswith(head_text):
-        payload = normalize_message_text(payload[len(head_text) :])
-    payload = re.sub(
-        r"^(?:做一句|做一段|写一句|写一段|说一句|说一段|做|写|说|"
-        r"内容(?:是|为)?|文本(?:是|为)?|文字(?:是|为)?|"
-        r"：|:|，|,|。)+",
-        "",
-        payload,
-    )
-    payload = _clean_text_payload(payload)
-    return "" if payload in _EMPTY_TEXT_PAYLOAD_WORDS else payload
-
-
-def _extract_command_tail_payload(
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> str:
-    heads = [schema.head, *schema.aliases]
-    for head in heads:
-        normalized_head = normalize_message_text(head)
-        if not normalized_head:
-            continue
-        head_index = normalize_message_text(message_text).find(normalized_head)
-        if head_index > 0:
-            payload = _clean_head_payload(
-                normalize_message_text(
-                    message_text[head_index + len(normalized_head) :]
-                ),
-                normalized_head,
-            )
-            if payload:
-                return payload
-        parsed = parse_command_with_head(
-            message_text,
-            normalized_head,
-            allow_sticky=True,
-            max_prefix_len=12,
-        )
-        if parsed is None:
-            continue
-        payload = _clean_head_payload(parsed.payload_text, normalized_head)
-        if payload:
-            return payload
-    return ""
-
-
-def _slot_accepts_url(slot: CommandSlotSpec) -> bool:
-    text = normalize_message_text(
-        " ".join([slot.name, slot.description, *slot.aliases])
-    ).casefold()
-    return any(
-        token in text for token in ("链接", "地址", "url", "bv", "av", "视频", "link")
-    )
-
-
-def _extract_url_payload(message_text: str) -> str:
-    match = _URL_PAYLOAD_PATTERN.search(normalize_message_text(message_text))
-    return match.group(0) if match else ""
-
-
-def _fill_slots_from_payload(
-    merged: dict[str, Any],
-    schema: PluginCommandSchema,
-    payload: str,
-) -> None:
-    argument_payload = _clean_text_payload(payload)
-    if not argument_payload:
-        return
-    payload_tokens = [token for token in argument_payload.split(" ") if token]
-    token_index = 0
-    for slot in schema.slots:
-        if slot.name in merged or slot.type in {"text", "at", "image"}:
-            continue
-        if token_index >= len(payload_tokens):
-            break
-        value: Any = payload_tokens[token_index]
-        token_index += 1
-        if slot.type == "int":
-            from .slot_extractors import parse_int_token
-
-            parsed_value = parse_int_token(value)
-            if parsed_value is None:
-                continue
-            value = parsed_value
-        merged[slot.name] = value
-    for slot in schema.slots:
-        if slot.name in merged or slot.type != "text":
-            continue
-        merged[slot.name] = argument_payload
-        break
-
-
-def _fill_link_slots_from_message(
-    merged: dict[str, Any],
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> None:
-    url_payload = _extract_url_payload(message_text)
-    if not url_payload:
-        return
-    for slot in schema.slots:
-        if slot.name in merged or slot.type != "text":
-            continue
-        if not _slot_accepts_url(slot):
-            continue
-        merged[slot.name] = url_payload
-        return
-
-
-def _schema_allows_tail_payload(schema: PluginCommandSchema) -> bool:
-    policy = normalize_message_text(str(schema.payload_policy or "")).lower()
-    extra_policy = normalize_message_text(str(schema.extra_text_policy or "")).lower()
-    if policy in {"none", "image_only"} or extra_policy == "discard":
-        return False
-    if (schema.requires or {}).get("text"):
-        return True
-    return any(slot.type not in {"at", "image"} for slot in schema.slots)
-
-
 def complete_slots(
     schema: PluginCommandSchema,
     *,
@@ -785,28 +353,24 @@ def complete_slots(
     message_text: str = "",
     arguments_text: str = "",
 ) -> tuple[dict[str, Any], list[str]]:
+    _ = (message_text, arguments_text)
     merged: dict[str, Any] = {}
+    slot_by_key: dict[str, CommandSlotSpec] = {}
+    for slot in schema.slots:
+        for key in (slot.name, *slot.aliases):
+            normalized = normalize_message_text(str(key or ""))
+            if normalized:
+                slot_by_key[normalized] = slot
+
     for key, value in dict(slots or {}).items():
+        slot = slot_by_key.get(normalize_message_text(str(key or "")))
+        if slot is None:
+            continue
         if value is None:
             continue
         if isinstance(value, str) and not normalize_message_text(value):
             continue
-        merged[key] = value
-    # Adapter extractors provide optional plugin-specific slot correction without
-    # leaking those rules into the generic renderer.
-    inferred = _infer_adapter_slots(schema, normalize_message_text(message_text))
-    if not inferred and arguments_text:
-        inferred = _infer_adapter_slots(schema, normalize_message_text(arguments_text))
-    merged.update(
-        inferred,
-    )
-    if _schema_allows_tail_payload(schema):
-        _fill_link_slots_from_message(merged, schema, message_text)
-    argument_payload = normalize_message_text(arguments_text)
-    if not argument_payload and _schema_allows_tail_payload(schema):
-        argument_payload = _extract_command_tail_payload(schema, message_text)
-    if argument_payload:
-        _fill_slots_from_payload(merged, schema, argument_payload)
+        merged[slot.name] = value
 
     missing: list[str] = []
     for slot in schema.slots:

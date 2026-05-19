@@ -26,6 +26,8 @@ from zhenxun.services.send_queue import (
     pop_send_observations,
 )
 
+from .artifact_store import get_artifact_store
+
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
     r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
@@ -51,6 +53,10 @@ _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN = re.compile(
     r"\[image(?:#\d+)?\]",
     re.IGNORECASE,
 )
+_OBSERVED_IMAGE_OUTPUT_PATTERN = re.compile(
+    r"(?:\[image\b|\[CQ:image\b|type=['\"]?image)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,55 @@ class RerouteExecutionResult:
     @property
     def observed_text(self) -> str:
         return "\n".join(item.text for item in self.outputs if item.text).strip()
+
+
+def artifacts_from_send_observations(
+    outputs: list[SendObservation],
+    *,
+    trace_id: str,
+) -> list[dict[str, Any]]:
+    """Convert plugin sends into compact artifact refs for model observations."""
+
+    store = get_artifact_store()
+    artifacts: list[dict[str, Any]] = []
+    for index, output in enumerate(outputs, 1):
+        raw = str(output.raw_message or "")
+        text = str(output.text or "")
+        if _OBSERVED_IMAGE_OUTPUT_PATTERN.search(raw):
+            artifacts.append(
+                store.store_reference(
+                    artifact_type="image",
+                    summary=f"plugin image output #{index}",
+                    trace_id=trace_id,
+                    source=output.api,
+                    size=len(raw),
+                ).to_dict()
+            )
+            if raw and raw != text:
+                ref = store.store_text(
+                    raw,
+                    artifact_type="plugin_output",
+                    trace_id=trace_id,
+                    source=f"{output.api}:raw_message",
+                    force_file=len(raw) > 240,
+                )
+                if ref is not None:
+                    artifacts.append(ref.to_dict())
+            continue
+
+        if raw and raw != text and len(raw) > len(text):
+            ref = store.store_text(
+                raw,
+                artifact_type="plugin_output",
+                trace_id=trace_id,
+                source=f"{output.api}:raw_message",
+                force_file=len(raw) > 240,
+            )
+            if ref is not None:
+                artifacts.append(ref.to_dict())
+            continue
+
+    return artifacts
 
 
 async def reroute_to_plugin(
@@ -467,6 +522,7 @@ def replace_mention_ids_with_names(
 
 __all__ = [
     "RerouteExecutionResult",
+    "artifacts_from_send_observations",
     "normalize_ai_reply_text",
     "replace_mention_ids_with_names",
     "reroute_to_plugin",

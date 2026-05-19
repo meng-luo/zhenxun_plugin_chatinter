@@ -142,6 +142,7 @@ def candidate_selection_to_native_route(
     candidates: list[CommandCandidate],
     message_text: str,
     stage: str,
+    candidate: CommandCandidate | None = None,
     has_reply: bool = False,
 ) -> tuple[NativeRouteDecision, NativeRouteResult | None] | None:
     if selection.action == "chat":
@@ -157,11 +158,13 @@ def candidate_selection_to_native_route(
     command_id = normalize_message_text(selection.command_id or "")
     if not command_id:
         return None
-    candidate = _find_candidate(candidates, command_id=command_id)
-    if candidate is None:
+    selected_candidate = candidate or _find_candidate(candidates, command_id=command_id)
+    if selected_candidate is None:
+        return None
+    if normalize_message_text(selected_candidate.schema.command_id) != command_id:
         return None
 
-    schema = candidate.schema
+    schema = selected_candidate.schema
     slots = _slots_to_dict(selection.slots)
     missing: list[str] = list(selection.missing or [])
     if selection.action == "usage":
@@ -172,14 +175,10 @@ def candidate_selection_to_native_route(
         slots, schema_missing = complete_slots(
             schema,
             slots=slots,
-            message_text=message_text,
-            arguments_text="",
         )
         rendered, render_missing = render_command(
             schema,
             slots=slots,
-            message_text=message_text,
-            arguments_text="",
         )
         missing.extend(schema_missing)
         missing.extend(render_missing)
@@ -191,18 +190,18 @@ def candidate_selection_to_native_route(
     decision = NativeRouteDecision(
         action=action,
         confidence=selection.confidence,
-        plugin_module=candidate.plugin_module,
-        plugin_name=candidate.plugin_name,
+        plugin_module=selected_candidate.plugin_module,
+        plugin_name=selected_candidate.plugin_name,
         command_id=schema.command_id,
         command=command,
         slots=[] if action == "usage" else _slots_to_items(slots),
         missing=[] if action == "usage" else missing,
-        reason=selection.reason or f"{stage}:{candidate.reason}",
+        reason=selection.reason or f"{stage}:{selected_candidate.reason}",
     )
     return decision, NativeRouteResult(
         decision=SkillRouteDecision(
-            plugin_name=candidate.plugin_name,
-            plugin_module=candidate.plugin_module,
+            plugin_name=selected_candidate.plugin_name,
+            plugin_module=selected_candidate.plugin_module,
             command=command,
             source=stage,
             skill_kind=stage,
@@ -219,8 +218,8 @@ def candidate_selection_to_native_route(
             ),
             0,
         ),
-        selected_score=candidate.score,
-        selected_reason=candidate.reason,
+        selected_score=selected_candidate.score,
+        selected_reason=selected_candidate.reason,
     )
 
 
