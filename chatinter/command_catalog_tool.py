@@ -58,7 +58,18 @@ class CommandCatalogState:
             self._command_order.append(command_id)
 
         self._trim_to_cap()
+        self._sort_stable()
+        self.retriever.registry.sync_command_tools(
+            self.candidates,
+            self._tool_map,
+        )
         return [cast(ToolExecutable, tool) for tool in tools]
+
+    def replace(self, candidates: list[CommandCandidate]) -> list[ToolExecutable]:
+        self._candidates.clear()
+        self._tool_map.clear()
+        self._command_order.clear()
+        return self.inject(candidates)
 
     def _trim_to_cap(self) -> None:
         cap = max(1, int(self.max_command_tools or _DEFAULT_COMMAND_TOOL_CAP))
@@ -74,6 +85,37 @@ class CommandCatalogState:
                     == command_id
                 ):
                     self._tool_map.pop(tool_name, None)
+
+    def _sort_stable(self) -> None:
+        candidates = [
+            self._candidates[command_id]
+            for command_id in self._command_order
+            if command_id in self._candidates
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                bool(candidate.exact_protected),
+                float(candidate.score or 0.0),
+                normalize_message_text(candidate.schema.command_id),
+            ),
+            reverse=True,
+        )
+        self._command_order = [
+            normalize_message_text(candidate.schema.command_id)
+            for candidate in candidates
+            if normalize_message_text(candidate.schema.command_id)
+        ]
+        ordered_tools: dict[str, ToolExecutable] = {}
+        for command_id in self._command_order:
+            for tool_name, tool in self._tool_map.items():
+                binding = getattr(tool, "binding", None)
+                if (
+                    normalize_message_text(str(getattr(binding, "command_id", "") or ""))
+                    == command_id
+                ):
+                    ordered_tools[tool_name] = tool
+                    break
+        self._tool_map = ordered_tools
 
 
 class CommandCatalogTool:
@@ -169,9 +211,86 @@ def _candidate_payload(
     *,
     index: int,
 ) -> dict[str, Any]:
-    payload = dict(payloads[index - 1]) if index - 1 < len(payloads) else {}
-    payload["tool_injected"] = True
-    return payload
+    raw = dict(payloads[index - 1]) if index - 1 < len(payloads) else {}
+    capability_raw = raw.get("capability")
+    capability: dict[str, Any] = (
+        capability_raw if isinstance(capability_raw, dict) else {}
+    )
+    target_policy_raw = capability.get("target_policy")
+    target_policy = (
+        target_policy_raw
+        if isinstance(target_policy_raw, dict)
+        else {}
+    )
+    compact: dict[str, Any] = {
+        "rank": raw.get("rank", index),
+        "score": raw.get("score"),
+        "command_id": raw.get("command_id"),
+        "plugin_name": raw.get("plugin_name"),
+        "plugin_module": raw.get("plugin_module"),
+        "head": raw.get("head"),
+        "role": raw.get("role"),
+        "payload_policy": raw.get("payload_policy"),
+        "target_policy": {
+            "requirement": target_policy.get("requirement")
+            or raw.get("target_requirement"),
+            "sources": target_policy.get("sources") or raw.get("target_sources") or [],
+            "allow_at": target_policy.get("allow_at", raw.get("allow_at")),
+        },
+        "slots": _compact_slots(raw.get("slots")),
+        "render": raw.get("render"),
+        "output_mode": capability.get("output_mode"),
+        "requires_real_tool": capability.get("requires_real_tool"),
+        "source_of_truth": capability.get("source_of_truth"),
+        "selection_note": "已注入同名 command tool；若匹配当前任务，请调用对应工具。",
+        "tool_injected": True,
+    }
+    reason = normalize_message_text(str(raw.get("reason", "") or ""))
+    if reason:
+        compact["reason"] = reason[:180]
+    aliases = raw.get("aliases")
+    if isinstance(aliases, list) and aliases:
+        compact["aliases"] = [
+            normalize_message_text(str(item or ""))
+            for item in aliases[:4]
+            if normalize_message_text(str(item or ""))
+        ]
+    description = normalize_message_text(str(raw.get("description", "") or ""))
+    if description:
+        compact["description"] = description[:160]
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _compact_slots(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    slots: list[dict[str, Any]] = []
+    for item in value[:6]:
+        if not isinstance(item, dict):
+            continue
+        slot = {
+            "name": item.get("name"),
+            "type": item.get("type"),
+            "required": item.get("required"),
+        }
+        aliases = item.get("aliases")
+        if isinstance(aliases, list) and aliases:
+            slot["aliases"] = [
+                normalize_message_text(str(alias or ""))
+                for alias in aliases[:3]
+                if normalize_message_text(str(alias or ""))
+            ]
+        description = normalize_message_text(str(item.get("description", "") or ""))
+        if description:
+            slot["description"] = description[:80]
+        slots.append(
+            {key: item_value for key, item_value in slot.items() if item_value not in (None, "", [])}
+        )
+    return slots
 
 
 def _guardrail_hint(*, retrieved: int, active_tools: int) -> str:

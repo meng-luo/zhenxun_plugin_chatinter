@@ -24,6 +24,7 @@ GuardrailAction = Literal["observe", "block_tool", "stop"]
 
 _CATALOG_NO_RESULT_LIMIT = 2
 _CATALOG_NO_RESULT_STOP_LIMIT = 3
+_CATALOG_RETRIEVE_STOP_LIMIT = 2
 _REPEAT_FAILURE_BLOCK_LIMIT = 2
 _REPEAT_FAILURE_STOP_LIMIT = 3
 _NO_VISIBLE_OUTPUT_OBSERVE_LIMIT = 2
@@ -417,6 +418,18 @@ class RuntimeGuardrails:
                 tool_name=COMMAND_CATALOG_TOOL_NAME,
                 payload={"active_command_tools": self.catalog_active_tools},
             )
+        if self.catalog_retrieve_count >= _CATALOG_RETRIEVE_STOP_LIMIT:
+            return self._decision(
+                reason="catalog_retrieve_budget_exhausted",
+                message=(
+                    "本轮已经检索过插件能力。请从已注入的命令工具中选择，"
+                    "或直接说明没有合适插件，不要继续检索。"
+                ),
+                severity="medium",
+                action="block_tool",
+                tool_name=COMMAND_CATALOG_TOOL_NAME,
+                payload={"catalog_retrieve_count": self.catalog_retrieve_count},
+            )
         return None
 
     def _record_visible_output_state(
@@ -546,6 +559,11 @@ def _is_catalog_result(output: dict[str, Any]) -> bool:
 
 
 def _has_visible_output(output: dict[str, Any]) -> bool:
+    if bool(output.get("visible_output")):
+        return True
+    summary = normalize_message_text(str(output.get("messages_sent_summary", "") or ""))
+    if summary:
+        return True
     messages = output.get("messages_sent")
     if isinstance(messages, list) and any(
         normalize_message_text(str(item or "")) for item in messages

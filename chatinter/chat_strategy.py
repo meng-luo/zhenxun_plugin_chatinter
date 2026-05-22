@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .chat_dialogue_planner import ChatDialoguePlan
+from .chat_dialogue_planner import ChatDialoguePlan, DialogueState
 
 
 def build_chat_strategy_prompt(plan: ChatDialoguePlan | None) -> str:
@@ -34,4 +34,34 @@ def build_chat_strategy_prompt(plan: ChatDialoguePlan | None) -> str:
     return common
 
 
-__all__ = ["build_chat_strategy_prompt"]
+def build_dialogue_state_prompt(state: DialogueState | None) -> str:
+    if state is None:
+        return ""
+    length_rule = {
+        "short": "优先短答，保留一点自然语气。",
+        "medium": "中等长度，先结论再补关键依据。",
+        "long": "可以展开，但先给结论和结构。",
+    }.get(state.response_length, "按用户问题自然控制长度。")
+    followup_rule = (
+        "如果关键上下文不足，只追问一个最关键问题。"
+        if state.need_followup
+        else "不要为了显得热情而多问无必要的问题。"
+    )
+    group_rule = {
+        "brief_react": "群聊里优先少说、接话，不抢话题。",
+        "answer_directly": "直接回答当前问题，别绕到工具或无关话题。",
+        "support": "先接住情绪，再给很小的可执行建议。",
+        "structured": "可简短分点，但不要写成长报告。",
+        "agent": "按超级用户 Agent 任务语气保持清晰、可验证。",
+    }.get(state.group_reply_policy, "按当前场景自然回复。")
+    topic_rule = f"当前话题线索={state.topic_hint}。" if state.topic_hint else ""
+    return (
+        "\n当前对话状态："
+        f"语气={state.tone}；用户情绪={state.user_emotion}；"
+        f"对话目的={state.dialogue_purpose}；回复长度={state.response_length}；"
+        f"连续性={state.continuity}；群聊策略={state.group_reply_policy}。"
+        f"{topic_rule}{length_rule}{followup_rule}{group_rule}"
+    )
+
+
+__all__ = ["build_chat_strategy_prompt", "build_dialogue_state_prompt"]

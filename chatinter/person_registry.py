@@ -55,6 +55,13 @@ class RelevantPerson:
     is_current_speaker: bool = False
 
 
+@dataclass(frozen=True)
+class PersonFactLayers:
+    person_facts: tuple[str, ...] = ()
+    relationship_facts: tuple[str, ...] = ()
+    preference_facts: tuple[str, ...] = ()
+
+
 def _cache_key(group_id: str | None, user_id: str) -> str:
     return f"{group_id or 'private'}:{user_id}"
 
@@ -333,6 +340,52 @@ def format_profile_lines(profile: PersonProfile, *, prefix: str = "") -> list[st
     if profile.confidence:
         lines.append(f"{label}_confidence={profile.confidence:.2f}")
     return lines
+
+
+def format_person_fact_layers(
+    profile: PersonProfile | None,
+    *,
+    prefix: str = "person",
+) -> PersonFactLayers:
+    """Expose stable person facts for layered long-term memory context."""
+
+    if profile is None or not profile.user_id:
+        return PersonFactLayers()
+    label = normalize_message_text(prefix) or "person"
+    person_facts: list[str] = [f"{label}_user_id={_xml_escape(profile.user_id)}"]
+    if profile.display_name:
+        person_facts.append(f"{label}_display_name={_xml_escape(profile.display_name)}")
+    if profile.group_card:
+        person_facts.append(f"{label}_group_card={_xml_escape(profile.group_card)}")
+    if profile.nickname:
+        person_facts.append(f"{label}_nickname={_xml_escape(profile.nickname)}")
+    if profile.aliases:
+        person_facts.append(
+            f"{label}_aliases={_xml_escape('、'.join(profile.aliases[:6]))}"
+        )
+    if profile.known_facts:
+        person_facts.append(
+            f"{label}_known_facts={_xml_escape('；'.join(profile.known_facts[:4]))}"
+        )
+    if profile.conflict_state:
+        person_facts.append(
+            f"{label}_conflict_state={_xml_escape(profile.conflict_state)}"
+        )
+    relationship_facts = (
+        (f"{label}_relationship={_xml_escape(profile.relationship)}",)
+        if profile.relationship
+        else ()
+    )
+    preference_facts: list[str] = []
+    for fact in profile.known_facts:
+        normalized = normalize_message_text(fact)
+        if any(marker in normalized for marker in ("喜欢", "不喜欢", "偏好", "讨厌")):
+            preference_facts.append(f"{label}_preference={_xml_escape(normalized)}")
+    return PersonFactLayers(
+        person_facts=tuple(person_facts),
+        relationship_facts=relationship_facts,
+        preference_facts=tuple(preference_facts[:4]),
+    )
 
 
 async def resolve_alias_candidates(
@@ -850,8 +903,10 @@ def _xml_escape(value: str) -> str:
 
 __all__ = [
     "AliasCandidate",
+    "PersonFactLayers",
     "PersonProfile",
     "RelevantPerson",
+    "format_person_fact_layers",
     "format_person_history_label",
     "format_profile_lines",
     "get_person_profile",

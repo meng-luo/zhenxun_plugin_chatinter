@@ -12,7 +12,6 @@ from ..patch_operations import FileChange, apply_changes_transaction
 from ..permission_policy import decide_file_read, decide_file_write
 from ..registry import register_superuser_tool
 from .common import (
-    MAX_OUTPUT_CHARS,
     actor_from_context,
     approval_required_result,
     audited_error_result,

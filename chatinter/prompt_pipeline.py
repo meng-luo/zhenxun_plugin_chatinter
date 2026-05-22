@@ -15,6 +15,7 @@ from .pipeline_stages import (
     stage_agent_run,
     stage_capability_hint,
     stage_current_user,
+    stage_dialogue_state,
     stage_event_context,
     stage_identity,
     stage_memory,
@@ -38,6 +39,7 @@ class PromptPipeline:
             "identity",
             "event_context",
             "thread_context",
+            "dialogue_state",
             "memory",
             "capability_hint",
             "current_user",
@@ -93,6 +95,7 @@ class PromptPipeline:
             cached_plain_text=frame.cached_plain_text,
         )
         await stage_thread_context(frame=frame)
+        await stage_dialogue_state(frame=frame)
         await stage_memory(frame=frame, bot=bot, event=event)
         await stage_capability_hint(
             frame=frame,

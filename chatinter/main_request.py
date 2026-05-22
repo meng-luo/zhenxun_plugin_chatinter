@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import isawaitable
+import re
 import time
 from typing import Any, cast
 import uuid
@@ -20,6 +21,7 @@ from zhenxun.services.llm.types.models import ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .agent_runtime import AgentRuntime
+from .agent_complexity import route_agent_complexity
 from .agent_state import AgentRunState, AgentRuntimeResult, AgentRuntimeTimelineItem
 from .command_catalog_tool import (
     COMMAND_CATALOG_TOOL_NAME,
@@ -38,9 +40,19 @@ from .native_route import (
     NativeRouteReport,
     NativeRouteResult,
 )
-from .route_text import is_usage_question, normalize_message_text
-from .soft_tool_policy import filter_soft_candidates
-from .superuser_agent import build_superuser_agent_tools
+from .provider_capability import ProviderCapabilityAdapter
+from .route_text import (
+    is_usage_question,
+    normalize_message_text,
+)
+from .soft_tool_policy import (
+    filter_soft_candidates,
+    is_high_reliability_candidate,
+    request_strength_for_candidate,
+    should_catalog_only_candidate,
+    sort_exposure_candidates,
+)
+from .superuser_agent import build_superuser_agent_tool_bundle
 from .tool_intent_gate import ToolIntentGate, ToolIntentGateResult
 from .tool_retriever import CommandToolRetriever
 from .turn_runtime import TurnBudgetController
@@ -48,6 +60,117 @@ from .turn_runtime import TurnBudgetController
 _MAIN_STAGE = "main_request"
 _TOOL_INTENT_GATE_STAGE = "tool_intent_gate"
 _MAX_REQUEST_TOOL_COUNT = 120
+_AUTO_COMMAND_TOOL_CAP = 32
+_REQUIRED_COMMAND_TOOL_CAP = 24
+_NEGATIVE_TOOL_MARKERS = (
+    "不是在让你",
+    "不是让你",
+    "不是叫你",
+    "不是要你",
+    "不要",
+    "别",
+    "不用",
+    "无需",
+    "不必",
+    "不想",
+    "不需要",
+)
+_NEGATIVE_TOOL_BRIDGE_TERMS = (
+    "真的",
+    "实际",
+    "真正",
+    "真",
+    "直接",
+    "去",
+    "来",
+    "再",
+    "帮我",
+    "给我",
+    "执行",
+    "调用",
+    "使用",
+    "运行",
+    "触发",
+    "进行",
+)
+_GENERIC_TOOL_ACTION_TERMS = (
+    "执行",
+    "调用",
+    "使用",
+    "运行",
+    "触发",
+    "操作",
+    "命令",
+    "工具",
+    "插件",
+)
+_DISCUSSION_ONLY_CONSTRAINTS = (
+    "只是讨论",
+    "只是在讨论",
+    "我在讨论",
+    "只是聊",
+    "只想聊",
+    "只聊",
+    "只是提到",
+    "只是说说",
+    "不是命令",
+)
+_DISCUSSION_INTENT_MARKERS = (
+    "聊聊",
+    "讨论",
+    "为什么",
+    "怎么看",
+    "会不会",
+    "是否应该",
+    "应不应该",
+    "边界",
+    "机制",
+    "原理",
+    "原因",
+    "隐喻",
+    "表达",
+    "体验",
+    "兜底",
+    "误判",
+    "不应该触发",
+)
+_DISCUSSION_META_TERMS = (
+    "插件",
+    "命令",
+    "工具",
+    "触发",
+    "误判",
+    "边界",
+    "api",
+    "产品",
+    "机制",
+    "词",
+    "梗",
+    "表达",
+    "召回率",
+)
+_STRONG_EXECUTION_REQUEST_TERMS = (
+    "帮我查",
+    "查询",
+    "搜一下",
+    "搜索",
+    "生成",
+    "制作",
+    "做个",
+    "画",
+    "翻译成",
+    "翻译为",
+    "执行",
+    "调用",
+    "运行",
+    "发一个",
+    "发一下",
+    "来一个",
+    "来一张",
+    "抽一",
+    "签个到",
+    "签到",
+)
 MainRequestRouteHook = Callable[["MainRequestResult"], Awaitable[None] | None]
 MainRequestReplyHook = Callable[[str], Awaitable[str] | str]
 
@@ -107,6 +230,20 @@ class ToolObligationDecision:
     reason: str
     required_tool_names: tuple[str, ...] = ()
     gate_result: ToolIntentGateResult | None = None
+
+
+@dataclass(frozen=True)
+class CandidateObligationEvaluation:
+    candidate: Any
+    score: float
+    request_strength: Any
+    capability_factor: float
+    recall_factor: float
+    reliability_factor: float
+    schema_factor: float
+    requires_real_tool: bool
+    real_output_factor: float
+    reason: str
 
 
 async def run_chatinter_main_request(
@@ -198,17 +335,33 @@ async def _run_main_request(
     initial_command_exposure: bool,
     enable_agent_tools: bool,
 ) -> MainRequestResult:
+    model_name = get_model_name()
+    provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
+    enable_plugin_tools = enable_plugin_tools and provider_adapter.profile.supports_tools
+    enable_agent_tools = enable_agent_tools and provider_adapter.profile.supports_tools
     retriever = CommandToolRetriever(
         knowledge_base,
         session_id=session_key,
         tools=cast(Any, command_tools),
     )
-    agent_tools = build_superuser_agent_tools() if enable_agent_tools else {}
+    capability_registry = retriever.registry
+    agent_bundle = (
+        build_superuser_agent_tool_bundle() if enable_agent_tools else None
+    )
+    agent_tools = agent_bundle.tools if agent_bundle is not None else {}
     base_tool_count = len(agent_tools) + (1 if enable_plugin_tools else 0)
-    command_tool_capacity = max(1, _MAX_REQUEST_TOOL_COUNT - base_tool_count)
+    command_tool_capacity = provider_adapter.command_tool_capacity(
+        reserved_tools=base_tool_count,
+    )
+    if enable_plugin_tools and command_tool_capacity <= 0:
+        enable_plugin_tools = False
+        base_tool_count = len(agent_tools)
+        command_tool_capacity = provider_adapter.command_tool_capacity(
+            reserved_tools=base_tool_count,
+        )
     catalog_state = CommandCatalogState(
         retriever=retriever,
-        max_command_tools=command_tool_capacity,
+        max_command_tools=max(command_tool_capacity, 1),
     )
 
     report.note_candidate_policy(
@@ -224,8 +377,16 @@ async def _run_main_request(
     tool_map: dict[str, ToolExecutable] = {}
     if enable_plugin_tools:
         catalog_tool = CommandCatalogTool(catalog_state)
-        tool_map[COMMAND_CATALOG_TOOL_NAME] = cast(ToolExecutable, catalog_tool)
-    tool_map.update(agent_tools)
+        capability_registry.register_catalog_tool(
+            tool_name=COMMAND_CATALOG_TOOL_NAME,
+            executable=cast(ToolExecutable, catalog_tool),
+        )
+    if agent_tools:
+        capability_registry.register_superuser_tools(
+            agent_tools,
+            cards=agent_bundle.cards if agent_bundle is not None else (),
+        )
+    tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
     if tool_map:
         report.note_tool_pool(len(tool_map))
     command_context = NativeCommandExecutionContext(
@@ -242,7 +403,7 @@ async def _run_main_request(
         )
         catalog_state.inject(list(initial_result.candidates))
         command_context.candidates = catalog_state.candidates
-        tool_map.update(catalog_state.tool_map)
+        tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
         report.note_prompt_exposure(catalog_state.candidates)
         report.tool_candidates = max(
             report.tool_candidates,
@@ -254,6 +415,7 @@ async def _run_main_request(
             limit=catalog_state.injected_count,
         )
     trace_id = uuid.uuid4().hex[:12]
+    run_id = trace_id
     obligation_decision = await _resolve_tool_obligation(
         message_text=message_text,
         enable_plugin_tools=enable_plugin_tools,
@@ -261,23 +423,43 @@ async def _run_main_request(
         candidates=catalog_state.candidates,
         tool_map=tool_map,
         trace_id=trace_id,
-        model_name=get_model_name(),
+        model_name=model_name,
         generation_config=build_reasoning_generation_config(),
         timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
         budget_controller=budget_controller,
+    )
+    if enable_plugin_tools:
+        _apply_tool_exposure_policy(
+            message_text=message_text,
+            decision=obligation_decision,
+            catalog_state=catalog_state,
+            command_context=command_context,
+            tool_map=tool_map,
+            report=report,
+            command_tool_capacity=command_tool_capacity,
+        )
+        tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
+    complexity_decision = route_agent_complexity(
+        message_text=message_text,
+        tool_map=tool_map,
+        enable_agent_tools=enable_agent_tools,
     )
     run_context = RunContext(
         session_id=session_key,
         extra={
             "native_command_context": command_context,
             "command_catalog_state": catalog_state,
+            "capability_registry": capability_registry,
+            "provider_capability": provider_adapter.profile.to_metadata(),
             "actor_user_id": session_key or "",
             "agent_mode": "superuser_agent" if enable_agent_tools else "chatinter",
             "enable_agent_tools": enable_agent_tools,
+            "agent_complexity": complexity_decision.to_metadata(),
         },
     )
     state = AgentRunState.create(
         trace_id=trace_id,
+        run_id=run_id,
         session_key=session_key,
         messages=messages,
         tool_map=tool_map,
@@ -287,6 +469,18 @@ async def _run_main_request(
         tool_obligation=obligation_decision.obligation,
         tool_obligation_reason=obligation_decision.reason,
         required_tool_names=obligation_decision.required_tool_names,
+        agent_complexity_mode=complexity_decision.mode,
+        agent_complexity_reason=complexity_decision.reason,
+    )
+    state.append_timeline(
+        role="system",
+        kind="provider_capability",
+        metadata=provider_adapter.profile.to_metadata(),
+    )
+    state.append_timeline(
+        role="system",
+        kind="agent_complexity",
+        metadata=complexity_decision.to_metadata(),
     )
     state.append_timeline(
         role="system",
@@ -297,7 +491,7 @@ async def _run_main_request(
         state=state,
         run_context=run_context,
         message_text=message_text,
-        model_name=get_model_name(),
+        model_name=model_name,
         generation_config=build_reasoning_generation_config(),
         timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
         budget_controller=budget_controller,
@@ -633,6 +827,23 @@ async def _resolve_tool_obligation(
             obligation="none",
             reason="no_command_candidates",
         )
+    negative_reason = _negative_tool_request_reason(
+        message_text,
+        candidates=candidates,
+    )
+    if negative_reason:
+        return ToolObligationDecision(
+            obligation="none",
+            reason=f"negative_tool_request:{negative_reason}",
+        )
+
+    cheap_decision = _cheap_tool_obligation_decision(
+        message_text=message_text,
+        candidates=candidates,
+        tool_map=tool_map,
+    )
+    if cheap_decision is not None:
+        return cheap_decision
 
     if budget_controller is not None and not budget_controller.allow_classifier(
         _TOOL_INTENT_GATE_STAGE
@@ -661,9 +872,9 @@ async def _resolve_tool_obligation(
         )
 
     required_tool_names: tuple[str, ...] = ()
-    if result.intent == "chat":
+    if result.obligation == "none":
         obligation = "none"
-    elif result.intent == "plugin_required":
+    elif result.obligation == "required":
         command_id_filter = {
             normalize_message_text(str(command_id or ""))
             for command_id in (
@@ -700,6 +911,543 @@ async def _resolve_tool_obligation(
     )
 
 
+def _negative_tool_request_reason(
+    message_text: str,
+    *,
+    candidates: list[Any],
+) -> str:
+    """Return a generic reason when the user explicitly says not to execute tools."""
+
+    normalized = normalize_message_text(message_text)
+    if not normalized:
+        return ""
+    if _has_discussion_only_constraint(normalized):
+        return "discussion_only_constraint"
+    if _has_negative_tool_action_phrase(
+        normalized,
+        capability_terms=_capability_action_terms(candidates),
+    ):
+        return "negative_action_phrase"
+    return ""
+
+
+def _has_discussion_only_constraint(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if any(term in normalized for term in _DISCUSSION_ONLY_CONSTRAINTS):
+        return True
+    if _has_strong_execution_request(normalized):
+        return False
+    return (
+        any(marker in normalized for marker in _DISCUSSION_INTENT_MARKERS)
+        and any(term in normalized for term in _DISCUSSION_META_TERMS)
+    )
+
+
+def _has_strong_execution_request(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    return any(term in normalized for term in _STRONG_EXECUTION_REQUEST_TERMS)
+
+
+def _has_negative_tool_action_phrase(
+    text: str,
+    *,
+    capability_terms: tuple[str, ...],
+) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    for marker in _NEGATIVE_TOOL_MARKERS:
+        start = 0
+        while True:
+            index = normalized.find(marker, start)
+            if index < 0:
+                break
+            tail = normalized[index + len(marker) :]
+            if _negative_tail_targets_tool_action(
+                tail,
+                capability_terms=capability_terms,
+            ):
+                return True
+            start = index + len(marker)
+    return False
+
+
+def _negative_tail_targets_tool_action(
+    tail: str,
+    *,
+    capability_terms: tuple[str, ...],
+) -> bool:
+    compact_tail = re.sub(r"[\s，,。.!！？?；;：:\"'“”‘’、]+", "", tail or "")
+    if not compact_tail:
+        return False
+    compact_tail = _strip_negative_bridge_terms(compact_tail)
+    if not compact_tail:
+        return False
+    search_area = compact_tail[:16]
+    return any(term in search_area for term in _GENERIC_TOOL_ACTION_TERMS) or any(
+        term in search_area for term in capability_terms
+    )
+
+
+def _strip_negative_bridge_terms(text: str) -> str:
+    stripped = text
+    changed = True
+    while changed and stripped:
+        changed = False
+        for term in _NEGATIVE_TOOL_BRIDGE_TERMS:
+            if term and stripped.startswith(term):
+                stripped = stripped[len(term) :]
+                changed = True
+                break
+    return stripped
+
+
+def _capability_action_terms(candidates: list[Any]) -> tuple[str, ...]:
+    terms: list[str] = []
+    for candidate in candidates:
+        schema = getattr(candidate, "schema", None)
+        snapshot = getattr(candidate, "tool", None)
+        raw_values: list[Any] = [
+            getattr(schema, "head", ""),
+            *list(getattr(schema, "aliases", []) or []),
+            *list(getattr(schema, "retrieval_phrases", []) or []),
+            *list(getattr(snapshot, "task_verbs", []) or []),
+        ]
+        for value in raw_values:
+            term = _compact_capability_term(value)
+            if term and term not in terms:
+                terms.append(term)
+    return tuple(terms[:64])
+
+
+def _compact_capability_term(value: Any) -> str:
+    text = normalize_message_text(str(value or ""))
+    if not text:
+        return ""
+    compact = re.sub(r"[\s，,。.!！？?；;：:\"'“”‘’、]+", "", text)
+    if len(compact) < 2 or len(compact) > 12:
+        return ""
+    return compact
+
+
+def _cheap_tool_obligation_decision(
+    *,
+    message_text: str,
+    candidates: list[Any],
+    tool_map: dict[str, ToolExecutable],
+) -> ToolObligationDecision | None:
+    """Resolve obvious tool obligation without spending a classifier call."""
+
+    if not candidates:
+        return ToolObligationDecision(obligation="none", reason="cheap:no_candidates")
+
+    actionable = [
+        candidate for candidate in candidates if _candidate_is_actionable(candidate)
+    ]
+    if not actionable:
+        return ToolObligationDecision(
+            obligation="auto",
+            reason="cheap:catalog_or_helper_only",
+        )
+
+    exact = [candidate for candidate in actionable if candidate.exact_protected]
+    if exact:
+        command_ids = _candidate_command_ids(exact)
+        tool_names = _tool_names_for_command_ids(tool_map, tuple(command_ids))
+        return ToolObligationDecision(
+            obligation="required" if tool_names else "auto",
+            reason="cheap:exact_command_candidate",
+            required_tool_names=tool_names,
+        )
+
+    evaluations = [
+        _candidate_obligation_evaluation(message_text, candidate)
+        for candidate in actionable
+    ]
+    required = [
+        evaluation.candidate
+        for evaluation in evaluations
+        if _evaluation_requires_tool(evaluation)
+    ]
+    if required:
+        required.sort(
+            key=lambda candidate: _candidate_obligation_evaluation(
+                message_text,
+                candidate,
+            ).score,
+            reverse=True,
+        )
+        command_ids = _candidate_command_ids(required[:8])
+        tool_names = _tool_names_for_command_ids(tool_map, tuple(command_ids))
+        best = _candidate_obligation_evaluation(message_text, required[0])
+        return ToolObligationDecision(
+            obligation="required" if tool_names else "auto",
+            reason=f"cheap:structured_required:{best.reason}",
+            required_tool_names=tool_names,
+        )
+
+    if any(_evaluation_allows_auto(evaluation) for evaluation in evaluations):
+        best = max(evaluations, key=lambda item: item.score)
+        return ToolObligationDecision(
+            obligation="auto",
+            reason=f"cheap:structured_auto:{best.reason}",
+        )
+
+    if _all_candidates_are_weak(actionable):
+        return ToolObligationDecision(
+            obligation="auto",
+            reason="cheap:weak_or_explicit_only_candidates",
+        )
+
+    # Ambiguous but non-trivial: keep the LLM gate for the hard middle band.
+    return None
+
+
+def _candidate_command_ids(candidates: list[Any]) -> list[str]:
+    result: list[str] = []
+    for candidate in candidates:
+        command_id = normalize_message_text(
+            str(getattr(getattr(candidate, "schema", None), "command_id", "") or "")
+        )
+        if command_id and command_id not in result:
+            result.append(command_id)
+    return result
+
+
+def _candidate_is_actionable(candidate: Any) -> bool:
+    schema = getattr(candidate, "schema", None)
+    role = normalize_message_text(str(getattr(schema, "command_role", "") or ""))
+    return role not in {"catalog", "helper"}
+
+
+def _candidate_is_concrete_or_external(candidate: Any) -> bool:
+    schema = getattr(candidate, "schema", None)
+    snapshot = getattr(candidate, "tool", None)
+    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
+    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    if output_mode in {"image", "file", "action", "plugin_output"}:
+        return True
+    if side_effect in {"query", "send", "mutate"}:
+        return True
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    )
+    if payload_policy not in {"", "none"}:
+        return True
+    if getattr(schema, "slots", None):
+        return True
+    requires = dict(getattr(schema, "requires", {}) or {})
+    return any(bool(requires.get(key)) for key in ("text", "image", "reply", "at"))
+
+
+def _candidate_requires_real_result(candidate: Any) -> bool:
+    snapshot = getattr(candidate, "tool", None)
+    if snapshot is not None and hasattr(snapshot, "requires_real_result"):
+        return bool(getattr(snapshot, "requires_real_result", True))
+    return _candidate_is_concrete_or_external(candidate)
+
+
+def _candidate_requires_real_tool(candidate: Any) -> bool:
+    snapshot = getattr(candidate, "tool", None)
+    if snapshot is not None and hasattr(snapshot, "requires_real_tool"):
+        return bool(getattr(snapshot, "requires_real_tool", True))
+    return _candidate_requires_real_result(candidate)
+
+
+def _candidate_capability_factor(candidate: Any) -> float:
+    schema = getattr(candidate, "schema", None)
+    snapshot = getattr(candidate, "tool", None)
+    factor = 1.0
+    source = normalize_message_text(
+        str(getattr(snapshot, "source_of_truth", "") or "unknown")
+    )
+    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
+    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    risk = normalize_message_text(
+        str(
+            getattr(snapshot, "risk", "")
+            or getattr(snapshot, "risk_level", "")
+            or "low"
+        )
+    )
+    entity_scope = normalize_message_text(
+        str(getattr(snapshot, "entity_scope", "") or "global")
+    )
+    policy = normalize_message_text(
+        str(getattr(snapshot, "execution_policy", "") or "normal")
+    )
+    intent_types = {
+        normalize_message_text(str(intent or "")).lower()
+        for intent in list(getattr(snapshot, "intent_types", []) or [])
+        if normalize_message_text(str(intent or ""))
+    }
+
+    if bool(getattr(snapshot, "requires_real_tool", False)):
+        factor *= 1.35
+    elif bool(getattr(snapshot, "requires_real_result", False)):
+        factor *= 1.2
+    if source in {"bot_state", "external_service", "local_state"}:
+        factor *= 1.28
+    elif source == "plugin_runtime":
+        factor *= 1.15
+    elif source == "model_knowledge":
+        factor *= 0.72
+    elif source in {"user_provided", "unknown"}:
+        factor *= 0.9
+
+    if output_mode in {"image", "file", "action"}:
+        factor *= 1.28
+    elif output_mode == "plugin_output":
+        factor *= 1.15
+    elif output_mode == "text":
+        factor *= 0.96
+
+    if side_effect in {"query", "send"}:
+        factor *= 1.12
+    elif side_effect == "mutate":
+        factor *= 1.2
+
+    if intent_types & {
+        "query",
+        "status",
+        "generate",
+        "media",
+        "random",
+        "transform",
+        "play",
+    }:
+        factor *= 1.12
+    if bool(getattr(snapshot, "generative", False)):
+        factor *= 1.08
+    if entity_scope in {"self_bot", "actor_user", "target_user", "group", "external"}:
+        factor *= 1.08
+    if risk == "medium":
+        factor *= 0.96
+    elif risk == "high":
+        factor *= 0.9
+    schema_quality = float(getattr(snapshot, "schema_quality", 0.5) or 0.5)
+    reliability = float(getattr(snapshot, "reliability", 0.5) or 0.5)
+    if schema_quality < 0.35:
+        factor *= 0.82
+    elif schema_quality >= 0.72:
+        factor *= 1.08
+    if reliability < 0.35:
+        factor *= 0.84
+    elif reliability >= 0.72:
+        factor *= 1.08
+    if policy == "explicit_only":
+        factor *= 0.82
+    elif policy == "confirmation_required":
+        factor *= 0.86
+    if bool(getattr(snapshot, "soft_tool", False)):
+        factor *= 0.84
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    )
+    if payload_policy not in {"", "none"}:
+        factor *= 1.06
+    if getattr(schema, "slots", None):
+        factor *= 1.05
+    return max(0.25, min(factor, 2.8))
+
+
+def _candidate_obligation_evaluation(
+    message_text: str,
+    candidate: Any,
+) -> CandidateObligationEvaluation:
+    request_strength = request_strength_for_candidate(message_text, candidate)
+    capability_factor = _candidate_capability_factor(candidate)
+    recall_factor = _candidate_recall_factor(candidate)
+    reliability_factor = _candidate_reliability_factor(candidate)
+    schema_factor = _candidate_schema_factor(candidate)
+    request_factor = _request_strength_factor(request_strength)
+    requires_real_tool = _candidate_requires_real_tool(candidate)
+    real_output_factor = _candidate_real_output_factor(candidate)
+    score = request_factor * capability_factor * recall_factor
+    score *= reliability_factor * schema_factor * real_output_factor
+    snapshot = getattr(candidate, "tool", None)
+    policy = normalize_message_text(
+        str(getattr(snapshot, "execution_policy", "") or "normal")
+    )
+    if policy == "explicit_only" and not request_strength.explicit:
+        score *= 0.48
+    elif policy == "strong_intent" and request_strength.score < 2.7:
+        score *= 0.68
+    if bool(getattr(snapshot, "soft_tool", False)) and not request_strength.explicit:
+        score *= 0.58
+    if not requires_real_tool:
+        score *= 0.62
+    reason = (
+        f"request={request_strength.score:.2f};"
+        f"capability_factor={capability_factor:.2f};"
+        f"recall_factor={recall_factor:.2f};"
+        f"reliability_factor={reliability_factor:.2f};"
+        f"schema_factor={schema_factor:.2f};"
+        f"real_output_factor={real_output_factor:.2f};"
+        f"score={score:.2f};"
+        f"policy={policy or 'normal'};"
+        f"{request_strength.reason}"
+    )
+    return CandidateObligationEvaluation(
+        candidate=candidate,
+        score=round(score, 3),
+        request_strength=request_strength,
+        capability_factor=capability_factor,
+        recall_factor=recall_factor,
+        reliability_factor=reliability_factor,
+        schema_factor=schema_factor,
+        requires_real_tool=requires_real_tool,
+        real_output_factor=real_output_factor,
+        reason=reason,
+    )
+
+
+def _evaluation_requires_tool(evaluation: CandidateObligationEvaluation) -> bool:
+    if not evaluation.requires_real_tool:
+        return False
+    if not evaluation.request_strength.explicit:
+        return False
+    if evaluation.recall_factor < 0.66:
+        return False
+    if evaluation.reliability_factor < 0.52:
+        return False
+    if evaluation.schema_factor < 0.58:
+        return False
+    if evaluation.score >= 2.65:
+        return True
+    if (
+        evaluation.request_strength.explicit
+        and evaluation.real_output_factor >= 1.12
+        and evaluation.score >= 2.05
+        and evaluation.recall_factor >= 0.72
+    ):
+        return True
+    if (
+        evaluation.request_strength.explicit
+        and "play" in set(getattr(evaluation.request_strength, "matched_intents", ()) or ())
+        and evaluation.real_output_factor >= 1.12
+        and evaluation.score >= 2.0
+        and evaluation.recall_factor >= 0.45
+    ):
+        return True
+    return (
+        evaluation.request_strength.exact_command
+        and evaluation.score >= 1.9
+    )
+
+
+def _evaluation_allows_auto(evaluation: CandidateObligationEvaluation) -> bool:
+    if evaluation.recall_factor < 0.42:
+        return False
+    if evaluation.score >= 1.55:
+        return True
+    return (
+        evaluation.request_strength.explicit
+        and evaluation.requires_real_tool
+        and evaluation.score >= 1.25
+    )
+
+
+def _request_strength_factor(request_strength: Any) -> float:
+    score = float(getattr(request_strength, "score", 0.0) or 0.0)
+    factor = 0.45 + min(max(score, 0.0), 6.0) / 3.0
+    if bool(getattr(request_strength, "exact_command", False)):
+        factor += 0.55
+    elif bool(getattr(request_strength, "direct_mention", False)):
+        factor += 0.25
+    if bool(getattr(request_strength, "explicit", False)):
+        factor += 0.25
+    return max(0.25, min(factor, 3.2))
+
+
+def _candidate_recall_factor(candidate: Any) -> float:
+    confidence = _candidate_confidence_score(candidate)
+    if bool(getattr(candidate, "exact_protected", False)):
+        confidence = max(confidence, 145.0)
+    return max(0.25, min(confidence / 110.0, 1.8))
+
+
+def _candidate_reliability_factor(candidate: Any) -> float:
+    features = getattr(candidate, "features", None)
+    snapshot = getattr(candidate, "tool", None)
+    feedback_reliability = float(
+        getattr(features, "reliability_score", 0.0) or 0.0
+    )
+    false_trigger = float(getattr(features, "false_trigger_score", 0.0) or 0.0)
+    param_failure = float(getattr(features, "param_failure_score", 0.0) or 0.0)
+    latency = float(getattr(features, "latency_score", 0.0) or 0.0)
+    prior = float(getattr(snapshot, "reliability", 0.5) or 0.5)
+    factor = 0.72 + prior * 0.56
+    factor += max(min(feedback_reliability, 18.0), -24.0) / 90.0
+    factor += max(min(false_trigger, 0.0), -24.0) / 70.0
+    factor += max(min(param_failure, 0.0), -18.0) / 80.0
+    factor += max(min(latency, 6.0), -8.0) / 120.0
+    if is_high_reliability_candidate(candidate):
+        factor += 0.12
+    return max(0.35, min(factor, 1.45))
+
+
+def _candidate_schema_factor(candidate: Any) -> float:
+    features = getattr(candidate, "features", None)
+    snapshot = getattr(candidate, "tool", None)
+    schema_score = float(getattr(features, "schema_score", 0.0) or 0.0)
+    quality = float(getattr(snapshot, "schema_quality", 0.5) or 0.5)
+    factor = 0.68 + quality * 0.52 + min(max(schema_score, 0.0), 22.5) / 120.0
+    return max(0.45, min(factor, 1.4))
+
+
+def _candidate_real_output_factor(candidate: Any) -> float:
+    snapshot = getattr(candidate, "tool", None)
+    if snapshot is None:
+        return 1.0
+    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
+    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    source = normalize_message_text(
+        str(getattr(snapshot, "source_of_truth", "") or "")
+    )
+    intent_types = {
+        normalize_message_text(str(intent or "")).lower()
+        for intent in list(getattr(snapshot, "intent_types", []) or [])
+        if normalize_message_text(str(intent or ""))
+    }
+    factor = 1.0
+    if output_mode in {"image", "file", "action"}:
+        factor *= 1.18
+    elif output_mode == "plugin_output":
+        factor *= 1.08
+    if side_effect in {"query", "send", "mutate"}:
+        factor *= 1.08
+    if bool(intent_types & {"generate", "media", "transform", "random", "query", "play"}):
+        factor *= 1.06
+    if source in {"bot_state", "external_service", "local_state", "plugin_runtime"}:
+        factor *= 1.06
+    if bool(getattr(snapshot, "requires_real_tool", False)):
+        factor *= 1.05
+    if bool(getattr(snapshot, "generative", False)):
+        factor *= 1.04
+    return max(0.85, min(factor, 1.35))
+
+
+def _candidate_confidence_score(candidate: Any) -> float:
+    features = getattr(candidate, "features", None)
+    exact = float(getattr(features, "exact_score", 0.0) or 0.0)
+    lexical = float(getattr(features, "lexical_score", 0.0) or 0.0)
+    semantic = float(getattr(features, "semantic_score", 0.0) or 0.0)
+    context = float(getattr(features, "context_score", 0.0) or 0.0)
+    schema = float(getattr(features, "schema_score", 0.0) or 0.0)
+    score = float(getattr(candidate, "score", 0.0) or 0.0)
+    return max(score, exact + lexical + semantic + context + schema)
+
+
+def _all_candidates_are_weak(candidates: list[Any]) -> bool:
+    if not candidates:
+        return True
+    best = max(_candidate_confidence_score(candidate) for candidate in candidates)
+    if best >= 90.0:
+        return False
+    return all(not _candidate_is_concrete_or_external(candidate) for candidate in candidates)
+
+
 def _command_tool_names(tool_map: dict[str, ToolExecutable]) -> tuple[str, ...]:
     names: list[str] = []
     for name, tool in tool_map.items():
@@ -708,6 +1456,228 @@ def _command_tool_names(tool_map: dict[str, ToolExecutable]) -> tuple[str, ...]:
         if command_id:
             names.append(normalize_message_text(name))
     return tuple(name for name in names if name)
+
+
+def _stable_initial_tool_map(
+    tool_map: dict[str, ToolExecutable],
+) -> dict[str, ToolExecutable]:
+    return {
+        name: tool_map[name]
+        for name in sorted(
+            tool_map,
+            key=lambda name: _initial_tool_sort_key(name, tool_map[name]),
+        )
+    }
+
+
+def _initial_tool_sort_key(name: str, tool: ToolExecutable) -> tuple[int, int, str]:
+    binding = getattr(tool, "binding", None)
+    if binding is None:
+        return (0, 0, normalize_message_text(name))
+    candidate = getattr(binding, "candidate", None)
+    score = int(float(getattr(candidate, "score", 0.0) or 0.0) * 100)
+    command_id = normalize_message_text(str(getattr(binding, "command_id", "") or ""))
+    return (1, -score, command_id or normalize_message_text(name))
+
+
+def _apply_tool_exposure_policy(
+    *,
+    message_text: str,
+    decision: ToolObligationDecision,
+    catalog_state: CommandCatalogState,
+    command_context: NativeCommandExecutionContext,
+    tool_map: dict[str, ToolExecutable],
+    report: NativeRouteReport,
+    command_tool_capacity: int,
+) -> None:
+    """Align first-turn executable tools with the structured gate."""
+
+    current_candidates = list(catalog_state.candidates)
+    if decision.obligation == "none":
+        _remove_command_tools(tool_map)
+        catalog_state.replace([])
+        command_context.candidates = []
+        report.note_tool_pool(len(tool_map))
+        report.note_candidate_policy(reason="tool_gate_no_command_exposure", limit=0)
+        return
+    if not current_candidates:
+        return
+
+    selected_ids = _command_ids_for_tool_names(tool_map, decision.required_tool_names)
+    if decision.gate_result is not None:
+        selected_ids.update(
+            normalize_message_text(str(command_id or ""))
+            for command_id in (
+                decision.gate_result.required_command_ids
+                + decision.gate_result.allowed_command_ids
+            )
+            if normalize_message_text(str(command_id or ""))
+        )
+
+    current_candidates = _filter_catalog_only_candidates(
+        current_candidates,
+        message_text=message_text,
+        selected_command_ids=selected_ids,
+    )
+    if not current_candidates:
+        _remove_command_tools(tool_map)
+        catalog_state.replace([])
+        command_context.candidates = []
+        report.note_tool_pool(len(tool_map))
+        report.note_candidate_policy(reason="feedback_catalog_only_exposure", limit=0)
+        return
+
+    if decision.obligation == "required":
+        filtered = _required_exposure_candidates(
+            message_text=message_text,
+            candidates=current_candidates,
+            selected_command_ids=selected_ids,
+        )
+    else:
+        filtered = filter_soft_candidates(
+            message_text,
+            current_candidates,
+            selected_command_ids=selected_ids,
+        )
+
+    exposure_cap = _command_exposure_cap(
+        decision=decision,
+        command_tool_capacity=command_tool_capacity,
+    )
+    filtered = sort_exposure_candidates(
+        message_text,
+        filtered,
+        selected_command_ids=selected_ids,
+    )[:exposure_cap]
+    _replace_command_tools(
+        tool_map=tool_map,
+        catalog_state=catalog_state,
+        candidates=filtered,
+    )
+    command_context.candidates = catalog_state.candidates
+    report.note_prompt_exposure(catalog_state.candidates)
+    report.tool_candidates = max(report.tool_candidates, catalog_state.injected_count)
+    report.note_tool_pool(len(tool_map))
+    report.note_candidate_policy(
+        reason=f"tool_gate_{decision.obligation}_command_exposure",
+        limit=catalog_state.injected_count,
+    )
+
+
+def _command_exposure_cap(
+    *,
+    decision: ToolObligationDecision,
+    command_tool_capacity: int,
+) -> int:
+    hard_cap = max(1, int(command_tool_capacity or _MAX_REQUEST_TOOL_COUNT))
+    if decision.obligation == "required":
+        policy_cap = _REQUIRED_COMMAND_TOOL_CAP
+    else:
+        policy_cap = _AUTO_COMMAND_TOOL_CAP
+    if decision.required_tool_names:
+        policy_cap = max(policy_cap, len(decision.required_tool_names) + 8)
+    return max(1, min(hard_cap, policy_cap))
+
+
+def _filter_catalog_only_candidates(
+    candidates: list[Any],
+    *,
+    message_text: str,
+    selected_command_ids: set[str],
+) -> list[Any]:
+    result: list[Any] = []
+    for candidate in candidates:
+        if should_catalog_only_candidate(
+            candidate,
+            message_text=message_text,
+            selected_command_ids=selected_command_ids,
+        ):
+            continue
+        result.append(candidate)
+    if result:
+        return result
+    return [
+        candidate
+        for candidate in candidates
+        if normalize_message_text(
+            str(getattr(getattr(candidate, "schema", None), "command_id", "") or "")
+        )
+        in selected_command_ids
+        or bool(getattr(candidate, "exact_protected", False))
+        or is_high_reliability_candidate(candidate)
+    ]
+
+
+def _required_exposure_candidates(
+    *,
+    message_text: str,
+    candidates: list[Any],
+    selected_command_ids: set[str],
+) -> list[Any]:
+    if selected_command_ids:
+        selected = [
+            candidate
+            for candidate in candidates
+            if normalize_message_text(
+                str(getattr(getattr(candidate, "schema", None), "command_id", "") or "")
+            )
+            in selected_command_ids
+        ]
+        if selected:
+            return selected
+    filtered = filter_soft_candidates(
+        message_text,
+        candidates,
+        selected_command_ids=selected_command_ids,
+    )
+    if filtered:
+        return filtered
+    return [
+        candidate
+        for candidate in candidates
+        if not bool(getattr(getattr(candidate, "tool", None), "soft_tool", False))
+    ] or candidates
+
+
+def _command_ids_for_tool_names(
+    tool_map: dict[str, ToolExecutable],
+    tool_names: tuple[str, ...],
+) -> set[str]:
+    wanted_names = {
+        normalize_message_text(str(name or ""))
+        for name in tool_names
+        if normalize_message_text(str(name or ""))
+    }
+    result: set[str] = set()
+    if not wanted_names:
+        return result
+    for name, tool in tool_map.items():
+        if normalize_message_text(name) not in wanted_names:
+            continue
+        binding = getattr(tool, "binding", None)
+        command_id = normalize_message_text(str(getattr(binding, "command_id", "")))
+        if command_id:
+            result.add(command_id)
+    return result
+
+
+def _remove_command_tools(tool_map: dict[str, ToolExecutable]) -> None:
+    for name, tool in list(tool_map.items()):
+        binding = getattr(tool, "binding", None)
+        command_id = normalize_message_text(str(getattr(binding, "command_id", "")))
+        if command_id:
+            tool_map.pop(name, None)
+
+
+def _replace_command_tools(
+    *,
+    tool_map: dict[str, ToolExecutable],
+    catalog_state: CommandCatalogState,
+    candidates: list[Any],
+) -> None:
+    _remove_command_tools(tool_map)
+    catalog_state.replace(candidates)
+    tool_map.update(catalog_state.tool_map)
 
 
 def _tool_names_for_command_ids(
@@ -733,7 +1703,10 @@ def _tool_names_for_command_ids(
 def _gate_obligation_reason(result: ToolIntentGateResult) -> str:
     return normalize_message_text(
         "tool_intent_gate:"
-        f"{result.intent}:confidence={float(result.confidence or 0.0):.2f}:"
+        f"{result.intent_type}:{result.obligation}:"
+        f"request_strength={result.request_strength}:"
+        f"mention_only={int(result.mention_only)}:"
+        f"needs_real_execution={int(result.needs_real_execution)}:"
         f"{result.reason or 'no_reason'}"
     )
 
@@ -750,11 +1723,14 @@ def _tool_obligation_metadata(
     if result is not None:
         metadata.update(
             {
-                "gate_intent": result.intent,
-                "gate_confidence": result.confidence,
+                "gate_intent_type": result.intent_type,
+                "gate_request_strength": result.request_strength,
+                "gate_mention_only": result.mention_only,
+                "gate_obligation": result.obligation,
                 "gate_reason": result.reason,
                 "required_command_ids": list(result.required_command_ids),
                 "allowed_command_ids": list(result.allowed_command_ids),
+                "candidate_intent_types": list(result.candidate_intent_types),
                 "needs_real_execution": result.needs_real_execution,
             }
         )

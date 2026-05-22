@@ -18,6 +18,7 @@ class PipelineStage(str, Enum):
     KNOWLEDGE = "knowledge"
     EVENT_CONTEXT = "event_context"
     THREAD_CONTEXT = "thread_context"
+    DIALOGUE_STATE = "dialogue_state"
     CONTEXT = "context"
     MEMORY = "memory"
     CAPABILITY_HINT = "capability_hint"
@@ -95,6 +96,7 @@ class TurnFrame:
     route_result: Any | None = None
     route_report: Any | None = None
     dialogue_plan: Any | None = None
+    dialogue_state: Any | None = None
     mention_name_map: dict[str, str] = field(default_factory=dict)
     mention_profiles: dict[str, dict[str, str]] = field(default_factory=dict)
     reply_images_data: list[Any] = field(default_factory=list)

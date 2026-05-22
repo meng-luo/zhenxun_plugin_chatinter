@@ -8,6 +8,12 @@ from .cache import (
     clear_impression_cache,
     get_user_impression_with_cache,
 )
+from .impression_provider import (
+    ImpressionProvider,
+    SignUserImpressionProvider,
+    get_impression_provider,
+    set_impression_provider,
+)
 from .multimodal import (
     extract_images_from_message,
     extract_images_from_reply_chain,
@@ -24,6 +30,10 @@ __all__ = [
     "extract_images_from_reply_chain",
     "extract_reply_from_message",
     "get_user_impression_with_cache",
+    "get_impression_provider",
+    "ImpressionProvider",
     "remove_reply_segment",
+    "set_impression_provider",
+    "SignUserImpressionProvider",
     "uni_to_text_with_tags",
 ]

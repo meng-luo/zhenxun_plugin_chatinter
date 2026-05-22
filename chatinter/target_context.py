@@ -6,10 +6,12 @@ from difflib import SequenceMatcher
 import re
 import time
 
+from nonebot.adapters import Bot
+
 from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 
-from .plugin_adapters import AdapterTargetPolicy
+from .target_policy import TargetPolicy
 from .route_execution import (
     contains_self_reference,
     contains_third_person_reference,
@@ -104,6 +106,9 @@ _TARGET_HINT_LEADING_NOISE_PATTERN = re.compile(
 _TARGET_HINT_TRAILING_NOISE_PATTERN = re.compile(
     r"(?:的)?(?:表情包?|梗图|头像|图片|照片|图|"
     r"一下|一把|一个|一张|个|张)+$"
+)
+_TARGET_HINT_ACTION_BOUNDARY_PATTERN = re.compile(
+    r"(?:\u505a\u6210|\u53d8\u6210|\u5236\u6210|\u505a\u4e3a|\u4f5c\u4e3a|\u751f\u6210|\u5236\u4f5c|\u505a|\u6574|\u5f04|\u6765|\u53d1|\u53d8|\u8f6c).*$"
 )
 _GROUP_MEMBER_PROFILE_CACHE_TTL = 90.0
 _GROUP_MEMBER_PROFILE_CACHE_MAX = 256
@@ -214,6 +219,7 @@ def _clean_fuzzy_target_hint(candidate: str) -> str:
         previous = text
         text = normalize_message_text(strip_invoke_prefix(text))
         text = normalize_message_text(_TARGET_HINT_LEADING_NOISE_PATTERN.sub("", text))
+        text = normalize_message_text(_TARGET_HINT_ACTION_BOUNDARY_PATTERN.sub("", text))
         text = normalize_message_text(_TARGET_HINT_TRAILING_NOISE_PATTERN.sub("", text))
         text = text.strip(" 的：:,，。.!！？?")
     if not text:
@@ -280,6 +286,7 @@ def _extract_fuzzy_target_hint(
 
 async def _get_group_member_profiles_for_fuzzy(
     group_id: str | None,
+    bot: Bot | None = None,
 ) -> list[dict[str, str | tuple[str, ...]]]:
     if not group_id:
         return []
@@ -289,15 +296,15 @@ async def _get_group_member_profiles_for_fuzzy(
     if cached and (now - cached[0]) < _GROUP_MEMBER_PROFILE_CACHE_TTL:
         return cached[1]
 
+    profiles: list[dict[str, str | tuple[str, ...]]] = []
     try:
         from zhenxun.models.group_member_info import GroupInfoUser
 
         members = await GroupInfoUser.filter(group_id=group_id).all()
     except Exception as exc:
         logger.debug(f"加载群成员映射失败: {exc}")
-        return []
+        members = []
 
-    profiles: list[dict[str, str | tuple[str, ...]]] = []
     for member in members:
         user_id = str(member.user_id).strip()
         if not user_id:
@@ -324,6 +331,25 @@ async def _get_group_member_profiles_for_fuzzy(
             }
         )
 
+    for profile in await _get_adapter_group_member_profiles(group_id, bot):
+        user_id = str(profile.get("user_id") or "").strip()
+        if not user_id or any(
+            str(item.get("user_id") or "").strip() == user_id for item in profiles
+        ):
+            continue
+        profiles.append(profile)
+
+    # Unit tests and freshly joined groups may not have GroupInfoUser persisted
+    # yet.  Fall back to recent chat history so nickname-target commands can
+    # still resolve known speakers without plugin-specific shortcuts.
+    for profile in await _get_recent_chat_member_profiles(group_id):
+        user_id = str(profile.get("user_id") or "").strip()
+        if not user_id or any(
+            str(item.get("user_id") or "").strip() == user_id for item in profiles
+        ):
+            continue
+        profiles.append(profile)
+
     _GROUP_MEMBER_PROFILE_CACHE[cache_key] = (now, profiles)
     if len(_GROUP_MEMBER_PROFILE_CACHE) > _GROUP_MEMBER_PROFILE_CACHE_MAX:
         for _evict_key in sorted(
@@ -332,6 +358,106 @@ async def _get_group_member_profiles_for_fuzzy(
         )[: len(_GROUP_MEMBER_PROFILE_CACHE) - _GROUP_MEMBER_PROFILE_CACHE_MAX]:
             _GROUP_MEMBER_PROFILE_CACHE.pop(_evict_key, None)
     return profiles
+
+
+async def _get_recent_chat_member_profiles(
+    group_id: str | None,
+) -> list[dict[str, str | tuple[str, ...]]]:
+    if not group_id:
+        return []
+    try:
+        from .models.chat_history import ChatInterPersonProfile
+
+        rows = (
+            await ChatInterPersonProfile.filter(group_id=group_id)
+            .order_by("-last_seen", "-id")
+            .limit(300)
+            .values("user_id", "nickname", "group_card", "aliases")
+        )
+    except Exception as exc:
+        logger.debug(f"加载近期群聊昵称失败: {exc}")
+        return []
+
+    profiles: list[dict[str, str | tuple[str, ...]]] = []
+    seen: set[str] = set()
+    for row in rows:
+        user_id = str(row.get("user_id") or "").strip()
+        nickname = str(row.get("nickname") or "").strip()
+        group_card = str(row.get("group_card") or "").strip()
+        aliases = _split_alias_text(str(row.get("aliases") or ""))
+        display_name = group_card or nickname or (aliases[0] if aliases else "")
+        if not user_id or user_id in seen or not display_name:
+            continue
+        seen.add(user_id)
+        profiles.append(
+            {
+                "user_id": user_id,
+                "display_name": display_name,
+                "nickname": nickname,
+                "user_name": group_card or nickname,
+                "uid": "",
+                "platform": "qq",
+                "alias_key": _normalize_alias_key(display_name),
+                "alias_keys": _build_alias_keys(
+                    display_name,
+                    nickname,
+                    group_card,
+                    *aliases,
+                ),
+            }
+        )
+    return profiles
+
+
+async def _get_adapter_group_member_profiles(
+    group_id: str | None,
+    bot: Bot | None,
+) -> list[dict[str, str | tuple[str, ...]]]:
+    if not group_id or bot is None:
+        return []
+    try:
+        rows = await bot.call_api("get_group_member_list", group_id=int(group_id))
+    except Exception as exc:
+        logger.debug(f"通过适配器加载群成员映射失败: {exc}")
+        return []
+    if not isinstance(rows, list | tuple):
+        return []
+
+    profiles: list[dict[str, str | tuple[str, ...]]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        user_id = str(row.get("user_id") or row.get("uid") or "").strip()
+        if not user_id:
+            continue
+        card = str(row.get("card") or "").strip()
+        nickname = str(row.get("nickname") or "").strip()
+        remark = str(row.get("remark") or "").strip()
+        user_name = card or nickname or remark
+        display_name = user_name or user_id
+        alias_keys = _build_alias_keys(display_name, card, nickname, remark)
+        profiles.append(
+            {
+                "user_id": user_id,
+                "display_name": display_name,
+                "nickname": nickname,
+                "user_name": user_name,
+                "uid": str(row.get("uid") or "").strip(),
+                "platform": "qq",
+                "alias_key": _normalize_alias_key(display_name),
+                "alias_keys": alias_keys,
+            }
+        )
+    return profiles
+
+
+def _split_alias_text(raw: str) -> tuple[str, ...]:
+    values: list[str] = []
+    for item in re.split(r"[、,，\n\r\t ]+", raw or ""):
+        text = normalize_message_text(item)
+        if text and text not in values:
+            values.append(text)
+    return tuple(values[:12])
 
 
 async def _get_group_recent_active_scores(group_id: str | None) -> dict[str, float]:
@@ -562,10 +688,10 @@ def _resolve_fuzzy_trigger_strength(
     *,
     original_message: str,
     route_message: str,
-    target_policy: AdapterTargetPolicy | None = None,
+    target_policy: TargetPolicy | None = None,
     command_heads: set[str] | None = None,
 ) -> str:
-    policy = target_policy or AdapterTargetPolicy()
+    policy = target_policy or TargetPolicy()
     normalized_original = normalize_message_text(original_message or "")
     normalized_route = normalize_message_text(route_message or "")
     if not normalized_original or not normalized_route:
@@ -607,9 +733,9 @@ def _needs_target_for_route(
     message_text: str,
     route_message: str,
     *,
-    target_policy: AdapterTargetPolicy | None = None,
+    target_policy: TargetPolicy | None = None,
 ) -> bool:
-    policy = target_policy or AdapterTargetPolicy()
+    policy = target_policy or TargetPolicy()
     normalized = normalize_message_text(message_text or "")
     if not normalized:
         return False
@@ -636,10 +762,11 @@ def _needs_target_for_route(
 async def _enrich_route_message_with_fuzzy_target(
     *,
     group_id: str | None,
+    bot: Bot | None = None,
     original_message: str,
     route_message: str,
     mention_profiles: dict[str, dict[str, str]],
-    target_policy: AdapterTargetPolicy | None = None,
+    target_policy: TargetPolicy | None = None,
     command_heads: set[str] | None = None,
 ) -> tuple[str, dict[str, dict[str, str]], str | None]:
     if not group_id:
@@ -660,7 +787,7 @@ async def _enrich_route_message_with_fuzzy_target(
     if not target_hint:
         return route_message, mention_profiles, None
 
-    profiles = await _get_group_member_profiles_for_fuzzy(group_id)
+    profiles = await _get_group_member_profiles_for_fuzzy(group_id, bot=bot)
     if not profiles:
         return route_message, mention_profiles, None
 
@@ -710,7 +837,7 @@ async def _enrich_route_message_with_fuzzy_target(
             _build_member_ambiguity_message(ambiguous_candidates),
         )
     if matched is None:
-        policy = target_policy or AdapterTargetPolicy()
+        policy = target_policy or TargetPolicy()
         if _needs_target_for_route(
             original_message,
             route_message,
@@ -752,6 +879,7 @@ async def _build_mention_profiles(
     group_id: str | None,
     message_text: str,
     bot_id: str | None = None,
+    bot: Bot | None = None,
 ) -> dict[str, dict[str, str]]:
     mention_profiles: dict[str, dict[str, str]] = {}
     mentioned_user_ids = _extract_mentioned_user_ids(message_text)
@@ -772,16 +900,21 @@ async def _build_mention_profiles(
     if not group_id:
         return mention_profiles
 
+    remaining_user_ids = {
+        user_id
+        for user_id in mentioned_user_ids
+        if user_id not in mention_profiles
+    }
     try:
         from zhenxun.models.group_member_info import GroupInfoUser
 
         members = await GroupInfoUser.filter(
             group_id=group_id,
-            user_id__in=list(mentioned_user_ids),
+            user_id__in=list(remaining_user_ids),
         ).all()
     except Exception as exc:
         logger.debug(f"解析@昵称失败: {exc}")
-        return mention_profiles
+        members = []
 
     for member in members:
         user_id = str(member.user_id)
@@ -803,7 +936,52 @@ async def _build_mention_profiles(
             "alias_key": alias_key,
         }
 
+    remaining_user_ids = {
+        user_id
+        for user_id in mentioned_user_ids
+        if user_id not in mention_profiles
+    }
+    if remaining_user_ids and bot is not None:
+        for user_id in remaining_user_ids:
+            profile = await _get_adapter_group_member_profile(
+                group_id=group_id,
+                user_id=user_id,
+                bot=bot,
+            )
+            if profile:
+                mention_profiles[user_id] = profile
+
     return mention_profiles
+
+
+async def _get_adapter_group_member_profile(
+    *,
+    group_id: str,
+    user_id: str,
+    bot: Bot,
+) -> dict[str, str] | None:
+    try:
+        row = await bot.call_api(
+            "get_group_member_info",
+            group_id=int(group_id),
+            user_id=int(user_id),
+        )
+    except Exception as exc:
+        logger.debug(f"通过适配器解析@昵称失败: {exc}")
+        return None
+    if not isinstance(row, dict):
+        return None
+    card = str(row.get("card") or "").strip()
+    nickname = str(row.get("nickname") or "").strip()
+    display_name = card or nickname or user_id
+    return {
+        "display_name": display_name,
+        "nickname": nickname,
+        "user_name": card or nickname,
+        "uid": str(row.get("uid") or "").strip(),
+        "platform": "qq",
+        "alias_key": _normalize_alias_key(display_name),
+    }
 
 
 def _append_mention_context_xml(

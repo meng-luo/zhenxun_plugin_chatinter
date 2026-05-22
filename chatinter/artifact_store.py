@@ -199,6 +199,28 @@ class ArtifactStore:
             self._items.move_to_end(artifact_id)
         return ref
 
+    def list_refs(
+        self,
+        *,
+        limit: int = 20,
+        artifact_type: str = "",
+        source_contains: str = "",
+    ) -> list[ArtifactRef]:
+        self._ensure_loaded()
+        normalized_type = normalize_message_text(artifact_type)
+        source_filter = normalize_message_text(source_contains).lower()
+        refs = list(self._items.values())
+        if normalized_type:
+            refs = [ref for ref in refs if ref.type == normalized_type]
+        if source_filter:
+            refs = [
+                ref
+                for ref in refs
+                if source_filter in normalize_message_text(ref.source).lower()
+            ]
+        refs.sort(key=lambda ref: ref.created_at or 0.0, reverse=True)
+        return refs[: max(1, min(int(limit or 20), 100))]
+
     def read_text(
         self,
         artifact_id: str,

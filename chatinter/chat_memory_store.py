@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import time
 from typing import Any
@@ -52,6 +52,71 @@ class MemoryCandidate:
     confidence: float = _MEMORY_CONFIDENCE_DEFAULT
 
 
+@dataclass(frozen=True)
+class LayeredMemoryRecall:
+    person_facts: tuple[str, ...] = ()
+    relationship_facts: tuple[str, ...] = ()
+    preference_facts: tuple[str, ...] = ()
+    recent_thread_facts: tuple[str, ...] = ()
+    other_facts: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.person_facts,
+                self.relationship_facts,
+                self.preference_facts,
+                self.recent_thread_facts,
+                self.other_facts,
+            )
+        )
+
+    def to_xml_lines(self) -> list[str]:
+        sections = (
+            ("person_facts", self.person_facts),
+            ("relationship_facts", self.relationship_facts),
+            ("preference_facts", self.preference_facts),
+            ("recent_thread_facts", self.recent_thread_facts),
+            ("other_facts", self.other_facts),
+        )
+        lines: list[str] = []
+        for tag, values in sections:
+            if not values:
+                continue
+            lines.append(f"<{tag}>")
+            lines.extend(values)
+            lines.append(f"</{tag}>")
+        return lines
+
+    def flatten(self) -> list[str]:
+        return [
+            *self.person_facts,
+            *self.relationship_facts,
+            *self.preference_facts,
+            *self.recent_thread_facts,
+            *self.other_facts,
+        ]
+
+
+@dataclass
+class _LayerBuckets:
+    person_facts: list[str] = field(default_factory=list)
+    relationship_facts: list[str] = field(default_factory=list)
+    preference_facts: list[str] = field(default_factory=list)
+    recent_thread_facts: list[str] = field(default_factory=list)
+    other_facts: list[str] = field(default_factory=list)
+
+    def freeze(self) -> LayeredMemoryRecall:
+        return LayeredMemoryRecall(
+            person_facts=tuple(self.person_facts),
+            relationship_facts=tuple(self.relationship_facts),
+            preference_facts=tuple(self.preference_facts),
+            recent_thread_facts=tuple(self.recent_thread_facts),
+            other_facts=tuple(self.other_facts),
+        )
+
+
 _PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "nickname",
@@ -73,6 +138,14 @@ _PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "nickname_correction",
         re.compile(r"(?:别|不要)叫我\s*([^\s，。,.!！?？]{1,24})"),
     ),
+    (
+        "relationship",
+        "relationship",
+        re.compile(
+            r"(?:我和|我跟)(?P<target>[^\s，。,.!！?？]{1,24})"
+            r"(?:是|关系是)(?P<relation>[^\s，。,.!！?？]{1,32})"
+        ),
+    ),
 )
 
 
@@ -90,7 +163,12 @@ def extract_memory_candidates(message_text: str) -> list[MemoryCandidate]:
         match = pattern.search(text)
         if not match:
             continue
-        value = _clean_memory_value(match.group(1))
+        if memory_type == "relationship":
+            value = _clean_memory_value(
+                f"{match.group('target')}={match.group('relation')}"
+            )
+        else:
+            value = _clean_memory_value(match.group(1))
         if not value:
             continue
         if value in {"一下", "这个", "那个", "它", "他", "她"}:
@@ -466,6 +544,57 @@ class ChatMemoryStore:
         limit: int = _MEMORY_LIMIT,
         recall_context: MemoryRecallContext | None = None,
     ) -> list[str]:
+        memories = await ChatMemoryStore._recall_rows(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            query=query,
+            limit=limit,
+            recall_context=recall_context,
+        )
+        lines: list[str] = []
+        for memory in memories:
+            line = _format_memory_line(memory)
+            if line:
+                lines.append(line)
+        return lines[: max(int(limit or 0), 0)]
+
+    @staticmethod
+    async def recall_layered(
+        *,
+        session_id: str,
+        user_id: str,
+        group_id: str | None,
+        query: str,
+        limit: int = _MEMORY_LIMIT,
+        recall_context: MemoryRecallContext | None = None,
+    ) -> LayeredMemoryRecall:
+        memories = await ChatMemoryStore._recall_rows(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            query=query,
+            limit=limit,
+            recall_context=recall_context,
+        )
+        buckets = _LayerBuckets()
+        for memory in memories:
+            line = _format_memory_line(memory)
+            if not line:
+                continue
+            _append_layered_memory(buckets, memory=memory, line=line)
+        return buckets.freeze()
+
+    @staticmethod
+    async def _recall_rows(
+        *,
+        session_id: str,
+        user_id: str,
+        group_id: str | None,
+        query: str,
+        limit: int,
+        recall_context: MemoryRecallContext | None,
+    ) -> list[Any]:
         memory_model = _get_memory_model()
         if memory_model is None:
             return []
@@ -492,7 +621,7 @@ class ChatMemoryStore:
                 recall_context=resolved_context,
                 top_k=limit,
             )
-            memories = await _merge_vector_memories(
+            return await _merge_vector_memories(
                 memory_model=memory_model,
                 structured_memories=memories,
                 vector_results=vector_results,
@@ -502,20 +631,45 @@ class ChatMemoryStore:
         except Exception as exc:
             _debug(f"chatinter memory recall skipped: {exc}")
             return []
-        lines: list[str] = []
-        for memory in memories:
-            memory_type = normalize_message_text(getattr(memory, "memory_type", ""))
-            key = normalize_message_text(getattr(memory, "key", ""))
-            value = normalize_message_text(getattr(memory, "value", ""))
-            if not value:
-                continue
-            label = f"{memory_type}:{key}".strip(":")
-            lines.append(f"{label}={value}" if label else value)
-        return lines[: max(int(limit or 0), 0)]
+
+
+def _format_memory_line(memory: Any) -> str:
+    memory_type = normalize_message_text(getattr(memory, "memory_type", ""))
+    key = normalize_message_text(getattr(memory, "key", ""))
+    value = normalize_message_text(getattr(memory, "value", ""))
+    if not value:
+        return ""
+    label = f"{memory_type}:{key}".strip(":")
+    return f"{label}={value}" if label else value
+
+
+def _append_layered_memory(
+    buckets: _LayerBuckets,
+    *,
+    memory: Any,
+    line: str,
+) -> None:
+    memory_type = normalize_message_text(getattr(memory, "memory_type", ""))
+    key = normalize_message_text(getattr(memory, "key", ""))
+    scope = normalize_message_text(getattr(memory, "scope", ""))
+    target: list[str]
+    if memory_type in {"nickname", "correction", "person_profile_summary"}:
+        target = buckets.person_facts
+    elif memory_type == "relationship" or key.startswith("relationship"):
+        target = buckets.relationship_facts
+    elif memory_type == "preference":
+        target = buckets.preference_facts
+    elif memory_type in {"group_digest", "thread_digest"} or scope == "thread":
+        target = buckets.recent_thread_facts
+    else:
+        target = buckets.other_facts
+    if line not in target:
+        target.append(line)
 
 
 __all__ = [
     "ChatMemoryStore",
+    "LayeredMemoryRecall",
     "MemoryCandidate",
     "extract_memory_candidates",
 ]

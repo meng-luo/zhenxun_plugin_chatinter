@@ -9,8 +9,10 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from ..background_tasks import (
     cancel_background_task,
     get_background_task,
+    list_observation_events,
     list_background_tasks,
     start_background_command,
+    wait_for_observation_event,
 )
 from ..permission_policy import (
     PermissionResult,
@@ -126,8 +128,17 @@ class BackgroundTaskStatusTool:
                         "type": ["boolean", "null"],
                         "description": "列出任务时是否包含已结束任务，默认 true。",
                     },
+                    "tail_only": {
+                        "type": ["boolean", "null"],
+                        "description": "是否只返回 stdout/stderr 尾部，默认 true。",
+                    },
                 },
-                "required": ["task_id", "include_output", "include_finished"],
+                "required": [
+                    "task_id",
+                    "include_output",
+                    "include_finished",
+                    "tail_only",
+                ],
                 "additionalProperties": False,
             },
         )
@@ -137,6 +148,7 @@ class BackgroundTaskStatusTool:
         task_id = str(kwargs.get("task_id", "") or "").strip()
         include_output = True if kwargs.get("include_output") is None else bool(kwargs.get("include_output"))
         include_finished = True if kwargs.get("include_finished") is None else bool(kwargs.get("include_finished"))
+        tail_only = True if kwargs.get("tail_only") is None else bool(kwargs.get("tail_only"))
         if task_id:
             task = get_background_task(
                 task_id=task_id,
@@ -145,10 +157,23 @@ class BackgroundTaskStatusTool:
             )
             if task is None:
                 return tool_result(False, "background_task_not_found", task_id=task_id)
+            payload = task.public_payload(include_output=include_output)
+            if include_output and tail_only:
+                payload.pop("stdout", None)
+                payload.pop("stderr", None)
             return tool_result(
                 True,
                 "background_task_status",
-                task=task.public_payload(include_output=include_output),
+                task=payload,
+                observation_events=[
+                    event.public_payload()
+                    for event in list_observation_events(
+                        task_id=task_id,
+                        user_id=actor["user_id"],
+                        session_key=actor["session_key"],
+                        limit=8,
+                    )
+                ],
             )
         tasks = list_background_tasks(
             user_id=actor["user_id"],
@@ -158,7 +183,14 @@ class BackgroundTaskStatusTool:
         return tool_result(
             True,
             "background_task_listed",
-            tasks=[task.public_payload(include_output=include_output) for task in tasks[:50]],
+            tasks=[
+                _task_payload(
+                    task,
+                    include_output=include_output,
+                    tail_only=tail_only,
+                )
+                for task in tasks[:50]
+            ],
             count=len(tasks),
         )
 
@@ -211,6 +243,129 @@ class BackgroundTaskCancelTool:
         return await cancel_task(actor=actor, task_id=task_id)
 
 
+class BackgroundObservationWaitTool:
+    name = "background_observation_wait"
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "超级用户私聊专用：等待后台任务 ObservationEvent。适合 AgentRun "
+                "resume 后继续长任务；输出会带 artifact 引用而不是塞入完整日志。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "后台任务 ID。"},
+                    "after_event_id": {
+                        "type": ["string", "null"],
+                        "description": "只等待此 event_id 之后的新事件。",
+                    },
+                    "timeout_seconds": {
+                        "type": ["number", "null"],
+                        "description": "最多等待秒数，默认 8，最大 30。",
+                    },
+                    "terminal_only": {
+                        "type": ["boolean", "null"],
+                        "description": "是否只等待 terminal 事件，默认 true。",
+                    },
+                },
+                "required": [
+                    "task_id",
+                    "after_event_id",
+                    "timeout_seconds",
+                    "terminal_only",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        actor = actor_from_context(context)
+        task_id = str(kwargs.get("task_id", "") or "").strip()
+        if not task_id:
+            return tool_result(False, "background_task_id_required")
+        event = await wait_for_observation_event(
+            task_id=task_id,
+            user_id=actor["user_id"],
+            session_key=actor["session_key"],
+            after_event_id=str(kwargs.get("after_event_id", "") or "").strip(),
+            timeout=_coerce_wait_timeout(kwargs.get("timeout_seconds")),
+            terminal_only=True
+            if kwargs.get("terminal_only") is None
+            else bool(kwargs.get("terminal_only")),
+        )
+        if event is None:
+            return tool_result(
+                False,
+                "background_observation_timeout",
+                task_id=task_id,
+                retryable=True,
+                need_continue=True,
+                instruction="稍后再次调用 background_observation_wait 或 background_task_status。",
+            )
+        return tool_result(
+            event.status == "completed",
+            "background_observation_event",
+            event=event.public_payload(),
+            task_id=event.task_id,
+            event_id=event.event_id,
+            artifacts=list(event.artifacts),
+            retryable=event.status not in {"completed", "failed", "cancelled", "error"},
+            need_continue=event.status not in {"completed", "failed", "cancelled", "error"},
+        )
+
+
+class BackgroundObservationListTool:
+    name = "background_observation_list"
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description="超级用户私聊专用：列出后台任务 ObservationEvent 流。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": ["string", "null"],
+                        "description": "任务 ID；为空则列出当前会话最近事件。",
+                    },
+                    "after_event_id": {
+                        "type": ["string", "null"],
+                        "description": "只列出此 event_id 之后的事件。",
+                    },
+                    "limit": {
+                        "type": ["integer", "null"],
+                        "description": "返回事件数，默认 20，最大 100。",
+                    },
+                    "terminal_only": {
+                        "type": ["boolean", "null"],
+                        "description": "是否只列出 terminal 事件，默认 false。",
+                    },
+                },
+                "required": ["task_id", "after_event_id", "limit", "terminal_only"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        actor = actor_from_context(context)
+        events = list_observation_events(
+            task_id=str(kwargs.get("task_id", "") or "").strip(),
+            user_id=actor["user_id"],
+            session_key=actor["session_key"],
+            after_event_id=str(kwargs.get("after_event_id", "") or "").strip(),
+            limit=_coerce_limit(kwargs.get("limit")),
+            terminal_only=bool(kwargs.get("terminal_only") or False),
+        )
+        return tool_result(
+            True,
+            "background_observation_listed",
+            events=[event.public_payload() for event in events],
+            count=len(events),
+        )
+
+
 async def start_background_task(
     *,
     actor: dict[str, str],
@@ -235,6 +390,11 @@ async def start_background_task(
         True,
         "background_task_started",
         task=task.public_payload(include_output=False),
+        observation_event=getattr(
+            getattr(task, "last_observation_event", None),
+            "public_payload",
+            lambda: {},
+        )(),
         instruction="稍后调用 background_task_status 查看进度和输出。",
     )
 
@@ -298,11 +458,37 @@ def _first_ask(*decisions: PermissionResult) -> PermissionResult | None:
     return None
 
 
+def _coerce_wait_timeout(value: Any) -> float:
+    try:
+        return max(0.5, min(float(value or 8.0), 30.0))
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _coerce_limit(value: Any) -> int:
+    try:
+        return max(1, min(int(value or 20), 100))
+    except (TypeError, ValueError):
+        return 20
+
+
+def _task_payload(task: Any, *, include_output: bool, tail_only: bool) -> dict[str, Any]:
+    payload = task.public_payload(include_output=include_output)
+    if include_output and tail_only:
+        payload.pop("stdout", None)
+        payload.pop("stderr", None)
+    return payload
+
+
 register_superuser_tool(BackgroundTaskStartTool)
 register_superuser_tool(BackgroundTaskStatusTool)
 register_superuser_tool(BackgroundTaskCancelTool)
+register_superuser_tool(BackgroundObservationWaitTool)
+register_superuser_tool(BackgroundObservationListTool)
 
 __all__ = [
+    "BackgroundObservationListTool",
+    "BackgroundObservationWaitTool",
     "BackgroundTaskCancelTool",
     "BackgroundTaskStartTool",
     "BackgroundTaskStatusTool",

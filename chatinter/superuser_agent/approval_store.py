@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
+import json
 import time
 import uuid
 from typing import Any
 
 from ..persistence import read_json, state_path, write_json
+from .audit_log import record_audit_event
 
 _APPROVAL_TTL_SECONDS = 300.0
 _APPROVALS_PATH = state_path("approvals.json")
@@ -23,14 +26,23 @@ class PendingApproval:
     action: str
     payload: dict[str, Any]
     reason: str = ""
+    matched_pattern: str = ""
+    payload_fingerprint: str = ""
+    scope: str = "session"
     created_at: float = field(default_factory=time.time)
     expires_at: float = field(
         default_factory=lambda: time.time() + _APPROVAL_TTL_SECONDS
     )
+    revoked_at: float = 0.0
+    revoked_reason: str = ""
 
     @property
     def expired(self) -> bool:
         return time.time() > self.expires_at
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_at > 0
 
     def to_public_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -47,6 +59,8 @@ def create_pending_approval(
     action: str,
     payload: dict[str, Any],
     reason: str = "",
+    matched_pattern: str = "",
+    ttl_seconds: float | None = None,
 ) -> PendingApproval:
     _ensure_loaded()
     _purge_expired()
@@ -57,6 +71,10 @@ def create_pending_approval(
         action=str(action or ""),
         payload=dict(payload or {}),
         reason=str(reason or ""),
+        matched_pattern=str(matched_pattern or ""),
+        payload_fingerprint=_payload_fingerprint(payload),
+        scope="session",
+        expires_at=time.time() + _coerce_ttl(ttl_seconds),
     )
     _PENDING_APPROVALS[approval.approval_id] = approval
     _save_approvals()
@@ -87,6 +105,49 @@ def reject_pending_approval(
         user_id=user_id,
         session_key=session_key,
     )
+
+
+def revoke_pending_approval(
+    *,
+    approval_id: str,
+    user_id: str,
+    session_key: str,
+    reason: str = "",
+) -> PendingApproval | None:
+    approval = _pop_pending_approval(
+        approval_id=approval_id,
+        user_id=user_id,
+        session_key=session_key,
+    )
+    if approval is None:
+        return None
+    revoked = PendingApproval(
+        approval_id=approval.approval_id,
+        user_id=approval.user_id,
+        session_key=approval.session_key,
+        action=approval.action,
+        payload=approval.payload,
+        reason=approval.reason,
+        matched_pattern=approval.matched_pattern,
+        payload_fingerprint=approval.payload_fingerprint,
+        scope=approval.scope,
+        created_at=approval.created_at,
+        expires_at=approval.expires_at,
+        revoked_at=time.time(),
+        revoked_reason=str(reason or ""),
+    )
+    record_audit_event(
+        event="approval_revoked",
+        user_id=revoked.user_id,
+        session_key=revoked.session_key,
+        action=revoked.action,
+        payload={
+            "approval_id": revoked.approval_id,
+            "reason": revoked.revoked_reason,
+        },
+        result={"revoked": True},
+    )
+    return revoked
 
 
 def get_pending_approval(
@@ -156,6 +217,14 @@ def _purge_expired() -> None:
         if approval.expired:
             _PENDING_APPROVALS.pop(approval_id, None)
             changed = True
+            record_audit_event(
+                event="approval_expired",
+                user_id=approval.user_id,
+                session_key=approval.session_key,
+                action=approval.action,
+            payload={"approval_id": approval.approval_id},
+            result={"expired": True},
+        )
     if changed:
         _save_approvals()
 
@@ -194,10 +263,16 @@ def _approval_from_payload(
             action=str(data.get("action", "") or ""),
             payload=dict(data.get("payload") or {}),
             reason=str(data.get("reason", "") or ""),
+            matched_pattern=str(data.get("matched_pattern", "") or ""),
+            payload_fingerprint=str(data.get("payload_fingerprint", "") or "")
+            or _payload_fingerprint(dict(data.get("payload") or {})),
+            scope=str(data.get("scope", "") or "session"),
             created_at=float(data.get("created_at") or time.time()),
             expires_at=float(
                 data.get("expires_at") or time.time() + _APPROVAL_TTL_SECONDS
             ),
+            revoked_at=float(data.get("revoked_at") or 0.0),
+            revoked_reason=str(data.get("revoked_reason", "") or ""),
         )
     except Exception:
         return None
@@ -214,6 +289,22 @@ def _save_approvals() -> None:
     )
 
 
+def _payload_fingerprint(payload: dict[str, Any]) -> str:
+    try:
+        text = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = str(payload or {})
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _coerce_ttl(value: float | None) -> float:
+    try:
+        seconds = float(value or _APPROVAL_TTL_SECONDS)
+    except (TypeError, ValueError):
+        seconds = _APPROVAL_TTL_SECONDS
+    return max(30.0, min(seconds, 3600.0))
+
+
 __all__ = [
     "PendingApproval",
     "consume_pending_approval",
@@ -221,4 +312,5 @@ __all__ = [
     "get_pending_approval",
     "list_pending_approvals",
     "reject_pending_approval",
+    "revoke_pending_approval",
 ]

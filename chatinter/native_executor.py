@@ -21,7 +21,29 @@ from .native_route import (
     candidate_selection_to_native_route,
 )
 from .route_text import collect_placeholders, normalize_message_text
-from .task_frame import TaskFrame, pop_task_text
+
+_PAYLOAD_EXPLANATION_MARKERS = (
+    "作为",
+    "将",
+    "把",
+    "直接",
+    "输入",
+    "填写",
+    "使用",
+    "文案",
+    "文本",
+    "内容",
+    "目标",
+    "无需",
+    "需要",
+    "指定",
+    "说明",
+    "参数",
+    "：",
+    ":",
+    "@",
+)
+from .task_frame import TaskFrame, pop_task_context, pop_task_text
 
 _NATIVE_EXECUTION_STAGE = "main_request"
 
@@ -32,6 +54,7 @@ class NativeValidatedRoute:
     route_result: NativeRouteResult | None
     reason: str
     task_frame: TaskFrame | None = None
+    candidate: CommandCandidate | None = None
 
 
 @dataclass(frozen=True)
@@ -107,24 +130,35 @@ class NativeCommandExecutionContext:
         raw_slots: dict[str, Any],
     ) -> NativeValidatedRoute | None:
         candidate = binding.candidate
-        task_text, plugin_raw_slots = pop_task_text(raw_slots)
-        slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
-        self.task_count += 1
-        fallback_text = normalize_message_text(candidate.schema.head)
-        effective_fallback_text = fallback_text or normalize_message_text(
-            candidate.schema.head
+        task_text, target_hint, payload_hint, plugin_raw_slots = pop_task_context(
+            raw_slots
         )
+        target_hint = _normalize_target_hint_for_schema(
+            candidate.schema,
+            target_hint,
+        )
+        slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
+        slots = _fill_missing_slots_from_payload_hint(
+            candidate.schema.slots,
+            slots,
+            payload_hint=payload_hint,
+            target_hint=target_hint,
+            task_text=task_text,
+        )
+        self.task_count += 1
         task_frame = TaskFrame(
             task_index=self.task_count,
             command_id=binding.command_id,
             plugin_module=candidate.plugin_module,
             task_text=task_text,
-            fallback_text=effective_fallback_text,
+            fallback_text="",
             slots=dict(slots),
+            target_hint=target_hint,
+            payload_hint=payload_hint,
             ambient_message=self.message_text,
         )
         route_message_text = _merge_ambient_context_tokens(
-            task_frame.effective_text,
+            _merge_task_frame_hints(task_frame),
             self.message_text,
         )
         selection = NativeCommandSelection(
@@ -154,6 +188,7 @@ class NativeCommandExecutionContext:
             route_result=route_result,
             reason=selection.reason,
             task_frame=task_frame,
+            candidate=candidate,
         )
 
     def _finalize_report(
@@ -197,6 +232,94 @@ def normalize_native_tool_slots(
     return normalized_slots
 
 
+def _fill_missing_slots_from_payload_hint(
+    slot_specs: list[CommandSlotSpec],
+    slots: dict[str, str],
+    *,
+    payload_hint: str,
+    target_hint: str,
+    task_text: str = "",
+) -> dict[str, str]:
+    """Use explicit generic hints only when a command slot is otherwise empty."""
+
+    if not slot_specs:
+        return slots
+    filled = dict(slots)
+    for slot in slot_specs:
+        if slot.name in filled:
+            continue
+        slot_type = str(slot.type or "text")
+        value = target_hint if slot_type == "at" else payload_hint
+        if slot_type == "text":
+            value = _safe_text_payload_hint(value, task_text=task_text)
+        if not value:
+            continue
+        coerced = _coerce_slot_value(slot, value)
+        if coerced is not None:
+            filled[slot.name] = coerced
+    return filled
+
+
+def _safe_text_payload_hint(payload_hint: str, *, task_text: str = "") -> str:
+    text = normalize_message_text(payload_hint)
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(marker in text for marker in _PAYLOAD_EXPLANATION_MARKERS):
+        return ""
+    # A hint longer than the task itself is usually an explanation from the
+    # model, not user-provided text content for the command.
+    if task_text and len(text) > max(len(normalize_message_text(task_text)) + 8, 48):
+        return ""
+    if lowered in {"null", "none", "undefined", "n/a"}:
+        return ""
+    return text
+
+
+def _schema_accepts_target(schema: Any) -> bool:
+    target_requirement = normalize_message_text(
+        str(getattr(schema, "target_requirement", "") or "")
+    )
+    if target_requirement in {"required", "optional"}:
+        return True
+    if bool(getattr(schema, "allow_at", False)):
+        return True
+    requires = dict(getattr(schema, "requires", {}) or {})
+    if bool(requires.get("at")) or bool(requires.get("image")):
+        return True
+    for slot in getattr(schema, "slots", []) or []:
+        if str(getattr(slot, "type", "") or "") == "at":
+            return True
+    return False
+
+
+def _normalize_target_hint_for_schema(schema: Any, target_hint: str) -> str:
+    text = normalize_message_text(target_hint)
+    if not text:
+        return ""
+    lowered = text.casefold()
+    no_target_values = {
+        "null",
+        "none",
+        "undefined",
+        "n/a",
+        "无",
+        "无目标",
+        "无特定目标",
+        "无需目标",
+        "无需指定目标",
+        "不需要目标",
+        "没有目标",
+    }
+    if lowered in no_target_values:
+        return ""
+    if any(marker in text for marker in ("无特定目标", "无需指定目标", "不需要目标")):
+        return ""
+    if not _schema_accepts_target(schema):
+        return ""
+    return text
+
+
 def _merge_ambient_context_tokens(task_text: str, ambient_text: str) -> str:
     """Expose media/@ context to validators without leaking other task text."""
 
@@ -209,6 +332,20 @@ def _merge_ambient_context_tokens(task_text: str, ambient_text: str) -> str:
     if not placeholders:
         return text
     return normalize_message_text(f"{text} {' '.join(placeholders)}")
+
+
+def _merge_task_frame_hints(task_frame: TaskFrame) -> str:
+    """Expose explicit LLM hints to validators without reusing full ambient tails."""
+
+    parts = [
+        task_frame.effective_text,
+        task_frame.target_hint,
+        _safe_text_payload_hint(
+            task_frame.payload_hint,
+            task_text=task_frame.effective_text,
+        ),
+    ]
+    return normalize_message_text(" ".join(part for part in parts if part))
 
 
 def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
@@ -301,6 +438,7 @@ def _execution_failure_from_exception(
             task_text=task_text,
             ambient_message=ambient_message,
             error=f"插件执行链路异常：{type(exc).__name__}: {exc}",
+            slots=route_result.slots if route_result is not None else {},
             retryable=False,
             plugin_module=binding.candidate.plugin_module,
         ),
@@ -358,6 +496,7 @@ def _ensure_execution_observation(
             task_text=task_text,
             ambient_message=ambient_message,
             error=error,
+            slots=route_result.slots if route_result is not None else {},
             retryable=not execution.success,
             plugin_module=plugin_module,
         ),

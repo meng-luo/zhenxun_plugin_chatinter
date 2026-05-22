@@ -18,7 +18,7 @@ from .feedback_keys import (
 )
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_route import NativeRouteResult
-from .plugin_adapters import AdapterTargetPolicy, get_adapter_target_policy
+from .target_policy import TargetPolicy, get_target_policy
 from .plugin_registry import PluginRegistry
 from .route_text import (
     ROUTE_ACTION_WORDS,
@@ -49,6 +49,9 @@ class RouteCommandSchemaView:
     aliases: tuple[str, ...] = ()
     prefixes: tuple[str, ...] = ()
     params: tuple[str, ...] = ()
+    description: str = ""
+    payload_policy: str = "none"
+    command_role: str = "execute"
     text_min: int = 0
     text_max: int | None = None
     image_min: int = 0
@@ -94,6 +97,7 @@ def build_route_observation(
         trace_id=trace_id,
         error=error,
         missing=missing,
+        slots=dict(route_result.slots or {}),
         retryable=retryable,
         plugin_module=decision.plugin_module,
         remaining_task_hint=remaining_task_hint,
@@ -201,8 +205,8 @@ def _get_route_target_policy(
     plugin_module: str = "",
     plugin_name: str = "",
     command_id: str = "",
-) -> AdapterTargetPolicy:
-    return get_adapter_target_policy(
+) -> TargetPolicy:
+    return get_target_policy(
         plugin_module=plugin_module,
         plugin_name=plugin_name,
         command_id=command_id,
@@ -211,7 +215,7 @@ def _get_route_target_policy(
 
 def _route_target_policy_from_result(
     route_result: NativeRouteResult,
-) -> AdapterTargetPolicy:
+) -> TargetPolicy:
     return _get_route_target_policy(
         plugin_module=route_result.decision.plugin_module,
         plugin_name=route_result.decision.plugin_name,
@@ -221,7 +225,7 @@ def _route_target_policy_from_result(
 
 def _has_adapter_context_hint(
     message_text: str,
-    policy: AdapterTargetPolicy,
+    policy: TargetPolicy,
 ) -> bool:
     hints = tuple(policy.context_hints or ())
     if not hints:
@@ -272,6 +276,13 @@ def _view_from_command_meta(meta) -> RouteCommandSchemaView:
             for item in (getattr(meta, "params", None) or [])
             if normalize_message_text(str(item or ""))
         ),
+        description=normalize_message_text(str(getattr(meta, "description", "") or "")),
+        payload_policy=normalize_message_text(
+            str(getattr(meta, "payload_policy", "") or "none")
+        ),
+        command_role=normalize_message_text(
+            str(getattr(meta, "command_role", "") or "execute")
+        ),
         text_min=max(int(getattr(meta, "text_min", 0) or 0), 0),
         text_max=getattr(meta, "text_max", None),
         image_min=max(int(getattr(meta, "image_min", 0) or 0), 0),
@@ -290,6 +301,23 @@ def _view_from_command_meta(meta) -> RouteCommandSchemaView:
         allow_sticky_arg=bool(getattr(meta, "allow_sticky_arg", False)),
         access_level=str(getattr(meta, "access_level", "") or "public"),
     )
+
+
+def _view_from_selected_candidate_schema(
+    route_result: NativeRouteResult,
+) -> RouteCommandSchemaView | None:
+    candidate = getattr(route_result, "selected_candidate", None)
+    schema = getattr(candidate, "schema", None)
+    if schema is None:
+        return None
+    command_id = normalize_message_text(str(getattr(schema, "command_id", "") or ""))
+    if (
+        route_result.command_id
+        and command_id
+        and command_id.casefold() != normalize_message_text(route_result.command_id).casefold()
+    ):
+        return None
+    return _view_from_plugin_command_schema(schema)
 
 
 def _view_from_plugin_command_schema(schema) -> RouteCommandSchemaView:
@@ -312,8 +340,34 @@ def _view_from_plugin_command_schema(schema) -> RouteCommandSchemaView:
             if alias
         ),
         params=params,
-        text_min=0 if params else int(bool(requires.get("text"))),
-        image_min=int(bool(requires.get("image"))),
+        description=normalize_message_text(
+            str(getattr(schema, "description", "") or "")
+        ),
+        payload_policy=normalize_message_text(
+            str(getattr(schema, "payload_policy", "") or "none")
+        ),
+        command_role=normalize_message_text(
+            str(getattr(schema, "command_role", "") or "execute")
+        ),
+        text_min=sum(
+            1
+            for slot in slots
+            if str(getattr(slot, "type", "") or "") == "text"
+            and bool(getattr(slot, "required", False))
+        )
+        or (0 if params else int(bool(requires.get("text")))),
+        image_min=sum(
+            1
+            for slot in slots
+            if str(getattr(slot, "type", "") or "") == "image"
+            and bool(getattr(slot, "required", False))
+        )
+        or int(bool(requires.get("image"))),
+        image_max=(
+            None
+            if any(str(getattr(slot, "type", "") or "") == "image" for slot in slots)
+            else int(bool(requires.get("image")))
+        ),
         allow_at=getattr(schema, "allow_at", None),
         actor_scope=str(getattr(schema, "actor_scope", "") or "allow_other"),
         target_requirement=str(getattr(schema, "target_requirement", "") or "none"),
@@ -364,6 +418,9 @@ def _is_public_command_meta(meta) -> bool:
 
 
 def _find_route_command_schema(route_result: NativeRouteResult, knowledge_plugins):
+    selected_schema = _view_from_selected_candidate_schema(route_result)
+    if selected_schema is not None:
+        return selected_schema
     decision = route_result.decision
     head = _normalize_head(decision.command)
     command_id = normalize_message_text(route_result.command_id or "").casefold()
@@ -468,9 +525,9 @@ def _build_route_message_with_explicit_context(
     user_id: str,
     reply_image_count: int,
     reply_sender_id: str | None,
-    target_policy: AdapterTargetPolicy | None = None,
+    target_policy: TargetPolicy | None = None,
 ) -> str:
-    policy = target_policy or AdapterTargetPolicy()
+    policy = target_policy or TargetPolicy()
     normalized = normalize_message_text(message_text or "")
     if not normalized:
         return normalized
@@ -527,41 +584,79 @@ def _build_route_message_with_explicit_context(
 def _select_adapter_policy_for_message(
     message_text: str,
     knowledge_base: PluginKnowledgeBase,
-) -> AdapterTargetPolicy:
+) -> TargetPolicy:
     normalized = normalize_message_text(message_text or "")
     if not normalized:
-        return AdapterTargetPolicy()
-    best_policy = AdapterTargetPolicy()
+        return TargetPolicy()
+    best_policy = TargetPolicy()
     best_score = 0
     for plugin in knowledge_base.plugins:
-        policy = _get_route_target_policy(
-            plugin_module=plugin.module,
-            plugin_name=plugin.name,
-        )
-        if not policy.context_hints:
-            continue
         score = 0
-        if policy.media_related:
-            score += 1
-        if _has_adapter_context_hint(normalized, policy):
-            score += 4
         command_texts: list[str] = []
         command_texts.extend(str(command or "") for command in plugin.commands)
         command_texts.extend(str(alias or "") for alias in plugin.aliases)
+        command_policies = []
         for meta in getattr(plugin, "command_meta", None) or []:
             command_texts.append(str(getattr(meta, "command", "") or ""))
+            command_texts.append(str(getattr(meta, "description", "") or ""))
             command_texts.extend(
                 str(alias or "") for alias in getattr(meta, "aliases", None) or []
             )
+            command_texts.extend(
+                str(param or "") for param in getattr(meta, "params", None) or []
+            )
+            command_texts.extend(
+                str(example or "") for example in getattr(meta, "examples", None) or []
+            )
+            command_policy = resolve_command_target_policy(meta)
+            command_policies.append(command_policy)
+            if command_policy.media_related:
+                score += 1
+            if command_policy.allow_at_as_target:
+                score += 1
+            if command_policy.allow_image_as_target:
+                score += 1
         if any(
             text and text in normalized
             for text in (normalize_message_text(item) for item in command_texts)
         ):
             score += 3
         if score > best_score:
-            best_policy = policy
+            best_policy = _merge_command_policies_to_adapter(command_policies)
             best_score = score
-    return best_policy if best_score > 0 else AdapterTargetPolicy()
+    return best_policy if best_score > 0 else TargetPolicy()
+
+
+def _merge_command_policies_to_adapter(
+    policies,
+) -> TargetPolicy:
+    context_hints: list[str] = []
+    for hint in (
+        "图片",
+        "头像",
+        "表情",
+        "表情包",
+        "照片",
+        "回复",
+        "@",
+        "昵称",
+        "目标",
+        "对象",
+    ):
+        context_hints.append(hint)
+    allow_at = any(policy.allow_at_as_target for policy in policies)
+    allow_image = any(policy.allow_image_as_target for policy in policies)
+    allow_reply_image = any(policy.allow_reply_image_as_target for policy in policies)
+    target_required = any(policy.target_requirement == "required" for policy in policies)
+    return TargetPolicy(
+        family="general",
+        context_hints=tuple(context_hints),
+        media_related=allow_image,
+        allow_at_as_target=allow_at,
+        allow_image_as_target=allow_image,
+        allow_reply_image_as_target=allow_reply_image,
+        require_target_for_third_person=target_required or allow_at or allow_image,
+    )
 
 
 def _build_reply_image_segments_for_reroute(
@@ -659,7 +754,43 @@ def _extract_text_token_count(command_text: str) -> int:
     payload = normalize_message_text(payload)
     if not payload:
         return 0
-    return len([token for token in payload.split(" ") if token])
+    return 1
+
+
+def _fulfilled_text_slot_count(route_result: NativeRouteResult) -> int:
+    """Count text slots that were explicitly filled by the selected tool call.
+
+    The rendered command tail may contain multiple text slots, but plain text
+    parsing cannot distinguish `cmd text1 text2` from one free-form text
+    payload.  When the LLM selected a concrete command schema, the slot map is
+    the source of truth for required text-slot satisfaction.
+    """
+
+    candidate = getattr(route_result, "selected_candidate", None)
+    schema = getattr(candidate, "schema", None)
+    slot_specs = list(getattr(schema, "slots", None) or [])
+    route_slots = getattr(route_result, "slots", None) or {}
+    if not slot_specs or not isinstance(route_slots, dict):
+        return 0
+
+    normalized_values = {
+        normalize_message_text(str(key or "")): value
+        for key, value in route_slots.items()
+        if normalize_message_text(str(key or ""))
+    }
+    count = 0
+    for slot in slot_specs:
+        if str(getattr(slot, "type", "") or "") != "text":
+            continue
+        name = normalize_message_text(str(getattr(slot, "name", "") or ""))
+        if not name:
+            continue
+        value = normalized_values.get(name)
+        if value is None:
+            continue
+        if normalize_message_text(str(value or "")):
+            count += 1
+    return count
 
 
 def _contains_self_reference(message_text: str) -> bool:
@@ -821,6 +952,15 @@ def _prepare_route_execution_plan(
         )
 
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
+    image_max_value = getattr(schema, "image_max", None)
+    try:
+        image_max = (
+            int(image_max_value)
+            if image_max_value is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        image_max = None
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
     policy = resolve_command_target_policy(
         schema,
@@ -850,7 +990,10 @@ def _prepare_route_execution_plan(
         for token in context_at_tokens:
             if token not in merged_at:
                 merged_at.append(token)
-        if target_requirement == "none" and merged_at:
+        if (
+            target_requirement == "none"
+            or (image_max is not None and image_max <= 0)
+        ) and merged_at:
             command = _remove_tokens_from_command(command, merged_at)
             merged_at = []
     merged_images = command_images[:]
@@ -886,7 +1029,10 @@ def _prepare_route_execution_plan(
         image_count = len(merged_images) + len(merged_at)
     else:
         image_count = len(merged_images)
-    text_count = _extract_text_token_count(command)
+    text_count = max(
+        _extract_text_token_count(command),
+        _fulfilled_text_slot_count(route_result),
+    )
 
     image_missing = max(image_min - image_count, 0)
     text_missing = max(text_min - text_count, 0)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import importlib
 import inspect
 from pathlib import Path
 import re
@@ -21,7 +20,7 @@ class AutoMetadataBuilder:
     - matcher 源码 AST 提取 on_xxx(..., aliases={...}) 别名
     - shortcut(...) / parser.shortcuts / manager.shortcuts 统一提取快捷命令
     - parser dry-run 探针判断是否支持粘连参数
-    - meme manager 反射提取模板类命令参数范围
+    - 通用 discovery hook 补充无法从 matcher 反射得到的结构化命令
     """
 
     _module_alias_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
@@ -33,6 +32,12 @@ class AutoMetadataBuilder:
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
     _no_command_log_cache: ClassVar[set[str]] = set()
     _sticky_probe_token: ClassVar[str] = "测试"
+    _command_discovery_entrypoints: ClassVar[tuple[str, ...]] = (
+        "chatinter_command_discovery",
+        "__chatinter_command_discovery__",
+        "get_chatinter_commands",
+        "__chatinter_skill_commands__",
+    )
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
@@ -66,15 +71,15 @@ class AutoMetadataBuilder:
                     loaded_plugin=loaded_plugin,
                 )
             )
-        manager_commands: list[dict[str, Any]] = []
+        discovery_commands: list[dict[str, Any]] = []
         if module_obj is not None:
-            manager_commands.extend(
-                await cls._extract_manager_command_data(
+            discovery_commands.extend(
+                await cls._extract_discovery_hook_command_data(
                     module_name=module_name,
                     module_obj=module_obj,
                 )
             )
-        extracted = [*matcher_commands, *manager_commands]
+        extracted = [*matcher_commands, *discovery_commands]
         if not extracted:
             if module_name not in cls._no_command_log_cache:
                 cls._no_command_log_cache.add(module_name)
@@ -563,18 +568,28 @@ class AutoMetadataBuilder:
             return ""
 
     @classmethod
-    async def _extract_manager_command_data(
+    async def _extract_discovery_hook_command_data(
         cls,
         *,
         module_name: str,
         module_obj: object,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        for manager in cls._iter_candidate_managers(
-            module_name=module_name,
-            module_obj=module_obj,
-        ):
-            result.extend(await cls._extract_meme_manager_command_data(manager))
+        for entrypoint in cls._command_discovery_entrypoints:
+            candidate = getattr(module_obj, entrypoint, None)
+            if candidate is None:
+                continue
+            try:
+                payload = candidate() if callable(candidate) else candidate
+                if inspect.isawaitable(payload):
+                    payload = await payload
+            except Exception as exc:
+                logger.debug(
+                    "ChatInter 通用命令发现 hook 调用失败: "
+                    f"module={module_name}, entrypoint={entrypoint}, error={exc}"
+                )
+                continue
+            result.extend(cls._normalize_discovery_payload(payload))
         return result
 
     @staticmethod
@@ -1019,125 +1034,74 @@ class AutoMetadataBuilder:
         return resolved
 
     @classmethod
-    async def _extract_meme_manager_command_data(
-        cls,
-        manager_obj: object,
-    ) -> list[dict[str, Any]]:
-        memes = cls._load_manager_memes(manager_obj)
-        if inspect.isawaitable(memes):
-            try:
-                memes = await memes
-            except Exception:
-                memes = None
-        if memes is None:
-            return []
-        if isinstance(memes, dict):
-            meme_items = list(memes.values())
-        elif isinstance(memes, list | tuple | set):
-            meme_items = list(memes)
-        else:
-            return []
+    def _normalize_discovery_payload(cls, payload: object) -> list[dict[str, Any]]:
+        items: list[object] = []
+        if isinstance(payload, dict):
+            commands = payload.get("commands")
+            if isinstance(commands, list | tuple):
+                items.extend(list(commands))
+            elif payload.get("command") or payload.get("head"):
+                items.append(payload)
+        elif isinstance(payload, list | tuple | set | frozenset):
+            items.extend(list(payload))
+        elif hasattr(payload, "commands"):
+            commands = getattr(payload, "commands", None)
+            if isinstance(commands, list | tuple):
+                items.extend(list(commands))
 
         result: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for meme in meme_items:
-            info = getattr(meme, "info", None)
-            params = getattr(info, "params", None) if info is not None else None
-            for command in cls._iter_meme_heads(meme, info):
-                normalized = cls._normalize_command(command)
-                if not normalized:
-                    continue
-                folded = normalized.casefold()
-                if folded in seen:
-                    continue
-                seen.add(folded)
-                result.append(
-                    {
-                        "command": normalized,
-                        "text_min": cls._safe_int(getattr(params, "min_texts", None)),
-                        "text_max": cls._safe_int(getattr(params, "max_texts", None)),
-                        "image_min": cls._safe_int(getattr(params, "min_images", None)),
-                        "image_max": cls._safe_int(getattr(params, "max_images", None)),
-                        "allow_at": True,
-                        "target_requirement": "optional",
-                        "target_sources": ["at", "reply", "nickname", "self"],
-                        "allow_sticky_arg": True,
-                    }
-                )
+        for item in items:
+            normalized = cls._normalize_discovery_item(item)
+            if normalized is not None:
+                result.append(normalized)
         return result
-
-    @staticmethod
-    def _load_manager_memes(manager_obj: object) -> object | None:
-        getter = getattr(manager_obj, "get_memes", None)
-        if callable(getter):
-            try:
-                return getter()
-            except Exception:
-                pass
-        for attr_name in ("memes", "meme_dict", "registry", "all_memes"):
-            value = getattr(manager_obj, attr_name, None)
-            if value is not None:
-                return value
-        return None
-
-    @staticmethod
-    def _iter_meme_heads(meme: object, info: object | None) -> list[str]:
-        heads: list[str] = []
-        seen: set[str] = set()
-
-        def add_head(value: object) -> None:
-            text = str(value or "").strip()
-            if not text:
-                return
-            folded = text.casefold()
-            if folded in seen:
-                return
-            seen.add(folded)
-            heads.append(text)
-
-        key = str(getattr(meme, "key", "") or "").strip()
-        if key:
-            add_head(key)
-        if info is None:
-            return heads
-        for keyword in getattr(info, "keywords", []) or []:
-            add_head(keyword)
-        for shortcut in getattr(info, "shortcuts", []) or []:
-            for attr_name in ("humanized", "pattern", "key"):
-                add_head(getattr(shortcut, attr_name, ""))
-        return heads
 
     @classmethod
-    def _iter_candidate_managers(
-        cls,
-        *,
-        module_name: str,
-        module_obj: object,
-    ) -> list[object]:
-        result: list[object] = []
-        seen_ids: set[int] = set()
-        for candidate_module in cls._iter_related_modules(
-            module_name=module_name,
-            module_obj=module_obj,
+    def _normalize_discovery_item(cls, item: object) -> dict[str, Any] | None:
+        if isinstance(item, str):
+            command = cls._normalize_command(item)
+            return {"command": command} if command else None
+        if not isinstance(item, dict):
+            return None
+
+        command = cls._normalize_command(str(item.get("command") or item.get("head") or ""))
+        if not command:
+            return None
+
+        schema = item.get("schema")
+        if not isinstance(schema, dict):
+            schema = {}
+        text_schema = schema.get("text")
+        image_schema = schema.get("image")
+        if not isinstance(text_schema, dict):
+            text_schema = {}
+        if not isinstance(image_schema, dict):
+            image_schema = {}
+
+        payload = dict(item)
+        payload["command"] = command
+        if "text_min" not in payload and text_schema.get("min") is not None:
+            payload["text_min"] = text_schema.get("min")
+        if "text_max" not in payload and text_schema.get("max") is not None:
+            payload["text_max"] = text_schema.get("max")
+        if "image_min" not in payload and image_schema.get("min") is not None:
+            payload["image_min"] = image_schema.get("min")
+        if "image_max" not in payload and image_schema.get("max") is not None:
+            payload["image_max"] = image_schema.get("max")
+        for field in (
+            "allow_at",
+            "actor_scope",
+            "target_requirement",
+            "target_sources",
+            "requires_reply",
+            "requires_private",
+            "requires_to_me",
+            "allow_sticky_arg",
+            "access_level",
         ):
-            for attr_name in (
-                "meme_manager",
-                "manager",
-                "MemeManager",
-                "MEME_MANAGER",
-            ):
-                manager = getattr(candidate_module, attr_name, None)
-                if manager is None or id(manager) in seen_ids:
-                    continue
-                seen_ids.add(id(manager))
-                result.append(manager)
-            for value in (getattr(candidate_module, "__dict__", {}) or {}).values():
-                if id(value) in seen_ids:
-                    continue
-                if callable(getattr(value, "get_memes", None)):
-                    seen_ids.add(id(value))
-                    result.append(value)
-        return result
+            if field not in payload and field in schema:
+                payload[field] = schema.get(field)
+        return payload
 
     @classmethod
     def _iter_related_modules(
@@ -1148,27 +1112,22 @@ class AutoMetadataBuilder:
     ) -> list[object]:
         result: list[object] = [module_obj]
         seen_ids: set[int] = {id(module_obj)}
-        if module_name:
-            manager_module_name = f"{module_name}.manager"
-            if manager_module_name not in sys.modules:
-                try:
-                    importlib.import_module(manager_module_name)
-                except Exception:
-                    pass
-            prefix = f"{module_name}."
-            for related_name, related_module in list(sys.modules.items()):
-                if (
-                    not related_name
-                    or related_module is None
-                    or id(related_module) in seen_ids
-                    or (
-                        related_name != module_name
-                        and not related_name.startswith(prefix)
-                    )
-                ):
-                    continue
-                seen_ids.add(id(related_module))
-                result.append(related_module)
+        if not module_name:
+            return result
+        prefix = f"{module_name}."
+        for related_name, related_module in list(sys.modules.items()):
+            if (
+                not related_name
+                or related_module is None
+                or id(related_module) in seen_ids
+                or (
+                    related_name != module_name
+                    and not related_name.startswith(prefix)
+                )
+            ):
+                continue
+            seen_ids.add(id(related_module))
+            result.append(related_module)
         return result
 
     @classmethod
@@ -1559,6 +1518,63 @@ class AutoMetadataBuilder:
         return result
 
     @classmethod
+    def _merge_numeric_requirement(
+        cls,
+        current: dict[str, Any],
+        payload: dict[str, Any],
+        field: str,
+        *,
+        prefer: str,
+    ) -> None:
+        incoming = payload.get(field)
+        if incoming is None:
+            return
+        current_value = current.get(field)
+        if current_value is None:
+            current[field] = incoming
+            return
+        incoming_int = cls._safe_int(incoming)
+        current_int = cls._safe_int(current_value)
+        if incoming_int is None:
+            return
+        if current_int is None:
+            current[field] = incoming
+            return
+        if prefer == "max":
+            current[field] = max(current_int, incoming_int)
+            return
+        if prefer == "min_positive":
+            if current_int <= 0:
+                current[field] = incoming_int
+            elif incoming_int > 0:
+                current[field] = min(current_int, incoming_int)
+
+    @classmethod
+    def _normalize_requirement_bounds(cls, payload: dict[str, Any]) -> None:
+        """Keep merged min/max constraints internally consistent.
+
+        Runtime matcher parsers sometimes expose a broad aggregate argument while
+        a richer metadata source exposes exact bounds.  The merged result must
+        still obey min <= max; an explicit max=0 means that input kind is not
+        accepted by this command.
+        """
+
+        for prefix in ("text", "image"):
+            min_key = f"{prefix}_min"
+            max_key = f"{prefix}_max"
+            max_value = payload.get(max_key)
+            if max_value is None:
+                continue
+            min_value = payload.get(min_key)
+            min_int = cls._safe_int(min_value)
+            max_int = cls._safe_int(max_value)
+            if min_int is None or max_int is None or max_int < 0:
+                continue
+            if min_int > max_int:
+                payload[min_key] = max_int
+
+
+    @classmethod
     def _merge_command_dicts(
         cls,
         commands: list[dict[str, Any]],
@@ -1602,12 +1618,15 @@ class AutoMetadataBuilder:
             current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
                 payload.get("requires_to_me")
             )
+            cls._merge_numeric_requirement(current, payload, "text_min", prefer="max")
+            cls._merge_numeric_requirement(current, payload, "image_min", prefer="max")
+            cls._merge_numeric_requirement(current, payload, "text_max", prefer="min_positive")
+            cls._merge_numeric_requirement(current, payload, "image_max", prefer="min_positive")
+            if payload.get("allow_at") is not None:
+                current["allow_at"] = bool(current.get("allow_at")) or bool(
+                    payload.get("allow_at")
+                )
             for field in (
-                "text_min",
-                "text_max",
-                "image_min",
-                "image_max",
-                "allow_at",
                 "actor_scope",
                 "target_requirement",
                 "allow_sticky_arg",
@@ -1615,6 +1634,7 @@ class AutoMetadataBuilder:
             ):
                 if current.get(field) is None and payload.get(field) is not None:
                     current[field] = payload.get(field)
+            cls._normalize_requirement_bounds(current)
         return sorted(
             merged.values(),
             key=lambda item: (

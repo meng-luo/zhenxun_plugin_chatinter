@@ -206,13 +206,24 @@ class PluginRegistry:
                 cls._extract_command_params_from_text(command_text),
             )
             examples: list[str] = []
+            example_descriptions: list[str] = []
             for item in getattr(raw, "examples", []) or []:
                 exec_text = str(getattr(item, "exec", "") or "").strip()
                 if exec_text:
                     examples.append(exec_text)
+                description_text = str(getattr(item, "description", "") or "").strip()
+                if description_text:
+                    example_descriptions.append(description_text)
+            description = str(getattr(raw, "description", "") or "").strip()
+            if example_descriptions:
+                description = cls._merge_text_fields(
+                    description,
+                    "；".join(example_descriptions),
+                )
             command_metas.append(
                 cls._with_command_meta_defaults(
                     command=command_text,
+                    description=description,
                     prefixes=getattr(raw, "prefixes", None),
                     params=params,
                     examples=examples,
@@ -247,6 +258,38 @@ class PluginRegistry:
             if token:
                 params.append(token)
         return cls._merge_unique_strings(params, [])
+
+    @classmethod
+    def _infer_aliases_from_examples(
+        cls,
+        command: str,
+        examples: list[str] | tuple[str, ...] | None,
+    ) -> list[str]:
+        """Infer alternate command heads from executable examples only.
+
+        This stays generic: it never checks plugin/module names, only whether an
+        example starts with a compact command head that differs from the primary
+        command.
+        """
+
+        primary = cls._normalize_command(command).casefold()
+        aliases: list[str] = []
+        for example in examples or []:
+            text = str(example or "").strip()
+            if not text:
+                continue
+            head_part = cls._command_placeholder_pattern.split(text, maxsplit=1)[0]
+            candidate = cls._normalize_command(head_part.split(maxsplit=1)[0])
+            if not candidate:
+                candidate = cls._normalize_command(text.split(maxsplit=1)[0])
+            if not candidate:
+                continue
+            if candidate.casefold() == primary:
+                continue
+            if len(candidate) > 32 or any(mark in candidate for mark in "，。！？；"):
+                continue
+            cls._append_command(aliases, candidate)
+        return aliases
 
     @classmethod
     def _build_command_meta_from_commands(
@@ -330,25 +373,51 @@ class PluginRegistry:
         parsed = str(actor_scope or "").strip().lower()
         if parsed in {"self_only", "allow_other"}:
             return parsed
-        if normalize.startswith("我的") or any(
+        if normalize.startswith(("我的", "自己", "本人")) or any(
             keyword in normalize for keyword in cls._self_only_command_keywords
         ):
             return "self_only"
         return "allow_other"
 
-    @staticmethod
+    @classmethod
     def _infer_target_requirement(
+        cls,
         *,
         actor_scope: str,
         target_requirement: object,
         allow_at: bool | None,
         image_min: int | None,
+        params: list[str] | tuple[str, ...] | None = None,
+        examples: list[str] | tuple[str, ...] | None = None,
     ) -> str:
         parsed = str(target_requirement or "").strip().lower()
         if parsed in {"none", "optional", "required"}:
             return parsed
         if actor_scope == "self_only":
             return "none"
+        text = normalize_message_text(
+            " ".join([*(params or ()), *(examples or ())])
+        ).lower()
+        target_like = any(
+            token in text
+            for token in (
+                "@",
+                "at",
+                "qq",
+                "user",
+                "member",
+                "target",
+                "nickname",
+                "用户",
+                "成员",
+                "群友",
+                "目标",
+                "对象",
+                "昵称",
+            )
+        )
+        if target_like:
+            return "required"
         if allow_at or (image_min or 0) > 0:
             return "optional"
         return "none"
@@ -402,6 +471,7 @@ class PluginRegistry:
         aliases: list[str] | tuple[str, ...] | None = None,
         prefixes: list[str] | tuple[str, ...] | None = None,
         params: list[str] | tuple[str, ...] | None = None,
+        description: str = "",
         examples: list[str] | tuple[str, ...] | None = None,
         text_min: int | None = None,
         text_max: int | None = None,
@@ -418,12 +488,23 @@ class PluginRegistry:
         access_level: object = None,
     ) -> PluginInfo.PluginCommandMeta:
         normalized_command = str(command or "").strip()
+        normalized_params = cls._merge_unique_strings(params, [])
+        normalized_examples = cls._merge_unique_strings(examples, [])
+        normalized_aliases = cls._merge_unique_strings(
+            aliases,
+            cls._infer_aliases_from_examples(
+                normalized_command,
+                normalized_examples,
+            ),
+        )
         resolved_actor_scope = cls._infer_actor_scope(normalized_command, actor_scope)
         resolved_target_requirement = cls._infer_target_requirement(
             actor_scope=resolved_actor_scope,
             target_requirement=target_requirement,
             allow_at=allow_at,
             image_min=image_min,
+            params=normalized_params,
+            examples=normalized_examples,
         )
         resolved_target_sources = cls._normalize_target_sources(
             actor_scope=resolved_actor_scope,
@@ -441,10 +522,11 @@ class PluginRegistry:
         resolved_access_level = cls._normalize_access_level(access_level)
         return PluginInfo.PluginCommandMeta(
             command=normalized_command,
-            aliases=cls._merge_unique_strings(aliases, []),
+            aliases=normalized_aliases,
             prefixes=cls._merge_unique_strings(prefixes, []),
-            params=cls._merge_unique_strings(params, []),
-            examples=cls._merge_unique_strings(examples, []),
+            params=normalized_params,
+            description=str(description or "").strip(),
+            examples=normalized_examples,
             text_min=text_min,
             text_max=text_max,
             image_min=image_min,
@@ -480,6 +562,7 @@ class PluginRegistry:
             "aliases": list(getattr(meta, "aliases", []) or []),
             "prefixes": list(getattr(meta, "prefixes", []) or []),
             "params": list(getattr(meta, "params", []) or []),
+            "description": str(getattr(meta, "description", "") or "").strip(),
             "examples": list(getattr(meta, "examples", []) or []),
             "text_min": cls._safe_int(getattr(meta, "text_min", None)),
             "text_max": cls._safe_int(getattr(meta, "text_max", None)),
@@ -519,6 +602,15 @@ class PluginRegistry:
                     result.append(text)
         return result
 
+    @staticmethod
+    def _merge_text_fields(*values: object) -> str:
+        parts: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in parts:
+                parts.append(text)
+        return "；".join(parts)
+
     @classmethod
     def _merge_command_meta_groups(
         cls,
@@ -549,6 +641,9 @@ class PluginRegistry:
                     ),
                     params=cls._merge_unique_strings(
                         left.get("params"), right.get("params")
+                    ),
+                    description=cls._merge_text_fields(
+                        left.get("description"), right.get("description")
                     ),
                     examples=cls._merge_unique_strings(
                         left.get("examples"), right.get("examples")
@@ -595,10 +690,11 @@ class PluginRegistry:
     def _command_meta_richness(
         cls,
         meta: PluginInfo.PluginCommandMeta,
-    ) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
         aliases = len(getattr(meta, "aliases", []) or [])
         prefixes = len(getattr(meta, "prefixes", []) or [])
         params = len(getattr(meta, "params", []) or [])
+        description = int(bool(getattr(meta, "description", "") or ""))
         examples = len(getattr(meta, "examples", []) or [])
         text_score = sum(
             1
@@ -617,6 +713,7 @@ class PluginRegistry:
         requires_to_me = int(bool(getattr(meta, "requires_to_me", False)))
         return (
             params,
+            description,
             text_score,
             aliases,
             prefixes,
@@ -691,6 +788,9 @@ class PluginRegistry:
                 )
                 payload["params"] = cls._merge_unique_strings(
                     payload.get("params"), item_payload.get("params")
+                )
+                payload["description"] = cls._merge_text_fields(
+                    payload.get("description"), item_payload.get("description")
                 )
                 payload["examples"] = cls._merge_unique_strings(
                     payload.get("examples"), item_payload.get("examples")
@@ -781,6 +881,9 @@ class PluginRegistry:
             target_payload["params"] = cls._merge_unique_strings(
                 target_payload.get("params"), item_payload.get("params")
             )
+            target_payload["description"] = cls._merge_text_fields(
+                target_payload.get("description"), item_payload.get("description")
+            )
             target_payload["examples"] = cls._merge_unique_strings(
                 target_payload.get("examples"), item_payload.get("examples")
             )
@@ -866,6 +969,7 @@ class PluginRegistry:
         prefixes = item.get("prefixes")
         params = item.get("params")
         examples = item.get("examples")
+        description = str(item.get("description") or item.get("desc") or "").strip()
         if not isinstance(aliases, list | tuple):
             aliases = []
         if not isinstance(prefixes, list | tuple):
@@ -878,12 +982,16 @@ class PluginRegistry:
         for example in examples:
             if isinstance(example, dict):
                 text = str(example.get("exec") or example.get("example") or "").strip()
+                example_description = str(example.get("description") or "").strip()
+                if example_description:
+                    description = cls._merge_text_fields(description, example_description)
             else:
                 text = str(example).strip()
             if text:
                 normalized_examples.append(text)
         return cls._with_command_meta_defaults(
             command=command_text,
+            description=description,
             aliases=[
                 str(alias).strip() for alias in aliases if str(alias or "").strip()
             ],
@@ -1020,6 +1128,82 @@ class PluginRegistry:
         return commands
 
     @classmethod
+    def _clean_usage_line(cls, line: str) -> str:
+        text = str(line or "").strip()
+        text = text.strip("` \t")
+        text = re.sub(r"^[\-\*\d\.\)、)\s]+", "", text).strip()
+        text = re.sub(r"^(?:命令|用法|示例|格式|usage|example)\s*[:：]\s*", "", text, flags=re.I)
+        return text.strip()
+
+    @staticmethod
+    def _split_usage_description(line: str) -> tuple[str, str]:
+        for separator in (" -- ", " - ", "：", ":"):
+            if separator in line:
+                left, right = line.split(separator, 1)
+                return left.strip(), right.strip()
+        return line.strip(), ""
+
+    @classmethod
+    def _line_starts_with_command(cls, line: str, command: str) -> bool:
+        normalized_line = cls._normalize_command(line).casefold()
+        normalized_command = cls._normalize_command(command).casefold()
+        if not normalized_line or not normalized_command:
+            return False
+        if normalized_line == normalized_command:
+            return True
+        return normalized_line.startswith(normalized_command + " ")
+
+    @classmethod
+    def _extract_usage_command_meta(
+        cls,
+        usage: str | None,
+        command_meta: list[PluginInfo.PluginCommandMeta],
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        if not usage:
+            return []
+
+        known_heads: list[str] = []
+        for meta in command_meta:
+            cls._append_command(known_heads, meta.command)
+            for alias in meta.aliases:
+                cls._append_command(known_heads, alias)
+        known_heads = sorted(known_heads, key=len, reverse=True)
+
+        result: list[PluginInfo.PluginCommandMeta] = []
+        for raw_line in str(usage or "").splitlines():
+            line = cls._clean_usage_line(raw_line)
+            if not line or line in {"```", "~~~"}:
+                continue
+            command_part, description = cls._split_usage_description(line)
+            matched_head = next(
+                (
+                    head
+                    for head in known_heads
+                    if cls._line_starts_with_command(command_part, head)
+                ),
+                "",
+            )
+            if not matched_head and cls._command_placeholder_pattern.search(command_part):
+                matched_head = cls._normalize_command(
+                    cls._command_placeholder_pattern.split(command_part, maxsplit=1)[0]
+                    .split(maxsplit=1)[0]
+                )
+            if not matched_head:
+                continue
+            if len(matched_head) > 32 or any(mark in matched_head for mark in "，。！？；"):
+                continue
+            params = cls._extract_command_params_from_text(command_part)
+            result.append(
+                cls._with_command_meta_defaults(
+                    command=matched_head,
+                    params=params,
+                    description=description,
+                    examples=[command_part],
+                )
+            )
+        return result
+
+    @classmethod
     def _is_runtime_plugin_allowed(cls, module_name: str, loaded_plugin=None) -> bool:
         return bool(
             module_name
@@ -1087,6 +1271,11 @@ class PluginRegistry:
             or str(getattr(loaded_plugin, "name", "") or "").strip()
             or module_name.rsplit(".", 1)[-1]
         )
+        resolved_usage = (
+            str(getattr(metadata, "usage", "") or "").strip()
+            if getattr(metadata, "usage", None)
+            else None
+        )
         commands = cls._extract_commands(extra_data, command_meta)
         if loaded_plugin is not None:
             matcher_commands = cls._extract_commands_from_matchers(loaded_plugin)
@@ -1104,6 +1293,10 @@ class PluginRegistry:
                     command_meta=command_meta,
                     matcher_commands=matcher_commands,
                 )
+        command_meta = cls._merge_command_meta_groups(
+            command_meta,
+            cls._extract_usage_command_meta(resolved_usage, command_meta),
+        )
         command_meta = cls._fold_plugin_alias_command_meta(
             command_meta,
             plugin_aliases=list(extra_data.aliases or []),
@@ -1125,11 +1318,6 @@ class PluginRegistry:
         )
         resolved_description = (
             str(getattr(metadata, "description", "") or "").strip() or "暂无描述"
-        )
-        resolved_usage = (
-            str(getattr(metadata, "usage", "") or "").strip()
-            if getattr(metadata, "usage", None)
-            else None
         )
         return PluginInfo(
             module=module_name,
@@ -1296,7 +1484,7 @@ class PluginRegistry:
 
         # ── 阶段 2：移除命令被子模块完全覆盖的父模块 ──
         # 当父模块（如 csgo）的所有命令都已出现在子模块（如 csgo.commands）中时，
-        # 父模块只是一个空壳容器，注册它会导致同一命令出现在多个 SkillSpec 中，
+        # 父模块只是一个空壳容器，注册它会导致同一命令出现在多个能力记录中，
         # 造成交叉路由混淆。此处将这类父模块过滤掉。
         parent_modules_to_remove: set[str] = set()
 

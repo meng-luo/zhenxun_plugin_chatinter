@@ -5,6 +5,7 @@ from zhenxun.services.llm.config.generation import (
     LLMGenerationConfig,
     ReasoningConfig,
     ReasoningEffort,
+    ToolConfig,
 )
 
 CHATINTER_GROUP = "chatinter"
@@ -103,3 +104,27 @@ def build_reasoning_generation_config() -> LLMGenerationConfig | None:
             show_thoughts=False,
         )
     )
+
+
+def build_tool_generation_config(
+    *,
+    tool_choice: str | dict[str, Any] | None,
+    base: LLMGenerationConfig | None = None,
+) -> LLMGenerationConfig | None:
+    """Build a per-request config whose tool mode matches runtime policy.
+
+    Some providers/adapters infer a default tool mode from generation config.
+    Keeping it explicit makes the request stable for cache-friendly payloads and
+    avoids accidental extra tool forcing when runtime decides `none`/`auto`.
+    """
+
+    base = base or build_reasoning_generation_config()
+    mode = "AUTO"
+    if isinstance(tool_choice, dict):
+        mode = "ANY"
+    elif tool_choice == "required":
+        mode = "ANY"
+    elif tool_choice is None or tool_choice == "none":
+        mode = "NONE"
+    tool_config = LLMGenerationConfig(tool_config=ToolConfig(mode=mode))
+    return base.merge_with(tool_config) if base is not None else tool_config

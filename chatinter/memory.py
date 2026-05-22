@@ -16,7 +16,7 @@ ChatInter - 聊天记忆管理
 import asyncio
 import re
 import time
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from nonebot.adapters import Bot, Event, Message
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
@@ -26,7 +26,7 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 from zhenxun.services.llm import LLMMessage
 
-from .chat_memory_store import ChatMemoryStore
+from .chat_memory_store import ChatMemoryStore, LayeredMemoryRecall
 from .config import (
     CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
     MAX_REPLY_LAYERS,
@@ -43,6 +43,9 @@ from .utils.unimsg_utils import (
     remove_reply_segment,
     uni_to_text_with_tags,
 )
+
+if TYPE_CHECKING:
+    from .chat_dialogue_planner import DialogueState
 
 _CONTEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,8}", re.IGNORECASE)
 _CONTEXT_STOPWORDS = {
@@ -127,6 +130,7 @@ class ChatMemory:
     def _build_conversation_focus(
         self,
         current_message_text: str,
+        dialogue_state: "DialogueState | None" = None,
     ) -> list[str]:
         normalized = self._normalize_context_text(current_message_text)
         if not normalized:
@@ -142,13 +146,109 @@ class ChatMemory:
         if not top_keywords:
             top_keywords = ["无"]
 
-        response_mode = "detailed" if self._is_complex_query(normalized) else "concise"
-        return [
+        response_mode = (
+            str(dialogue_state.response_length)
+            if dialogue_state is not None
+            else "detailed"
+            if self._is_complex_query(normalized)
+            else "concise"
+        )
+        lines = [
             "<conversation_focus>",
             f"query_keywords={','.join(top_keywords)}",
             f"response_mode={response_mode}",
-            "</conversation_focus>",
         ]
+        if dialogue_state is not None:
+            lines.extend(
+                (
+                    f"tone={dialogue_state.tone}",
+                    f"user_emotion={dialogue_state.user_emotion}",
+                    f"dialogue_purpose={dialogue_state.dialogue_purpose}",
+                    f"need_followup={int(dialogue_state.need_followup)}",
+                )
+            )
+        lines.append("</conversation_focus>")
+        return lines
+
+    @staticmethod
+    def _build_layered_memory_xml(
+        layered_memory: LayeredMemoryRecall,
+        *,
+        person_fact_lines: list[str] | tuple[str, ...] = (),
+        relationship_fact_lines: list[str] | tuple[str, ...] = (),
+        preference_fact_lines: list[str] | tuple[str, ...] = (),
+    ) -> list[str]:
+        person_facts = tuple(
+            dict.fromkeys(
+                (
+                    *person_fact_lines,
+                    *layered_memory.person_facts,
+                )
+            )
+        )
+        relationship_facts = tuple(
+            dict.fromkeys(
+                (
+                    *relationship_fact_lines,
+                    *layered_memory.relationship_facts,
+                )
+            )
+        )
+        preference_facts = tuple(
+            dict.fromkeys(
+                (
+                    *preference_fact_lines,
+                    *layered_memory.preference_facts,
+                )
+            )
+        )
+        merged = LayeredMemoryRecall(
+            person_facts=person_facts,
+            relationship_facts=relationship_facts,
+            preference_facts=preference_facts,
+            recent_thread_facts=layered_memory.recent_thread_facts,
+            other_facts=layered_memory.other_facts,
+        )
+        return merged.to_xml_lines()
+
+    @staticmethod
+    def _profile_fact_lines(dialogue_context: DialogueContextPack | None) -> tuple[
+        list[str],
+        list[str],
+        list[str],
+    ]:
+        if dialogue_context is None:
+            return [], [], []
+        try:
+            from .person_registry import format_person_fact_layers
+        except Exception:
+            return [], [], []
+
+        person_facts: list[str] = []
+        relationship_facts: list[str] = []
+        preference_facts: list[str] = []
+        seen_user_ids: set[str] = set()
+
+        def append_profile(profile, *, prefix: str) -> None:
+            user_id = str(getattr(profile, "user_id", "") or "")
+            if not user_id or user_id in seen_user_ids:
+                return
+            seen_user_ids.add(user_id)
+            layers = format_person_fact_layers(profile, prefix=prefix)
+            person_facts.extend(layers.person_facts)
+            relationship_facts.extend(layers.relationship_facts)
+            preference_facts.extend(layers.preference_facts)
+
+        append_profile(
+            getattr(dialogue_context, "speaker_profile", None),
+            prefix="speaker",
+        )
+        for index, person in enumerate(
+            getattr(dialogue_context, "relevant_people", ()) or (),
+            start=1,
+        ):
+            append_profile(getattr(person, "profile", None), prefix=f"person_{index}")
+        return person_facts[:24], relationship_facts[:12], preference_facts[:12]
 
     @staticmethod
     def _extract_http_url(value: object) -> str:
@@ -299,6 +399,7 @@ class ChatMemory:
         bot_id: str | None = None,
         event: Event | None = None,
         dialogue_context: DialogueContextPack | None = None,
+        dialogue_state: "DialogueState | None" = None,
     ) -> tuple[str, str, list[Image], list[LLMMessage]]:
         """构建完整的上下文（System + Context + Current + History Messages）
 
@@ -367,7 +468,14 @@ class ChatMemory:
             packed_context = dialogue_context.to_context_xml()
             if packed_context:
                 lines.append(packed_context)
-        lines.extend(self._build_conversation_focus(current_message_text))
+        lines.extend(
+            self._build_conversation_focus(
+                current_message_text,
+                dialogue_state=dialogue_state,
+            )
+        )
+        if dialogue_state is not None:
+            lines.append(dialogue_state.to_xml())
         thread = getattr(dialogue_context, "thread", None)
         addressee = getattr(dialogue_context, "addressee", None)
         thread_id = str(getattr(thread, "thread_id", "") or "").strip()
@@ -396,21 +504,33 @@ class ChatMemory:
         history_messages = list(history_payload.messages)
         append_chatroom_history_context(lines, history_payload.chatroom_lines)
 
-        memory_lines = await ChatMemoryStore.recall(
+        recall_context = MemoryRecallContext.build(
+            session_id=session_id,
+            user_id=user_id,
+            group_id=group_id,
+            thread_id=thread_id or None,
+            topic_key=str(getattr(thread, "topic_key", "") or ""),
+            participants=thread_user_ids,
+            addressee_user_id=addressee_user_id or None,
+            query=current_message_text,
+        )
+        layered_memory = await ChatMemoryStore.recall_layered(
             session_id=session_id,
             user_id=user_id,
             group_id=group_id,
             query=current_message_text,
-            recall_context=MemoryRecallContext.build(
-                session_id=session_id,
-                user_id=user_id,
-                group_id=group_id,
-                thread_id=thread_id or None,
-                topic_key=str(getattr(thread, "topic_key", "") or ""),
-                participants=thread_user_ids,
-                addressee_user_id=addressee_user_id or None,
-                query=current_message_text,
-            ),
+            recall_context=recall_context,
+        )
+        (
+            person_fact_lines,
+            relationship_fact_lines,
+            preference_fact_lines,
+        ) = self._profile_fact_lines(dialogue_context)
+        memory_lines = self._build_layered_memory_xml(
+            layered_memory,
+            person_fact_lines=person_fact_lines,
+            relationship_fact_lines=relationship_fact_lines,
+            preference_fact_lines=preference_fact_lines,
         )
         if memory_lines:
             lines.append("<long_term_memory>")

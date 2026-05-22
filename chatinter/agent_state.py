@@ -13,6 +13,8 @@ from zhenxun.services.llm.types.protocols import ToolExecutable
 from .artifact_store import get_artifact_store, summarize_artifact_text
 from .route_text import normalize_message_text
 from .task_frame import TASK_TEXT_FIELD
+from .task_graph import TaskGraph
+from .task_ledger import CapabilityLedger, TaskLedger
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,10 @@ class AgentBudgetState:
 @dataclass
 class AgentRuntimeResult:
     final_text: str
+    run_id: str = ""
+    trace_id: str = ""
+    status: str = "completed"
+    paused_reason: str = ""
     tool_results: tuple[ToolResult, ...] = ()
     timeline: tuple[AgentRuntimeTimelineItem, ...] = ()
     messages: tuple[LLMMessage, ...] = ()
@@ -103,6 +109,14 @@ class AgentRunState:
     session_key: str | None
     messages: list[LLMMessage]
     tool_map: dict[str, ToolExecutable]
+    run_id: str = ""
+    status: str = "running"
+    paused_reason: str = ""
+    resume_cursor: dict[str, Any] = field(default_factory=dict)
+    waiting_approval_ids: list[str] = field(default_factory=list)
+    background_task_ids: list[str] = field(default_factory=list)
+    observation_event_ids: list[str] = field(default_factory=list)
+    artifact_refs: list[str] = field(default_factory=list)
     tool_calls: list[LLMToolCall] = field(default_factory=list)
     observations: list[AgentObservation] = field(default_factory=list)
     pending_tasks: list[PendingTask] = field(default_factory=list)
@@ -120,12 +134,19 @@ class AgentRunState:
     direct_answer_interceptions: int = 0
     final_validation_interceptions: int = 0
     coverage_interceptions: int = 0
+    task_graph: TaskGraph | None = None
+    task_graph_interceptions: int = 0
+    capability_ledger: CapabilityLedger = field(default_factory=CapabilityLedger)
+    task_ledger: TaskLedger | None = None
+    agent_complexity_mode: str = "standard"
+    agent_complexity_reason: str = ""
 
     @classmethod
     def create(
         cls,
         *,
         trace_id: str,
+        run_id: str | None = None,
         session_key: str | None,
         messages: list[LLMMessage],
         tool_map: dict[str, ToolExecutable],
@@ -135,9 +156,12 @@ class AgentRunState:
         tool_obligation: str = "none",
         tool_obligation_reason: str = "",
         required_tool_names: tuple[str, ...] = (),
+        agent_complexity_mode: str = "standard",
+        agent_complexity_reason: str = "",
     ) -> "AgentRunState":
         state = cls(
             trace_id=trace_id,
+            run_id=normalize_message_text(run_id or trace_id),
             session_key=session_key,
             messages=list(messages),
             tool_map=dict(tool_map),
@@ -147,6 +171,9 @@ class AgentRunState:
             required_tool_names=tuple(
                 normalize_message_text(name) for name in required_tool_names if name
             ),
+            agent_complexity_mode=normalize_message_text(agent_complexity_mode)
+            or "standard",
+            agent_complexity_reason=normalize_message_text(agent_complexity_reason),
         )
         state.capture_budget(budget_controller)
         state.append_timeline(
@@ -180,16 +207,35 @@ class AgentRunState:
         )
 
     def append_model_request(self, *, tool_count: int) -> None:
+        task_graph_summary: dict[str, Any] = {}
+        if self.task_graph is not None:
+            task_graph_summary = {
+                "graph_id": self.task_graph.graph_id,
+                "status": self.task_graph.status,
+                "incomplete_tasks": [
+                    {"task_id": task.task_id, "goal": task.goal}
+                    for task in self.task_graph.incomplete_tasks[:5]
+                ],
+            }
         self.append_timeline(
             role="system",
             kind="model_request",
             metadata={
+                "run_id": self.run_id,
+                "status": self.status,
                 "step": self.step,
                 "tool_count": tool_count,
                 "tool_obligation": self.tool_obligation,
                 "tool_obligation_reason": self.tool_obligation_reason,
                 "required_tool_count": len(self.required_tool_names),
+                "agent_complexity_mode": self.agent_complexity_mode,
+                "agent_complexity_reason": self.agent_complexity_reason,
                 "pending_tasks": [task.text for task in self.pending_tasks[-5:]],
+                "task_graph": task_graph_summary,
+                "task_ledger": self.task_ledger.to_public_payload()
+                if self.task_ledger is not None
+                else {},
+                "capability_ledger": self.capability_ledger.public_entries(limit=12),
             },
         )
 
@@ -237,6 +283,8 @@ class AgentRunState:
             tool_result=tool_result,
         )
         self.observations.append(observation)
+        self._update_resume_refs(observation)
+        self._update_capability_ledger(observation)
         self._update_task_state(observation)
         self.messages.append(
             LLMMessage.tool_response(
@@ -254,6 +302,30 @@ class AgentRunState:
                 "step": self.step,
                 "output": observation.output or tool_result.output,
                 "pending_tasks": [task.text for task in self.pending_tasks[-5:]],
+            },
+        )
+
+    def append_synthetic_observation(
+        self,
+        observation: AgentObservation,
+        *,
+        timeline_kind: str,
+        content: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.observations.append(observation)
+        self._update_resume_refs(observation)
+        self._update_capability_ledger(observation)
+        self._update_task_state(observation)
+        self.append_timeline(
+            role="tool",
+            kind=timeline_kind,
+            content=content,
+            tool_name=observation.tool_name,
+            metadata={
+                "step": self.step,
+                "output": observation.output,
+                **dict(metadata or {}),
             },
         )
 
@@ -319,6 +391,42 @@ class AgentRunState:
                 )
             )
 
+    def set_task_graph(self, graph: TaskGraph | None, *, source: str) -> None:
+        self.task_graph = graph
+        if graph is None:
+            return
+        self.append_timeline(
+            role="system",
+            kind="task_graph",
+            metadata={
+                "source": normalize_message_text(source),
+                "graph": graph.to_public_payload(),
+            },
+        )
+
+    def incomplete_task_goals(self) -> list[str]:
+        if self.task_ledger is not None:
+            return self.task_ledger.incomplete_goals
+        if self.task_graph is None:
+            return []
+        return [task.goal for task in self.task_graph.incomplete_tasks if task.goal]
+
+    def set_task_ledger(self, ledger: TaskLedger | None, *, source: str) -> None:
+        self.task_ledger = ledger
+        if ledger is None:
+            return
+        self.append_timeline(
+            role="system",
+            kind="task_ledger",
+            metadata={
+                "source": normalize_message_text(source),
+                "ledger": ledger.to_public_payload(),
+            },
+        )
+
+    def refresh_capability_ledger(self, tools: list[dict[str, Any]]) -> None:
+        self.capability_ledger.refresh_tools(tools)
+
     def transition_force_final(self, reason: str) -> None:
         self.recovery_action = reason
         self.stop_reason = reason
@@ -335,7 +443,64 @@ class AgentRunState:
             metadata={"step": self.step},
         )
 
+    def pause(
+        self,
+        *,
+        reason: str,
+        cursor: dict[str, Any] | None = None,
+        final_text: str = "",
+    ) -> None:
+        self.status = "paused"
+        self.paused_reason = normalize_message_text(reason)
+        self.stop_reason = f"paused:{self.paused_reason or 'unknown'}"
+        self.resume_cursor = dict(cursor or {})
+        if final_text:
+            self.final_text = normalize_message_text(final_text)
+        self.append_timeline(
+            role="system",
+            kind="agent_paused",
+            content=self.paused_reason,
+            metadata={
+                "step": self.step,
+                "resume_cursor": dict(self.resume_cursor),
+                "waiting_approval_ids": list(self.waiting_approval_ids),
+                "background_task_ids": list(self.background_task_ids),
+                "observation_event_ids": list(self.observation_event_ids[-20:]),
+                "artifact_refs": list(self.artifact_refs[-20:]),
+            },
+        )
+
+    def resume(
+        self,
+        *,
+        reason: str = "manual_resume",
+    ) -> None:
+        self.status = "running"
+        self.paused_reason = ""
+        self.stop_reason = "running"
+        self.resume_cursor = {}
+        self.append_timeline(
+            role="system",
+            kind="agent_resumed",
+            content=normalize_message_text(reason),
+            metadata={"step": self.step},
+        )
+
+    def cancel(self, *, reason: str = "") -> None:
+        self.status = "cancelled"
+        self.paused_reason = ""
+        self.stop_reason = "cancelled"
+        self.recovery_action = normalize_message_text(reason) or "cancelled_by_user"
+        self.append_timeline(
+            role="system",
+            kind="agent_cancelled",
+            content=self.recovery_action or "cancelled_by_user",
+            metadata={"step": self.step},
+        )
+
     def complete_final(self, final_text: str, *, reason: str) -> None:
+        self.status = "completed"
+        self.paused_reason = ""
         self.final_text = normalize_message_text(final_text)
         self.stop_reason = reason
         self.messages.append(LLMMessage.assistant_text_response(self.final_text))
@@ -367,6 +532,10 @@ class AgentRunState:
     def to_result(self) -> AgentRuntimeResult:
         return AgentRuntimeResult(
             final_text=self.final_text,
+            run_id=self.run_id,
+            trace_id=self.trace_id,
+            status=self.status,
+            paused_reason=self.paused_reason,
             tool_results=tuple(
                 observation.result
                 for observation in self.observations
@@ -426,6 +595,15 @@ class AgentRunState:
         )
 
     def _update_task_state(self, observation: AgentObservation) -> None:
+        if self.task_ledger is not None and observation.ok:
+            self.task_ledger.apply_coverage(
+                covered_task_ids=_covered_ledger_task_ids(
+                    self.task_ledger,
+                    observation,
+                ),
+                unsupported_tasks=[],
+                reason="observation_update",
+            )
         if observation.task_text:
             self.pending_tasks = [
                 task
@@ -448,6 +626,68 @@ class AgentRunState:
                 source="observation",
                 command_id=observation.command_id,
             )
+
+    def _update_capability_ledger(self, observation: AgentObservation) -> None:
+        self.capability_ledger.record_observation(
+            tool_name=observation.tool_name,
+            command_id=observation.command_id,
+            plugin=observation.matched_plugin,
+            ok=observation.ok,
+            task_id=_best_matching_ledger_task_id(self.task_ledger, observation),
+            error=observation.error,
+        )
+
+    def _update_resume_refs(self, observation: AgentObservation) -> None:
+        output = observation.output or {}
+        event_id = _first_text(output.get("event_id"))
+        if event_id and event_id not in self.observation_event_ids:
+            self.observation_event_ids.append(event_id)
+
+        approval_id = _first_text(
+            output.get("approval_id"),
+            _nested_get(output, "approval", "approval_id"),
+        )
+        if approval_id and approval_id not in self.waiting_approval_ids:
+            self.waiting_approval_ids.append(approval_id)
+
+        task_id = _first_text(
+            output.get("task_id"),
+            _nested_get(output, "task", "task_id"),
+        )
+        if task_id and task_id not in self.background_task_ids:
+            self.background_task_ids.append(task_id)
+
+        event = output.get("observation_event")
+        if isinstance(event, dict):
+            nested_event_id = _first_text(event.get("event_id"))
+            if nested_event_id and nested_event_id not in self.observation_event_ids:
+                self.observation_event_ids.append(nested_event_id)
+        nested_event = output.get("event")
+        if isinstance(nested_event, dict):
+            nested_event_id = _first_text(nested_event.get("event_id"))
+            if nested_event_id and nested_event_id not in self.observation_event_ids:
+                self.observation_event_ids.append(nested_event_id)
+
+        artifact_groups = [output.get("artifacts")]
+        if isinstance(event, dict):
+            artifact_groups.append(event.get("artifacts"))
+        if isinstance(nested_event, dict):
+            artifact_groups.append(nested_event.get("artifacts"))
+        for artifacts in artifact_groups:
+            if not isinstance(artifacts, list | tuple):
+                continue
+            for item in artifacts:
+                if not isinstance(item, dict):
+                    continue
+                artifact_id = normalize_message_text(str(item.get("artifact_id") or ""))
+                if artifact_id and artifact_id not in self.artifact_refs:
+                    self.artifact_refs.append(artifact_id)
+        artifact_id = _first_text(
+            output.get("artifact_id"),
+            _nested_get(output, "artifact", "artifact_id"),
+        )
+        if artifact_id and artifact_id not in self.artifact_refs:
+            self.artifact_refs.append(artifact_id)
 
 
 def _parse_tool_arguments(arguments: str) -> dict[str, Any] | str:
@@ -524,6 +764,11 @@ def _compact_tool_argument_string(
 
 
 def _observation_content(observation: AgentObservation) -> str:
+    summary = normalize_message_text(
+        str(observation.output.get("messages_sent_summary", "") or "")
+    )
+    if summary:
+        return summary
     messages_sent = observation.output.get("messages_sent")
     if isinstance(messages_sent, list):
         content = "\n".join(
@@ -553,6 +798,23 @@ def _has_task(tasks: list[PendingTask], text: str) -> bool:
     return any(task.text == normalized for task in tasks)
 
 
+def _nested_get(payload: dict[str, Any], *keys: str) -> Any:
+    value: Any = payload
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        if text:
+            return text
+    return ""
+
+
 def _same_or_nested_task(left: str, right: str) -> bool:
     first = normalize_message_text(left)
     second = normalize_message_text(right)
@@ -574,6 +836,38 @@ def _task_covered_by_observation(
     if rendered_command and _same_or_nested_task(task_text, rendered_command):
         return True
     return bool(task.command_id and task.command_id == command_id)
+
+
+def _covered_ledger_task_ids(
+    ledger: TaskLedger,
+    observation: AgentObservation,
+) -> list[str]:
+    task_id = _best_matching_ledger_task_id(ledger, observation)
+    return [task_id] if task_id else []
+
+
+def _best_matching_ledger_task_id(
+    ledger: TaskLedger | None,
+    observation: AgentObservation,
+) -> str:
+    if ledger is None:
+        return ""
+    candidates = [
+        observation.task_text,
+        observation.rendered_command,
+        observation.command_id,
+        observation.matched_plugin,
+    ]
+    for task in ledger.tasks:
+        goal = normalize_message_text(task.goal)
+        if any(_same_or_nested_task(goal, item) for item in candidates if item):
+            return task.task_id
+        command_id = normalize_message_text(observation.command_id)
+        if command_id and command_id in {
+            normalize_message_text(item) for item in task.expected_capabilities
+        }:
+            return task.task_id
+    return ""
 
 
 __all__ = [

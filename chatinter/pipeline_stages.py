@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, cast
 import uuid
+import re
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import UniMessage
@@ -21,14 +22,20 @@ from zhenxun.services.llm import LLMContentPart, LLMMessage
 from zhenxun.utils.message import MessageUtils
 
 from .addressee_resolver import AddresseeResult, resolve_addressee
-from .chat_dialogue_planner import plan_chat_dialogue
+from .chat_dialogue_planner import (
+    build_dialogue_state,
+    load_dialogue_state,
+    persist_dialogue_state,
+    plan_chat_dialogue,
+)
 from .chat_handler import (
     artifacts_from_send_observations,
+    messages_summary_from_send_observations,
     normalize_ai_reply_text,
     replace_mention_ids_with_names,
     reroute_to_plugin_with_result,
 )
-from .chat_strategy import build_chat_strategy_prompt
+from .chat_strategy import build_chat_strategy_prompt, build_dialogue_state_prompt
 from .config import get_config_value
 from .context_packer import DialogueContextPack
 from .event_context import ChatInterEventContext, build_event_context
@@ -41,6 +48,7 @@ from .event_runtime import (
 from .execution_observer import (
     EXECUTION_REASON_CANCELLED,
     EXECUTION_REASON_ERROR,
+    EXECUTION_REASON_INVALID_COMMAND,
     EXECUTION_REASON_REROUTE_FAILED,
     EXECUTION_REASON_ROUTE_SUCCESS,
     ExecutionObservation,
@@ -64,6 +72,7 @@ from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState
 from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
+from .models.pydantic_models import CommandToolSnapshot
 from .native_route import (
     NativeRouteDecision,
     NativeRouteReport,
@@ -99,6 +108,7 @@ from .route_text import (
     normalize_message_text,
     should_force_knowledge_refresh,
 )
+from .response_quality_judge import ResponseQualityJudge
 from .target_context import (
     append_mention_context_xml,
     build_mention_name_map,
@@ -123,10 +133,14 @@ from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
 
 if TYPE_CHECKING:
-    pass
+    from .chat_dialogue_planner import DialogueState
 
 _KNOWLEDGE_REFRESH_COOLDOWN = 30.0
 _last_knowledge_refresh_ts = 0.0
+_DIALOGUE_STATE_CONTEXT_PATTERN = re.compile(
+    r"\n?<dialogue_state>.*?</dialogue_state>",
+    re.DOTALL,
+)
 _GROUP_PLUGIN_SELECTOR_RULES = """
 <chatinter_main_request>
 你正在处理群聊消息。你可以自然聊天，也可以在合适时调用候选插件工具。
@@ -161,25 +175,48 @@ _SUPERUSER_AGENT_RULES = """
 <chatinter_superuser_agent>
 场景：超级用户私聊。你既可以自然聊天，也可以作为 Agent 管理项目和服务器。
 闲聊、解释、计划讨论直接回复；只有需要真实检查或操作时才调用工具。
+复杂任务会先生成 TaskGraph。每个任务都有 goal、required_tools、
+acceptance_criteria、status、observations、artifacts；你应按任务图推进，
+不要把未通过 observation/verifier 的任务说成完成。
+运行时会做复杂度分流：轻任务走单工具快路径，不一定生成 TaskGraph；
+复杂任务才启用 planner-executor-verifier。无论哪种路径，都以真实
+Observation 作为完成依据。
 
 工具选择优先级：
+- 工具状态：tool_registry_status 查看可用 Agent 工具、分类和风险。
+- 任务管理：todo_read / todo_write 维护短 Todo；复杂工程任务先列 Todo，
+  逐项推进并用 observation 标记完成。
 - 插件开发：plugin_dev_inspect / plugin_dev_scaffold / plugin_dev_write_file。
 - 文件操作：read_file / list_dir / search_files / write_file / append_file / replace_in_file。
 - 工程修改：patch_prepare 先生成 diff，patch_apply 应用，patch_rollback 回滚，patch_show 查看历史。
-- 大输出读取：artifact_read 读取被压缩的长日志、diff、工具结果。
+- 大输出读取：artifact_list / artifact_read 读取被压缩的长日志、diff、工具结果。
+- AgentRun：agent_run_status 查询状态，agent_run_resume 恢复暂停任务，
+  agent_run_cancel 取消暂停/运行中的任务。
 - 项目命令：python_exec / python_module / uv_command / git_command。
 - 服务器维护：server_status / process_list / server_command。
-- 长任务：background_task_start，之后用 background_task_status 查看，必要时 background_task_cancel。
-- 审计和确认：list_pending_approvals / approve_pending_action / reject_pending_action / audit_log_query。
+- 长任务：background_task_start，之后用 background_observation_wait /
+  background_observation_list / background_task_status 查看 ObservationEvent，
+  必要时 background_task_cancel。
+- 工程验收：engineering_eval_plan 建立“读代码 -> 改代码 -> 跑测试 -> 可回滚”的 eval，engineering_eval_run 记录测试结果。
+- 审计和确认：list_pending_approvals / approve_pending_action / reject_pending_action / revoke_pending_approval / audit_log_query。
 - 只有无法归类的普通命令才用 shell_command。
 
 安全规则：
 所有敏感操作由 data/configs/chatinter_agent_permissions.yaml 的 allow/ask/deny 控制。
 ask 会返回 approval_required 和 approval_id；先向用户说明待确认内容，用户确认后调用
-approve_pending_action，用户拒绝或取消则调用 reject_pending_action。deny 直接说明无法执行。
+approve_pending_action，再用 agent_run_resume 继续原任务；用户拒绝或取消则调用
+reject_pending_action。deny 直接说明无法执行。
+后台任务启动后当前 AgentRun 会暂停；稍后使用 agent_run_resume 恢复，并先查看
+background_task_status 再继续后续步骤。
 不要声称完成未实际执行的操作；工具返回 Observation 后再继续下一步或总结。
+final 前会检查 TaskGraph 未完成项；如果被提示 task_graph_incomplete，
+继续完成缺失任务，不能用口头总结替代执行证据。
+Todo 是过程控制，不替代真实工具结果；Todo completed 需要对应 observation 支持。
 涉及代码修改时，优先使用 patch_prepare -> patch_apply，便于用户预览和回滚。
+patch_apply 会校验文件未在 prepare 后被外部修改；冲突时重新 read_file 后再 prepare。
 工具结果出现 artifact_id 时，先根据摘要判断；需要原文再调用 artifact_read。
+执行工程改动后，使用 engineering_eval_run 或专用 python/uv/git 工具完成验收；失败时说明失败点，
+必要时用 patch_rollback 回滚。
 </chatinter_superuser_agent>
 """.strip()
 
@@ -389,6 +426,74 @@ def _route_report_observer_kwargs(
     }
 
 
+_STRUCTURAL_REROUTE_FAILURE_ERRORS = {
+    "reroute timeout",
+    "unresolved image placeholder",
+}
+_VISIBLE_OUTPUT_REQUIRED_MODES = {"image", "file"}
+_VISIBLE_OUTPUT_REQUIRED_SIDE_EFFECTS = {"query", "send", "mutate"}
+
+
+def _candidate_tool_snapshot(validated: NativeValidatedRoute) -> CommandToolSnapshot | None:
+    candidate = getattr(validated, "candidate", None)
+    snapshot = getattr(candidate, "tool", None) if candidate is not None else None
+    return snapshot if isinstance(snapshot, CommandToolSnapshot) else None
+
+
+def _route_requires_visible_output(validated: NativeValidatedRoute) -> bool:
+    snapshot = _candidate_tool_snapshot(validated)
+    if snapshot is None:
+        return False
+    if not bool(getattr(snapshot, "requires_real_tool", True)):
+        return False
+    role = normalize_message_text(str(getattr(snapshot, "command_role", "") or ""))
+    if role in {"helper", "usage", "catalog"}:
+        return False
+    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
+    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    if output_mode == "plugin_output" and side_effect == "send":
+        return True
+    return (
+        output_mode in _VISIBLE_OUTPUT_REQUIRED_MODES
+        or side_effect in _VISIBLE_OUTPUT_REQUIRED_SIDE_EFFECTS
+    )
+
+
+def _reroute_success_from_observation(
+    *,
+    validated: NativeValidatedRoute,
+    reroute_success: bool,
+    output_texts: list[str],
+    output_artifacts: list[dict[str, object]],
+) -> tuple[bool, str, bool]:
+    if not reroute_success:
+        return False, "", True
+    if not _route_requires_visible_output(validated):
+        return True, "", False
+    if output_texts or output_artifacts:
+        return True, "", False
+    return False, "plugin_completed_without_visible_output", True
+
+
+def _execution_failure_reason(
+    *,
+    reroute_result,
+    observation_error: str,
+) -> str:
+    error = normalize_message_text(
+        observation_error or getattr(reroute_result, "error", "") or ""
+    )
+    if error in _STRUCTURAL_REROUTE_FAILURE_ERRORS:
+        return EXECUTION_REASON_REROUTE_FAILED
+    if error == "plugin_completed_without_visible_output":
+        return EXECUTION_REASON_INVALID_COMMAND
+    if getattr(reroute_result, "timed_out", False):
+        return EXECUTION_REASON_REROUTE_FAILED
+    if error:
+        return EXECUTION_REASON_ERROR
+    return EXECUTION_REASON_REROUTE_FAILED
+
+
 def _append_route_notice(context_xml: str, notice: str) -> str:
     text = normalize_message_text(notice)
     if not text:
@@ -440,10 +545,13 @@ async def _execute_native_tool_route(
     )
     target_resolution = await resolve_execution_target(
         group_id=group_id,
+        bot=bot,
+        bot_id=getattr(bot, "self_id", None),
         route_result=route_result,
         knowledge_plugins=knowledge_plugins,
         task_message=task_message,
         ambient_message=current_message,
+        target_hint=task_frame.target_hint if task_frame is not None else "",
         mention_profiles=mention_profiles,
     )
     if target_resolution.blocked:
@@ -519,18 +627,37 @@ async def _execute_native_tool_route(
         wait=True,
         timeout=float(get_config_value("NATIVE_REROUTE_TIMEOUT", 10) or 10),
     )
-    if reroute_result.success:
+    output_texts = messages_summary_from_send_observations(reroute_result.outputs)
+    output_artifacts = artifacts_from_send_observations(
+        reroute_result.outputs,
+        trace_id=reroute_result.trace_id,
+    )
+    observed_success, observation_error, retryable = _reroute_success_from_observation(
+        validated=validated,
+        reroute_success=reroute_result.success,
+        output_texts=output_texts,
+        output_artifacts=output_artifacts,
+    )
+    if observed_success:
         observation = execution_frame.finish(
             success=True,
             reason=EXECUTION_REASON_ROUTE_SUCCESS,
         )
         feedback_reason = _FEEDBACK_REASON_ROUTE_SUCCESS
     else:
+        failure_reason = _execution_failure_reason(
+            reroute_result=reroute_result,
+            observation_error=observation_error,
+        )
         observation = execution_frame.finish(
             success=False,
-            reason=EXECUTION_REASON_REROUTE_FAILED,
+            reason=failure_reason,
         )
-        feedback_reason = _FEEDBACK_REASON_REROUTE_FAILED
+        feedback_reason = (
+            _FEEDBACK_REASON_REROUTE_FAILED
+            if failure_reason == EXECUTION_REASON_REROUTE_FAILED
+            else failure_reason
+        )
     _tag_execution_observation(trace, observation)
     await FeedbackStore.record_plugin_outcome(
         session_id=session_id,
@@ -538,36 +665,32 @@ async def _execute_native_tool_route(
         route_result=route_result,
         modules=target_modules,
         route_command=route_command,
-        success=reroute_result.success,
+        success=observed_success,
         reason=feedback_reason,
     )
 
-    output_texts = [item.text for item in reroute_result.outputs if item.text]
-    output_artifacts = artifacts_from_send_observations(
-        reroute_result.outputs,
-        trace_id=reroute_result.trace_id,
-    )
+    error_text = observation_error or reroute_result.error or ""
     payload = build_route_observation(
         route_result=route_result,
-        ok=reroute_result.success,
+        ok=observed_success,
         route_command=route_command,
         messages_sent=output_texts,
         artifacts=output_artifacts,
         task_text=task_message,
         ambient_message=current_message,
         trace_id=reroute_result.trace_id,
-        error=reroute_result.error or "",
-        retryable=bool(reroute_result.timed_out or reroute_result.error),
+        error=error_text,
+        retryable=bool(retryable or reroute_result.timed_out or reroute_result.error),
     )
     display_text = (
-        "插件已执行，已观测到发送输出。"
-        if reroute_result.success and output_texts
-        else "插件已执行。"
-        if reroute_result.success
-        else reroute_result.error or "插件执行失败。"
+        "???????????????"
+        if observed_success and (output_texts or output_artifacts)
+        else "??????"
+        if observed_success
+        else error_text or "???????"
     )
     return NativeToolExecutionResult(
-        success=reroute_result.success,
+        success=observed_success,
         route_result=route_result,
         route_command=route_command,
         output=payload,
@@ -640,6 +763,7 @@ async def stage_event_context(
         frame.group_id,
         event_context.message_text_with_tags,
         bot_id=frame.bot_id,
+        bot=bot,
     )
     frame.mention_profiles = mention_profiles
     if frame.turn_messages:
@@ -693,6 +817,7 @@ async def stage_memory(
     bot: Bot,
     event: Event,
 ) -> None:
+    dialogue_state = frame.dialogue_state or _build_pre_memory_dialogue_state(frame)
     memory_message = (
         frame.raw_message
         if frame.turn_messages
@@ -712,7 +837,9 @@ async def stage_memory(
         frame.bot_id,
         event,
         frame.dialogue_context_pack,
+        dialogue_state,
     )
+    frame.dialogue_state = dialogue_state
     frame.set_context(
         system_prompt=chat_system_prompt,
         context_xml=context_xml,
@@ -720,6 +847,65 @@ async def stage_memory(
         history_messages=history_messages,
     )
     frame.stage(PipelineStage.MEMORY)
+
+
+async def stage_dialogue_state(*, frame: TurnFrame) -> None:
+    dialogue_state = _build_pre_memory_dialogue_state(frame)
+    if dialogue_state is not None:
+        frame.dialogue_state = dialogue_state
+        frame.update_tags(
+            dialogue_tone=dialogue_state.tone,
+            dialogue_emotion=dialogue_state.user_emotion,
+            dialogue_purpose=dialogue_state.dialogue_purpose,
+        )
+    frame.stage(PipelineStage.DIALOGUE_STATE)
+
+
+def _build_pre_memory_dialogue_state(frame: TurnFrame) -> "DialogueState | None":
+    try:
+        fallback_intent = frame.intent_profile
+        previous_state = load_dialogue_state(
+            session_key=frame.session_key,
+            user_id=frame.user_id,
+            group_id=frame.group_id,
+        )
+        relevant_people = getattr(frame.dialogue_context_pack, "relevant_people", ())
+        thread_topic = normalize_message_text(
+            str(getattr(frame.thread_context, "topic_key", "") or "")
+        )
+        plan = plan_chat_dialogue(
+            message_text=frame.current_message or frame.raw_message,
+            intent=fallback_intent,
+            has_images=bool(getattr(frame.event_context, "images", ()) or ()),
+            has_reply=bool(
+                getattr(getattr(frame.event_context, "reply", None), "sender_id", "")
+            ),
+        )
+        frame.dialogue_plan = frame.dialogue_plan or plan
+        state = build_dialogue_state(
+            message_text=frame.current_message or frame.raw_message,
+            plan=plan,
+            intent=fallback_intent,
+            scenario=frame.scenario,
+            has_images=bool(getattr(frame.event_context, "images", ()) or ()),
+            has_reply=bool(
+                getattr(getattr(frame.event_context, "reply", None), "sender_id", "")
+            ),
+            previous_state=previous_state,
+            is_group=bool(frame.group_id),
+            relevant_people_count=len(tuple(relevant_people or ())),
+            thread_topic=thread_topic,
+        )
+        persist_dialogue_state(
+            session_key=frame.session_key,
+            user_id=frame.user_id,
+            group_id=frame.group_id,
+            message_text=frame.current_message or frame.raw_message,
+            state=state,
+        )
+        return state
+    except Exception:
+        return None
 
 
 async def _prepare_current_message_context(
@@ -754,6 +940,7 @@ async def _prepare_current_message_context(
 async def _prepare_capability_route_context(
     *,
     frame: TurnFrame,
+    bot: Bot,
     event: Event,
 ) -> None:
     knowledge_base = frame.knowledge_base
@@ -789,6 +976,7 @@ async def _prepare_capability_route_context(
     )
     target_resolution = await resolve_pre_route_target(
         group_id=frame.group_id,
+        bot=bot,
         original_message=frame.current_message,
         route_message=route_message_base,
         mention_profiles=frame.mention_profiles,
@@ -992,7 +1180,7 @@ async def stage_capability_hint(
         middleware=middleware,
         cached_plain_text=cached_plain_text,
     )
-    await _prepare_capability_route_context(frame=frame, event=event)
+    await _prepare_capability_route_context(frame=frame, bot=bot, event=event)
     await _select_capability_route(
         frame=frame,
         bot=bot,
@@ -1010,6 +1198,9 @@ def _build_system_prompt(frame: TurnFrame) -> str:
     strategy_prompt = build_chat_strategy_prompt(dialogue_plan)
     if strategy_prompt:
         parts.append(strategy_prompt)
+    state_prompt = build_dialogue_state_prompt(frame.dialogue_state)
+    if state_prompt:
+        parts.append(state_prompt)
     if frame.scenario == "group_plugin_selector":
         parts.append(_GROUP_PLUGIN_SELECTOR_RULES)
     elif frame.scenario == "superuser_agent":
@@ -1075,6 +1266,12 @@ def _build_turn_queue_context(frame: TurnFrame) -> str:
     return "\n".join(sections)
 
 
+def _replace_dialogue_state_context(context_xml: str, dialogue_state) -> str:
+    block = dialogue_state.to_xml()
+    base = _DIALOGUE_STATE_CONTEXT_PATTERN.sub("", str(context_xml or "")).strip()
+    return f"{base}\n{block}".strip() if base else block
+
+
 async def stage_current_user(
     *,
     frame: TurnFrame,
@@ -1108,12 +1305,30 @@ async def stage_current_user(
         has_images=bool(image_parts),
         has_reply=frame.has_reply,
     )
+    dialogue_state = build_dialogue_state(
+        message_text=frame.current_message,
+        plan=dialogue_plan,
+        intent=frame.intent_profile,
+        scenario=frame.scenario,
+        has_images=bool(image_parts),
+        has_reply=frame.has_reply,
+    )
     frame.dialogue_plan = dialogue_plan
+    frame.dialogue_state = dialogue_state
+    frame.enriched_context_xml = _replace_dialogue_state_context(
+        frame.enriched_context_xml,
+        dialogue_state,
+    )
     frame.update_tags(
         chat_kind=dialogue_plan.kind,
         chat_style=dialogue_plan.style,
         chat_reason=dialogue_plan.reason,
+        dialogue_tone=dialogue_state.tone,
+        dialogue_emotion=dialogue_state.user_emotion,
+        dialogue_purpose=dialogue_state.dialogue_purpose,
     )
+
+
 async def stage_scratchpad(
     *,
     frame: TurnFrame,
@@ -1240,6 +1455,22 @@ async def stage_agent_run(
         reply_text = main_result.output.final_text
         if not normalize_message_text(reply_text):
             reply_text = "我暂时没想好怎么回答你。"
+        if ResponseQualityJudge.should_judge(
+            scenario=frame.scenario,
+            main_result=main_result,
+        ):
+            quality = ResponseQualityJudge.judge(
+                final_text=reply_text,
+                original_message=frame.current_message,
+                dialogue_state=frame.dialogue_state,
+                main_result=main_result,
+            )
+            if not quality.ok:
+                frame.update_tags(response_quality=quality.reason)
+                if quality.revised_text:
+                    reply_text = quality.revised_text
+                elif quality.instruction:
+                    envelope.add(ChannelName.ANALYSIS, quality.instruction)
         envelope.add(ChannelName.FINAL, reply_text)
     frame.final_envelope = envelope
 
@@ -1421,6 +1652,7 @@ __all__ = [
     "stage_agent_run",
     "stage_capability_hint",
     "stage_current_user",
+    "stage_dialogue_state",
     "stage_event_context",
     "stage_identity",
     "stage_memory",

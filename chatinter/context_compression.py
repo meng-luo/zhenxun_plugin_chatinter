@@ -12,8 +12,8 @@ from .artifact_store import get_artifact_store, summarize_artifact_text
 from .route_text import normalize_message_text
 from .turn_runtime import estimate_text_tokens
 
-_MAX_PROMPT_TOKENS = 9000
-_TARGET_PROMPT_TOKENS = 6500
+_MAX_PROMPT_TOKENS = 4500
+_TARGET_PROMPT_TOKENS = 3000
 _MAX_SUMMARY_LINES = 24
 _MAX_SUMMARY_CHARS = 2600
 _TOOL_ARGUMENT_LIMIT = 360
@@ -250,10 +250,34 @@ def _hard_clip_messages(
 
 
 def _prefix_end(messages: list[LLMMessage]) -> int:
-    index = 0
-    while index < len(messages) and messages[index].role == "system":
+    if not messages:
+        return 0
+    index = 1 if messages[0].role == "system" else 0
+    while index < len(messages):
+        message = messages[index]
+        if message.role != "user":
+            break
+        text = normalize_message_text(_message_text(message))
+        if not _is_static_context_message(text):
+            break
         index += 1
     return index
+
+
+def _is_static_context_message(text: str) -> bool:
+    if not text:
+        return False
+    prefixes = (
+        "<qq_context>",
+        "<event_context>",
+        "<turn_identity>",
+        "<chatroom_history>",
+        "<dialogue_state>",
+        "<memory",
+        "<capability",
+        "<compressed_history_summary>",
+    )
+    return any(text.startswith(prefix) for prefix in prefixes)
 
 
 def _message_summary(message: LLMMessage, *, trace_id: str) -> str:

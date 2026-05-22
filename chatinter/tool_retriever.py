@@ -6,15 +6,19 @@ command as a native function tool in the first model request.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 from .capability_registry import CapabilityRegistry
 from .command_index import CommandCandidate, build_command_candidates
-from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
+from .models.pydantic_models import PluginKnowledgeBase
 from .route_text import normalize_message_text
-from .soft_tool_policy import filter_soft_candidates
+from .soft_tool_policy import (
+    filter_soft_candidates,
+    is_high_reliability_candidate,
+    should_catalog_only_candidate,
+    sort_exposure_candidates,
+)
 
 _DEFAULT_RETRIEVAL_LIMIT = 24
 _MAX_RETRIEVAL_LIMIT = 64
@@ -88,10 +92,12 @@ class CommandToolRetriever:
 
         This restores broad command-level choice without exceeding provider tool
         limits when a plugin contributes many command schemas.
+        Low-reliability commands stay catalog-discoverable but are not exposed
+        automatically unless they are exact/high-confidence choices.
         """
 
         normalized_query = normalize_message_text(query)
-        grouped = _group_tools_by_plugin(self.registry.tools)
+        grouped = self.registry.command_tools_by_plugin()
         selected: list[CommandCandidate] = []
         for plugin_tools in grouped.values():
             if len(plugin_tools) <= large_plugin_command_cap:
@@ -105,7 +111,10 @@ class CommandToolRetriever:
                     include_unscored=True,
                 )
                 selected.extend(
-                    filter_soft_candidates(normalized_query, plugin_candidates)
+                    _initial_exposure_candidates(
+                        normalized_query,
+                        plugin_candidates,
+                    )
                 )
                 continue
             plugin_candidates = build_command_candidates(
@@ -118,10 +127,16 @@ class CommandToolRetriever:
                 include_unscored=False,
             )
             selected.extend(
-                filter_soft_candidates(normalized_query, plugin_candidates)
+                _initial_exposure_candidates(
+                    normalized_query,
+                    plugin_candidates,
+                )
             )
 
-        selected = _dedupe_and_trim_candidates(selected, max_total=max_total)
+        selected = _dedupe_and_trim_candidates(
+            sort_exposure_candidates(normalized_query, selected),
+            max_total=max_total,
+        )
         return CommandRetrievalResult(
             query=normalized_query,
             candidates=tuple(selected),
@@ -141,19 +156,6 @@ def _coerce_limit(limit: int | None) -> int:
     except (TypeError, ValueError):
         value = _DEFAULT_RETRIEVAL_LIMIT
     return max(1, min(value, _MAX_RETRIEVAL_LIMIT))
-
-
-def _group_tools_by_plugin(
-    tools: list[CommandToolSnapshot],
-) -> dict[str, list[CommandToolSnapshot]]:
-    grouped: dict[str, list[CommandToolSnapshot]] = defaultdict(list)
-    for tool in tools:
-        key = normalize_message_text(tool.plugin_module or tool.plugin_name)
-        if not key:
-            key = "unknown"
-        grouped[key].append(tool)
-    return dict(grouped)
-
 
 def _dedupe_and_trim_candidates(
     candidates: list[CommandCandidate],
@@ -180,20 +182,75 @@ def _dedupe_and_trim_candidates(
     return ordered[:cap]
 
 
+def _initial_exposure_candidates(
+    message_text: str,
+    candidates: list[CommandCandidate],
+) -> list[CommandCandidate]:
+    filtered = filter_soft_candidates(message_text, candidates)
+    result: list[CommandCandidate] = []
+    deferred: list[CommandCandidate] = []
+    for candidate in filtered:
+        if should_catalog_only_candidate(candidate, message_text=message_text):
+            deferred.append(candidate)
+            continue
+        result.append(candidate)
+    if result:
+        return sort_exposure_candidates(message_text, result)
+    exact_or_reliable = [
+        candidate
+        for candidate in filtered
+        if candidate.exact_protected or is_high_reliability_candidate(candidate)
+    ]
+    if exact_or_reliable:
+        return sort_exposure_candidates(message_text, exact_or_reliable)
+    return []
+
+
 def _candidate_rank_key(
     candidate: CommandCandidate,
-) -> tuple[int, float, float, int, str]:
+) -> tuple[int, int, int, float, float, float, float, float, float, float, int, str]:
     exact = 1 if candidate.exact_protected else 0
+    tool = candidate.tool
+    soft = 0 if bool(getattr(tool, "soft_tool", False)) else 1
+    concrete = 1 if _is_concrete_tool(tool) else 0
     score = float(candidate.score or 0.0)
     context = float(getattr(candidate.features, "context_score", 0.0) or 0.0)
+    schema = float(getattr(candidate.features, "schema_score", 0.0) or 0.0)
+    reliability = float(getattr(candidate.features, "reliability_score", 0.0) or 0.0)
+    false_trigger = float(
+        getattr(candidate.features, "false_trigger_score", 0.0) or 0.0
+    )
+    param_failure = float(
+        getattr(candidate.features, "param_failure_score", 0.0) or 0.0
+    )
+    latency = float(getattr(candidate.features, "latency_score", 0.0) or 0.0)
     non_empty = 1 if score > 0 else 0
     return (
         exact,
+        concrete,
+        soft,
+        reliability + false_trigger + param_failure + latency,
+        reliability,
+        schema,
         score,
         context,
+        param_failure,
+        latency,
         non_empty,
         normalize_message_text(candidate.schema.command_id),
     )
+
+
+def _is_concrete_tool(tool: object | None) -> bool:
+    if tool is None:
+        return False
+    output_mode = normalize_message_text(str(getattr(tool, "output_mode", "") or ""))
+    side_effect = normalize_message_text(str(getattr(tool, "side_effect", "") or ""))
+    return output_mode in {"image", "file", "action"} or side_effect in {
+        "query",
+        "send",
+        "mutate",
+    }
 
 
 __all__ = [

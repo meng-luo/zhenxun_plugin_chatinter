@@ -7,6 +7,7 @@ ChatInter - 聊天响应处理
 import asyncio
 from dataclasses import dataclass, field
 import re
+import time
 from typing import Any, cast
 import uuid
 
@@ -27,6 +28,7 @@ from zhenxun.services.send_queue import (
 )
 
 from .artifact_store import get_artifact_store
+from .route_text import normalize_message_text
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
@@ -71,6 +73,114 @@ class RerouteExecutionResult:
     @property
     def observed_text(self) -> str:
         return "\n".join(item.text for item in self.outputs if item.text).strip()
+
+
+def _captured_send_count(bot: Bot) -> int | None:
+    records = getattr(bot, "sent_messages", None)
+    return len(records) if isinstance(records, list) else None
+
+
+def _captured_send_observations(
+    bot: Bot,
+    *,
+    trace_id: str,
+    start_index: int | None,
+) -> list[SendObservation]:
+    records = getattr(bot, "sent_messages", None)
+    if start_index is None or not isinstance(records, list):
+        return []
+    outputs: list[SendObservation] = []
+    for item in records[start_index : start_index + 12]:
+        if isinstance(item, tuple) and len(item) >= 2:
+            api, data = item[0], item[1]
+        else:
+            api, data = "captured_send", item
+        payload = data if isinstance(data, dict) else {"message": data}
+        raw = _message_payload_to_text(payload.get("message"))
+        if not raw and isinstance(payload, dict):
+            for key in ("messages", "message", "raw_message"):
+                raw = _message_payload_to_text(payload.get(key))
+                if raw:
+                    break
+        if not raw and isinstance(payload, dict) and str(api or "") in {
+            "send_msg",
+            "send_group_msg",
+            "send_private_msg",
+        }:
+            raw = "[plugin visible send]"
+        outputs.append(
+            SendObservation(
+                trace_id=trace_id,
+                api=str(api or "captured_send"),
+                text=normalize_message_text(raw)[:900],
+                raw_message=raw[:900],
+                result={},
+                timestamp=time.time(),
+            )
+        )
+    return outputs
+
+
+def _message_payload_to_text(message: Any) -> str:
+    if message is None:
+        return ""
+    if hasattr(message, "extract_plain_text"):
+        try:
+            plain = str(message.extract_plain_text())
+            if plain.strip():
+                return plain
+        except Exception:
+            pass
+    if isinstance(message, (list, tuple)):
+        parts = [_message_payload_to_text(item) for item in message]
+        return " ".join(part for part in parts if part).strip()
+    if isinstance(message, dict):
+        segment_type = str(message.get("type", "") or "")
+        data = message.get("data")
+        if segment_type:
+            if segment_type == "text" and isinstance(data, dict):
+                return str(data.get("text", "") or "")
+            if segment_type == "image":
+                return "[plugin image output]"
+            if segment_type == "music":
+                source = ""
+                music_id = ""
+                if isinstance(data, dict):
+                    source = str(data.get("type", "") or "")
+                    music_id = str(data.get("id", "") or "")
+                suffix = " ".join(item for item in (source, music_id) if item)
+                return f"[plugin music output{': ' + suffix if suffix else ''}]"
+            if segment_type in {"record", "voice"}:
+                return "[plugin voice output]"
+            if segment_type == "video":
+                return "[plugin video output]"
+            if segment_type in {"node", "forward"}:
+                return "[plugin forward message]"
+            return f"[plugin {segment_type} output]"
+        for key in ("message", "messages", "raw_message", "content"):
+            raw = _message_payload_to_text(message.get(key))
+            if raw:
+                return raw
+    try:
+        return str(message)
+    except Exception:
+        return ""
+
+
+def _merge_captured_outputs_if_empty(
+    outputs: list[SendObservation],
+    *,
+    bot: Bot,
+    trace_id: str,
+    start_index: int | None,
+) -> list[SendObservation]:
+    if outputs:
+        return outputs
+    return _captured_send_observations(
+        bot,
+        trace_id=trace_id,
+        start_index=start_index,
+    )
 
 
 def artifacts_from_send_observations(
@@ -122,6 +232,24 @@ def artifacts_from_send_observations(
     return artifacts
 
 
+def messages_summary_from_send_observations(
+    outputs: list[SendObservation],
+) -> list[str]:
+    """Summarize real plugin sends; image-only sends still count as visible."""
+
+    summaries: list[str] = []
+    for index, output in enumerate(outputs, 1):
+        text = normalize_message_text(str(output.text or ""))
+        raw = str(output.raw_message or "")
+        if text:
+            summaries.append(text[:260])
+        elif _OBSERVED_IMAGE_OUTPUT_PATTERN.search(raw):
+            summaries.append(f"[plugin image output #{index}]")
+        elif raw:
+            summaries.append(normalize_message_text(raw)[:260])
+    return summaries[:8]
+
+
 async def reroute_to_plugin(
     bot: Bot,
     event: Event,
@@ -156,6 +284,7 @@ async def reroute_to_plugin_with_result(
     try:
         import time
 
+        captured_send_start = _captured_send_count(bot)
         event_data = event.model_dump()
         bot_self_id = str(getattr(bot, "self_id", "")) or None
         new_message = _build_reroute_message(
@@ -243,7 +372,12 @@ async def reroute_to_plugin_with_result(
                     timeout=max(float(timeout), 0.5),
                 )
             except asyncio.TimeoutError:
-                outputs = pop_send_observations(trace_key)
+                outputs = _merge_captured_outputs_if_empty(
+                    pop_send_observations(trace_key),
+                    bot=bot,
+                    trace_id=trace_key,
+                    start_index=captured_send_start,
+                )
                 task.add_done_callback(
                     lambda _done_task: pop_send_observations(trace_key)
                 )
@@ -257,7 +391,12 @@ async def reroute_to_plugin_with_result(
                     timed_out=True,
                 )
             except Exception as exc:
-                outputs = pop_send_observations(trace_key)
+                outputs = _merge_captured_outputs_if_empty(
+                    pop_send_observations(trace_key),
+                    bot=bot,
+                    trace_id=trace_key,
+                    start_index=captured_send_start,
+                )
                 logger.warning(f"消息重路由执行异常：{command_text}, error={exc}")
                 return RerouteExecutionResult(
                     success=False,
@@ -266,7 +405,12 @@ async def reroute_to_plugin_with_result(
                     outputs=outputs,
                     error=str(exc),
                 )
-        outputs = pop_send_observations(trace_key)
+        outputs = _merge_captured_outputs_if_empty(
+            pop_send_observations(trace_key),
+            bot=bot,
+            trace_id=trace_key,
+            start_index=captured_send_start,
+        )
         logger.info(f"消息重路由成功：{command_text}")
         return RerouteExecutionResult(
             success=True,
@@ -523,6 +667,7 @@ def replace_mention_ids_with_names(
 __all__ = [
     "RerouteExecutionResult",
     "artifacts_from_send_observations",
+    "messages_summary_from_send_observations",
     "normalize_ai_reply_text",
     "replace_mention_ids_with_names",
     "reroute_to_plugin",

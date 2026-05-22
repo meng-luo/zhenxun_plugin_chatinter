@@ -29,6 +29,7 @@ from .scenario_router import ChatInterScenario, ScenarioRoute
 from .turn_queue import TurnProcessor, get_turn_queue
 
 _COLLECT_DELAY_SECONDS = 1.8
+_NATIVE_OUTPUT_WAIT_SECONDS = 0.8
 _MAX_CACHE_SIZE = 512
 _MAX_CACHE_AGE_SECONDS = 120.0
 _MAX_TAIL_TASKS = 5
@@ -66,6 +67,7 @@ _CONTINUATION_PREFIX_PATTERN = re.compile(
 )
 _NATIVE_ROUTE_CACHE_SIGNATURE: tuple[tuple[str, ...], ...] | None = None
 _NATIVE_ROUTE_PREFIX_MAP: dict[str, tuple["_NativeCommandEntry", ...]] = {}
+_SENT_OBSERVER_REGISTERED = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,7 @@ def schedule_native_tail_followup(
     if not _remember_message(key):
         return False
     _mark_native_tail_pending(event, raw_message)
+    _ensure_sent_observer_registered()
     asyncio.create_task(
         _run_native_tail_followup(
             bot=bot,
@@ -172,9 +175,12 @@ async def _run_native_tail_followup(
 ) -> None:
     try:
         await asyncio.sleep(_COLLECT_DELAY_SECONDS)
+        if not _native_command_has_completed(event):
+            await _wait_native_command_output(event)
         result = await _judge_native_tail(
             raw_message=raw_message,
             route_modules=route_modules,
+            native_completed=_native_command_has_completed(event),
         )
     except Exception as exc:
         logger.warning(f"[ChatInter] native-tail collector failed: {exc}")
@@ -268,14 +274,20 @@ async def _judge_native_tail(
     *,
     raw_message: str,
     route_modules: set[str],
+    native_completed: bool,
 ) -> NativeTailTaskResult:
     payload = {
         "original_message": normalize_message_text(raw_message),
         "native_route_modules": sorted(route_modules),
         "native_command_status": (
-            "The leading native command has already been handed to the original "
-            "NoneBot plugin. Only identify independent follow-up tasks that still "
-            "need ChatInter."
+            "completed_or_observed"
+            if native_completed
+            else "handed_to_original_plugin_but_output_not_observed"
+        ),
+        "continuation_policy": (
+            "The leading native command has priority. ChatInter may only handle "
+            "independent follow-up tasks after that leading command; never repeat "
+            "or reinterpret the leading command."
         ),
     }
     digest = hashlib.blake2s(
@@ -335,6 +347,39 @@ def _clear_native_tail_pending(event: Event) -> None:
         setattr(event, "_chatinter_native_tail_pending", False)
     except Exception:
         pass
+
+
+def _native_command_has_completed(event: Event) -> bool:
+    return bool(getattr(event, "_chatinter_native_tail_observed_output", False))
+
+
+async def _wait_native_command_output(event: Event) -> None:
+    deadline = time.monotonic() + _NATIVE_OUTPUT_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if _native_command_has_completed(event):
+            return
+        await asyncio.sleep(0.05)
+
+
+def _ensure_sent_observer_registered() -> None:
+    global _SENT_OBSERVER_REGISTERED
+    if _SENT_OBSERVER_REGISTERED:
+        return
+    try:
+        from nonebot.message import event_postprocessor
+    except Exception:
+        return
+
+    @event_postprocessor
+    async def _chatinter_native_tail_output_observer(event: Event) -> None:
+        if not bool(getattr(event, "_chatinter_native_tail_pending", False)):
+            return
+        try:
+            setattr(event, "_chatinter_native_tail_observed_output", True)
+        except Exception:
+            pass
+
+    _SENT_OBSERVER_REGISTERED = True
 
 
 def _remember_message(key: str) -> bool:

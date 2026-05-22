@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import difflib
+import hashlib
 from pathlib import Path
 import time
 import uuid
@@ -43,6 +44,12 @@ class FileSnapshot:
     after_content: str = ""
     diff: str = ""
     replacements: int = 0
+    before_sha256: str = ""
+    after_sha256: str = ""
+    before_size: int = 0
+    after_size: int = 0
+    before_mtime_ns: int = 0
+    after_mtime_ns: int = 0
 
 
 @dataclass
@@ -56,6 +63,12 @@ class PatchOperation:
     snapshots: list[FileSnapshot]
     status: OperationStatus = "prepared"
     approval_id: str | None = None
+    bound_eval_id: str = ""
+    workspace_lock: dict[str, str] = field(default_factory=dict)
+    workspace_lock_details: dict[str, Any] = field(default_factory=dict)
+    pre_checkpoint_id: str = ""
+    post_checkpoint_id: str = ""
+    rollback_checkpoint_id: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str = ""
@@ -69,6 +82,12 @@ class PatchOperation:
             "reason": self.reason,
             "status": self.status,
             "approval_id": self.approval_id,
+            "bound_eval_id": self.bound_eval_id,
+            "workspace_lock": dict(self.workspace_lock),
+            "workspace_lock_details": dict(self.workspace_lock_details),
+            "pre_checkpoint_id": self.pre_checkpoint_id,
+            "post_checkpoint_id": self.post_checkpoint_id,
+            "rollback_checkpoint_id": self.rollback_checkpoint_id,
             "created_at": int(self.created_at),
             "updated_at": int(self.updated_at),
             "error": self.error,
@@ -79,6 +98,12 @@ class PatchOperation:
                     "before_chars": len(snapshot.before_content),
                     "after_chars": len(snapshot.after_content),
                     "replacements": snapshot.replacements,
+                    "before_sha256": snapshot.before_sha256,
+                    "after_sha256": snapshot.after_sha256,
+                    "before_size": snapshot.before_size,
+                    "after_size": snapshot.after_size,
+                    "before_mtime_ns": snapshot.before_mtime_ns,
+                    "after_mtime_ns": snapshot.after_mtime_ns,
                     "diff": snapshot.diff,
                     **(
                         {
@@ -105,6 +130,12 @@ class PatchOperation:
             "snapshots": [asdict(snapshot) for snapshot in self.snapshots],
             "status": self.status,
             "approval_id": self.approval_id,
+            "bound_eval_id": self.bound_eval_id,
+            "workspace_lock": dict(self.workspace_lock),
+            "workspace_lock_details": dict(self.workspace_lock_details),
+            "pre_checkpoint_id": self.pre_checkpoint_id,
+            "post_checkpoint_id": self.post_checkpoint_id,
+            "rollback_checkpoint_id": self.rollback_checkpoint_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
@@ -122,6 +153,9 @@ def create_patch_operation(
     _ensure_loaded()
     if not changes:
         raise ValueError("patch operation requires at least one change")
+    conflict = _prepared_operation_conflict(changes)
+    if conflict:
+        raise RuntimeError(conflict)
     snapshots = [_build_snapshot(change) for change in changes]
     operation = PatchOperation(
         operation_id=uuid.uuid4().hex[:12],
@@ -132,7 +166,10 @@ def create_patch_operation(
         changes=changes,
         snapshots=snapshots,
         approval_id=approval_id,
+        workspace_lock=_workspace_lock_for_snapshots(snapshots),
+        workspace_lock_details=_workspace_lock_details_for_snapshots(snapshots),
     )
+    operation.pre_checkpoint_id = _write_checkpoint(operation, phase="pre_apply")
     _OPERATIONS[operation.operation_id] = operation
     _save_operations()
     record_audit_event(
@@ -169,23 +206,51 @@ def apply_patch_operation(
         )
     if operation.status == "rolled_back":
         return tool_result(False, "patch_operation_already_rolled_back", operation_id=operation_id)
-    touched: list[FileSnapshot] = []
+    if operation.status == "failed":
+        return tool_result(
+            False,
+            "patch_operation_failed_needs_reprepare",
+            operation=operation.public_payload(),
+            instruction="该 patch operation 已失败。为避免旧快照误写，请重读文件后重新 patch_prepare。",
+        )
     try:
+        lock_error = _workspace_lock_error(operation)
+        if lock_error:
+            raise RuntimeError(lock_error)
+        conflict = _prepared_operation_conflict(
+            operation.changes,
+            ignore_operation_id=operation.operation_id,
+        )
+        if conflict:
+            raise RuntimeError(conflict)
         for change, snapshot in zip(operation.changes, operation.snapshots, strict=False):
             target = Path(change.path)
             if change.create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
             elif not target.parent.exists():
                 raise FileNotFoundError(str(target.parent))
+        for snapshot in operation.snapshots:
+            if not _snapshot_matches_current(snapshot):
+                raise RuntimeError(
+                    f"file changed since patch_prepare: {snapshot.path}"
+                )
+        touched: list[FileSnapshot] = []
         for change, snapshot in zip(operation.changes, operation.snapshots, strict=False):
             target = Path(change.path)
             target.write_text(snapshot.after_content, encoding="utf-8")
+            snapshot.after_mtime_ns = _mtime_ns(target)
+            snapshot.after_size = _file_size(target)
+            snapshot.after_sha256 = _sha256(
+                target.read_text(encoding="utf-8", errors="replace")
+            )
             touched.append(snapshot)
         operation.status = "applied"
         operation.approval_id = approval_id or operation.approval_id
+        operation.post_checkpoint_id = _write_checkpoint(operation, phase="post_apply")
         operation.updated_at = time.time()
         operation.error = ""
         _save_operations()
+        eval_run = _bind_eval_after_apply(operation, actor=actor)
         record_audit_event(
             event="patch_operation_applied",
             user_id=actor["user_id"],
@@ -202,9 +267,14 @@ def apply_patch_operation(
             True,
             "patch_operation_applied",
             operation=operation.public_payload(),
+            eval=eval_run.public_payload() if eval_run is not None else None,
+            instruction=(
+                "patch 已应用并绑定工程 eval。下一步调用 engineering_eval_run "
+                "执行建议测试；如果失败，根据 observation 决定重读、二次 patch 或 rollback。"
+            ),
         )
     except Exception as exc:
-        _restore_snapshots(touched)
+        _restore_snapshots(locals().get("touched", []))
         operation.status = "failed"
         operation.error = str(exc)
         operation.updated_at = time.time()
@@ -249,6 +319,13 @@ def rollback_patch_operation(
             operation=operation.public_payload(),
         )
     try:
+        lock_error = _rollback_lock_error(operation)
+        if lock_error:
+            raise RuntimeError(lock_error)
+        operation.rollback_checkpoint_id = _write_checkpoint(
+            operation,
+            phase="pre_rollback",
+        )
         for snapshot in reversed(operation.snapshots):
             target = Path(snapshot.path)
             if snapshot.existed_before:
@@ -377,6 +454,12 @@ def _build_snapshot(change: FileChange) -> FileSnapshot:
         after_content=after,
         diff=diff,
         replacements=replacements,
+        before_sha256=_sha256(before),
+        after_sha256=_sha256(after),
+        before_size=_file_size(target) if existed else 0,
+        after_size=len(after.encode("utf-8")),
+        before_mtime_ns=_mtime_ns(target) if existed else 0,
+        after_mtime_ns=0,
     )
 
 
@@ -441,7 +524,7 @@ def _operation_from_payload(
             if isinstance(change, dict)
         ]
         snapshots = [
-            FileSnapshot(**snapshot)
+            _snapshot_from_payload(snapshot)
             for snapshot in payload.get("snapshots", [])
             if isinstance(snapshot, dict)
         ]
@@ -455,6 +538,12 @@ def _operation_from_payload(
             snapshots=snapshots,
             status=str(payload.get("status", "") or "prepared"),  # type: ignore[arg-type]
             approval_id=str(payload.get("approval_id", "") or "") or None,
+            bound_eval_id=str(payload.get("bound_eval_id", "") or ""),
+            workspace_lock=dict(payload.get("workspace_lock") or {}),
+            workspace_lock_details=dict(payload.get("workspace_lock_details") or {}),
+            pre_checkpoint_id=str(payload.get("pre_checkpoint_id", "") or ""),
+            post_checkpoint_id=str(payload.get("post_checkpoint_id", "") or ""),
+            rollback_checkpoint_id=str(payload.get("rollback_checkpoint_id", "") or ""),
             created_at=float(payload.get("created_at") or time.time()),
             updated_at=float(payload.get("updated_at") or time.time()),
             error=str(payload.get("error", "") or ""),
@@ -484,6 +573,198 @@ def _restore_snapshots(snapshots: list[FileSnapshot]) -> None:
                 target.unlink()
         except Exception:
             continue
+
+
+def _snapshot_matches_current(snapshot: FileSnapshot) -> bool:
+    target = Path(snapshot.path)
+    if not snapshot.existed_before:
+        return not target.exists()
+    if not target.exists():
+        return False
+    current = target.read_text(encoding="utf-8", errors="replace")
+    return _sha256(current) == snapshot.before_sha256
+
+
+def _snapshot_matches_after(snapshot: FileSnapshot) -> bool:
+    target = Path(snapshot.path)
+    if not target.exists():
+        return False
+    current = target.read_text(encoding="utf-8", errors="replace")
+    return _sha256(current) == snapshot.after_sha256
+
+
+def _workspace_lock_for_snapshots(snapshots: list[FileSnapshot]) -> dict[str, str]:
+    return {
+        snapshot.path: snapshot.before_sha256
+        for snapshot in snapshots
+        if snapshot.existed_before
+    }
+
+
+def _workspace_lock_details_for_snapshots(
+    snapshots: list[FileSnapshot],
+) -> dict[str, Any]:
+    return {
+        snapshot.path: {
+            "existed_before": snapshot.existed_before,
+            "before_sha256": snapshot.before_sha256,
+            "before_size": snapshot.before_size,
+            "before_mtime_ns": snapshot.before_mtime_ns,
+            "parent_exists": Path(snapshot.path).parent.exists(),
+        }
+        for snapshot in snapshots
+    }
+
+
+def _workspace_lock_error(operation: PatchOperation) -> str:
+    for snapshot in operation.snapshots:
+        if not snapshot.existed_before:
+            if Path(snapshot.path).exists():
+                return f"workspace dirty lock failed: new file already exists: {snapshot.path}"
+            continue
+        if not _snapshot_matches_current(snapshot):
+            return f"workspace dirty lock failed: file changed before apply: {snapshot.path}"
+        target = Path(snapshot.path)
+        if snapshot.before_size and _file_size(target) != snapshot.before_size:
+            return f"workspace dirty lock failed: file size changed before apply: {snapshot.path}"
+    return ""
+
+
+def _rollback_lock_error(operation: PatchOperation) -> str:
+    for snapshot in operation.snapshots:
+        if not snapshot.existed_before and not Path(snapshot.path).exists():
+            continue
+        if not _snapshot_matches_after(snapshot):
+            return f"workspace dirty lock failed: file changed after apply: {snapshot.path}"
+    return ""
+
+
+def _bind_eval_after_apply(
+    operation: PatchOperation,
+    *,
+    actor: dict[str, str],
+):
+    if operation.bound_eval_id:
+        try:
+            from .engineering_eval import get_engineering_eval
+
+            return get_engineering_eval(operation.bound_eval_id)
+        except Exception:
+            return None
+    try:
+        from .engineering_eval import create_engineering_eval, suggest_test_commands
+
+        files = [snapshot.path for snapshot in operation.snapshots]
+        eval_run = create_engineering_eval(
+            actor=actor,
+            task=operation.reason or operation.action or "patch apply validation",
+            files=files,
+            tests=suggest_test_commands(files=files, task=operation.reason),
+            rollback_operation_id=operation.operation_id,
+            patch_operation_id=operation.operation_id,
+        )
+        operation.bound_eval_id = eval_run.eval_id
+        operation.updated_at = time.time()
+        _save_operations()
+        return eval_run
+    except Exception:
+        return None
+
+
+def _snapshot_from_payload(payload: dict[str, Any]) -> FileSnapshot:
+    before = str(payload.get("before_content", "") or "")
+    after = str(payload.get("after_content", "") or "")
+    return FileSnapshot(
+        path=str(payload.get("path", "") or ""),
+        existed_before=bool(payload.get("existed_before")),
+        before_content=before,
+        after_content=after,
+        diff=str(payload.get("diff", "") or ""),
+        replacements=int(payload.get("replacements", 0) or 0),
+        before_sha256=str(payload.get("before_sha256", "") or "") or _sha256(before),
+        after_sha256=str(payload.get("after_sha256", "") or "") or _sha256(after),
+        before_size=int(payload.get("before_size", 0) or 0),
+        after_size=int(payload.get("after_size", 0) or 0),
+        before_mtime_ns=int(payload.get("before_mtime_ns", 0) or 0),
+        after_mtime_ns=int(payload.get("after_mtime_ns", 0) or 0),
+    )
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except Exception:
+        return 0
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime_ns)
+    except Exception:
+        return 0
+
+
+def _prepared_operation_conflict(
+    changes: list[FileChange],
+    *,
+    ignore_operation_id: str = "",
+) -> str:
+    _ensure_loaded()
+    paths = {str(Path(change.path)) for change in changes if change.path}
+    if not paths:
+        return ""
+    for operation in _OPERATIONS.values():
+        if operation.operation_id == ignore_operation_id:
+            continue
+        if operation.status != "prepared":
+            continue
+        other_paths = {snapshot.path for snapshot in operation.snapshots}
+        overlap = sorted(paths & other_paths)
+        if overlap:
+            return (
+                "workspace dirty lock failed: another prepared patch operation "
+                f"touches {overlap[0]} (operation_id={operation.operation_id})"
+            )
+    return ""
+
+
+def _write_checkpoint(operation: PatchOperation, *, phase: str) -> str:
+    checkpoint_id = f"{operation.operation_id}_{phase}_{uuid.uuid4().hex[:8]}"
+    write_json(
+        state_path("patch_checkpoints", f"{checkpoint_id}.json"),
+        {
+            "checkpoint_id": checkpoint_id,
+            "operation_id": operation.operation_id,
+            "phase": phase,
+            "created_at": time.time(),
+            "status": operation.status,
+            "action": operation.action,
+            "reason": operation.reason,
+            "approval_id": operation.approval_id,
+            "workspace_lock_details": operation.workspace_lock_details,
+            "files": [
+                {
+                    "path": snapshot.path,
+                    "existed_before": snapshot.existed_before,
+                    "before_sha256": snapshot.before_sha256,
+                    "after_sha256": snapshot.after_sha256,
+                    "before_size": snapshot.before_size,
+                    "after_size": snapshot.after_size,
+                    "before_mtime_ns": snapshot.before_mtime_ns,
+                    "after_mtime_ns": snapshot.after_mtime_ns,
+                    "diff": snapshot.diff,
+                    "before_content": snapshot.before_content,
+                    "after_content": snapshot.after_content,
+                }
+                for snapshot in operation.snapshots
+            ],
+        },
+    )
+    return checkpoint_id
 
 
 def _compact_text(value: str, *, max_chars: int) -> str:

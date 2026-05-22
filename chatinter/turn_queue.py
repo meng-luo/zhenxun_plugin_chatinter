@@ -54,6 +54,7 @@ class QueuedMessage:
     dedupe_key: str = ""
     created_at: float = field(default_factory=time.monotonic)
     pending_human_update: bool = False
+    reply_to_message_id: str = ""
 
 
 @dataclass
@@ -92,9 +93,9 @@ class QueuedTurn:
 @dataclass
 class _ConversationState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    current: QueuedTurn | None = None
+    current_by_user: dict[str, QueuedTurn] = field(default_factory=dict)
     pending: deque[QueuedTurn] = field(default_factory=deque)
-    flush_task: asyncio.Task | None = None
+    flush_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     worker_task: asyncio.Task | None = None
     active_turn: QueuedTurn | None = None
     active_updates: list[str] = field(default_factory=list)
@@ -171,12 +172,14 @@ class TurnQueue:
                 state.active_turn is not None
                 and state.active_turn.user_id == item.user_id
                 and item.source == "message"
+                and _is_followup_for_active_turn(state.active_turn, item)
             ):
                 self._record_active_update_locked(state, item)
             self._add_to_current_or_queue_locked(state, item)
             self._schedule_flush_locked(
                 state,
                 item.conversation_key,
+                item.user_id,
                 processor,
                 delay=_collect_delay(item),
             )
@@ -212,11 +215,13 @@ class TurnQueue:
             # treated as live human updates instead of starting another LLM turn.
             self._record_active_update_locked(state, item)
             return True
-        if state.current is not None and _can_merge(state.current, item):
-            state.current.messages.append(item)
+        current = state.current_by_user.get(item.user_id)
+        if current is not None and _can_merge(current, item):
+            current.messages.append(item)
             self._schedule_flush_locked(
                 state,
                 item.conversation_key,
+                item.user_id,
                 processor,
                 delay=_collect_delay(item),
             )
@@ -229,13 +234,13 @@ class TurnQueue:
         state: _ConversationState,
         item: QueuedMessage,
     ) -> None:
-        current = state.current
+        current = state.current_by_user.get(item.user_id)
         if current is not None and _can_merge(current, item):
             current.messages.append(item)
             return
         if current is not None:
             self._enqueue_turn_locked(state, current)
-        state.current = QueuedTurn(
+        state.current_by_user[item.user_id] = QueuedTurn(
             conversation_key=item.conversation_key,
             user_id=item.user_id,
             group_id=item.group_id,
@@ -259,19 +264,22 @@ class TurnQueue:
         self,
         state: _ConversationState,
         conversation_key: str,
+        user_id: str,
         processor: TurnProcessor,
         *,
         delay: float,
     ) -> None:
-        if state.flush_task is not None and not state.flush_task.done():
-            state.flush_task.cancel()
-        state.flush_task = asyncio.create_task(
-            self._flush_later(conversation_key, processor, delay=delay)
+        previous_task = state.flush_tasks.get(user_id)
+        if previous_task is not None and not previous_task.done():
+            previous_task.cancel()
+        state.flush_tasks[user_id] = asyncio.create_task(
+            self._flush_later(conversation_key, user_id, processor, delay=delay)
         )
 
     async def _flush_later(
         self,
         conversation_key: str,
+        user_id: str,
         processor: TurnProcessor,
         *,
         delay: float,
@@ -282,16 +290,19 @@ class TurnQueue:
             if state is None:
                 return
             async with state.lock:
-                self._flush_current_locked(state)
+                self._flush_current_locked(state, user_id)
+                task = state.flush_tasks.get(user_id)
+                if task is asyncio.current_task():
+                    state.flush_tasks.pop(user_id, None)
                 self._ensure_worker_locked(state, conversation_key, processor)
         except asyncio.CancelledError:
             return
 
-    def _flush_current_locked(self, state: _ConversationState) -> None:
-        if state.current is None:
+    def _flush_current_locked(self, state: _ConversationState, user_id: str) -> None:
+        current = state.current_by_user.pop(user_id, None)
+        if current is None:
             return
-        self._enqueue_turn_locked(state, state.current)
-        state.current = None
+        self._enqueue_turn_locked(state, current)
 
     def _enqueue_turn_locked(
         self,
@@ -355,9 +366,13 @@ class TurnQueue:
                     state.active_updates.extend(turn.pending_human_updates)
                 else:
                     turn = None
-                    if state.current is not None:
+                    if state.current_by_user:
                         idle_started = time.monotonic()
                     elif time.monotonic() - idle_started >= _IDLE_WORKER_EXIT_SECONDS:
+                        for task in state.flush_tasks.values():
+                            if not task.done():
+                                task.cancel()
+                        state.flush_tasks.clear()
                         state.worker_task = None
                         if self._states.get(conversation_key) is state:
                             self._states.pop(conversation_key, None)
@@ -487,6 +502,7 @@ def _build_queued_message(
             if must_keep_override is not None
             else priority >= 1
         ),
+        reply_to_message_id=_reply_message_id(event),
     )
 
 
@@ -515,7 +531,7 @@ def _has_dedupe_locked(state: _ConversationState, dedupe_key: str) -> bool:
         dedupe_key,
     ):
         return True
-    if state.current is not None and _turn_has_dedupe(state.current, dedupe_key):
+    if any(_turn_has_dedupe(turn, dedupe_key) for turn in state.current_by_user.values()):
         return True
     return any(_turn_has_dedupe(turn, dedupe_key) for turn in state.pending)
 
@@ -556,6 +572,38 @@ def _is_reply_to_bot(bot: Bot, event: Event) -> bool:
         sender_id = getattr(sender, "user_id", None)
     return bool(
         sender_id is not None and str(sender_id) == str(getattr(bot, "self_id", ""))
+    )
+
+
+def _reply_message_id(event: Event) -> str:
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return ""
+    if isinstance(reply, dict):
+        return normalize_message_text(
+            str(reply.get("message_id") or reply.get("id") or "")
+        )
+    return normalize_message_text(
+        str(getattr(reply, "message_id", "") or getattr(reply, "id", "") or "")
+    )
+
+
+def _is_followup_for_active_turn(
+    active_turn: QueuedTurn,
+    item: QueuedMessage,
+) -> bool:
+    if item.reply_to_message_id:
+        return any(
+            item.reply_to_message_id == message.message_id
+            for message in active_turn.messages
+            if message.message_id
+        )
+    if item.must_keep:
+        return True
+    if not active_turn.messages:
+        return False
+    return time.monotonic() - active_turn.messages[-1].created_at <= (
+        COLLECT_WINDOW_SECONDS * 2
     )
 
 

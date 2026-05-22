@@ -12,6 +12,7 @@ import re
 
 from zhenxun.utils.pydantic_compat import model_dump
 
+from .capability_card import build_capability_card
 from .command_schema import build_command_schemas
 from .models.pydantic_models import (
     CapabilityGraphSnapshot,
@@ -21,7 +22,6 @@ from .models.pydantic_models import (
     PluginCommandSchema,
     PluginReference,
 )
-from .plugin_adapters import command_family_from_adapter
 from .route_text import normalize_message_text
 
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]{1,6}", re.IGNORECASE)
@@ -34,9 +34,6 @@ def _append_unique(target: list[str], value: object) -> None:
 
 
 def _command_family(schema: PluginCommandSchema, *, plugin_module: str) -> str:
-    adapter_family = command_family_from_adapter(schema, plugin_module=plugin_module)
-    if adapter_family:
-        return adapter_family
     module = normalize_message_text(plugin_module).casefold()
     if schema.command_role in {"catalog", "helper", "usage"}:
         return schema.command_role
@@ -64,7 +61,7 @@ def _infer_task_verbs(
         "生成": ("生成", "制作", "做", "来", "发送", "随机"),
         "添加": ("添加", "新增", "创建", "设置", "绑定"),
         "删除": ("删除", "移除", "取消", "关闭", "退回", "解绑"),
-        "翻译": ("翻译", "语种"),
+        "翻译": ("翻译", "语种", "缩写", "简称", "黑话", "解释", "展开"),
         "播放": ("播放", "点播", "音乐", "歌曲", "点歌", "搜歌"),
         "统计": ("统计", "排行", "词云", "报告"),
         "帮助": ("用法", "教程", "帮助", "说明", "参数", "示例"),
@@ -123,6 +120,9 @@ def _capability_text(
         schema.description or reference.does,
         "动作:" + "/".join(task_verbs) if task_verbs else "",
         "输入:" + "/".join(input_requirements) if input_requirements else "",
+        "来源:" + schema.source if schema.source else "",
+        "角色:" + schema.command_role if schema.command_role else "",
+        "负载:" + schema.payload_policy if schema.payload_policy else "",
     ]
     return normalize_message_text("；".join(part for part in parts if part))
 
@@ -141,6 +141,19 @@ def _schema_signature(
         "schema": model_dump(schema),
     }
     return sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _schema_meta(schema: PluginCommandSchema) -> dict[str, object]:
+    requires = schema.requires or {}
+    text_slots = [slot for slot in schema.slots if slot.type == "text"]
+    image_slots = [slot for slot in schema.slots if slot.type == "image"]
+    return {
+        "text_min": sum(1 for slot in text_slots if slot.required),
+        "text_max": len(text_slots) if text_slots else (1 if requires.get("text") else 0),
+        "image_min": 1 if requires.get("image") else 0,
+        "image_max": len(image_slots) if image_slots else (1 if requires.get("image") else 0),
+        "target_accepts_at": bool(requires.get("at") or schema.allow_at),
+    }
 
 
 def _summarize_requirement(command: CommandCapability) -> dict[str, bool]:
@@ -189,6 +202,7 @@ def build_plugin_reference(plugin: PluginCapability) -> PluginReference:
     }
     for command in plugin.commands:
         _append_unique(commands, command.command)
+        _append_unique(examples, command.description)
         for alias in command.aliases:
             _append_unique(aliases, alias)
         for example in command.examples:
@@ -202,7 +216,12 @@ def build_plugin_reference(plugin: PluginCapability) -> PluginReference:
     if does == "暂无描述" and plugin.usage:
         does = normalize_message_text(plugin.usage)
 
-    command_schemas = build_command_schemas(plugin.module, plugin.commands)
+    command_schemas = build_command_schemas(
+        plugin.module,
+        plugin.commands,
+        usage=plugin.usage,
+        plugin_description=plugin.description,
+    )
     if command_schemas:
         requires = _summarize_schema_requires(command_schemas)
 
@@ -251,6 +270,7 @@ def build_command_tool_snapshots(
         reference = build_plugin_reference(plugin)
         plugin_usage = normalize_message_text(plugin.usage or "") or None
         for schema in reference.command_schemas:
+            family = _command_family(schema, plugin_module=reference.module)
             task_verbs = _infer_task_verbs(schema, reference)
             input_requirements = _input_requirements(schema)
             capability_text = _capability_text(
@@ -274,42 +294,67 @@ def build_command_tool_snapshots(
                 *schema.retrieval_phrases,
             ]:
                 _append_unique(phrases, value)
-            snapshots.append(
-                CommandToolSnapshot(
-                    command_id=schema.command_id,
-                    plugin_module=reference.module,
-                    plugin_name=reference.name,
-                    head=schema.head,
-                    aliases=list(schema.aliases),
-                    description=schema.description or reference.does,
+            snapshot = CommandToolSnapshot(
+                command_id=schema.command_id,
+                plugin_module=reference.module,
+                plugin_name=reference.name,
+                head=schema.head,
+                aliases=list(schema.aliases),
+                description=schema.description or reference.does,
+                usage=plugin_usage,
+                examples=list(reference.examples),
+                slots=list(schema.slots),
+                requires=dict(schema.requires or {}),
+                allow_at=schema.allow_at,
+                actor_scope=schema.actor_scope,
+                target_requirement=schema.target_requirement,
+                target_sources=list(schema.target_sources),
+                render=schema.render,
+                payload_policy=schema.payload_policy,
+                extra_text_policy=schema.extra_text_policy,
+                command_role=schema.command_role,
+                family=family,
+                retrieval_phrases=phrases,
+                capability_text=capability_text,
+                task_verbs=task_verbs,
+                input_requirements=input_requirements,
+                source=schema.source,
+                confidence=schema.confidence,
+                matcher_key=schema.matcher_key,
+                source_signature=_schema_signature(
+                    module=reference.module,
+                    name=reference.name,
                     usage=plugin_usage,
-                    examples=list(reference.examples),
-                    slots=list(schema.slots),
-                    requires=dict(schema.requires or {}),
-                    allow_at=schema.allow_at,
-                    actor_scope=schema.actor_scope,
-                    target_requirement=schema.target_requirement,
-                    target_sources=list(schema.target_sources),
-                    render=schema.render,
-                    payload_policy=schema.payload_policy,
-                    extra_text_policy=schema.extra_text_policy,
-                    command_role=schema.command_role,
-                    family=_command_family(schema, plugin_module=reference.module),
-                    retrieval_phrases=phrases,
-                    capability_text=capability_text,
-                    task_verbs=task_verbs,
-                    input_requirements=input_requirements,
-                    source=schema.source,
-                    confidence=schema.confidence,
-                    matcher_key=schema.matcher_key,
-                    source_signature=_schema_signature(
-                        module=reference.module,
-                        name=reference.name,
-                        usage=plugin_usage,
-                        schema=schema,
-                    ),
-                )
+                    schema=schema,
+                ),
+                meta=_schema_meta(schema),
             )
+            card = build_capability_card(
+                tool=snapshot,
+                family=family,
+                description=snapshot.description or capability_text,
+            )
+            snapshot = snapshot.model_copy(
+                update={
+                    "use_cases": list(card.use_cases),
+                    "anti_use_cases": list(card.anti_use_cases),
+                    "output_mode": card.output_mode,
+                    "side_effect": card.side_effect,
+                    "risk_level": card.risk_level,
+                    "risk": card.risk,
+                    "source_of_truth": card.source_of_truth,
+                    "requires_real_tool": card.requires_real_tool,
+                    "entity_scope": card.entity_scope,
+                    "reliability": card.reliability,
+                    "schema_quality": card.schema_quality,
+                    "soft_tool": card.soft_tool,
+                    "intent_types": list(card.intent_types),
+                    "requires_real_result": card.requires_real_result,
+                    "generative": card.generative,
+                    "execution_policy": card.execution_policy,
+                }
+            )
+            snapshots.append(snapshot)
             if max_items is not None and len(snapshots) >= max_items:
                 return snapshots
     return snapshots

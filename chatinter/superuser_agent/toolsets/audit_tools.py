@@ -40,8 +40,18 @@ class AuditLogQueryTool:
                         "type": ["boolean", "null"],
                         "description": "是否只查询当前私聊会话，默认 true。",
                     },
+                    "contains": {
+                        "type": ["string", "null"],
+                        "description": "可选全文过滤，例如 approval_id、operation_id、task_id。",
+                    },
                 },
-                "required": ["limit", "action", "event", "current_session_only"],
+                "required": [
+                    "limit",
+                    "action",
+                    "event",
+                    "current_session_only",
+                    "contains",
+                ],
                 "additionalProperties": False,
             },
         )
@@ -51,6 +61,7 @@ class AuditLogQueryTool:
         limit = _coerce_int(kwargs.get("limit"), default=50, lower=1, upper=200)
         action = str(kwargs.get("action", "") or "").strip()
         event = str(kwargs.get("event", "") or "").strip()
+        contains = str(kwargs.get("contains", "") or "").strip()
         current_session_only = kwargs.get("current_session_only")
         if current_session_only is None:
             current_session_only = True
@@ -60,6 +71,7 @@ class AuditLogQueryTool:
             session_key=actor["session_key"] if current_session_only else "",
             action=action,
             event=event,
+            contains=contains,
         )
         record_audit_event(
             event="audit_queried",
@@ -70,6 +82,7 @@ class AuditLogQueryTool:
                 "limit": limit,
                 "action": action,
                 "event": event,
+                "contains": contains,
                 "current_session_only": bool(current_session_only),
             },
             result={"count": len(entries)},

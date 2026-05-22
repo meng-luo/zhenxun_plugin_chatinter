@@ -11,6 +11,7 @@ from ..approval_store import (
     consume_pending_approval,
     list_pending_approvals,
     reject_pending_approval,
+    revoke_pending_approval,
 )
 from ..audit_log import record_audit_event
 from ..registry import register_superuser_tool
@@ -106,6 +107,54 @@ class RejectPendingActionTool:
         return tool_result(
             True,
             "approval_rejected",
+            approval=approval.to_public_payload(),
+            reason=reason,
+        )
+
+
+class RevokePendingApprovalTool:
+    name = "revoke_pending_approval"
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description="超级用户私聊专用：撤销一个待确认操作，使其不能再被确认执行。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "approval_id": {
+                        "type": "string",
+                        "description": "待撤销操作 ID。",
+                    },
+                    "reason": {
+                        "type": ["string", "null"],
+                        "description": "撤销原因，可为空。",
+                    },
+                },
+                "required": ["approval_id", "reason"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        actor = actor_from_context(context)
+        approval_id = str(kwargs.get("approval_id", "") or "").strip()
+        reason = str(kwargs.get("reason", "") or "")
+        approval = revoke_pending_approval(
+            approval_id=approval_id,
+            user_id=actor["user_id"],
+            session_key=actor["session_key"],
+            reason=reason,
+        )
+        if approval is None:
+            return tool_result(
+                False,
+                "approval_not_found_or_expired",
+                approval_id=approval_id,
+            )
+        return tool_result(
+            True,
+            "approval_revoked",
             approval=approval.to_public_payload(),
             reason=reason,
         )
@@ -300,6 +349,33 @@ async def execute_approved_action(
             actor=actor,
             task_id=str(approval.payload.get("task_id", "") or ""),
         )
+    if approval.action == "engineering_eval_plan":
+        from .engineering_eval_tools import _plan_payload
+        from ..engineering_eval import create_engineering_eval
+
+        eval_run = create_engineering_eval(
+            actor=actor,
+            **_plan_payload(approval.payload),
+        )
+        return tool_result(
+            True,
+            "engineering_eval_planned",
+            approval_id=approval.approval_id,
+            eval=eval_run.public_payload(),
+            suggested_tests=eval_run.suggested_tests,
+        )
+    if approval.action == "engineering_eval_run":
+        from .engineering_eval_tools import run_engineering_eval_step
+
+        return await run_engineering_eval_step(
+            actor=actor,
+            eval_id=str(approval.payload.get("eval_id", "") or ""),
+            step_index=approval.payload.get("step_index"),
+            command=str(approval.payload.get("command", "") or ""),
+            cwd=str(approval.payload.get("cwd", "") or "") or None,
+            timeout_seconds=approval.payload.get("timeout_seconds"),
+            approval_id=approval.approval_id,
+        )
     if approval.action == "uv_command":
         from .uv_tools import run_uv_command
 
@@ -415,11 +491,13 @@ def _coerce_int(value: Any, *, default: int, lower: int, upper: int) -> int:
 
 register_superuser_tool(ApprovePendingActionTool)
 register_superuser_tool(RejectPendingActionTool)
+register_superuser_tool(RevokePendingApprovalTool)
 register_superuser_tool(ListPendingApprovalsTool)
 
 __all__ = [
     "ApprovePendingActionTool",
     "ListPendingApprovalsTool",
     "RejectPendingActionTool",
+    "RevokePendingApprovalTool",
     "execute_approved_action",
 ]

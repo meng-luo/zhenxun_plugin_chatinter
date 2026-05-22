@@ -24,6 +24,7 @@ class PluginInfo(BaseModel):
         aliases: list[str] = Field(default_factory=list, description="命令别名")
         prefixes: list[str] = Field(default_factory=list, description="命令前缀")
         params: list[str] = Field(default_factory=list, description="参数提示")
+        description: str = Field(default="", description="命令描述")
         examples: list[str] = Field(default_factory=list, description="示例命令")
         text_min: int | None = Field(default=None, description="文本参数最小数量")
         text_max: int | None = Field(default=None, description="文本参数最大数量")
@@ -117,6 +118,7 @@ class CommandCapability(BaseModel):
     command: str = Field(description="命令主干")
     aliases: list[str] = Field(default_factory=list, description="命令别名")
     prefixes: list[str] = Field(default_factory=list, description="命令前缀")
+    description: str = Field(default="", description="命令描述")
     examples: list[str] = Field(default_factory=list, description="示例命令")
     requirement: CommandRequirement = Field(default_factory=CommandRequirement)
     allow_sticky_arg: bool = Field(default=False, description="是否允许粘连参数")
@@ -295,6 +297,99 @@ class CommandToolSnapshot(BaseModel):
         default_factory=list,
         description="输入需求摘要，如 文本/图片/回复/链接/@",
     )
+    use_cases: list[str] = Field(
+        default_factory=list,
+        description="适用场景摘要，由插件元数据/schema 自动生成",
+    )
+    anti_use_cases: list[str] = Field(
+        default_factory=list,
+        description="不适用场景摘要，用于降低闲聊误触发",
+    )
+    output_mode: Literal["text", "image", "file", "plugin_output", "action"] = Field(
+        default="plugin_output",
+        description="工具主要输出形态",
+    )
+    side_effect: Literal["none", "query", "send", "mutate"] = Field(
+        default="send",
+        description="工具副作用级别",
+    )
+    risk_level: Literal["low", "medium", "high"] = Field(
+        default="low",
+        description="能力风险级别",
+    )
+    risk: Literal["low", "medium", "high"] = Field(
+        default="low",
+        description="通用风险级别别名，供运行时策略统一读取",
+    )
+    source_of_truth: Literal[
+        "model_knowledge",
+        "plugin_runtime",
+        "bot_state",
+        "external_service",
+        "local_state",
+        "user_provided",
+        "unknown",
+    ] = Field(
+        default="plugin_runtime",
+        description="真实结果来源，用于判断能否由模型直接回答",
+    )
+    requires_real_tool: bool = Field(
+        default=True,
+        description="是否必须调用真实工具才能宣称完成",
+    )
+    entity_scope: Literal[
+        "none",
+        "self_bot",
+        "actor_user",
+        "target_user",
+        "group",
+        "global",
+        "external",
+    ] = Field(
+        default="global",
+        description="能力作用的实体范围",
+    )
+    reliability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="能力初始可靠性估计，历史反馈会继续修正",
+    )
+    schema_quality: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="schema 完整度估计，用于暴露和 obligation 决策",
+    )
+    soft_tool: bool = Field(
+        default=False,
+        description="低上下文软工具，只有明确请求时才应执行",
+    )
+    meta: dict[str, Any] = Field(
+        default_factory=dict,
+        description="????????????/??????",
+    )
+    intent_types: list[str] = Field(
+        default_factory=list,
+        description="通用能力类型，如 query/generate/media/status/random/help",
+    )
+    requires_real_result: bool = Field(
+        default=True,
+        description="是否需要真实插件执行结果，避免模型直接代答",
+    )
+    generative: bool = Field(
+        default=False,
+        description="是否属于生成/随机/媒体制作类能力",
+    )
+    execution_policy: Literal[
+        "normal",
+        "explicit_only",
+        "strong_intent",
+        "confirmation_required",
+    ] = Field(
+        default="normal",
+        description="运行时执行门槛，由能力属性自动推导",
+    )
     source: Literal["explicit", "matcher", "metadata", "fallback", "override"] = Field(
         default="fallback",
         description="schema 来源，用于候选诊断和路由加权",
@@ -321,6 +416,11 @@ class CommandCandidateFeatures(BaseModel):
     slot_score: float = Field(default=0.0, description="参数槽位命中分")
     context_score: float = Field(default=0.0, description="图片/@/回复上下文命中分")
     feedback_score: float = Field(default=0.0, description="执行反馈加权分")
+    schema_score: float = Field(default=0.0, description="schema 完整度加权分")
+    reliability_score: float = Field(default=0.0, description="历史成功可靠性分")
+    false_trigger_score: float = Field(default=0.0, description="历史误触发惩罚分")
+    param_failure_score: float = Field(default=0.0, description="历史参数失败惩罚分")
+    latency_score: float = Field(default=0.0, description="历史平均耗时调节分")
     negative_score: float = Field(default=0.0, description="冲突或不兼容惩罚分")
 
 
@@ -345,6 +445,18 @@ class CommandCandidateSnapshot(BaseModel):
     command_role: str = Field(default="execute", description="命令角色")
     source: str = Field(default="fallback", description="schema 来源")
     confidence: float = Field(default=0.5, description="schema 置信度")
+    intent_types: list[str] = Field(default_factory=list, description="通用能力类型")
+    requires_real_result: bool = Field(default=True, description="是否需要真实结果")
+    generative: bool = Field(default=False, description="是否为生成/随机类能力")
+    execution_policy: str = Field(default="normal", description="执行门槛策略")
+    source_of_truth: str = Field(default="plugin_runtime", description="真实结果来源")
+    requires_real_tool: bool = Field(default=True, description="是否必须真实工具")
+    output_mode: str = Field(default="plugin_output", description="主要输出形态")
+    entity_scope: str = Field(default="global", description="作用实体范围")
+    risk: str = Field(default="low", description="风险级别")
+    reliability: float = Field(default=0.5, description="能力可靠性估计")
+    schema_quality: float = Field(default=0.5, description="schema 完整度估计")
+    soft_tool: bool = Field(default=False, description="是否为低上下文软工具")
     features: CommandCandidateFeatures = Field(
         default_factory=CommandCandidateFeatures,
         description="候选可解释特征",

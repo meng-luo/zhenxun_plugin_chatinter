@@ -330,30 +330,6 @@ TEMPLATE_ROUTE_HINT_WORDS = (
     "[@",
 )
 
-MEME_TRIGGER_WORDS = (
-    "表情包",
-    "表情",
-    "梗图",
-    "meme",
-    "做一张",
-    "生成一张",
-    "来一张",
-    "来一个",
-    "再来一张",
-    "再来一个",
-    "制作一张",
-    "做个",
-    "做一个",
-    "做张",
-    "制作一个",
-    "来个",
-    "再来个",
-    "做图",
-    "生成图",
-    "制作",
-    "启动",
-)
-
 KNOWLEDGE_REFRESH_WORDS = (
     "表情",
     "梗图",
@@ -427,7 +403,6 @@ _ROUTE_INLINE_NOISE_WORDS = (
 
 _ROUTE_CONTEXT_HINT_WORDS = (
     ROUTE_ACTION_WORDS
-    + MEME_TRIGGER_WORDS
     + (
         "给",
         "对",
@@ -979,22 +954,7 @@ def has_chat_context_hint(text: str) -> bool:
     return contains_any(text, CHAT_CONTEXT_HINT_WORDS)
 
 
-def _is_meme_plugin(plugin: PluginInfo) -> bool:
-    module_l = plugin.module.lower()
-    name_l = plugin.name.lower()
-    if "meme" in module_l:
-        return True
-    if "表情" in name_l:
-        return True
-    command_text = " ".join(str(command).lower() for command in plugin.commands)
-    if "表情搜索" in command_text and "表情详情" in command_text:
-        return True
-    return False
-
-
 def _is_template_like_plugin(plugin: PluginInfo) -> bool:
-    if _is_meme_plugin(plugin):
-        return True
     command_text = " ".join(
         normalize_message_text(command) for command in plugin.commands
     )
@@ -1034,7 +994,6 @@ def has_template_route_context(
     has_template_hint = contains_any(normalized, TEMPLATE_ROUTE_HINT_WORDS)
     has_placeholder = "[image" in normalized or "[@" in normalized
     has_route_action = contains_any(normalized, ROUTE_ACTION_WORDS)
-    has_meme_trigger = contains_any(normalized, MEME_TRIGGER_WORDS)
     matched_template = False
     matched_non_template = False
 
@@ -1058,16 +1017,12 @@ def has_template_route_context(
                 else:
                     matched_non_template = True
 
-    if not (
-        has_template_hint or has_placeholder or has_meme_trigger or matched_template
-    ):
+    if not (has_template_hint or has_placeholder or matched_template):
         return False
-    if matched_non_template and not (
-        has_template_hint or has_placeholder or has_meme_trigger
-    ):
+    if matched_non_template and not (has_template_hint or has_placeholder):
         return False
 
-    if has_template_hint or has_placeholder or has_meme_trigger:
+    if has_template_hint or has_placeholder:
         return has_route_action or has_placeholder or matched_template
     return matched_template
 
@@ -1138,11 +1093,6 @@ def should_force_knowledge_refresh(
 
     plugin_count = len(knowledge_base.plugins)
     if plugin_count <= 2 and contains_any(normalized_message, KNOWLEDGE_REFRESH_WORDS):
-        return True
-
-    if contains_any(normalized_message, MEME_TRIGGER_WORDS) and not any(
-        _is_template_like_plugin(plugin) for plugin in knowledge_base.plugins
-    ):
         return True
 
     if plugin_count <= 8 and contains_any(normalized_message, STRONG_EXECUTE_WORDS):

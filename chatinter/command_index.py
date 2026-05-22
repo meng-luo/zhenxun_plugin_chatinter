@@ -11,7 +11,11 @@ from dataclasses import dataclass
 import re
 
 from .capability_graph import build_capability_graph_snapshot
-from .feedback import get_command_feedback_score
+from .feedback import (
+    get_command_feedback_profile,
+    get_command_success_examples,
+    get_contextual_command_feedback_profile,
+)
 from .models.pydantic_models import (
     CommandCandidateFeatures,
     CommandCandidateSnapshot,
@@ -37,6 +41,30 @@ _FAMILY_SOFT_CAP = 6
 _PLUGIN_SOFT_CAP = 8
 _EXACT_KEEP_LIMIT = 8
 _CJK_COMMAND_BOUNDARY_CHARS = frozenset(" ，,。.!！？?；;：:/|）)]】}《<>")
+_MEDIA_CONTEXT_TERMS = (
+    "表情",
+    "表情包",
+    "梗图",
+    "头像",
+    "图片",
+    "照片",
+    "这张图",
+    "这图",
+    "图",
+)
+_MEDIA_ACTION_TERMS = (
+    "做",
+    "制作",
+    "生成",
+    "整",
+    "弄",
+    "来",
+    "发",
+    "画",
+    "转",
+    "识别",
+    "搜",
+)
 
 
 @dataclass(frozen=True)
@@ -83,8 +111,14 @@ def _reason_feature_deltas(reason: str) -> dict[str, float]:
         return {"semantic_score": 1.0}
     if reason in {"image_signal", "image_policy", "at_signal", "reply_signal"}:
         return {"context_score": 1.0}
-    if reason == "feedback":
+    if reason in {"feedback", "success_example_history"}:
         return {"feedback_score": 1.0}
+    if reason == "schema_quality":
+        return {"schema_score": 1.0}
+    if reason == "reliable_history":
+        return {"reliability_score": 1.0}
+    if reason in {"false_trigger_history", "low_reliability_history"}:
+        return {"false_trigger_score": 1.0}
     if reason.endswith("_penalty") or "penalty" in reason:
         return {"negative_score": 1.0}
     return {}
@@ -95,6 +129,11 @@ def _build_candidate_features(
     score: float,
     reasons: tuple[str, ...],
     feedback_score: float = 0.0,
+    schema_score: float = 0.0,
+    reliability_score: float = 0.0,
+    false_trigger_score: float = 0.0,
+    param_failure_score: float = 0.0,
+    latency_score: float = 0.0,
 ) -> CommandCandidateFeatures:
     values = {
         "lexical_score": 0.0,
@@ -103,6 +142,11 @@ def _build_candidate_features(
         "slot_score": 0.0,
         "context_score": 0.0,
         "feedback_score": float(feedback_score),
+        "schema_score": float(schema_score),
+        "reliability_score": float(reliability_score),
+        "false_trigger_score": float(false_trigger_score),
+        "param_failure_score": float(param_failure_score),
+        "latency_score": float(latency_score),
         "negative_score": 0.0,
     }
     for reason in reasons:
@@ -161,10 +205,81 @@ def _tool_text(tool: CommandToolSnapshot, schema: PluginCommandSchema) -> str:
                 tool.capability_text,
                 " ".join(tool.task_verbs),
                 " ".join(tool.input_requirements),
+                " ".join(getattr(tool, "use_cases", []) or []),
+                " ".join(getattr(tool, "anti_use_cases", []) or []),
+                " ".join(getattr(tool, "intent_types", []) or []),
+                getattr(tool, "output_mode", ""),
+                getattr(tool, "side_effect", ""),
+                getattr(tool, "risk_level", ""),
+                getattr(tool, "risk", ""),
+                getattr(tool, "source_of_truth", ""),
+                "requires_real_tool"
+                if bool(getattr(tool, "requires_real_tool", False))
+                else "",
+                getattr(tool, "entity_scope", ""),
+                "soft_tool" if bool(getattr(tool, "soft_tool", False)) else "",
+                f"reliability {float(getattr(tool, 'reliability', 0.0) or 0.0):.2f}",
+                f"schema_quality {float(getattr(tool, 'schema_quality', 0.0) or 0.0):.2f}",
+                getattr(tool, "execution_policy", ""),
                 " ".join(tool.retrieval_phrases),
             ]
         )
     )
+
+
+def _schema_quality_score(
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+) -> float:
+    score = 0.0
+    if normalize_message_text(schema.command_id):
+        score += 0.5
+    if normalize_message_text(schema.head):
+        score += 0.75
+    if normalize_message_text(schema.description or tool.description):
+        score += 0.7
+    if normalize_message_text(schema.render or tool.render):
+        score += 0.8
+    if schema.aliases or tool.aliases:
+        score += 0.35
+    if schema.retrieval_phrases or tool.retrieval_phrases:
+        score += 0.45
+    if getattr(tool, "capability_text", ""):
+        score += 0.45
+    if getattr(tool, "use_cases", None):
+        score += 0.35
+    if getattr(tool, "anti_use_cases", None):
+        score += 0.25
+
+    slots = list(schema.slots or [])
+    if slots:
+        described = sum(
+            1
+            for slot in slots
+            if normalize_message_text(slot.description) or slot.aliases
+        )
+        score += 0.45 + min(described / max(len(slots), 1), 1.0) * 0.75
+        required_count = sum(1 for slot in slots if slot.required)
+        if required_count and "{" in str(schema.render or ""):
+            score += 0.35
+
+    requires = schema.requires or {}
+    if any(bool(requires.get(key)) for key in ("text", "image", "reply", "at")):
+        score += 0.35
+    if schema.payload_policy not in {"", "none"}:
+        score += 0.35
+    if schema.target_requirement != "none" or schema.target_sources:
+        score += 0.35
+    if schema.source in {"explicit", "override"}:
+        score += 1.0
+    elif schema.source == "metadata":
+        score += 0.7
+    elif schema.source == "matcher":
+        score += 0.35
+    elif schema.source == "fallback":
+        score -= 0.35
+    score += max(0.0, min(float(schema.confidence or 0.0), 1.0)) * 1.2
+    return max(0.0, min(score, 7.5))
 
 
 def _query_variants(query: str) -> tuple[str, str]:
@@ -222,6 +337,119 @@ def _is_embedded_short_cjk_match(text: str, phrase: str) -> bool:
     return not _has_cjk_command_boundary(normalized_text, normalized_phrase)
 
 
+def _has_media_template_context(
+    text: str,
+    *,
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+) -> bool:
+    """Whether a short CJK head is likely a media/template action, not noise."""
+
+    lowered = normalize_message_text(text).casefold()
+    if not lowered:
+        return False
+    output_mode = normalize_message_text(str(getattr(tool, "output_mode", "") or ""))
+    intent_types = {
+        normalize_message_text(str(intent or "")).lower()
+        for intent in list(getattr(tool, "intent_types", []) or [])
+        if normalize_message_text(str(intent or ""))
+    }
+    role = normalize_message_text(str(schema.command_role or ""))
+    payload_policy = normalize_message_text(str(schema.payload_policy or ""))
+    media_capability = (
+        role == "template"
+        or payload_policy in {"image_only", "text_or_image"}
+        or output_mode == "image"
+        or bool(intent_types & {"media", "generate", "transform"})
+        or bool(getattr(tool, "generative", False))
+    )
+    if not media_capability:
+        return False
+    return any(term in lowered for term in _MEDIA_CONTEXT_TERMS) and any(
+        term in lowered for term in _MEDIA_ACTION_TERMS
+    )
+
+
+def _direct_retrieval_phrase_score(
+    *,
+    normalized: str,
+    schema: PluginCommandSchema,
+) -> tuple[float, tuple[str, ...]]:
+    """Score explicit schema phrases that token overlap often misses in CJK."""
+
+    lowered = normalize_message_text(normalized).casefold()
+    if not lowered:
+        return 0.0, ()
+    score = 0.0
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for raw_phrase in [
+        *list(schema.retrieval_phrases or []),
+        schema.description,
+    ]:
+        phrase = normalize_message_text(str(raw_phrase or "")).casefold()
+        if not phrase or phrase in seen:
+            continue
+        seen.add(phrase)
+        if len(phrase) < 2:
+            continue
+        if phrase not in lowered:
+            continue
+        score += min(72.0 + len(phrase) * 8.0, 160.0)
+        reasons.append("direct_retrieval_phrase")
+    return score, tuple(dict.fromkeys(reasons))
+
+
+def _success_example_score(*, normalized: str, command_id: str) -> float:
+    """Boost commands that previously succeeded for similar user messages.
+
+    This is generic feedback learning: examples are produced by real executions
+    as message -> command_id -> slots -> rendered_command and are never tied to
+    plugin names.
+    """
+
+    query = normalize_message_text(normalized)
+    if not query:
+        return 0.0
+    query_tokens = _tokens(query)
+    if not query_tokens:
+        return 0.0
+
+    best = 0.0
+    for example in get_command_success_examples(command_id=command_id, limit=8):
+        if not isinstance(example, dict):
+            continue
+        example_text = normalize_message_text(str(example.get("message", "") or ""))
+        rendered = normalize_message_text(
+            str(example.get("rendered_command", "") or "")
+        )
+        slots = example.get("slots") or {}
+        slot_text = ""
+        if isinstance(slots, dict):
+            slot_text = normalize_message_text(
+                " ".join(str(value or "") for value in slots.values())
+            )
+        search_text = normalize_message_text(
+            " ".join(part for part in (example_text, rendered, slot_text) if part)
+        )
+        if not search_text:
+            continue
+        if query == example_text:
+            best = max(best, 42.0)
+            continue
+        tokens = _tokens(search_text)
+        if not tokens:
+            continue
+        overlap = len(query_tokens & tokens)
+        if overlap < 2:
+            continue
+        jaccard = overlap / max(len(query_tokens | tokens), 1)
+        containment = overlap / max(min(len(query_tokens), len(tokens)), 1)
+        if jaccard >= 0.28 or containment >= 0.55:
+            best = max(best, min(12.0 + overlap * 6.0 + containment * 18.0, 42.0))
+    return best
+
+
 def _base_score_tool(
     tool: CommandToolSnapshot,
     schema: PluginCommandSchema,
@@ -264,6 +492,14 @@ def _base_score_tool(
     if head and head in lowered and not _is_embedded_short_cjk_match(lowered, head):
         score += 120.0 + min(len(head), 8)
         reasons.append("head")
+    elif (
+        head
+        and len(head) <= 2
+        and head in lowered
+        and _has_media_template_context(lowered, tool=tool, schema=schema)
+    ):
+        score += 96.0 + min(len(head), 4) * 8.0
+        reasons.append("short_media_template_head")
     for alias in aliases:
         if alias and lowered.startswith(alias):
             score += 240.0
@@ -275,6 +511,14 @@ def _base_score_tool(
         ):
             score += 150.0 + min(len(alias), 12)
             reasons.append("alias")
+
+    phrase_score, phrase_reasons = _direct_retrieval_phrase_score(
+        normalized=normalized,
+        schema=schema,
+    )
+    if phrase_score:
+        score += phrase_score
+        reasons.extend(phrase_reasons)
 
     phrase_text = _tool_text(tool, schema)
     overlap = len(_tokens(normalized) & _tokens(phrase_text))
@@ -322,20 +566,94 @@ def _base_score_tool(
     if role == "random" and "随机" in lowered:
         score += 100.0
         reasons.append("random")
-    feedback_score = get_command_feedback_score(
+
+    success_example_score = _success_example_score(
+        normalized=normalized,
+        command_id=schema.command_id,
+    )
+    if success_example_score:
+        score += success_example_score
+        reasons.append("success_example_history")
+
+    evidence_score = score
+    if evidence_score <= 0 and not exact_protected:
+        return 0.0, ("fallback",), False, _empty_features()
+
+    schema_quality = _schema_quality_score(tool, schema)
+    schema_score = schema_quality * 3.0
+    if schema_score:
+        score += schema_score
+        reasons.append("schema_quality")
+
+    feedback_profile = get_command_feedback_profile(
         command_id=schema.command_id,
         session_id=session_id,
         plugin_module=plugin_module,
     )
+    context_profile = get_contextual_command_feedback_profile(
+        message_text=normalized,
+        command_id=schema.command_id,
+    )
+    feedback_score = feedback_profile.feedback_score
+    if success_example_score:
+        feedback_score += success_example_score
     if feedback_score:
         score += feedback_score
         reasons.append("feedback")
+    reliability_score = (
+        feedback_profile.reliability_score
+        + context_profile.reliability_score * 0.7
+    )
+    false_trigger_score = (
+        feedback_profile.false_trigger_score
+        + context_profile.false_trigger_score * 0.9
+    )
+    param_failure_score = (
+        feedback_profile.param_failure_score
+        + context_profile.param_failure_score * 0.8
+    )
+    latency_score = feedback_profile.latency_score
+    if reliability_score:
+        score += reliability_score
+        if feedback_profile.high_reliability or context_profile.high_reliability:
+            reasons.append("reliable_history")
+    if false_trigger_score:
+        score += false_trigger_score
+        reasons.append(
+            "context_false_trigger_history"
+            if context_profile.false_trigger_score
+            else "false_trigger_history"
+        )
+    if param_failure_score:
+        score += param_failure_score
+        reasons.append(
+            "context_param_failure_history"
+            if context_profile.param_failure_score
+            else "param_failure_history"
+        )
+    if latency_score:
+        score += latency_score
+        reasons.append("latency_history")
+    if (
+        feedback_profile.low_reliability or context_profile.low_reliability
+    ) and not exact_protected:
+        score = max(score - 24.0, 0.0)
+        reasons.append("low_reliability_history")
+
+    if bool(getattr(tool, "soft_tool", False)) and not exact_protected:
+        score = max(score - 28.0, 1.0)
+        reasons.append("soft_tool_penalty")
 
     deduped_reasons = tuple(dict.fromkeys(reasons)) or ("fallback",)
     features = _build_candidate_features(
         score=score,
         reasons=deduped_reasons,
         feedback_score=feedback_score,
+        schema_score=schema_score,
+        reliability_score=reliability_score,
+        false_trigger_score=false_trigger_score,
+        param_failure_score=param_failure_score,
+        latency_score=latency_score,
     )
     return score, deduped_reasons, exact_protected, features
 
@@ -360,6 +678,28 @@ def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema
         confidence=tool.confidence,
         matcher_key=tool.matcher_key,
         retrieval_phrases=tool.retrieval_phrases,
+    )
+
+
+def _unscored_features(
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+    *,
+    session_id: str | None,
+) -> CommandCandidateFeatures:
+    schema_score = _schema_quality_score(tool, schema) * 3.0
+    feedback_profile = get_command_feedback_profile(
+        command_id=schema.command_id,
+        session_id=session_id,
+        plugin_module=tool.plugin_module,
+    )
+    return CommandCandidateFeatures(
+        schema_score=schema_score,
+        feedback_score=feedback_profile.feedback_score,
+        reliability_score=feedback_profile.reliability_score,
+        false_trigger_score=feedback_profile.false_trigger_score,
+        param_failure_score=feedback_profile.param_failure_score,
+        latency_score=feedback_profile.latency_score,
     )
 
 
@@ -448,6 +788,26 @@ def _merge_ranked_candidates(
                 current_features.feedback_score,
                 candidate.features.feedback_score,
             ),
+            schema_score=max(
+                current_features.schema_score,
+                candidate.features.schema_score,
+            ),
+            reliability_score=max(
+                current_features.reliability_score,
+                candidate.features.reliability_score,
+            ),
+            false_trigger_score=min(
+                current_features.false_trigger_score,
+                candidate.features.false_trigger_score,
+            ),
+            param_failure_score=min(
+                current_features.param_failure_score,
+                candidate.features.param_failure_score,
+            ),
+            latency_score=_merge_latency_feature(
+                current_features.latency_score,
+                candidate.features.latency_score,
+            ),
             negative_score=min(
                 current_features.negative_score,
                 candidate.features.negative_score,
@@ -483,6 +843,14 @@ def _merge_ranked_candidates(
         reverse=True,
     )
     return merged
+
+
+def _merge_latency_feature(current: float, incoming: float) -> float:
+    if incoming < 0:
+        return min(current, incoming)
+    if current < 0:
+        return current
+    return max(current, incoming)
 
 
 def _diversify_candidates(
@@ -581,14 +949,19 @@ def build_command_candidates(
                 break
             if tool.command_id in seen_ids:
                 continue
+            schema = _schema_from_tool_snapshot(tool)
             selected.append(
                 _ScoredCandidate(
                     tool=tool,
-                    schema=_schema_from_tool_snapshot(tool),
+                    schema=schema,
                     score=0.0,
                     reasons=("full_exposure",),
                     exact_protected=False,
-                    features=_empty_features(),
+                    features=_unscored_features(
+                        tool,
+                        schema,
+                        session_id=session_id,
+                    ),
                 )
             )
             seen_ids.add(tool.command_id)
@@ -696,6 +1069,11 @@ def dump_candidate_for_prompt(
             "slot": round(features.slot_score, 2),
             "context": round(features.context_score, 2),
             "feedback": round(features.feedback_score, 2),
+            "schema": round(features.schema_score, 2),
+            "reliability": round(features.reliability_score, 2),
+            "false_trigger": round(features.false_trigger_score, 2),
+            "param_failure": round(features.param_failure_score, 2),
+            "latency": round(features.latency_score, 2),
             "negative": round(features.negative_score, 2),
         }.items()
         if value
@@ -732,6 +1110,38 @@ def build_candidate_snapshots(
                 command_role=schema.command_role,
                 source=schema.source,
                 confidence=schema.confidence,
+                intent_types=list(getattr(candidate.tool, "intent_types", []) or []),
+                requires_real_result=bool(
+                    getattr(candidate.tool, "requires_real_result", True)
+                ),
+                generative=bool(getattr(candidate.tool, "generative", False)),
+                execution_policy=str(
+                    getattr(candidate.tool, "execution_policy", "normal") or "normal"
+                ),
+                source_of_truth=str(
+                    getattr(candidate.tool, "source_of_truth", "plugin_runtime")
+                    or "plugin_runtime"
+                ),
+                requires_real_tool=bool(
+                    getattr(candidate.tool, "requires_real_tool", True)
+                ),
+                output_mode=str(
+                    getattr(candidate.tool, "output_mode", "plugin_output")
+                    or "plugin_output"
+                ),
+                entity_scope=str(
+                    getattr(candidate.tool, "entity_scope", "global") or "global"
+                ),
+                risk=str(
+                    getattr(candidate.tool, "risk", "")
+                    or getattr(candidate.tool, "risk_level", "low")
+                    or "low"
+                ),
+                reliability=float(getattr(candidate.tool, "reliability", 0.5) or 0.5),
+                schema_quality=float(
+                    getattr(candidate.tool, "schema_quality", 0.5) or 0.5
+                ),
+                soft_tool=bool(getattr(candidate.tool, "soft_tool", False)),
                 features=candidate.features or _empty_features(),
             )
         )

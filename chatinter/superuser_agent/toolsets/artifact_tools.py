@@ -68,6 +68,52 @@ class ArtifactReadTool:
         )
 
 
+class ArtifactListTool:
+    name = "artifact_list"
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "超级用户私聊专用：列出 ArtifactStore 最近保存的长日志、diff、"
+                "后台任务输出和工具结果引用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": ["integer", "null"],
+                        "description": "最多返回数量，默认 20，最大 100。",
+                    },
+                    "artifact_type": {
+                        "type": ["string", "null"],
+                        "description": "可选类型过滤，例如 log/plugin_output/text/image/file。",
+                    },
+                    "source_contains": {
+                        "type": ["string", "null"],
+                        "description": "可选 source 关键词过滤，例如 background_task 或 patch。",
+                    },
+                },
+                "required": ["limit", "artifact_type", "source_contains"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        actor_from_context(context)
+        refs = get_artifact_store().list_refs(
+            limit=_coerce_limit(kwargs.get("limit")),
+            artifact_type=str(kwargs.get("artifact_type", "") or ""),
+            source_contains=str(kwargs.get("source_contains", "") or ""),
+        )
+        return tool_result(
+            True,
+            "artifact_list",
+            artifacts=[ref.to_dict() for ref in refs],
+            count=len(refs),
+        )
+
+
 def _coerce_max_chars(value: Any) -> int:
     try:
         return max(1, min(int(value or 4000), 12000))
@@ -82,6 +128,14 @@ def _coerce_offset(value: Any) -> int:
         return 0
 
 
-register_superuser_tool(ArtifactReadTool)
+def _coerce_limit(value: Any) -> int:
+    try:
+        return max(1, min(int(value or 20), 100))
+    except (TypeError, ValueError):
+        return 20
 
-__all__ = ["ArtifactReadTool"]
+
+register_superuser_tool(ArtifactReadTool, category="artifact", risk="low", read_only=True)
+register_superuser_tool(ArtifactListTool, category="artifact", risk="low", read_only=True)
+
+__all__ = ["ArtifactListTool", "ArtifactReadTool"]

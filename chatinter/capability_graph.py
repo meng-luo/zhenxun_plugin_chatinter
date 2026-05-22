@@ -142,6 +142,7 @@ def capability_from_meta(
         command=command,
         aliases=aliases,
         prefixes=prefixes,
+        description=normalize_message_text(getattr(meta, "description", "") or ""),
         examples=examples,
         requirement=requirement_from_meta(meta),
         allow_sticky_arg=bool(meta.allow_sticky_arg),

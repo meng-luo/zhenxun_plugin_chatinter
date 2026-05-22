@@ -74,6 +74,7 @@ def approval_required_result(
         action=action,
         payload=payload,
         reason=permission.reason,
+        matched_pattern=permission.matched_pattern,
     )
     record_audit_event(
         event="approval_created",

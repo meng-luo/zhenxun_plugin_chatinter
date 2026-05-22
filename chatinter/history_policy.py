@@ -16,12 +16,14 @@ from .utils.unimsg_utils import uni_to_text_with_tags
 
 _HISTORY_MESSAGE_CLIP = 220
 _CHATROOM_LINE_CLIP = 180
-_TURN_HISTORY_TOKEN_BUDGET = 3200
-_MIN_RECENT_TURNS = 3
+_TURN_HISTORY_TOKEN_BUDGET = 1400
+_MIN_RECENT_TURNS = 1
 _SUMMARY_FETCH_LIMIT = 24
-_SUMMARY_MAX_LINES = 10
+_SUMMARY_MAX_LINES = 8
 _SUMMARY_USER_CLIP = 96
 _SUMMARY_RESULT_CLIP = 128
+_TOOL_HISTORY_KEEP_RECENT_TURNS = 1
+_TOOL_HISTORY_MAX_TOOL_ITEMS = 2
 
 
 @dataclass(frozen=True)
@@ -82,10 +84,14 @@ async def _build_turn_managed_dialog_messages(
     fetch_limit = max(limit, min(_SUMMARY_FETCH_LIMIT, limit + _SUMMARY_MAX_LINES))
     dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
     turns: list[_HistoryTurn] = []
-    for dialog in dialogs:
+    total_dialogs = len(dialogs)
+    for index, dialog in enumerate(dialogs):
         timeline_messages = await _timeline_to_history_messages(
             dialog,
             group_id=group_id,
+            include_tool_details=(
+                total_dialogs - index <= _TOOL_HISTORY_KEEP_RECENT_TURNS
+            ),
         )
         if timeline_messages:
             turns.append(
@@ -134,6 +140,7 @@ async def _timeline_to_history_messages(
     dialog: ChatInterChatHistory,
     *,
     group_id: str | None,
+    include_tool_details: bool,
 ) -> list[LLMMessage]:
     timeline = dialog.get_timeline()
     if not timeline:
@@ -145,6 +152,7 @@ async def _timeline_to_history_messages(
         fallback_name=str(dialog.nickname or ""),
         bot_id=None,
     )
+    tool_items = 0
     for item in timeline:
         role = str(item.get("role", "") or "")
         kind = str(item.get("kind", "") or "")
@@ -157,6 +165,9 @@ async def _timeline_to_history_messages(
                 messages.append(LLMMessage.user(f"{sender}: {content}"))
             continue
         if kind == "tool_call":
+            if not include_tool_details or tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
+                continue
+            tool_items += 1
             tool_name = _clean_history_text(item.get("tool_name", ""), 80)
             arguments = _clean_history_text(
                 _timeline_metadata_text(item, "arguments"),
@@ -168,6 +179,9 @@ async def _timeline_to_history_messages(
             messages.append(LLMMessage.assistant_text_response(text))
             continue
         if kind == "tool_result":
+            if not include_tool_details or tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
+                continue
+            tool_items += 1
             tool_name = _clean_history_text(item.get("tool_name", ""), 80)
             result_text = content or _clean_history_text(
                 _timeline_metadata_text(item, "output"),

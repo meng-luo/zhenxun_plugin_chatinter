@@ -13,7 +13,7 @@ from zhenxun.services.llm import embed_documents, embed_query, list_embedding_mo
 from zhenxun.services.log import logger
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
-from .plugin_adapters import get_adapter_target_policy
+from .target_policy import get_target_policy
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy
 
@@ -157,7 +157,7 @@ def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
     target_capable = False
     image_capable = False
     self_only = False
-    adapter_policy = get_adapter_target_policy(
+    adapter_policy = get_target_policy(
         plugin_module=plugin.module,
         plugin_name=plugin.name,
     )

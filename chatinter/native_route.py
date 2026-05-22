@@ -15,7 +15,6 @@ from pydantic import BaseModel, Field, field_validator
 from .command_index import CommandCandidate
 from .command_schema import complete_slots, render_command
 from .route_text import normalize_message_text
-from .skill_registry import SkillRouteDecision
 
 _AT_PLACEHOLDER_PATTERN = re.compile(r"\[@[^\]\s]+\]")
 _AT_INLINE_PATTERN = re.compile(r"@\d{5,20}")
@@ -24,10 +23,20 @@ _ROUTE_TRACE_SAMPLE_LIMIT = 12
 
 
 @dataclass(frozen=True)
+class SkillRouteDecision:
+    plugin_name: str
+    plugin_module: str
+    command: str
+    source: str
+    skill_kind: str
+
+
+@dataclass(frozen=True)
 class NativeRouteResult:
     decision: SkillRouteDecision
     stage: str
     report: "NativeRouteReport | None" = None
+    selected_candidate: CommandCandidate | None = None
     command_id: str | None = None
     slots: dict[str, Any] = field(default_factory=dict)
     missing: tuple[str, ...] = ()
@@ -207,6 +216,7 @@ def candidate_selection_to_native_route(
             skill_kind=stage,
         ),
         stage=stage,
+        selected_candidate=selected_candidate,
         command_id=schema.command_id,
         slots=_slots_to_dict(decision.slots),
         missing=tuple(decision.missing),

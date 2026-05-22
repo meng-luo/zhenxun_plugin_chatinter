@@ -199,6 +199,17 @@ _DEFAULT_POLICY: dict[str, Any] = {
             ],
             "deny": [],
         },
+        "eval": {
+            "allow": [
+                "engineering_eval_plan*",
+                "engineering_eval_status*",
+            ],
+            "ask": [
+                "engineering_eval_run*",
+                "engineering_eval_rollback*",
+            ],
+            "deny": [],
+        },
         "file": {
             "allow_read": ["C:/zhenxun/**"],
             "ask_read": [],
@@ -253,6 +264,10 @@ def decide_uv(command: str) -> PermissionResult:
 
 def decide_python(command: str) -> PermissionResult:
     return _decide_command("python", command, default="ask")
+
+
+def decide_eval(command: str) -> PermissionResult:
+    return _decide_command("eval", command, default="ask")
 
 
 def decide_file_read(path: str) -> PermissionResult:
@@ -365,6 +380,7 @@ def _normalize_path(value: str) -> str:
 __all__ = [
     "PermissionResult",
     "decide_background",
+    "decide_eval",
     "decide_file_read",
     "decide_file_write",
     "decide_git",
