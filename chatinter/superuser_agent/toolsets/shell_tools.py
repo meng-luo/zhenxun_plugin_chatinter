@@ -10,6 +10,7 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from ..audit_log import record_audit_event
 from ..permission_policy import decide_shell
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd
 from .common import (
     actor_from_context,
     approval_required_result,
@@ -18,6 +19,7 @@ from .common import (
     decode,
     permission_denied_result,
     tool_result,
+    worktree_id_from_context,
 )
 
 SHELL_TIMEOUT_SECONDS = 20.0
@@ -65,6 +67,13 @@ class ShellCommandTool:
         reason = str(kwargs.get("reason", "") or "")
         timeout_seconds = coerce_timeout(kwargs.get("timeout_seconds"))
         actor = actor_from_context(context)
+        cwd, isolation = resolve_cwd(
+            cwd,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
         if not command:
             return tool_result(False, "shell_empty_command", command=command)
         decision = decide_shell(command)
@@ -73,6 +82,7 @@ class ShellCommandTool:
             "cwd": cwd,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -94,6 +104,7 @@ class ShellCommandTool:
             actor=actor,
             approval_id=None,
             timeout_seconds=timeout_seconds,
+            isolation=isolation,
         )
 
 
@@ -105,6 +116,7 @@ async def run_shell_command(
     approval_id: str | None = None,
     timeout_seconds: float | None = None,
     action: str = "shell_command",
+    isolation: dict[str, Any] | None = None,
 ) -> ToolResult:
     timeout = coerce_timeout(timeout_seconds, default=SHELL_TIMEOUT_SECONDS)
     try:
@@ -122,6 +134,7 @@ async def run_shell_command(
             "command": command,
             "cwd": cwd,
             "approval_id": approval_id,
+            "isolation": isolation or {},
             "returncode": process.returncode,
             "stdout": decode(stdout),
             "stderr": decode(stderr),

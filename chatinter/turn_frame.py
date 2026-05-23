@@ -97,6 +97,10 @@ class TurnFrame:
     route_report: Any | None = None
     dialogue_plan: Any | None = None
     dialogue_state: Any | None = None
+    chat_runtime_profile: Any | None = None
+    chat_tool_exposure_state: str = "unknown"
+    previous_dialogue_state: Any | None = None
+    chat_memory_layered: Any | None = None
     mention_name_map: dict[str, str] = field(default_factory=dict)
     mention_profiles: dict[str, dict[str, str]] = field(default_factory=dict)
     reply_images_data: list[Any] = field(default_factory=list)

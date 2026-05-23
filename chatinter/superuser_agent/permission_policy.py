@@ -57,12 +57,16 @@ _DEFAULT_POLICY: dict[str, Any] = {
                 "git diff*",
                 "git log*",
                 "git branch*",
+                "git worktree list*",
                 "git show*",
                 "git remote -v*",
                 "git rev-parse*",
                 "git ls-files*",
             ],
             "ask": [
+                "git worktree add*",
+                "git worktree remove*",
+                "git worktree prune*",
                 "git add*",
                 "git commit*",
                 "git push*",
@@ -87,6 +91,8 @@ _DEFAULT_POLICY: dict[str, Any] = {
         "server": {
             "allow": [
                 "server_status",
+                "mcp_runtime_status*",
+                "mcp_runtime_refresh*",
                 "process_list*",
                 "disk_usage*",
                 "systemctl status*",
@@ -104,6 +110,7 @@ _DEFAULT_POLICY: dict[str, Any] = {
                 "uptime*",
             ],
             "ask": [
+                "mcp_runtime_reload*",
                 "systemctl restart*",
                 "systemctl start*",
                 "systemctl stop*",
@@ -201,6 +208,14 @@ _DEFAULT_POLICY: dict[str, Any] = {
         },
         "eval": {
             "allow": [
+                "engineering_loop_start*",
+                "engineering_loop_status*",
+                "engineering_lsp_read*",
+                "semantic_patch_plan*",
+                "engineering_loop_bind*",
+                "engineering_failure_diagnose*",
+                "engineering_eval_gate*",
+                "engineering_loop_complete*",
                 "engineering_eval_plan*",
                 "engineering_eval_status*",
             ],

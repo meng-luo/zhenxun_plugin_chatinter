@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from .chat_memory_store import ChatMemoryStore, extract_memory_candidates
+from .chat_memory_store import (
+    ChatMemoryStore,
+    MemoryCandidate,
+    extract_memory_candidates,
+)
 from .group_memory_digest import build_group_memory_digest
 from .memory_policy import MemoryPolicyDecision, decide_memory_policy
 from .person_registry import upsert_person_alias
@@ -109,14 +113,20 @@ class MemoryWriter:
                 candidate_count=len(candidates) + len(person_aliases),
             )
 
+        memory_scope = _memory_scope_from_policy(policy)
+        memory_type_prefix = ""
+        if memory_scope == "thread":
+            memory_type_prefix = "thread_"
+        scoped_candidates = _scope_candidates(candidates, prefix=memory_type_prefix)
+        scoped_candidates.extend(_dialogue_fact_candidates(context))
         written = await ChatMemoryStore.record_candidates(
             session_id=context.session_id,
             user_id=context.user_id,
             group_id=context.group_id,
-            candidates=candidates,
+            candidates=scoped_candidates,
             source_dialog_id=context.source_dialog_id,
             source_message=message_text,
-            scope="user",
+            scope=memory_scope,
             thread_id=context.thread_id,
             topic_key=context.topic_key,
             participants=context.participants,
@@ -230,6 +240,57 @@ def _clean_alias(value: str) -> str:
     if alias in {"我", "自己", "本人", "这个", "那个", "他", "她", "它", "ta"}:
         return ""
     return alias[:24]
+
+
+def _memory_scope_from_policy(policy: MemoryPolicyDecision) -> str:
+    if policy.scope in {"user", "group", "thread"}:
+        return policy.scope
+    return "user"
+
+
+def _scope_candidates(
+    candidates: list[MemoryCandidate],
+    *,
+    prefix: str,
+) -> list[MemoryCandidate]:
+    if not prefix:
+        return candidates
+    return [
+        MemoryCandidate(
+            memory_type=f"{prefix}{candidate.memory_type}",
+            key=candidate.key,
+            value=candidate.value,
+            confidence=candidate.confidence,
+        )
+        for candidate in candidates
+    ]
+
+
+def _dialogue_fact_candidates(context: MemoryWriteContext) -> list[MemoryCandidate]:
+    """Write generic chat-side facts without touching tool/plugin policy."""
+
+    candidates: list[MemoryCandidate] = []
+    message = normalize_message_text(context.message_text)
+    response = normalize_message_text(context.response_text)
+    if context.thread_id and context.topic_key and message:
+        candidates.append(
+            MemoryCandidate(
+                memory_type="recent_thread_fact",
+                key=normalize_message_text(context.topic_key)[:96],
+                value=message[:160],
+                confidence=0.48,
+            )
+        )
+    if response and len(response) <= 160 and message and len(message) <= 180:
+        candidates.append(
+            MemoryCandidate(
+                memory_type="dialogue_style",
+                key="last_chat_exchange",
+                value=f"user={message[:80]} | bot={response[:80]}",
+                confidence=0.34,
+            )
+        )
+    return candidates[:2]
 
 
 def _is_safe_self_alias_match(text: str, match: re.Match[str]) -> bool:

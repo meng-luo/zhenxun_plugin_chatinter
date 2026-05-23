@@ -103,12 +103,13 @@ def is_public_capability_source(plugin: PluginInfo) -> bool:
 
 
 def requirement_from_meta(meta: PluginInfo.PluginCommandMeta) -> CommandRequirement:
-    return CommandRequirement(
+    requirement = CommandRequirement(
         params=[
             normalize_message_text(param)
             for param in meta.params
             if normalize_message_text(param)
         ],
+        choices=dict(getattr(meta, "choices", {}) or {}),
         text_min=max(int(meta.text_min or 0), 0),
         text_max=meta.text_max,
         image_min=max(int(meta.image_min or 0), 0),
@@ -121,6 +122,7 @@ def requirement_from_meta(meta: PluginInfo.PluginCommandMeta) -> CommandRequirem
         requires_private=bool(meta.requires_private),
         requires_to_me=bool(meta.requires_to_me),
     )
+    return requirement
 
 
 def capability_from_meta(
@@ -146,6 +148,7 @@ def capability_from_meta(
         examples=examples,
         requirement=requirement_from_meta(meta),
         allow_sticky_arg=bool(meta.allow_sticky_arg),
+        shortcut_renders=list(getattr(meta, "shortcut_renders", []) or []),
     )
 
 

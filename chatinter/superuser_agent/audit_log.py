@@ -1,4 +1,4 @@
-﻿"""Audit log for superuser agent operations."""
+"""Audit log for superuser agent operations."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
+
+from ..runtime_events import emit_runtime_event
 
 _AUDIT_LOG_PATH = Path("data/log/chatinter_agent_audit.log")
 _MAX_QUERY_LINES = 2000
@@ -36,6 +38,23 @@ def record_audit_event(
     except Exception:
         # Audit must never break the bot turn. Tool results still contain the
         # user-visible status if logging fails.
+        pass
+    try:
+        emit_runtime_event(
+            kind="audit",
+            status="info",
+            source=f"audit:{event}",
+            session_key=entry["session_key"],
+            user_id=entry["user_id"],
+            summary=f"{event}:{action}",
+            payload={
+                "event": event,
+                "action": action,
+                "payload": payload or {},
+                "result": result or {},
+            },
+        )
+    except Exception:
         pass
 
 

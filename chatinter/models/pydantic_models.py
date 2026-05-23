@@ -24,6 +24,14 @@ class PluginInfo(BaseModel):
         aliases: list[str] = Field(default_factory=list, description="命令别名")
         prefixes: list[str] = Field(default_factory=list, description="命令前缀")
         params: list[str] = Field(default_factory=list, description="参数提示")
+        choices: dict[str, list[str]] = Field(
+            default_factory=dict,
+            description="参数枚举约束，key 为参数名，value 为可选值",
+        )
+        shortcut_renders: list[dict[str, Any]] = Field(
+            default_factory=list,
+            description="解析器 shortcut 到真实命令的通用渲染映射",
+        )
         description: str = Field(default="", description="命令描述")
         examples: list[str] = Field(default_factory=list, description="示例命令")
         text_min: int | None = Field(default=None, description="文本参数最小数量")
@@ -90,6 +98,10 @@ class CommandRequirement(BaseModel):
     """插件命令执行前置条件"""
 
     params: list[str] = Field(default_factory=list, description="文本参数提示")
+    choices: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="参数枚举约束",
+    )
     text_min: int = Field(default=0, description="文本参数最小数量")
     text_max: int | None = Field(default=None, description="文本参数最大数量")
     image_min: int = Field(default=0, description="图片参数最小数量")
@@ -122,6 +134,10 @@ class CommandCapability(BaseModel):
     examples: list[str] = Field(default_factory=list, description="示例命令")
     requirement: CommandRequirement = Field(default_factory=CommandRequirement)
     allow_sticky_arg: bool = Field(default=False, description="是否允许粘连参数")
+    shortcut_renders: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="解析器 shortcut 到真实命令的通用渲染映射",
+    )
 
 
 class PluginCapability(BaseModel):
@@ -168,6 +184,10 @@ class CommandSlotSpec(BaseModel):
     default: Any = Field(default=None, description="默认值")
     aliases: list[str] = Field(default_factory=list, description="自然语言别名")
     description: str = Field(default="", description="槽位说明")
+    choices: list[str] = Field(
+        default_factory=list,
+        description="可选枚举值；来自命令解析器的 Literal/Union 约束",
+    )
 
 
 class PluginCommandSchema(BaseModel):
@@ -230,6 +250,10 @@ class PluginCommandSchema(BaseModel):
     retrieval_phrases: list[str] = Field(
         default_factory=list,
         description="工具检索短语，不直接暴露为可执行命令",
+    )
+    shortcut_renders: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="解析器 shortcut 到真实命令的通用渲染映射",
     )
 
 

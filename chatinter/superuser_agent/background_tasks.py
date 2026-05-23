@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 import time
-import uuid
 from typing import Any
+import uuid
 
 from ..artifact_store import get_artifact_store, summarize_artifact_text
 from ..persistence import read_json, state_path, write_json
+from ..runtime_events import emit_runtime_event
 from .audit_log import record_audit_event
 
 _MAX_OUTPUT_CHARS = 8000
@@ -548,6 +549,7 @@ def _emit_observation_event(task: BackgroundTask, *, kind: str) -> ObservationEv
     )
     _OBSERVATION_EVENTS[event.event_id] = event
     _save_events()
+    _emit_background_runtime_event(event)
     _notify_watchers(event)
     return event
 
@@ -663,6 +665,36 @@ def _event_from_payload(
         )
     except Exception:
         return None
+
+
+def _emit_background_runtime_event(event: ObservationEvent) -> None:
+    emit_runtime_event(
+        kind="background_job",
+        status=_runtime_status_from_background(event.status),
+        source=f"background:{event.kind}",
+        session_key=event.session_key,
+        user_id=event.user_id,
+        summary=f"{event.kind}:{event.task_id}:{event.status}",
+        payload=event.public_payload(),
+        artifacts=list(event.artifacts),
+        related_ids={
+            "background_task_id": event.task_id,
+            "observation_event_id": event.event_id,
+        },
+    )
+
+
+def _runtime_status_from_background(status: str) -> str:
+    normalized = str(status or "")
+    if normalized == "running":
+        return "progress"
+    if normalized == "completed":
+        return "completed"
+    if normalized in {"cancelled", "interrupted_after_restart"}:
+        return "cancelled"
+    if normalized in {"failed", "error"}:
+        return "failed"
+    return "info"
 
 
 def _decode(data: bytes | None) -> str:

@@ -5,22 +5,30 @@ from __future__ import annotations
 from typing import Any
 
 from zhenxun.services.llm import LLMMessage
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.tools import RunContext
+from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
+from ...agent_complexity import route_agent_complexity
 from ...agent_run_store import (
     get_agent_run_snapshot,
-    load_agent_run_state,
     list_agent_run_snapshots,
+    load_agent_run_state,
+    project_agent_run_state,
     query_agent_run_events,
     update_agent_run_status,
 )
 from ...agent_runtime import AgentRuntime
-from ...agent_complexity import route_agent_complexity
-from ...config import build_reasoning_generation_config, get_config_value, get_model_name
+from ...capability_registry import CapabilityRegistry
+from ...config import (
+    build_reasoning_generation_config,
+    get_config_value,
+    get_model_name,
+)
+from ...models.pydantic_models import PluginKnowledgeBase
+from ...provider_capability import ProviderCapabilityAdapter
 from ...route_text import normalize_message_text
 from ..audit_log import record_audit_event
-from ..registry import build_superuser_agent_tools, register_superuser_tool
+from ..registry import register_superuser_tool
 from .common import actor_from_context, tool_result
 
 
@@ -84,7 +92,14 @@ class AgentRunStatusTool:
                 session_key=session_key,
                 limit=limit,
             )
+            projection = project_agent_run_state(
+                run_id=trace_id,
+                session_key=session_key,
+                include_details=False,
+            )
             payload = snapshot if include_full else _compact_snapshot(snapshot)
+            if isinstance(payload, dict):
+                payload["runtime_projection"] = projection
             record_audit_event(
                 event="agent_run_queried",
                 user_id=actor["user_id"],
@@ -160,7 +175,18 @@ class AgentRunResumeTool:
                 snapshot_status=snapshot.get("status", ""),
             )
 
-        tools = build_superuser_agent_tools()
+        model_name = get_model_name()
+        provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
+        capability_registry = CapabilityRegistry.from_knowledge_base(
+            PluginKnowledgeBase(plugins=[], user_role="超级管理员"),
+            session_id=actor["session_key"],
+            tools=[],
+        )
+        capability_registry.register_available_superuser_tools()
+        mcp_status = await capability_registry.register_available_mcp_tools(
+            provider_adapter=provider_adapter,
+        )
+        tools = capability_registry.executable_tool_map()
         state = load_agent_run_state(run_id, tool_map=tools)
         if state is None:
             return tool_result(False, "agent_run_resume_load_failed", run_id=run_id)
@@ -186,7 +212,16 @@ class AgentRunResumeTool:
             role="user",
             kind="agent_resume_request",
             content=resume_message or "继续这个 AgentRun。",
-            metadata={"run_id": state.run_id, "snapshot_status": snapshot.get("status", "")},
+            metadata={
+                "run_id": state.run_id,
+                "snapshot_status": snapshot.get("status", ""),
+                "task_graph_preserved": state.task_graph is not None,
+                "task_ledger_preserved": state.task_ledger is not None,
+                "capability_ledger_preserved": bool(
+                    state.capability_ledger.public_entries(limit=1)
+                ),
+                "resume_integrity": snapshot.get("resume_integrity", {}),
+            },
         )
         state.append_timeline(
             role="system",
@@ -201,13 +236,16 @@ class AgentRunResumeTool:
                 "enable_agent_tools": True,
                 "resumed_run_id": state.run_id,
                 "agent_complexity": complexity_decision.to_metadata(),
+                "capability_registry": capability_registry,
+                "provider_capability": provider_adapter.profile.to_metadata(),
+                "mcp_status": mcp_status,
             },
         )
         runtime = AgentRuntime(
             state=state,
             run_context=run_context,
             message_text=resume_message or "继续这个 AgentRun。",
-            model_name=get_model_name(),
+            model_name=model_name,
             generation_config=build_reasoning_generation_config(),
             timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
             budget_controller=None,
@@ -235,12 +273,20 @@ class AgentRunResumeTool:
             observation_event_ids=list(state.observation_event_ids[-10:]),
             artifact_refs=list(state.artifact_refs[-10:]),
             task_graph=_compact_task_graph(
-                result.timeline[-1].metadata.get("task_graph", {})
-                if result.timeline
-                else snapshot.get("task_graph")
+                state.task_graph.to_public_payload() if state.task_graph is not None else {}
             )
             or _compact_task_graph(snapshot.get("task_graph")),
-            resume_integrity=snapshot.get("resume_integrity", {}),
+            task_ledger=state.task_ledger.to_public_payload()
+            if state.task_ledger is not None
+            else snapshot.get("task_ledger", {}),
+            resume_integrity={
+                **dict(snapshot.get("resume_integrity") or {}),
+                "runtime_projection": project_agent_run_state(
+                    run_id=result.run_id or run_id,
+                    session_key=actor["session_key"],
+                    include_details=False,
+                ),
+            },
         )
 
 

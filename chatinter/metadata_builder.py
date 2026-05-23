@@ -25,6 +25,9 @@ class AutoMetadataBuilder:
 
     _module_alias_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
     _module_prefix_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
+    _module_shortcut_render_cache: ClassVar[
+        dict[str, dict[str, list[dict[str, object]]]]
+    ] = {}
     _module_context_cache: ClassVar[
         dict[str, tuple[int, dict[str, dict[str, bool]]]]
     ] = {}
@@ -96,6 +99,7 @@ class AutoMetadataBuilder:
     ) -> list[dict[str, Any]]:
         alias_map = cls._build_module_alias_map(loaded_plugin)
         prefix_map = cls._build_module_prefix_map(loaded_plugin)
+        shortcut_render_map = cls._build_module_shortcut_render_map(loaded_plugin)
         result: list[dict[str, Any]] = []
         for matcher in cls._iter_plugin_matchers(loaded_plugin):
             module_obj = getattr(matcher, "module", None)
@@ -176,6 +180,11 @@ class AutoMetadataBuilder:
                         prefix_map.get(command_head.casefold(), []),
                     ),
                     "params": parser_schema["params"],
+                    "slot_choices": parser_schema.get("slot_choices", {}),
+                    "shortcut_renders": cls._merge_shortcut_renders(
+                        parser_schema.get("shortcut_renders", []),
+                        shortcut_render_map.get(command_head.casefold(), []),
+                    ),
                     "text_min": parser_schema["text_min"],
                     "text_max": parser_schema["text_max"],
                     "image_min": parser_schema["image_min"],
@@ -273,6 +282,8 @@ class AutoMetadataBuilder:
     def _default_parser_schema() -> dict[str, Any]:
         return {
             "params": [],
+            "slot_choices": {},
+            "shortcut_renders": [],
             "prefixes": [],
             "text_min": 0,
             "text_max": None,
@@ -434,6 +445,8 @@ class AutoMetadataBuilder:
             "command": command,
             "prefixes": parser_schema["prefixes"],
             "params": parser_schema["params"],
+            "slot_choices": parser_schema.get("slot_choices", {}),
+            "shortcut_renders": parser_schema.get("shortcut_renders", []),
             "text_min": parser_schema["text_min"],
             "text_max": parser_schema["text_max"],
             "image_min": parser_schema["image_min"],
@@ -665,8 +678,27 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(shortcuts, [])
 
     @classmethod
+    def _extract_parser_shortcut_renders(cls, parser: object) -> list[dict[str, object]]:
+        renders: list[dict[str, object]] = []
+        for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
+            labels = cls._extract_shortcut_labels(
+                shortcut_key=shortcut_key,
+                shortcut_obj=shortcut_obj,
+            )
+            args = cls._extract_shortcut_args(shortcut_obj)
+            command = cls._extract_shortcut_command(shortcut_obj)
+            if not labels or not command:
+                continue
+            for label in labels:
+                render = cls._render_shortcut_command(command, args)
+                if render:
+                    renders.append({"alias": label, "render": render, "args": args})
+        return cls._merge_shortcut_renders(renders)
+
+    @classmethod
     def _extract_parser_schema(cls, parser: object) -> dict[str, Any]:
         params: list[str] = []
+        slot_choices: dict[str, list[str]] = {}
         text_min = 0
         text_max: int | None = 0
         image_min = 0
@@ -687,6 +719,9 @@ class AutoMetadataBuilder:
             arg_name = str(getattr(arg, "name", "") or "").strip()
             if arg_name:
                 params.append(arg_name)
+                choices = cls._extract_arg_choices(arg)
+                if choices:
+                    slot_choices[arg_name] = choices
             arg_repr = f"{arg_name} {getattr(arg, 'value', None)!r}".lower()
             is_optional = cls._is_optional_arg(arg)
             is_variadic = cls._is_variadic_arg(arg)
@@ -714,6 +749,8 @@ class AutoMetadataBuilder:
             image_max = 0
         return {
             "params": cls._merge_unique_strings(params, []),
+            "slot_choices": slot_choices,
+            "shortcut_renders": cls._extract_parser_shortcut_renders(parser),
             "text_min": text_min,
             "text_max": text_max,
             "image_min": image_min,
@@ -723,6 +760,71 @@ class AutoMetadataBuilder:
             "prefixes": prefixes,
             "sample_text": sample_text,
         }
+
+    @classmethod
+    def _extract_arg_choices(cls, arg: object) -> list[str]:
+        value = getattr(arg, "value", None)
+        candidates: list[object] = []
+        base = getattr(value, "base", None)
+        if isinstance(base, list | tuple | set | frozenset):
+            candidates.extend(list(base))
+        for attr_name in ("choices", "choice", "options", "__args__"):
+            raw = getattr(value, attr_name, None)
+            if isinstance(raw, list | tuple | set | frozenset):
+                candidates.extend(list(raw))
+        if not candidates:
+            return []
+        choices: list[str] = []
+        for item in candidates:
+            if not isinstance(item, str | int | float | bool):
+                continue
+            text = cls._normalize_command(str(item))
+            if text and text not in choices:
+                choices.append(text)
+        return choices
+
+    @classmethod
+    def _extract_shortcut_args(cls, shortcut_obj: object) -> list[str]:
+        for attr_name in ("args", "arguments"):
+            raw = getattr(shortcut_obj, attr_name, None)
+            if isinstance(raw, list | tuple):
+                args: list[str] = []
+                for item in raw:
+                    text = cls._normalize_command(str(item or ""))
+                    if text:
+                        args.append(text)
+                return args
+        return []
+
+    @classmethod
+    def _extract_shortcut_command(cls, shortcut_obj: object) -> str:
+        raw = getattr(shortcut_obj, "command", None)
+        if isinstance(raw, str):
+            return cls._normalize_command(raw)
+        if isinstance(raw, list | tuple) and raw:
+            first = raw[0]
+            text = getattr(first, "text", None)
+            if text is not None:
+                return cls._normalize_command(str(text))
+            normalized_first = cls._normalize_command(str(first))
+            match = re.search(r"text=['\"]([^'\"]+)['\"]", str(first))
+            if match:
+                return cls._normalize_command(match.group(1))
+            return normalized_first
+        text = getattr(raw, "text", None)
+        if text is not None:
+            return cls._normalize_command(str(text))
+        return ""
+
+    @classmethod
+    def _render_shortcut_command(cls, command: str, args: list[str]) -> str:
+        parts = [cls._normalize_command(command)]
+        for arg in args:
+            text = cls._normalize_command(str(arg or ""))
+            if not text or "{" in text or "}" in text:
+                continue
+            parts.append(text)
+        return cls._normalize_command(" ".join(part for part in parts if part))
 
     @staticmethod
     def _is_optional_arg(arg: object) -> bool:
@@ -1098,6 +1200,8 @@ class AutoMetadataBuilder:
             "requires_to_me",
             "allow_sticky_arg",
             "access_level",
+            "slot_choices",
+            "shortcut_renders",
         ):
             if field not in payload and field in schema:
                 payload[field] = schema.get(field)
@@ -1165,6 +1269,23 @@ class AutoMetadataBuilder:
         return merged
 
     @classmethod
+    def _build_module_shortcut_render_map(
+        cls,
+        loaded_plugin: object,
+    ) -> dict[str, list[dict[str, object]]]:
+        merged: dict[str, list[dict[str, object]]] = {}
+        for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            if module_obj is None:
+                continue
+            for command, renders in cls._load_module_shortcut_render_map(module_obj).items():
+                merged[command] = cls._merge_shortcut_renders(
+                    merged.get(command),
+                    renders,
+                )
+        return merged
+
+    @classmethod
     def _load_module_alias_map(cls, module_obj: object) -> dict[str, list[str]]:
         source_file = inspect.getsourcefile(cast(Any, module_obj))
         if not source_file:
@@ -1208,6 +1329,52 @@ class AutoMetadataBuilder:
             )
         cls._module_alias_cache[cache_key] = (mtime_ns, alias_map)
         return alias_map
+
+    @classmethod
+    def _load_module_shortcut_render_map(
+        cls,
+        module_obj: object,
+    ) -> dict[str, list[dict[str, object]]]:
+        source_file = inspect.getsourcefile(cast(Any, module_obj))
+        if not source_file:
+            return {}
+        try:
+            path = Path(source_file)
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return {}
+
+        cache_key = f"shortcut_render:{path}:{mtime_ns}"
+        cached = getattr(cls, "_module_shortcut_render_cache", {}).get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+        render_map: dict[str, list[dict[str, object]]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            shortcut_command, shortcut_aliases, shortcut_args = (
+                cls._extract_shortcut_render_from_call_node(node)
+            )
+            if not shortcut_command or not shortcut_aliases:
+                continue
+            entries = render_map.setdefault(shortcut_command.casefold(), [])
+            for alias in shortcut_aliases:
+                render = cls._render_shortcut_command(shortcut_command, shortcut_args)
+                if render:
+                    entries.append(
+                        {"alias": alias, "render": render, "args": shortcut_args}
+                    )
+        render_map = {
+            key: cls._merge_shortcut_renders(value) for key, value in render_map.items()
+        }
+        cls._module_shortcut_render_cache[cache_key] = render_map
+        return render_map
 
     @classmethod
     def _load_module_prefix_map(cls, module_obj: object) -> dict[str, list[str]]:
@@ -1335,18 +1502,27 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _extract_shortcut_from_call_node(cls, node: ast.Call) -> tuple[str, list[str]]:
+        command, aliases, _args = cls._extract_shortcut_render_from_call_node(node)
+        return command, aliases
+
+    @classmethod
+    def _extract_shortcut_render_from_call_node(
+        cls,
+        node: ast.Call,
+    ) -> tuple[str, list[str], list[str]]:
         if cls._get_call_name(node.func) != "shortcut" or not node.args:
-            return "", []
+            return "", [], []
 
         shortcut_key = ""
         first_arg = node.args[0]
         if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
             shortcut_key = cls._coerce_shortcut_alias(first_arg.value)
         if not shortcut_key:
-            return "", []
+            return "", [], []
 
         target_command = ""
         humanized_aliases: list[str] = [shortcut_key]
+        shortcut_args: list[str] = []
         for keyword in node.keywords or []:
             if keyword.arg == "command":
                 try:
@@ -1363,9 +1539,25 @@ class AutoMetadataBuilder:
                 humanized = cls._coerce_shortcut_alias(str(raw_humanized or ""))
                 if humanized:
                     humanized_aliases.append(humanized)
+                continue
+            if keyword.arg in {"arguments", "args"}:
+                try:
+                    raw_args = ast.literal_eval(keyword.value)
+                except Exception:
+                    raw_args = []
+                if isinstance(raw_args, list | tuple):
+                    shortcut_args = [
+                        cls._normalize_command(str(item or ""))
+                        for item in raw_args
+                        if cls._normalize_command(str(item or ""))
+                    ]
         if not target_command:
-            return "", []
-        return target_command, cls._merge_unique_strings(humanized_aliases, [])
+            return "", [], []
+        return (
+            target_command,
+            cls._merge_unique_strings(humanized_aliases, []),
+            shortcut_args,
+        )
 
     @classmethod
     def _normalize_command(cls, command: str) -> str:
@@ -1573,6 +1765,58 @@ class AutoMetadataBuilder:
             if min_int > max_int:
                 payload[min_key] = max_int
 
+    @classmethod
+    def _merge_slot_choices(cls, *values: object) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for raw_key, raw_choices in value.items():
+                key = cls._normalize_command(str(raw_key or ""))
+                if not key:
+                    continue
+                if isinstance(raw_choices, str):
+                    choices = [raw_choices]
+                elif isinstance(raw_choices, list | tuple | set | frozenset):
+                    choices = [str(choice) for choice in raw_choices]
+                else:
+                    continue
+                merged[key] = cls._merge_unique_strings(merged.get(key), choices)
+        return merged
+
+    @classmethod
+    def _merge_shortcut_renders(cls, *values: object) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for value in values:
+            if not isinstance(value, list | tuple):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                alias = cls._normalize_command(str(item.get("alias") or ""))
+                render = cls._normalize_command(str(item.get("render") or ""))
+                if not alias or not render:
+                    continue
+                marker = (alias.casefold(), render.casefold())
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                args = item.get("args")
+                merged.append(
+                    {
+                        "alias": alias,
+                        "render": render,
+                        "args": [
+                            cls._normalize_command(str(arg or ""))
+                            for arg in args
+                            if cls._normalize_command(str(arg or ""))
+                        ]
+                        if isinstance(args, list | tuple)
+                        else [],
+                    }
+                )
+        return merged
 
     @classmethod
     def _merge_command_dicts(
@@ -1593,6 +1837,14 @@ class AutoMetadataBuilder:
             current["params"] = cls._merge_unique_strings(
                 current.get("params"),
                 payload.get("params"),
+            )
+            current["slot_choices"] = cls._merge_slot_choices(
+                current.get("slot_choices"),
+                payload.get("slot_choices"),
+            )
+            current["shortcut_renders"] = cls._merge_shortcut_renders(
+                current.get("shortcut_renders"),
+                payload.get("shortcut_renders"),
             )
             current["examples"] = cls._merge_unique_strings(
                 current.get("examples"),

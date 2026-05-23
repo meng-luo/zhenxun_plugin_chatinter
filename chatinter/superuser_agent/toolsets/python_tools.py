@@ -10,6 +10,7 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from ..audit_log import record_audit_event
 from ..permission_policy import decide_python
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd
 from .common import (
     actor_from_context,
     approval_required_result,
@@ -19,6 +20,7 @@ from .common import (
     permission_denied_result,
     project_root,
     tool_result,
+    worktree_id_from_context,
 )
 
 
@@ -60,6 +62,13 @@ class PythonExecTool:
         reason = str(kwargs.get("reason", "") or "")
         timeout_seconds = coerce_timeout(kwargs.get("timeout_seconds"))
         actor = actor_from_context(context)
+        cwd, isolation = resolve_cwd(
+            cwd,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
         if not code.strip():
             return tool_result(False, "python_empty_code")
         decision = decide_python("python_exec " + code[:240].replace("\n", " "))
@@ -68,6 +77,7 @@ class PythonExecTool:
             "cwd": cwd,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -88,6 +98,7 @@ class PythonExecTool:
             cwd=cwd,
             actor=actor,
             timeout_seconds=timeout_seconds,
+            isolation=isolation,
         )
 
 
@@ -135,6 +146,13 @@ class PythonModuleTool:
         reason = str(kwargs.get("reason", "") or "")
         timeout_seconds = coerce_timeout(kwargs.get("timeout_seconds"))
         actor = actor_from_context(context)
+        cwd, isolation = resolve_cwd(
+            cwd,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
         if not module:
             return tool_result(False, "python_empty_module")
         command_preview = "python -m " + " ".join([module, *args])
@@ -145,6 +163,7 @@ class PythonModuleTool:
             "cwd": cwd,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -166,6 +185,7 @@ class PythonModuleTool:
             cwd=cwd,
             actor=actor,
             timeout_seconds=timeout_seconds,
+            isolation=isolation,
         )
 
 
@@ -176,6 +196,7 @@ async def run_python_code(
     actor: dict[str, str],
     approval_id: str | None = None,
     timeout_seconds: float | None = None,
+    isolation: dict[str, Any] | None = None,
 ) -> ToolResult:
     return await _run_python_process(
         args=["-"],
@@ -185,7 +206,7 @@ async def run_python_code(
         action="python_exec",
         approval_id=approval_id,
         timeout_seconds=timeout_seconds,
-        payload={"code_preview": code[:240]},
+        payload={"code_preview": code[:240], "isolation": isolation or {}},
     )
 
 
@@ -197,6 +218,7 @@ async def run_python_module(
     actor: dict[str, str],
     approval_id: str | None = None,
     timeout_seconds: float | None = None,
+    isolation: dict[str, Any] | None = None,
 ) -> ToolResult:
     return await _run_python_process(
         args=["-m", module, *args],
@@ -206,7 +228,7 @@ async def run_python_module(
         action="python_module",
         approval_id=approval_id,
         timeout_seconds=timeout_seconds,
-        payload={"module": module, "args": args},
+        payload={"module": module, "args": args, "isolation": isolation or {}},
     )
 
 
@@ -252,6 +274,7 @@ async def _run_python_process(
             args=args,
             cwd=cwd,
             approval_id=approval_id,
+            isolation=dict(payload.get("isolation") or {}),
             returncode=process.returncode,
             stdout=decode(stdout),
             stderr=decode(stderr),

@@ -16,6 +16,7 @@ import time
 from typing import Any, Literal
 
 from .route_text import normalize_message_text
+from .runtime_events import emit_runtime_event
 
 ArtifactType = Literal["text", "image", "html", "file", "log", "plugin_output"]
 
@@ -249,6 +250,16 @@ class ArtifactStore:
         while len(self._items) > self.max_items:
             self._items.popitem(last=False)
         self._save_manifest()
+        emit_runtime_event(
+            kind="artifact",
+            status="created",
+            source=ref.source or "artifact_store",
+            trace_id=_trace_from_artifact_id(ref.artifact_id),
+            summary=ref.summary,
+            payload=ref.to_dict(),
+            artifacts=[ref.to_dict()],
+            related_ids={"artifact_id": ref.artifact_id},
+        )
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -598,6 +609,11 @@ def _safe_int(value: Any) -> int:
         return max(int(value or 0), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _trace_from_artifact_id(artifact_id: str) -> str:
+    parts = normalize_message_text(artifact_id).split("_")
+    return parts[2] if len(parts) >= 4 else ""
 
 
 __all__ = [

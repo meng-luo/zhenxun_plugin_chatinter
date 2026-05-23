@@ -209,6 +209,7 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
         )
     if approval.action == "git_command":
         from .git_tools import run_git_command
@@ -219,6 +220,7 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
         )
     if approval.action == "server_status":
         from .server_tools import server_status
@@ -226,6 +228,7 @@ async def execute_approved_action(
         return await server_status(
             path=str(approval.payload.get("path", "") or ""),
             actor=actor,
+            isolation=dict(approval.payload.get("isolation") or {}),
             approval_id=approval.approval_id,
         )
     if approval.action == "process_list":
@@ -246,6 +249,24 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
+        )
+    if approval.action == "mcp_runtime_reload":
+        from ...mcp_runtime import get_mcp_runtime_manager
+
+        server_names = [
+            str(item or "").strip()
+            for item in (approval.payload.get("server_names") or [])
+            if str(item or "").strip()
+        ]
+        result = await get_mcp_runtime_manager().reload(
+            server_names=server_names or None,
+        )
+        return tool_result(
+            True,
+            "mcp_runtime_reloaded",
+            approval_id=approval.approval_id,
+            **result.to_payload(),
         )
     if approval.action == "plugin_dev_inspect":
         from .plugin_dev_tools import inspect_plugin
@@ -255,6 +276,7 @@ async def execute_approved_action(
             plugin_root=str(approval.payload.get("plugin_root", "") or "") or None,
             max_files=_coerce_int(approval.payload.get("max_files"), default=80, lower=1, upper=300),
             actor=actor,
+            worktree_id=str(approval.payload.get("worktree_id", "") or ""),
             approval_id=approval.approval_id,
         )
     if approval.action == "plugin_dev_scaffold":
@@ -270,6 +292,7 @@ async def execute_approved_action(
             plugin_root=str(approval.payload.get("plugin_root", "") or "") or None,
             overwrite=bool(approval.payload.get("overwrite") or False),
             actor=actor,
+            worktree_id=str(approval.payload.get("worktree_id", "") or ""),
             approval_id=approval.approval_id,
         )
     if approval.action == "plugin_dev_write_file":
@@ -284,7 +307,57 @@ async def execute_approved_action(
             overwrite=bool(approval.payload.get("overwrite") if approval.payload.get("overwrite") is not None else True),
             reason=str(approval.payload.get("reason", "") or ""),
             actor=actor,
+            worktree_id=str(approval.payload.get("worktree_id", "") or ""),
             approval_id=approval.approval_id,
+        )
+    if approval.action == "worktree_create":
+        from ..workspace_isolation import create_worktree_session
+
+        try:
+            session = create_worktree_session(
+                actor=actor,
+                repo_root=str(approval.payload.get("repo_root", "") or "") or None,
+                base_ref=str(approval.payload.get("base_ref", "") or "HEAD") or "HEAD",
+                branch_name=str(approval.payload.get("branch_name", "") or ""),
+                reason=str(approval.payload.get("reason", "") or ""),
+            )
+        except Exception as exc:
+            return tool_result(
+                False,
+                "worktree_create_failed",
+                approval_id=approval.approval_id,
+                error=str(exc),
+            )
+        return tool_result(
+            True,
+            "worktree_created",
+            approval_id=approval.approval_id,
+            worktree=session.public_payload(),
+            instruction=(
+                "隔离 worktree 已启用。后续工程读写、patch、eval、shell/git 命令"
+                "默认使用 worktree_path；仓库内绝对路径也会映射到隔离 worktree。"
+            ),
+        )
+    if approval.action == "worktree_remove":
+        from ..workspace_isolation import remove_worktree_session
+
+        session = remove_worktree_session(
+            actor=actor,
+            worktree_id=str(approval.payload.get("worktree_id", "") or ""),
+            force=bool(approval.payload.get("force") or False),
+        )
+        if session is None:
+            return tool_result(
+                False,
+                "worktree_not_found",
+                approval_id=approval.approval_id,
+                worktree_id=str(approval.payload.get("worktree_id", "") or ""),
+            )
+        return tool_result(
+            True,
+            "worktree_removed",
+            approval_id=approval.approval_id,
+            worktree=session.public_payload(),
         )
     if approval.action == "patch_apply":
         from .patch_tools import apply_prepared_patch
@@ -294,6 +367,9 @@ async def execute_approved_action(
             operation_id=str(approval.payload.get("operation_id", "") or ""),
             approval_id=approval.approval_id,
             reason=str(approval.payload.get("reason", "") or ""),
+            engineering_loop_id=str(
+                approval.payload.get("engineering_loop_id", "") or ""
+            ),
         )
     if approval.action == "patch_prepare":
         from ..patch_operations import normalize_change
@@ -317,7 +393,11 @@ async def execute_approved_action(
             actor=actor,
             changes=changes,
             reason=str(approval.payload.get("reason", "") or ""),
+            pre_resolved=bool(approval.payload.get("pre_resolved") or False),
             approval_id=approval.approval_id,
+            engineering_loop_id=str(
+                approval.payload.get("engineering_loop_id", "") or ""
+            ),
         )
     if approval.action == "patch_rollback":
         from .patch_tools import rollback_prepared_patch
@@ -327,6 +407,9 @@ async def execute_approved_action(
             operation_id=str(approval.payload.get("operation_id", "") or ""),
             approval_id=approval.approval_id,
             reason=str(approval.payload.get("reason", "") or ""),
+            engineering_loop_id=str(
+                approval.payload.get("engineering_loop_id", "") or ""
+            ),
         )
     if approval.action == "background_task_start":
         from .background_tools import start_background_task
@@ -340,6 +423,7 @@ async def execute_approved_action(
             cwd=str(payload.get("cwd", "") or "") or None,
             reason=str(payload.get("reason", "") or ""),
             rendered_command=str(payload.get("rendered_command", "") or ""),
+            isolation=dict(payload.get("isolation") or {}),
             approval_id=approval.approval_id,
         )
     if approval.action == "background_task_cancel":
@@ -350,18 +434,29 @@ async def execute_approved_action(
             task_id=str(approval.payload.get("task_id", "") or ""),
         )
     if approval.action == "engineering_eval_plan":
-        from .engineering_eval_tools import _plan_payload
         from ..engineering_eval import create_engineering_eval
+        from .engineering_eval_tools import _plan_payload
 
         eval_run = create_engineering_eval(
             actor=actor,
             **_plan_payload(approval.payload),
         )
+        engineering_loop_id = str(
+            approval.payload.get("engineering_loop_id", "") or ""
+        )
+        if engineering_loop_id:
+            try:
+                from ..engineering_loop import bind_eval
+
+                bind_eval(loop_id=engineering_loop_id, eval_id=eval_run.eval_id)
+            except Exception:
+                pass
         return tool_result(
             True,
             "engineering_eval_planned",
             approval_id=approval.approval_id,
             eval=eval_run.public_payload(),
+            engineering_loop_id=engineering_loop_id,
             suggested_tests=eval_run.suggested_tests,
         )
     if approval.action == "engineering_eval_run":
@@ -374,7 +469,11 @@ async def execute_approved_action(
             command=str(approval.payload.get("command", "") or ""),
             cwd=str(approval.payload.get("cwd", "") or "") or None,
             timeout_seconds=approval.payload.get("timeout_seconds"),
+            pre_resolved_cwd=True,
             approval_id=approval.approval_id,
+            engineering_loop_id=str(
+                approval.payload.get("engineering_loop_id", "") or ""
+            ),
         )
     if approval.action == "uv_command":
         from .uv_tools import run_uv_command
@@ -385,6 +484,7 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
         )
     if approval.action == "python_exec":
         from .python_tools import run_python_code
@@ -395,6 +495,7 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
         )
     if approval.action == "python_module":
         from .python_tools import run_python_module
@@ -406,6 +507,7 @@ async def execute_approved_action(
             actor=actor,
             approval_id=approval.approval_id,
             timeout_seconds=coerce_timeout(approval.payload.get("timeout_seconds")),
+            isolation=dict(approval.payload.get("isolation") or {}),
         )
     if approval.action == "read_file":
         from .file_tools import read_file
@@ -414,6 +516,7 @@ async def execute_approved_action(
             path=str(approval.payload.get("path", "") or ""),
             max_chars=coerce_max_chars(approval.payload.get("max_chars")),
             actor=actor,
+            isolation=dict(approval.payload.get("isolation") or {}),
             approval_id=approval.approval_id,
         )
     if approval.action == "list_dir":
@@ -422,6 +525,7 @@ async def execute_approved_action(
         return await list_dir(
             path=str(approval.payload.get("path", "") or "."),
             actor=actor,
+            isolation=dict(approval.payload.get("isolation") or {}),
             approval_id=approval.approval_id,
         )
     if approval.action == "search_files":
@@ -433,6 +537,7 @@ async def execute_approved_action(
             contains=str(approval.payload.get("contains", "") or ""),
             max_results=_coerce_int(approval.payload.get("max_results"), default=50, lower=1, upper=200),
             actor=actor,
+            isolation=dict(approval.payload.get("isolation") or {}),
             approval_id=approval.approval_id,
         )
     if approval.action == "write_file":

@@ -11,6 +11,7 @@ from ..audit_log import record_audit_event
 from ..patch_operations import FileChange, apply_changes_transaction
 from ..permission_policy import decide_file_read, decide_file_write
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_working_path
 from .common import (
     actor_from_context,
     approval_required_result,
@@ -19,6 +20,7 @@ from .common import (
     compact_text,
     permission_denied_result,
     tool_result,
+    worktree_id_from_context,
 )
 
 
@@ -50,8 +52,15 @@ class ReadFileTool:
         path = str(kwargs.get("path", "") or "").strip()
         max_chars = coerce_max_chars(kwargs.get("max_chars"))
         actor = actor_from_context(context)
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
         decision = decide_file_read(path)
-        payload = {"path": path, "max_chars": max_chars}
+        payload = {"path": path, "max_chars": max_chars, "isolation": isolation}
         if decision.decision == "deny":
             return permission_denied_result(
                 actor=actor,
@@ -66,7 +75,12 @@ class ReadFileTool:
                 payload=payload,
                 permission=decision,
             )
-        return await read_file(path=path, max_chars=max_chars, actor=actor)
+        return await read_file(
+            path=path,
+            max_chars=max_chars,
+            actor=actor,
+            isolation=isolation,
+        )
 
 
 class ListDirTool:
@@ -92,8 +106,15 @@ class ListDirTool:
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
         path = str(kwargs.get("path", "") or ".").strip() or "."
         actor = actor_from_context(context)
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
         decision = decide_file_read(path)
-        payload = {"path": path}
+        payload = {"path": path, "isolation": isolation}
         if decision.decision == "deny":
             return permission_denied_result(
                 actor=actor,
@@ -108,7 +129,7 @@ class ListDirTool:
                 payload=payload,
                 permission=decision,
             )
-        return await list_dir(path=path, actor=actor)
+        return await list_dir(path=path, actor=actor, isolation=isolation)
 
 
 class SearchFilesTool:
@@ -152,12 +173,20 @@ class SearchFilesTool:
         except (TypeError, ValueError):
             max_results = 50
         actor = actor_from_context(context)
+        root, isolation = resolve_working_path(
+            root,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", root=root, isolation=isolation)
         decision = decide_file_read(root)
         payload = {
             "root": root,
             "pattern": pattern,
             "contains": contains,
             "max_results": max_results,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -179,6 +208,7 @@ class SearchFilesTool:
             contains=contains,
             max_results=max_results,
             actor=actor,
+            isolation=isolation,
         )
 
 
@@ -217,12 +247,20 @@ class WriteFileTool:
         create_dirs = bool(kwargs.get("create_dirs") or False)
         reason = str(kwargs.get("reason", "") or "")
         actor = actor_from_context(context)
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
         decision = decide_file_write(path)
         payload = {
             "path": path,
             "content": content,
             "create_dirs": create_dirs,
             "reason": reason,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -282,12 +320,20 @@ class AppendFileTool:
         create_dirs = bool(kwargs.get("create_dirs") or False)
         reason = str(kwargs.get("reason", "") or "")
         actor = actor_from_context(context)
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
         decision = decide_file_write(path)
         payload = {
             "path": path,
             "content": content,
             "create_dirs": create_dirs,
             "reason": reason,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -361,6 +407,13 @@ class ReplaceInFileTool:
                 expected_replacements = None
         reason = str(kwargs.get("reason", "") or "")
         actor = actor_from_context(context)
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
         decision = decide_file_write(path)
         payload = {
             "path": path,
@@ -368,6 +421,7 @@ class ReplaceInFileTool:
             "new_text": new_text,
             "expected_replacements": expected_replacements,
             "reason": reason,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -398,6 +452,7 @@ async def read_file(
     path: str,
     max_chars: int,
     actor: dict[str, str],
+    isolation: dict[str, Any] | None = None,
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
@@ -406,6 +461,7 @@ async def read_file(
         result = {
             "path": path,
             "approval_id": approval_id,
+            "isolation": isolation or {},
             "content": content,
             "truncated": len(text) > len(content),
         }
@@ -432,6 +488,7 @@ async def list_dir(
     *,
     path: str,
     actor: dict[str, str],
+    isolation: dict[str, Any] | None = None,
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
@@ -457,6 +514,7 @@ async def list_dir(
             "dir_listed",
             path=path,
             approval_id=approval_id,
+            isolation=isolation or {},
             entries=entries,
         )
     except Exception as exc:
@@ -476,6 +534,7 @@ async def search_files(
     contains: str,
     max_results: int,
     actor: dict[str, str],
+    isolation: dict[str, Any] | None = None,
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
@@ -523,6 +582,7 @@ async def search_files(
             pattern=pattern,
             contains=contains,
             approval_id=approval_id,
+            isolation=isolation or {},
             results=results,
             truncated=len(results) >= max_results,
         )

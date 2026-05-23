@@ -653,13 +653,25 @@ def _append_layered_memory(
     key = normalize_message_text(getattr(memory, "key", ""))
     scope = normalize_message_text(getattr(memory, "scope", ""))
     target: list[str]
-    if memory_type in {"nickname", "correction", "person_profile_summary"}:
+    if memory_type in {
+        "nickname",
+        "correction",
+        "person_profile_summary",
+        "thread_nickname",
+        "thread_correction",
+        "thread_person_profile_summary",
+    }:
         target = buckets.person_facts
-    elif memory_type == "relationship" or key.startswith("relationship"):
+    elif memory_type in {"relationship", "thread_relationship"} or key.startswith("relationship"):
         target = buckets.relationship_facts
-    elif memory_type == "preference":
+    elif memory_type in {"preference", "thread_preference"}:
         target = buckets.preference_facts
-    elif memory_type in {"group_digest", "thread_digest"} or scope == "thread":
+    elif memory_type in {
+        "group_digest",
+        "thread_digest",
+        "thread_fact",
+        "recent_thread_fact",
+    } or scope == "thread":
         target = buckets.recent_thread_facts
     else:
         target = buckets.other_facts

@@ -12,6 +12,7 @@ from ..audit_log import record_audit_event
 from ..patch_operations import FileChange, apply_changes_transaction
 from ..permission_policy import decide_plugin_dev
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_working_path
 from .common import (
     actor_from_context,
     approval_required_result,
@@ -20,6 +21,7 @@ from .common import (
     permission_denied_result,
     project_root,
     tool_result,
+    worktree_id_from_context,
 )
 
 _PLUGIN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -67,6 +69,7 @@ class PluginDevInspectTool:
             "plugin_name": plugin_name,
             "plugin_root": plugin_root,
             "max_files": max_files,
+            "worktree_id": worktree_id_from_context(context),
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -87,6 +90,7 @@ class PluginDevInspectTool:
             plugin_root=plugin_root,
             max_files=max_files,
             actor=actor,
+            worktree_id=str(payload.get("worktree_id", "") or ""),
         )
 
 
@@ -153,6 +157,7 @@ class PluginDevScaffoldTool:
             "menu_type": str(kwargs.get("menu_type", "") or "功能").strip() or "功能",
             "plugin_root": str(kwargs.get("plugin_root", "") or "").strip() or None,
             "overwrite": bool(kwargs.get("overwrite") or False),
+            "worktree_id": worktree_id_from_context(context),
         }
         decision = decide_plugin_dev("plugin_dev_scaffold " + payload["plugin_name"])
         if decision.decision == "deny":
@@ -169,7 +174,11 @@ class PluginDevScaffoldTool:
                 payload=payload,
                 permission=decision,
             )
-        return await scaffold_plugin(actor=actor, **payload)
+        return await scaffold_plugin(
+            actor=actor,
+            worktree_id=str(payload.pop("worktree_id", "") or ""),
+            **payload,
+        )
 
 
 class PluginDevWriteFileTool:
@@ -234,6 +243,7 @@ class PluginDevWriteFileTool:
             "create_dirs": True if kwargs.get("create_dirs") is None else bool(kwargs.get("create_dirs")),
             "overwrite": True if kwargs.get("overwrite") is None else bool(kwargs.get("overwrite")),
             "reason": str(kwargs.get("reason", "") or ""),
+            "worktree_id": worktree_id_from_context(context),
         }
         decision = decide_plugin_dev(
             f"plugin_dev_write_file {payload['plugin_name']} {payload['relative_path']}"
@@ -253,7 +263,11 @@ class PluginDevWriteFileTool:
                 payload=payload,
                 permission=decision,
             )
-        return await write_plugin_file(actor=actor, **payload)
+        return await write_plugin_file(
+            actor=actor,
+            worktree_id=str(payload.pop("worktree_id", "") or ""),
+            **payload,
+        )
 
 
 async def inspect_plugin(
@@ -262,11 +276,16 @@ async def inspect_plugin(
     plugin_root: str | None,
     max_files: int,
     actor: dict[str, str],
+    worktree_id: str = "",
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
-        root = _plugin_root(plugin_root)
-        target = _plugin_dir(plugin_name, plugin_root) if plugin_name else root
+        root = _plugin_root(plugin_root, actor=actor, worktree_id=worktree_id)
+        target = (
+            _plugin_dir(plugin_name, plugin_root, actor=actor, worktree_id=worktree_id)
+            if plugin_name
+            else root
+        )
         if not target.exists():
             return tool_result(False, "plugin_path_not_found", path=str(target))
         files: list[dict[str, Any]] = []
@@ -334,6 +353,7 @@ async def scaffold_plugin(
     plugin_root: str | None,
     overwrite: bool,
     actor: dict[str, str],
+    worktree_id: str = "",
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
@@ -342,7 +362,7 @@ async def scaffold_plugin(
             return tool_result(False, "plugin_display_name_required")
         if not command:
             return tool_result(False, "plugin_command_required")
-        plugin_dir = _plugin_dir(plugin_name, plugin_root)
+        plugin_dir = _plugin_dir(plugin_name, plugin_root, actor=actor, worktree_id=worktree_id)
         init_path = plugin_dir / "__init__.py"
         if init_path.exists() and not overwrite:
             return tool_result(False, "plugin_already_exists", path=str(init_path))
@@ -411,13 +431,14 @@ async def write_plugin_file(
     overwrite: bool,
     reason: str,
     actor: dict[str, str],
+    worktree_id: str = "",
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
         _validate_plugin_name(plugin_name)
         if not relative_path:
             return tool_result(False, "plugin_relative_path_required")
-        plugin_dir = _plugin_dir(plugin_name, plugin_root)
+        plugin_dir = _plugin_dir(plugin_name, plugin_root, actor=actor, worktree_id=worktree_id)
         target = _safe_child(plugin_dir, relative_path)
         if target.exists() and not overwrite:
             return tool_result(False, "plugin_file_exists", path=str(target))
@@ -475,14 +496,40 @@ async def write_plugin_file(
         )
 
 
-def _plugin_root(plugin_root: str | None) -> Path:
-    root = Path(plugin_root) if plugin_root else project_root() / _DEFAULT_PLUGIN_ROOT
-    return root.resolve()
+def _plugin_root(
+    plugin_root: str | None,
+    *,
+    actor: dict[str, str] | None = None,
+    worktree_id: str = "",
+) -> Path:
+    raw = str(plugin_root or "").strip() or str(_DEFAULT_PLUGIN_ROOT)
+    if actor is None:
+        root = Path(raw)
+        if not root.is_absolute():
+            root = project_root() / root
+        return root.resolve()
+    resolved, _isolation = resolve_working_path(
+        raw,
+        actor=actor,
+        worktree_id=worktree_id,
+    )
+    if _isolation.get("invalid_worktree") or _isolation.get("escaped_worktree"):
+        raise ValueError("worktree path resolution failed for plugin root")
+    return Path(resolved).resolve()
 
 
-def _plugin_dir(plugin_name: str, plugin_root: str | None) -> Path:
+def _plugin_dir(
+    plugin_name: str,
+    plugin_root: str | None,
+    *,
+    actor: dict[str, str] | None = None,
+    worktree_id: str = "",
+) -> Path:
     _validate_plugin_name(plugin_name)
-    return (_plugin_root(plugin_root) / plugin_name).resolve()
+    return (
+        _plugin_root(plugin_root, actor=actor, worktree_id=worktree_id)
+        / plugin_name
+    ).resolve()
 
 
 def _validate_plugin_name(plugin_name: str) -> None:

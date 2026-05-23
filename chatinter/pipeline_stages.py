@@ -8,9 +8,8 @@ ChatInter - pipeline stages
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, cast
+from typing import cast
 import uuid
-import re
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna.uniseg import UniMessage
@@ -22,12 +21,6 @@ from zhenxun.services.llm import LLMContentPart, LLMMessage
 from zhenxun.utils.message import MessageUtils
 
 from .addressee_resolver import AddresseeResult, resolve_addressee
-from .chat_dialogue_planner import (
-    build_dialogue_state,
-    load_dialogue_state,
-    persist_dialogue_state,
-    plan_chat_dialogue,
-)
 from .chat_handler import (
     artifacts_from_send_observations,
     messages_summary_from_send_observations,
@@ -35,7 +28,7 @@ from .chat_handler import (
     replace_mention_ids_with_names,
     reroute_to_plugin_with_result,
 )
-from .chat_strategy import build_chat_strategy_prompt, build_dialogue_state_prompt
+from .chat_runtime import ChatRuntime
 from .config import get_config_value
 from .context_packer import DialogueContextPack
 from .event_context import ChatInterEventContext, build_event_context
@@ -71,8 +64,8 @@ from .main_request import MainRequestResult, run_chatinter_main_request
 from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState
-from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
 from .models.pydantic_models import CommandToolSnapshot
+from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
 from .native_route import (
     NativeRouteDecision,
     NativeRouteReport,
@@ -91,8 +84,8 @@ from .plugin_registry import (
 from .route_execution import (
     build_invalid_route_observation,
     build_reply_image_segments_for_reroute,
-    build_route_observation,
     build_route_message_with_explicit_context,
+    build_route_observation,
     build_target_modules,
     collect_target_capable_command_heads,
     extract_at_tokens,
@@ -108,7 +101,6 @@ from .route_text import (
     normalize_message_text,
     should_force_knowledge_refresh,
 )
-from .response_quality_judge import ResponseQualityJudge
 from .target_context import (
     append_mention_context_xml,
     build_mention_name_map,
@@ -132,15 +124,8 @@ from .turn_runtime import TurnBudgetController
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
 
-if TYPE_CHECKING:
-    from .chat_dialogue_planner import DialogueState
-
 _KNOWLEDGE_REFRESH_COOLDOWN = 30.0
 _last_knowledge_refresh_ts = 0.0
-_DIALOGUE_STATE_CONTEXT_PATTERN = re.compile(
-    r"\n?<dialogue_state>.*?</dialogue_state>",
-    re.DOTALL,
-)
 _GROUP_PLUGIN_SELECTOR_RULES = """
 <chatinter_main_request>
 你正在处理群聊消息。你可以自然聊天，也可以在合适时调用候选插件工具。
@@ -187,9 +172,19 @@ Observation 作为完成依据。
 - 任务管理：todo_read / todo_write 维护短 Todo；复杂工程任务先列 Todo，
   逐项推进并用 observation 标记完成。
 - 插件开发：plugin_dev_inspect / plugin_dev_scaffold / plugin_dev_write_file。
+- 工程隔离：worktree_create / worktree_status / worktree_list / worktree_remove。
 - 文件操作：read_file / list_dir / search_files / write_file / append_file / replace_in_file。
+- 工程闭环协议：engineering_loop_start -> engineering_lsp_read -> semantic_patch_plan
+  -> patch_prepare -> patch_apply -> engineering_eval_run -> engineering_eval_gate
+  -> engineering_loop_complete。复杂代码任务优先走这条固定协议；不要跳过
+  engineering_lsp_read 直接 patch。
+- 工程失败恢复协议：engineering_eval_run 失败后先用 engineering_failure_diagnose
+  固化诊断，再根据 allowed_next_tools 选择重读代码、二次 semantic_patch/patch、
+  或 patch_rollback；不要原样重复失败测试，也不要绕过诊断直接二次 patch。
 - 工程修改：patch_prepare 先生成 diff，patch_apply 应用，patch_rollback 回滚，patch_show 查看历史。
 - 大输出读取：artifact_list / artifact_read 读取被压缩的长日志、diff、工具结果。
+- 运行时事件：runtime_event_list / runtime_event_read 查看统一事件流，
+  包括 AgentRun、工具进度、Observation、Artifact、Approval、Background Job、TaskGraph。
 - AgentRun：agent_run_status 查询状态，agent_run_resume 恢复暂停任务，
   agent_run_cancel 取消暂停/运行中的任务。
 - 项目命令：python_exec / python_module / uv_command / git_command。
@@ -207,16 +202,24 @@ ask 会返回 approval_required 和 approval_id；先向用户说明待确认内
 approve_pending_action，再用 agent_run_resume 继续原任务；用户拒绝或取消则调用
 reject_pending_action。deny 直接说明无法执行。
 后台任务启动后当前 AgentRun 会暂停；稍后使用 agent_run_resume 恢复，并先查看
-background_task_status 再继续后续步骤。
+runtime_event_list 或 background_task_status 再继续后续步骤。
 不要声称完成未实际执行的操作；工具返回 Observation 后再继续下一步或总结。
 final 前会检查 TaskGraph 未完成项；如果被提示 task_graph_incomplete，
 继续完成缺失任务，不能用口头总结替代执行证据。
 Todo 是过程控制，不替代真实工具结果；Todo completed 需要对应 observation 支持。
-涉及代码修改时，优先使用 patch_prepare -> patch_apply，便于用户预览和回滚。
+涉及代码修改时，优先使用工程闭环协议；轻微单文件修改至少使用
+patch_prepare -> patch_apply，便于用户预览和回滚。
+当主工作区可能有用户改动，或任务涉及代码写入、多文件修改、插件开发、长时间验证时，先用
+worktree_create 创建隔离工作区；创建后 read/write/search、shell/git、patch、eval、plugin_dev
+默认落到该 worktree。不要把隔离 worktree 的改动说成已经合入主工作区；总结时用
+worktree_status 给出分支、路径和 diff 摘要。
+如果用户明确要求直接改主工作区，可以不创建 worktree，但必须说明风险并遵守 approval。
 patch_apply 会校验文件未在 prepare 后被外部修改；冲突时重新 read_file 后再 prepare。
 工具结果出现 artifact_id 时，先根据摘要判断；需要原文再调用 artifact_read。
-执行工程改动后，使用 engineering_eval_run 或专用 python/uv/git 工具完成验收；失败时说明失败点，
-必要时用 patch_rollback 回滚。
+执行工程改动后，必须通过 engineering_eval_gate：gate 未通过时，按返回的
+diagnosis / recovery_plan 选择重读代码、二次 semantic patch/patch_prepare，
+或 patch_rollback。
+不要在 gate blocked 时声称任务完成。
 </chatinter_superuser_agent>
 """.strip()
 
@@ -451,7 +454,7 @@ def _route_requires_visible_output(validated: NativeValidatedRoute) -> bool:
         return False
     output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
     side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
-    if output_mode == "plugin_output" and side_effect == "send":
+    if output_mode == "plugin_output":
         return True
     return (
         output_mode in _VISIBLE_OUTPUT_REQUIRED_MODES
@@ -817,12 +820,19 @@ async def stage_memory(
     bot: Bot,
     event: Event,
 ) -> None:
-    dialogue_state = frame.dialogue_state or _build_pre_memory_dialogue_state(frame)
+    profile = ChatRuntime.attach_profile(frame)
+    if profile is not None:
+        frame.chat_runtime_profile = profile
+        frame.dialogue_plan = profile.dialogue_plan
+        frame.dialogue_state = profile.dialogue_state
+        frame.previous_dialogue_state = profile.previous_state
+    dialogue_state = frame.dialogue_state
     memory_message = (
         frame.raw_message
         if frame.turn_messages
         else frame.uni_msg or frame.raw_message
     )
+    memory_dialogue_state = ChatRuntime.memory_dialogue_state(frame)
     (
         chat_system_prompt,
         context_xml,
@@ -837,7 +847,12 @@ async def stage_memory(
         frame.bot_id,
         event,
         frame.dialogue_context_pack,
-        dialogue_state,
+        memory_dialogue_state,
+    )
+    frame.chat_memory_layered = getattr(
+        frame.dialogue_context_pack,
+        "layered_memory",
+        None,
     )
     frame.dialogue_state = dialogue_state
     frame.set_context(
@@ -850,63 +865,20 @@ async def stage_memory(
 
 
 async def stage_dialogue_state(*, frame: TurnFrame) -> None:
-    dialogue_state = _build_pre_memory_dialogue_state(frame)
-    if dialogue_state is not None:
-        frame.dialogue_state = dialogue_state
+    profile = ChatRuntime.attach_profile(frame)
+    if profile is not None:
+        frame.chat_runtime_profile = profile
+        frame.dialogue_plan = profile.dialogue_plan
+        frame.dialogue_state = profile.dialogue_state
+        frame.previous_dialogue_state = profile.previous_state
         frame.update_tags(
-            dialogue_tone=dialogue_state.tone,
-            dialogue_emotion=dialogue_state.user_emotion,
-            dialogue_purpose=dialogue_state.dialogue_purpose,
+            dialogue_tone=profile.dialogue_state.tone,
+            dialogue_emotion=profile.dialogue_state.user_emotion,
+            dialogue_purpose=profile.dialogue_state.dialogue_purpose,
+            reply_posture=profile.dialogue_state.reply_posture,
+            group_atmosphere=profile.dialogue_state.group_atmosphere,
         )
     frame.stage(PipelineStage.DIALOGUE_STATE)
-
-
-def _build_pre_memory_dialogue_state(frame: TurnFrame) -> "DialogueState | None":
-    try:
-        fallback_intent = frame.intent_profile
-        previous_state = load_dialogue_state(
-            session_key=frame.session_key,
-            user_id=frame.user_id,
-            group_id=frame.group_id,
-        )
-        relevant_people = getattr(frame.dialogue_context_pack, "relevant_people", ())
-        thread_topic = normalize_message_text(
-            str(getattr(frame.thread_context, "topic_key", "") or "")
-        )
-        plan = plan_chat_dialogue(
-            message_text=frame.current_message or frame.raw_message,
-            intent=fallback_intent,
-            has_images=bool(getattr(frame.event_context, "images", ()) or ()),
-            has_reply=bool(
-                getattr(getattr(frame.event_context, "reply", None), "sender_id", "")
-            ),
-        )
-        frame.dialogue_plan = frame.dialogue_plan or plan
-        state = build_dialogue_state(
-            message_text=frame.current_message or frame.raw_message,
-            plan=plan,
-            intent=fallback_intent,
-            scenario=frame.scenario,
-            has_images=bool(getattr(frame.event_context, "images", ()) or ()),
-            has_reply=bool(
-                getattr(getattr(frame.event_context, "reply", None), "sender_id", "")
-            ),
-            previous_state=previous_state,
-            is_group=bool(frame.group_id),
-            relevant_people_count=len(tuple(relevant_people or ())),
-            thread_topic=thread_topic,
-        )
-        persist_dialogue_state(
-            session_key=frame.session_key,
-            user_id=frame.user_id,
-            group_id=frame.group_id,
-            message_text=frame.current_message or frame.raw_message,
-            state=state,
-        )
-        return state
-    except Exception:
-        return None
-
 
 async def _prepare_current_message_context(
     *,
@@ -1113,6 +1085,9 @@ async def _select_capability_route(
         else []
     )
     frame.command_tools = command_tools
+    frame.chat_tool_exposure_state = (
+        "plugin_tools_exposed" if frame.allow_plugin_tools and command_tools else "none"
+    )
 
     intent_profile = classify_message_intent(route_message, knowledge_base)
     frame.intent_profile = intent_profile
@@ -1193,14 +1168,12 @@ async def stage_capability_hint(
 
 def _build_system_prompt(frame: TurnFrame) -> str:
     base_prompt = frame.system_prompt
-    dialogue_plan = frame.dialogue_plan
     parts = [normalize_message_text(base_prompt)]
-    strategy_prompt = build_chat_strategy_prompt(dialogue_plan)
-    if strategy_prompt:
-        parts.append(strategy_prompt)
-    state_prompt = build_dialogue_state_prompt(frame.dialogue_state)
-    if state_prompt:
-        parts.append(state_prompt)
+    chat_prompt = ChatRuntime.build_prompt_context(
+        frame,
+        base_context_xml=frame.enriched_context_xml or frame.context_xml,
+    )
+    parts.extend(chat_prompt.system_fragments)
     if frame.scenario == "group_plugin_selector":
         parts.append(_GROUP_PLUGIN_SELECTOR_RULES)
     elif frame.scenario == "superuser_agent":
@@ -1266,12 +1239,6 @@ def _build_turn_queue_context(frame: TurnFrame) -> str:
     return "\n".join(sections)
 
 
-def _replace_dialogue_state_context(context_xml: str, dialogue_state) -> str:
-    block = dialogue_state.to_xml()
-    base = _DIALOGUE_STATE_CONTEXT_PATTERN.sub("", str(context_xml or "")).strip()
-    return f"{base}\n{block}".strip() if base else block
-
-
 async def stage_current_user(
     *,
     frame: TurnFrame,
@@ -1299,26 +1266,23 @@ async def stage_current_user(
     frame.enriched_context_xml = frame.context_xml
     if frame.intent_profile is None:
         raise RuntimeError("missing intent profile for main request")
-    dialogue_plan = plan_chat_dialogue(
-        message_text=frame.current_message,
-        intent=frame.intent_profile,
-        has_images=bool(image_parts),
-        has_reply=frame.has_reply,
+    profile = ChatRuntime.attach_profile(frame)
+    if profile is not None:
+        frame.chat_runtime_profile = profile
+        frame.dialogue_plan = profile.dialogue_plan
+        frame.dialogue_state = profile.dialogue_state
+        frame.previous_dialogue_state = profile.previous_state
+    dialogue_plan = frame.dialogue_plan
+    dialogue_state = frame.dialogue_state
+    if dialogue_plan is None or dialogue_state is None:
+        raise RuntimeError("missing chat runtime profile")
+    chat_prompt = ChatRuntime.build_prompt_context(
+        frame,
+        base_context_xml=frame.enriched_context_xml,
     )
-    dialogue_state = build_dialogue_state(
-        message_text=frame.current_message,
-        plan=dialogue_plan,
-        intent=frame.intent_profile,
-        scenario=frame.scenario,
-        has_images=bool(image_parts),
-        has_reply=frame.has_reply,
-    )
-    frame.dialogue_plan = dialogue_plan
-    frame.dialogue_state = dialogue_state
-    frame.enriched_context_xml = _replace_dialogue_state_context(
-        frame.enriched_context_xml,
-        dialogue_state,
-    )
+    frame.enriched_context_xml = chat_prompt.context_xml
+    if chat_prompt.tags:
+        frame.update_tags(**chat_prompt.tags)
     frame.update_tags(
         chat_kind=dialogue_plan.kind,
         chat_style=dialogue_plan.style,
@@ -1326,6 +1290,8 @@ async def stage_current_user(
         dialogue_tone=dialogue_state.tone,
         dialogue_emotion=dialogue_state.user_emotion,
         dialogue_purpose=dialogue_state.dialogue_purpose,
+        reply_posture=dialogue_state.reply_posture,
+        group_atmosphere=dialogue_state.group_atmosphere,
     )
 
 
@@ -1455,22 +1421,16 @@ async def stage_agent_run(
         reply_text = main_result.output.final_text
         if not normalize_message_text(reply_text):
             reply_text = "我暂时没想好怎么回答你。"
-        if ResponseQualityJudge.should_judge(
-            scenario=frame.scenario,
-            main_result=main_result,
-        ):
-            quality = ResponseQualityJudge.judge(
-                final_text=reply_text,
-                original_message=frame.current_message,
-                dialogue_state=frame.dialogue_state,
-                main_result=main_result,
-            )
-            if not quality.ok:
-                frame.update_tags(response_quality=quality.reason)
-                if quality.revised_text:
-                    reply_text = quality.revised_text
-                elif quality.instruction:
-                    envelope.add(ChannelName.ANALYSIS, quality.instruction)
+        quality = ChatRuntime.judge_final_reply(
+            frame=frame,
+            final_text=reply_text,
+        )
+        if not quality.ok:
+            frame.update_tags(response_quality=quality.reason)
+            if quality.revised_text:
+                reply_text = quality.revised_text
+            elif quality.instruction:
+                envelope.add(ChannelName.ANALYSIS, quality.instruction)
         envelope.add(ChannelName.FINAL, reply_text)
     frame.final_envelope = envelope
 
@@ -1556,6 +1516,10 @@ async def stage_send(frame: TurnFrame) -> None:
             reply_text=envelope.final,
             weight=0.2,
         )
+    _persist_plain_chat_dialogue_state(
+        frame=frame,
+        reply_text=envelope.final,
+    )
     _tag_execution_observation(
         frame.trace,
         frame.chat_execution_frame.finish(
@@ -1580,6 +1544,18 @@ async def stage_send(frame: TurnFrame) -> None:
         budget_controller=frame.budget_controller,
     )
     frame.turn_finished = True
+
+
+def _persist_plain_chat_dialogue_state(
+    *,
+    frame: TurnFrame,
+    reply_text: str,
+) -> None:
+    try:
+        if ChatRuntime.persist_dialogue_state(frame=frame, reply_text=reply_text):
+            frame.update_tags(dialogue_state_persisted="1")
+    except Exception:
+        return
 
 
 async def handle_pipeline_cancelled(frame: TurnFrame) -> None:

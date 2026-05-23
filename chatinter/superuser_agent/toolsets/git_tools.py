@@ -8,12 +8,14 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
 from ..permission_policy import decide_git
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd
 from .common import (
     actor_from_context,
     approval_required_result,
     coerce_timeout,
     permission_denied_result,
     tool_result,
+    worktree_id_from_context,
 )
 from .shell_tools import run_shell_command
 
@@ -60,6 +62,13 @@ class GitCommandTool:
         reason = str(kwargs.get("reason", "") or "")
         timeout_seconds = coerce_timeout(kwargs.get("timeout_seconds"))
         actor = actor_from_context(context)
+        cwd, isolation = resolve_cwd(
+            cwd,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
         if not args:
             return tool_result(False, "git_empty_args")
         command = git_command_from_args(args)
@@ -70,6 +79,7 @@ class GitCommandTool:
             "cwd": cwd,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -91,6 +101,7 @@ class GitCommandTool:
             actor=actor,
             approval_id=None,
             timeout_seconds=timeout_seconds,
+            isolation=isolation,
         )
 
 
@@ -101,6 +112,7 @@ async def run_git_command(
     actor: dict[str, str],
     approval_id: str | None = None,
     timeout_seconds: float | None = None,
+    isolation: dict[str, Any] | None = None,
 ) -> ToolResult:
     command = git_command_from_args(args)
     return await run_shell_command(
@@ -110,6 +122,7 @@ async def run_git_command(
         approval_id=approval_id,
         timeout_seconds=timeout_seconds,
         action="git_command",
+        isolation=isolation,
     )
 
 

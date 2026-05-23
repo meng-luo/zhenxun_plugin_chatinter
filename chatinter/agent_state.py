@@ -11,7 +11,9 @@ from zhenxun.services.llm.types.models import LLMToolCall, LLMToolFunction, Tool
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .artifact_store import get_artifact_store, summarize_artifact_text
+from .provider_capability import ProviderCapabilityAdapter
 from .route_text import normalize_message_text
+from .runtime_events import emit_runtime_event_from_state
 from .task_frame import TASK_TEXT_FIELD
 from .task_graph import TaskGraph
 from .task_ledger import CapabilityLedger, TaskLedger
@@ -205,6 +207,14 @@ class AgentRunState:
                 metadata=dict(metadata or {}),
             )
         )
+        _emit_timeline_runtime_event(
+            self,
+            role=role,
+            kind=kind,
+            content=content,
+            tool_name=tool_name,
+            metadata=dict(metadata or {}),
+        )
 
     def append_model_request(self, *, tool_count: int) -> None:
         task_graph_summary: dict[str, Any] = {}
@@ -277,20 +287,30 @@ class AgentRunState:
         tool_call: LLMToolCall,
         tool_result: ToolResult,
         model_payload: dict[str, Any],
+        provider_adapter: ProviderCapabilityAdapter | None = None,
     ) -> None:
         observation = self._build_observation(
             tool_call=tool_call,
             tool_result=tool_result,
         )
         self.observations.append(observation)
+        _emit_observation_runtime_event(self, observation)
         self._update_resume_refs(observation)
         self._update_capability_ledger(observation)
         self._update_task_state(observation)
         self.messages.append(
-            LLMMessage.tool_response(
-                tool_call_id=tool_call.id,
-                function_name=tool_call.function.name,
-                result=model_payload,
+            (
+                provider_adapter.tool_result_message(
+                    tool_call=tool_call,
+                    function_name=tool_call.function.name,
+                    result=model_payload,
+                )
+                if provider_adapter is not None
+                else LLMMessage.tool_response(
+                    tool_call_id=tool_call.id,
+                    function_name=tool_call.function.name,
+                    result=model_payload,
+                )
             )
         )
         self.append_timeline(
@@ -314,6 +334,7 @@ class AgentRunState:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self.observations.append(observation)
+        _emit_observation_runtime_event(self, observation)
         self._update_resume_refs(observation)
         self._update_capability_ledger(observation)
         self._update_task_state(observation)
@@ -595,6 +616,7 @@ class AgentRunState:
         )
 
     def _update_task_state(self, observation: AgentObservation) -> None:
+        changed = False
         if self.task_ledger is not None and observation.ok:
             self.task_ledger.apply_coverage(
                 covered_task_ids=_covered_ledger_task_ids(
@@ -604,6 +626,7 @@ class AgentRunState:
                 unsupported_tasks=[],
                 reason="observation_update",
             )
+            changed = True
         if observation.task_text:
             self.pending_tasks = [
                 task
@@ -620,12 +643,16 @@ class AgentRunState:
                     step=observation.step,
                 )
             )
+            changed = True
         if observation.need_continue and observation.remaining_task_hint:
             self.add_pending_tasks(
                 [observation.remaining_task_hint],
                 source="observation",
                 command_id=observation.command_id,
             )
+            changed = True
+        if changed:
+            _emit_task_state_runtime_event(self, observation)
 
     def _update_capability_ledger(self, observation: AgentObservation) -> None:
         self.capability_ledger.record_observation(
@@ -688,6 +715,10 @@ class AgentRunState:
         )
         if artifact_id and artifact_id not in self.artifact_refs:
             self.artifact_refs.append(artifact_id)
+        for artifact in observation.artifacts:
+            artifact_id = normalize_message_text(str(artifact.get("artifact_id") or ""))
+            if artifact_id and artifact_id not in self.artifact_refs:
+                self.artifact_refs.append(artifact_id)
 
 
 def _parse_tool_arguments(arguments: str) -> dict[str, Any] | str:
@@ -791,6 +822,193 @@ def _observation_content(observation: AgentObservation) -> str:
     if observation.result:
         return normalize_message_text(str(observation.result.display_content or ""))
     return ""
+
+
+def _emit_timeline_runtime_event(
+    state: AgentRunState,
+    *,
+    role: str,
+    kind: str,
+    content: str,
+    tool_name: str,
+    metadata: dict[str, Any],
+) -> None:
+    event_kind, event_status = _runtime_kind_status_from_timeline(kind)
+    emit_runtime_event_from_state(
+        state,
+        kind=event_kind,
+        status=event_status,
+        source=f"timeline:{kind}",
+        summary=content or tool_name or kind,
+        payload={
+            "role": role,
+            "timeline_kind": kind,
+            "tool_name": tool_name,
+            "metadata": metadata,
+        },
+        artifacts=_artifacts_from_payload(metadata),
+        related_ids=_related_ids_from_payload(metadata),
+    )
+
+
+def _emit_observation_runtime_event(
+    state: AgentRunState,
+    observation: AgentObservation,
+) -> None:
+    emit_runtime_event_from_state(
+        state,
+        kind="tool_observation" if observation.tool_name else "observation",
+        status="completed" if observation.ok else "failed",
+        source=f"tool:{observation.tool_name or 'synthetic'}",
+        summary=_observation_content(observation),
+        payload={
+            "tool_call_id": observation.tool_call_id,
+            "tool_name": observation.tool_name,
+            "command_id": observation.command_id,
+            "rendered_command": observation.rendered_command,
+            "matched_plugin": observation.matched_plugin,
+            "task_text": observation.task_text,
+            "ok": observation.ok,
+            "need_continue": observation.need_continue,
+            "remaining_task_hint": observation.remaining_task_hint,
+            "error": observation.error,
+            "output": observation.output,
+        },
+        artifacts=list(observation.artifacts),
+        related_ids={
+            "tool_call_id": observation.tool_call_id,
+            "command_id": observation.command_id,
+            "background_task_id": _first_text(
+                observation.output.get("task_id"),
+                _nested_get(observation.output, "task", "task_id"),
+            ),
+            "approval_id": _first_text(
+                observation.output.get("approval_id"),
+                _nested_get(observation.output, "approval", "approval_id"),
+            ),
+            "observation_event_id": _first_text(
+                observation.output.get("event_id"),
+                _nested_get(observation.output, "event", "event_id"),
+                _nested_get(observation.output, "observation_event", "event_id"),
+            ),
+        },
+    )
+
+
+def _emit_task_state_runtime_event(
+    state: AgentRunState,
+    observation: AgentObservation,
+) -> None:
+    payload: dict[str, Any] = {
+        "source_observation": {
+            "tool_name": observation.tool_name,
+            "command_id": observation.command_id,
+            "task_text": observation.task_text,
+            "ok": observation.ok,
+        },
+        "pending_tasks": [
+            {"text": task.text, "source": task.source, "command_id": task.command_id}
+            for task in state.pending_tasks[-20:]
+        ],
+        "completed_tasks": [
+            {
+                "text": task.text,
+                "command_id": task.command_id,
+                "rendered_command": task.rendered_command,
+                "matched_plugin": task.matched_plugin,
+                "ok": task.ok,
+            }
+            for task in state.completed_tasks[-20:]
+        ],
+    }
+    if state.task_ledger is not None:
+        payload["task_ledger"] = state.task_ledger.to_public_payload()
+    if state.task_graph is not None:
+        payload["task_graph"] = state.task_graph.to_public_payload()
+    emit_runtime_event_from_state(
+        state,
+        kind="task_ledger" if state.task_ledger is not None else "task_graph",
+        status="progress",
+        source="task_state:observation_update",
+        summary=observation.task_text or observation.command_id or observation.tool_name,
+        payload=payload,
+        artifacts=list(observation.artifacts),
+        related_ids={
+            "tool_call_id": observation.tool_call_id,
+            "command_id": observation.command_id,
+        },
+    )
+
+
+def _runtime_kind_status_from_timeline(
+    timeline_kind: str,
+) -> tuple[str, str]:
+    kind = normalize_message_text(timeline_kind)
+    if kind == "model_request":
+        return "model_request", "started"
+    if kind == "tool_call":
+        return "tool_call", "started"
+    if kind in {"tool_result", "background_observation_event"}:
+        return "tool_observation", "completed"
+    if kind in {"task_graph", "task_graph_verification"}:
+        return "task_graph", "progress"
+    if kind.startswith("task_ledger"):
+        return "task_ledger", "progress"
+    if kind == "runtime_guardrail":
+        return "guardrail", "blocked"
+    if kind in {"agent_paused"}:
+        return "agent_run", "waiting"
+    if kind in {"agent_resumed"}:
+        return "agent_run", "started"
+    if kind in {"agent_cancelled"}:
+        return "agent_run", "cancelled"
+    if kind == "assistant_text":
+        return "agent_run", "completed"
+    if kind == "todo_sync":
+        return "todo", "progress"
+    return "system", "info"
+
+
+def _artifacts_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    values = [payload.get("artifacts")]
+    output = payload.get("output")
+    if isinstance(output, dict):
+        values.append(output.get("artifacts"))
+    event = payload.get("event")
+    if isinstance(event, dict):
+        values.append(event.get("artifacts"))
+    for value in values:
+        if not isinstance(value, list | tuple):
+            continue
+        for item in value:
+            if isinstance(item, dict) and item.get("artifact_id"):
+                result.append(dict(item))
+    return result
+
+
+def _related_ids_from_payload(payload: dict[str, Any]) -> dict[str, str]:
+    output = payload.get("output")
+    output = output if isinstance(output, dict) else {}
+    event = payload.get("event")
+    event = event if isinstance(event, dict) else {}
+    return {
+        "approval_id": _first_text(
+            output.get("approval_id"),
+            _nested_get(output, "approval", "approval_id"),
+        ),
+        "background_task_id": _first_text(
+            output.get("task_id"),
+            _nested_get(output, "task", "task_id"),
+            event.get("task_id"),
+        ),
+        "observation_event_id": _first_text(
+            output.get("event_id"),
+            _nested_get(output, "event", "event_id"),
+            _nested_get(output, "observation_event", "event_id"),
+            event.get("event_id"),
+        ),
+    }
 
 
 def _has_task(tasks: list[PendingTask], text: str) -> bool:

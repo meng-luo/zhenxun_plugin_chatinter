@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
+from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .capability_card import (
@@ -30,7 +31,9 @@ from .command_index import (
 )
 from .feedback import get_command_feedback_profile
 from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
+from .native_command_tools import build_native_command_tools
 from .plugin_reference import build_command_tool_snapshots
+from .provider_capability import ProviderCapabilityAdapter
 from .route_text import normalize_message_text
 
 
@@ -365,6 +368,88 @@ class CapabilityRegistry:
                 raw_card=raw_card,
             )
 
+    def register_available_superuser_tools(self) -> None:
+        """Load and register currently available superuser tools.
+
+        Callers should not import the superuser registry directly for runtime
+        exposure; this keeps availability, risk and metadata under this unified
+        registry.
+        """
+
+        from .superuser_agent.registry import build_superuser_agent_tool_bundle
+
+        bundle = build_superuser_agent_tool_bundle()
+        self.register_superuser_tools(bundle.tools, cards=bundle.cards)
+
+    def register_external_tools(
+        self,
+        tools: dict[str, ToolExecutable],
+        *,
+        provider_adapter: ProviderCapabilityAdapter,
+        namespace: str = "external",
+        source: str = "mcp",
+    ) -> None:
+        """Register MCP/external tools through the unified capability layer."""
+
+        normalized_namespace = normalize_message_text(namespace) or "external"
+        normalized_source = normalize_message_text(source) or "mcp"
+        for name, executable in tools.items():
+            tool_name = provider_adapter.sanitize_external_tool_name(
+                str(name or ""),
+                namespace=normalized_namespace,
+            )
+            if not tool_name:
+                continue
+            wrapped = ProviderExternalTool(
+                name=tool_name,
+                executable=executable,
+                adapter=provider_adapter,
+            )
+            card = _capability_card_from_external_tool(
+                tool_name=tool_name,
+                executable=executable,
+                namespace=normalized_namespace,
+                source=normalized_source,
+                provider_adapter=provider_adapter,
+            )
+            self.register_executable_tool(
+                tool_name=tool_name,
+                executable=cast(ToolExecutable, wrapped),
+                kind="runtime_tool",
+                card=card,
+                raw_card={
+                    "namespace": normalized_namespace,
+                    "source": normalized_source,
+                    "provider_protocol": provider_adapter.mcp_metadata(),
+                },
+            )
+
+    async def register_available_mcp_tools(
+        self,
+        *,
+        provider_adapter: ProviderCapabilityAdapter,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Discover configured MCP servers and register available tools.
+
+        MCP is superuser-agent scoped by callers, but the discovered tools
+        still flow through this unified capability registry so availability,
+        provider schema normalization and risk metadata are not split into a
+        side channel.
+        """
+
+        from .mcp_runtime import get_mcp_runtime_manager
+
+        result = await get_mcp_runtime_manager().discover_tools(force=force)
+        for server_name, tools in result.tools_by_server.items():
+            self.register_external_tools(
+                tools,
+                provider_adapter=provider_adapter,
+                namespace=f"mcp_{server_name}",
+                source="mcp",
+            )
+        return result.to_payload()
+
     def sync_command_tools(
         self,
         candidates: list[CommandCandidate],
@@ -409,8 +494,40 @@ class CapabilityRegistry:
                 kind="plugin_command",
                 card=card,
                 command_record=command_record,
-                feedback_profile=feedback,
-            )
+            feedback_profile=feedback,
+        )
+
+    def inject_plugin_command_candidates(
+        self,
+        candidates: list[CommandCandidate],
+        *,
+        max_command_tools: int,
+    ) -> list[ToolExecutable]:
+        """Replace executable plugin command tools from selected candidates.
+
+        This is the only path that turns command recall results into runtime
+        tools.  Catalog and first-turn exposure both call this method so the
+        runtime never sees command tools that are not represented in the
+        registry.
+        """
+
+        selected = self._trim_command_candidates(
+            candidates,
+            max_command_tools=max_command_tools,
+        )
+        tools = build_native_command_tools(selected)
+        tool_map = {
+            normalize_message_text(tool.binding.tool_name): cast(ToolExecutable, tool)
+            for tool in tools
+            if normalize_message_text(tool.binding.tool_name)
+        }
+        self.sync_command_tools(selected, tool_map)
+        return list(tool_map.values())
+
+    def clear_plugin_command_tools(self) -> None:
+        """Remove executable plugin commands while keeping discoverable records."""
+
+        self._remove_tool_kind("plugin_command")
 
     def register_executable_tool(
         self,
@@ -455,9 +572,39 @@ class CapabilityRegistry:
         include_unavailable: bool = False,
     ) -> dict[str, ToolExecutable]:
         return {
-            name: record.executable
-            for name, record in sorted(self.tool_records.items())
-            if include_unavailable or record.available
+            record.tool_name: record.executable
+            for record in self._sorted_tool_records(
+                include_unavailable=include_unavailable
+            )
+        }
+
+    def executable_tool_count(
+        self,
+        *,
+        kind: str | None = None,
+        include_unavailable: bool = False,
+    ) -> int:
+        normalized_kind = normalize_message_text(kind or "")
+        return sum(
+            1
+            for record in self.tool_records.values()
+            if (not normalized_kind or record.kind == normalized_kind)
+            and (include_unavailable or record.available)
+        )
+
+    def executable_tool_map_by_kind(
+        self,
+        kind: str,
+        *,
+        include_unavailable: bool = False,
+    ) -> dict[str, ToolExecutable]:
+        normalized_kind = normalize_message_text(kind)
+        return {
+            record.tool_name: record.executable
+            for record in self._sorted_tool_records(
+                include_unavailable=include_unavailable
+            )
+            if record.kind == normalized_kind
         }
 
     def tool_record_for(self, tool_name: str) -> ToolCapabilityRecord | None:
@@ -475,15 +622,21 @@ class CapabilityRegistry:
             if (kind is None or record.kind == kind)
             and (include_unavailable or record.available)
         ]
-        records.sort(
-            key=lambda record: (
-                _kind_rank(record.kind),
-                -record.reliability,
-                -record.schema_quality,
-                record.tool_name,
-            )
-        )
+        records.sort(key=_tool_record_sort_key)
         return tuple(record.to_prompt_payload() for record in records)
+
+    def _sorted_tool_records(
+        self,
+        *,
+        include_unavailable: bool,
+    ) -> list[ToolCapabilityRecord]:
+        records = [
+            record
+            for record in self.tool_records.values()
+            if include_unavailable or record.available
+        ]
+        records.sort(key=_tool_record_sort_key)
+        return records
 
     def _remove_tool_kind(self, kind: str) -> None:
         removed = False
@@ -493,6 +646,29 @@ class CapabilityRegistry:
                 removed = True
         if removed:
             self.generation += 1
+
+    @staticmethod
+    def _trim_command_candidates(
+        candidates: list[CommandCandidate],
+        *,
+        max_command_tools: int,
+    ) -> list[CommandCandidate]:
+        cap = max(1, int(max_command_tools or 1))
+        by_id: dict[str, CommandCandidate] = {}
+        for candidate in candidates:
+            command_id = normalize_message_text(candidate.schema.command_id)
+            if not command_id:
+                continue
+            previous = by_id.get(command_id)
+            if previous is None or _command_candidate_rank_key(
+                candidate
+            ) > _command_candidate_rank_key(previous):
+                by_id[command_id] = candidate
+        return sorted(
+            by_id.values(),
+            key=_command_candidate_rank_key,
+            reverse=True,
+        )[:cap]
 
 
 def _ensure_command_tools(
@@ -672,6 +848,87 @@ def _capability_card_from_superuser_tool(
     )
 
 
+class ProviderExternalTool:
+    """Provider-normalized wrapper for MCP/external ToolExecutable objects."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        executable: ToolExecutable,
+        adapter: ProviderCapabilityAdapter,
+    ) -> None:
+        self.name = normalize_message_text(name)
+        self.executable = executable
+        self.adapter = adapter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.executable, name)
+
+    async def get_definition(self) -> ToolDefinition:
+        definition = await self.executable.get_definition()
+        sanitized = self.adapter.sanitize_tool_definition(definition)
+        return ToolDefinition(
+            name=self.name or sanitized.name,
+            description=sanitized.description,
+            parameters=sanitized.parameters,
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        result = await self.executable.execute(context=context, **kwargs)
+        return ToolResult(
+            output=self.adapter.tool_result_payload(result.output),
+            display_content=result.display_content,
+        )
+
+
+def _capability_card_from_external_tool(
+    *,
+    tool_name: str,
+    executable: ToolExecutable,
+    namespace: str,
+    source: str,
+    provider_adapter: ProviderCapabilityAdapter,
+) -> CapabilityCard:
+    description = normalize_message_text(
+        str(getattr(executable, "description", "") or "")
+    )
+    source_of_truth = "external_service" if source in {"mcp", "external"} else "local_state"
+    return CapabilityCard(
+        command_id=tool_name,
+        plugin_module=f"chatinter.{source}",
+        plugin_name=f"{source}:{namespace}",
+        family=f"{source}:{namespace}",
+        description=description or f"External runtime tool {tool_name}",
+        use_cases=(description or f"调用外部工具 {tool_name}",),
+        anti_use_cases=("未被当前场景暴露时不可调用",),
+        task_verbs=(namespace, source),
+        input_requirements=("tool_schema",),
+        output_mode="plugin_output",
+        side_effect="query",
+        risk_level="medium",
+        risk="medium",
+        source_of_truth=cast(CapabilitySourceOfTruth, source_of_truth),
+        requires_real_tool=True,
+        entity_scope="external",
+        reliability=0.55,
+        schema_quality=0.6,
+        soft_tool=False,
+        intent_types=("external_tool", source),
+        requires_real_result=True,
+        generative=False,
+        execution_policy="strong_intent",
+        risk_tags=("external", source),
+        permission_tags=("runtime", source, f"provider:{provider_adapter.profile.family}"),
+        search_text=normalize_message_text(
+            " ".join([tool_name, namespace, source, description])
+        ),
+        capability_kind="runtime_tool",
+        tool_name=tool_name,
+        metadata={"provider_protocol": provider_adapter.mcp_metadata()},
+    )
+
+
 def _capability_id(*, kind: str, tool_name: str, card: CapabilityCard) -> str:
     if kind == "plugin_command" and card.command_id:
         return f"plugin_command:{card.command_id}"
@@ -691,6 +948,40 @@ def _kind_rank(kind: str) -> int:
         "plugin_command": 2,
         "runtime_tool": 3,
     }.get(kind, 9)
+
+
+def _tool_record_sort_key(
+    record: ToolCapabilityRecord,
+) -> tuple[int, int, float, float, str]:
+    score = 0.0
+    if record.command_record is not None:
+        score = _tool_score(record.executable)
+    return (
+        _kind_rank(record.kind),
+        -int(score * 100),
+        -record.reliability,
+        -record.schema_quality,
+        record.tool_name,
+    )
+
+
+def _tool_score(executable: ToolExecutable) -> float:
+    binding = getattr(executable, "binding", None)
+    candidate = getattr(binding, "candidate", None)
+    try:
+        return float(getattr(candidate, "score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _command_candidate_rank_key(
+    candidate: CommandCandidate,
+) -> tuple[int, float, str]:
+    return (
+        1 if candidate.exact_protected else 0,
+        float(candidate.score or 0.0),
+        normalize_message_text(candidate.schema.command_id),
+    )
 
 
 def _normalize_risk(value: Any) -> str:
@@ -773,5 +1064,6 @@ __all__ = [
     "CapabilityCard",
     "CapabilityRecord",
     "CapabilityRegistry",
+    "ProviderExternalTool",
     "ToolCapabilityRecord",
 ]

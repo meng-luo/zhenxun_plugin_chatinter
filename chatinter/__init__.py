@@ -136,16 +136,19 @@ _fallback_matcher = on_message(
     block=True,
     rule=to_me(),
 )
+setattr(_fallback_matcher, "_zx_dispatch_lane", "fallback_ai")
 
 _turn_followup_matcher = on_message(
     priority=998,
     block=False,
 )
+setattr(_turn_followup_matcher, "_zx_dispatch_lane", "passive_light")
 
 _native_tail_collector_matcher = on_message(
     priority=4,
     block=False,
 )
+setattr(_native_tail_collector_matcher, "_zx_dispatch_lane", "passive_light")
 
 
 def _is_private_text_only_message(
@@ -428,6 +431,15 @@ async def _on_startup():
     _chat_memory.set_bot_nickname(BotConfig.self_nickname)
     await PluginRegistry.preload_cache()
     _dynamic_rescan_task = asyncio.create_task(_rescan_dynamic_matchers_after_startup())
+
+
+@driver.on_shutdown
+async def _on_shutdown():
+    """Release long-lived ChatInter runtime resources."""
+
+    from .mcp_runtime import get_mcp_runtime_manager
+
+    await get_mcp_runtime_manager().shutdown()
 
 
 async def _rescan_dynamic_matchers_after_startup():

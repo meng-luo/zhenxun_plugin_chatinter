@@ -26,11 +26,6 @@ from .agent_state import (
     CompletedTask,
     PendingTask,
 )
-from .task_ledger import (
-    capability_ledger_from_payload,
-    task_ledger_from_payload,
-)
-from .task_graph import task_graph_from_payload, task_graph_to_payload
 from .persistence import (
     append_jsonl,
     read_json,
@@ -38,6 +33,12 @@ from .persistence import (
     to_jsonable,
     utc_now_iso,
     write_json,
+)
+from .runtime_events import emit_runtime_event, project_runtime_state
+from .task_graph import task_graph_from_payload, task_graph_to_payload
+from .task_ledger import (
+    capability_ledger_from_payload,
+    task_ledger_from_payload,
 )
 
 
@@ -54,6 +55,7 @@ def persist_agent_run_state(
         if run_id and run_id != str(getattr(state, "trace_id", "") or ""):
             write_json(_run_snapshot_path(run_id), payload)
         append_jsonl(_run_events_path(), _event_payload(payload))
+        _emit_agent_run_runtime_event(payload)
     except Exception:
         # Persistence must never break a user turn or tool execution.
         return
@@ -75,7 +77,31 @@ def load_agent_run_state(
     snapshot = get_agent_run_snapshot(run_id)
     if not isinstance(snapshot, dict):
         return None
-    return _state_from_snapshot(snapshot, tool_map=tool_map)
+    state = _state_from_snapshot(snapshot, tool_map=tool_map)
+    if state is None:
+        return None
+    projection = project_agent_run_state(
+        run_id=run_id,
+        session_key=str(snapshot.get("session_key", "") or ""),
+        include_details=False,
+    )
+    _merge_projection_refs(state, projection)
+    return state
+
+
+def project_agent_run_state(
+    *,
+    run_id: str = "",
+    trace_id: str = "",
+    session_key: str = "",
+    include_details: bool = True,
+) -> dict[str, Any]:
+    return project_runtime_state(
+        run_id=run_id,
+        trace_id=trace_id,
+        session_key=session_key,
+        include_details=include_details,
+    )
 
 
 def update_agent_run_status(
@@ -102,6 +128,7 @@ def update_agent_run_status(
     if safe_trace and safe_trace != safe_run:
         write_json(_run_snapshot_path(safe_trace), snapshot)
     append_jsonl(_run_events_path(), _event_payload({**snapshot, "stage": status}))
+    _emit_agent_run_runtime_event({**snapshot, "stage": status})
     return snapshot
 
 
@@ -256,6 +283,61 @@ def _event_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _emit_agent_run_runtime_event(snapshot: dict[str, Any]) -> None:
+    emit_runtime_event(
+        kind="agent_run",
+        status=_runtime_status_from_snapshot(snapshot),
+        source=f"agent_run_store:{snapshot.get('stage', '')}",
+        run_id=str(snapshot.get("run_id", "") or snapshot.get("trace_id", "")),
+        trace_id=str(snapshot.get("trace_id", "") or ""),
+        session_key=str(snapshot.get("session_key", "") or ""),
+        step=int(snapshot.get("step", 0) or 0),
+        summary=str(snapshot.get("stage", "") or snapshot.get("status", "")),
+        payload={
+            "stage": snapshot.get("stage", ""),
+            "status": snapshot.get("status", ""),
+            "paused_reason": snapshot.get("paused_reason", ""),
+            "stop_reason": snapshot.get("stop_reason", ""),
+            "recovery_action": snapshot.get("recovery_action", ""),
+            "waiting_approval_ids": snapshot.get("waiting_approval_ids", []),
+            "background_task_ids": snapshot.get("background_task_ids", []),
+            "observation_event_ids": snapshot.get("observation_event_ids", []),
+            "artifact_refs": snapshot.get("artifact_refs", []),
+            "tool_call_count": len(snapshot.get("tool_calls", []) or []),
+            "observation_count": len(snapshot.get("observations", []) or []),
+            "pending_task_count": len(snapshot.get("pending_tasks", []) or []),
+            "completed_task_count": len(snapshot.get("completed_tasks", []) or []),
+            "metadata": snapshot.get("metadata", {}),
+        },
+        related_ids={
+            "approval_id": _last_text(snapshot.get("waiting_approval_ids")),
+            "background_task_id": _last_text(snapshot.get("background_task_ids")),
+            "observation_event_id": _last_text(snapshot.get("observation_event_ids")),
+            "artifact_id": _last_text(snapshot.get("artifact_refs")),
+        },
+    )
+
+
+def _runtime_status_from_snapshot(snapshot: dict[str, Any]) -> str:
+    status = str(snapshot.get("status", "") or "")
+    stage = str(snapshot.get("stage", "") or "")
+    if status == "paused":
+        return "waiting"
+    if status in {"completed", "failed", "cancelled"}:
+        return status
+    if stage in {"started", "step_started", "model_request"}:
+        return "started"
+    if stage in {"guardrail"}:
+        return "blocked"
+    return "progress"
+
+
+def _last_text(value: Any) -> str:
+    if isinstance(value, list | tuple) and value:
+        return str(value[-1] or "")
+    return ""
+
+
 def _run_snapshot_path(trace_id: str):
     safe_trace = _safe_trace_id(trace_id)
     return state_path("agent_runs", f"{safe_trace or 'unknown'}.json")
@@ -365,6 +447,39 @@ def _state_from_snapshot(
     except Exception:
         return None
     return state
+
+
+def _merge_projection_refs(
+    state: AgentRunState,
+    projection: dict[str, Any],
+) -> None:
+    if not isinstance(projection, dict):
+        return
+    for attr, key in (
+        ("waiting_approval_ids", "waiting_approval_ids"),
+        ("background_task_ids", "background_task_ids"),
+        ("observation_event_ids", "observation_event_ids"),
+        ("artifact_refs", "artifact_refs"),
+    ):
+        target = getattr(state, attr, None)
+        if not isinstance(target, list):
+            continue
+        for item in projection.get(key, []) or []:
+            text = str(item or "")
+            if text and text not in target:
+                target.append(text)
+    projected_status = str(projection.get("status", "") or "")
+    if projected_status in {"paused", "cancelled", "completed", "failed"}:
+        state.status = projected_status
+    paused_reason = str(projection.get("paused_reason", "") or "")
+    if paused_reason:
+        state.paused_reason = paused_reason
+    stop_reason = str(projection.get("stop_reason", "") or "")
+    if stop_reason:
+        state.stop_reason = stop_reason
+    recovery_action = str(projection.get("recovery_action", "") or "")
+    if recovery_action:
+        state.recovery_action = recovery_action
 
 
 def _messages_from_payload(value: Any) -> list[LLMMessage]:
@@ -639,9 +754,10 @@ def _task_ledger_payload(state: Any) -> dict[str, Any] | None:
 
 __all__ = [
     "get_agent_run_snapshot",
-    "load_agent_run_state",
     "list_agent_run_snapshots",
+    "load_agent_run_state",
     "persist_agent_run_state",
+    "project_agent_run_state",
     "query_agent_run_events",
     "update_agent_run_status",
 ]

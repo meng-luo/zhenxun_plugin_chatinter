@@ -15,6 +15,7 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from ..audit_log import record_audit_event
 from ..permission_policy import decide_server
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd, resolve_working_path
 from .common import (
     actor_from_context,
     approval_required_result,
@@ -24,6 +25,7 @@ from .common import (
     permission_denied_result,
     project_root,
     tool_result,
+    worktree_id_from_context,
 )
 from .shell_tools import run_shell_command
 
@@ -55,7 +57,14 @@ class ServerStatusTool:
         actor = actor_from_context(context)
         decision = decide_server("server_status")
         path = str(kwargs.get("path", "") or "").strip() or str(project_root())
-        payload = {"path": path}
+        path, isolation = resolve_working_path(
+            path,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+        payload = {"path": path, "isolation": isolation}
         if decision.decision == "deny":
             return permission_denied_result(
                 actor=actor,
@@ -70,7 +79,7 @@ class ServerStatusTool:
                 payload=payload,
                 permission=decision,
             )
-        return await server_status(path=path, actor=actor)
+        return await server_status(path=path, actor=actor, isolation=isolation)
 
 
 class ProcessListTool:
@@ -168,6 +177,13 @@ class ServerCommandTool:
         reason = str(kwargs.get("reason", "") or "")
         timeout_seconds = coerce_timeout(kwargs.get("timeout_seconds"))
         actor = actor_from_context(context)
+        cwd, isolation = resolve_cwd(
+            cwd,
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
         if not command:
             return tool_result(False, "server_empty_command")
         decision = decide_server(command)
@@ -176,6 +192,7 @@ class ServerCommandTool:
             "cwd": cwd,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
+            "isolation": isolation,
         }
         if decision.decision == "deny":
             return permission_denied_result(
@@ -197,6 +214,7 @@ class ServerCommandTool:
             actor=actor,
             approval_id=None,
             timeout_seconds=timeout_seconds,
+            isolation=isolation,
         )
 
 
@@ -204,6 +222,7 @@ async def server_status(
     *,
     path: str,
     actor: dict[str, str],
+    isolation: dict[str, Any] | None = None,
     approval_id: str | None = None,
 ) -> ToolResult:
     try:
@@ -215,6 +234,7 @@ async def server_status(
             "python": platform.python_version(),
             "pid": os.getpid(),
             "cwd": str(Path.cwd()),
+            "isolation": isolation or {},
             "disk": {
                 "path": str(disk_path),
                 "total": usage.total,
@@ -290,6 +310,7 @@ async def run_server_command(
     actor: dict[str, str],
     approval_id: str | None = None,
     timeout_seconds: float | None = None,
+    isolation: dict[str, Any] | None = None,
 ) -> ToolResult:
     return await run_shell_command(
         command=command,
@@ -298,6 +319,7 @@ async def run_server_command(
         approval_id=approval_id,
         timeout_seconds=timeout_seconds,
         action="server_command",
+        isolation=isolation,
     )
 
 

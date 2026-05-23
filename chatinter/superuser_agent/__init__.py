@@ -3,14 +3,12 @@
 from .approval_store import list_pending_approvals
 from .registry import (
     build_superuser_agent_tool_bundle,
-    build_superuser_agent_tools,
     registered_superuser_tool_names,
     superuser_tool_cards,
 )
 
 __all__ = [
     "build_superuser_agent_tool_bundle",
-    "build_superuser_agent_tools",
     "list_pending_approvals",
     "registered_superuser_tool_names",
     "superuser_tool_cards",

@@ -17,11 +17,13 @@ from ..engineering_eval import (
 )
 from ..permission_policy import decide_eval
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd
 from .common import (
     actor_from_context,
     approval_required_result,
     permission_denied_result,
     tool_result,
+    worktree_id_from_context,
 )
 from .shell_tools import run_shell_command
 
@@ -54,8 +56,18 @@ class EngineeringEvalPlanTool:
                         "type": ["string", "null"],
                         "description": "可选 patch operation_id，失败时可回滚。",
                     },
+                    "engineering_loop_id": {
+                        "type": ["string", "null"],
+                        "description": "可选工程闭环 loop_id；传入后自动绑定 eval gate。",
+                    },
                 },
-                "required": ["task", "files", "tests", "rollback_operation_id"],
+                "required": [
+                    "task",
+                    "files",
+                    "tests",
+                    "rollback_operation_id",
+                    "engineering_loop_id",
+                ],
                 "additionalProperties": False,
             },
         )
@@ -79,10 +91,15 @@ class EngineeringEvalPlanTool:
                 permission=decision,
             )
         eval_run = create_engineering_eval(actor=actor, **payload)
+        _bind_engineering_loop_eval(
+            engineering_loop_id=str(kwargs.get("engineering_loop_id", "") or ""),
+            eval_id=eval_run.eval_id,
+        )
         return tool_result(
             True,
             "engineering_eval_planned",
             eval=eval_run.public_payload(),
+            engineering_loop=_loop_payload(str(kwargs.get("engineering_loop_id", "") or "")),
             suggested_tests=eval_run.suggested_tests,
             instruction=(
                 "按 eval steps 执行：先读代码，再修改，再用 engineering_eval_run "
@@ -121,8 +138,19 @@ class EngineeringEvalRunTool:
                         "type": ["number", "null"],
                         "description": "超时时间，默认 20 秒，最大 120 秒。",
                     },
+                    "engineering_loop_id": {
+                        "type": ["string", "null"],
+                        "description": "可选工程闭环 loop_id；传入后更新 eval gate。",
+                    },
                 },
-                "required": ["eval_id", "step_index", "command", "cwd", "timeout_seconds"],
+                "required": [
+                    "eval_id",
+                    "step_index",
+                    "command",
+                    "cwd",
+                    "timeout_seconds",
+                    "engineering_loop_id",
+                ],
                 "additionalProperties": False,
             },
         )
@@ -136,6 +164,8 @@ class EngineeringEvalRunTool:
             command=str(kwargs.get("command", "") or "").strip(),
             cwd=str(kwargs.get("cwd", "") or "") or None,
             timeout_seconds=kwargs.get("timeout_seconds"),
+            worktree_id=worktree_id_from_context(context),
+            engineering_loop_id=str(kwargs.get("engineering_loop_id", "") or ""),
         )
 
 
@@ -203,7 +233,10 @@ async def run_engineering_eval_step(
     command: str = "",
     cwd: str | None = None,
     timeout_seconds: Any = None,
+    worktree_id: str = "",
+    pre_resolved_cwd: bool = False,
     approval_id: str | None = None,
+    engineering_loop_id: str = "",
 ) -> ToolResult:
     eval_run = get_engineering_eval(eval_id)
     if eval_run is None or eval_run.user_id != actor["user_id"] or eval_run.session_key != actor["session_key"]:
@@ -216,6 +249,20 @@ async def run_engineering_eval_step(
             eval=eval_run.public_payload(),
         )
     step = eval_run.steps[resolved_index]
+    cwd, isolation = (
+        (
+            cwd or step.cwd,
+            {
+                "isolated": False,
+                "pre_resolved": True,
+                "resolved": cwd or step.cwd or "",
+            },
+        )
+        if pre_resolved_cwd
+        else resolve_cwd(cwd or step.cwd, actor=actor, worktree_id=worktree_id)
+    )
+    if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
+        return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
     command = str(command or step.command or "").strip()
     if not command:
         return tool_result(
@@ -228,7 +275,8 @@ async def run_engineering_eval_step(
         "eval_id": eval_id,
         "step_index": resolved_index,
         "command": command,
-        "cwd": cwd or step.cwd,
+        "cwd": cwd,
+        "isolation": isolation,
     }
     if not approval_id:
         decision = decide_eval("engineering_eval_run " + command)
@@ -253,6 +301,7 @@ async def run_engineering_eval_step(
         approval_id=approval_id,
         timeout_seconds=timeout_seconds,
         action="engineering_eval_run",
+        isolation=isolation,
     )
     ok = bool(isinstance(result.output, dict) and result.output.get("ok"))
     command_result = dict(result.output) if isinstance(result.output, dict) else {}
@@ -262,11 +311,21 @@ async def run_engineering_eval_step(
         status="passed" if ok else "failed",
         result=command_result,
     )
+    _update_engineering_loop_from_eval(
+        engineering_loop_id=engineering_loop_id,
+        eval_id=eval_id,
+    )
     failure_observation = (
         build_failure_observation(eval_run, step_index=resolved_index)
         if eval_run is not None and not ok
         else {}
     )
+    if eval_run is not None and not ok:
+        _diagnose_engineering_loop_failure(
+            engineering_loop_id=engineering_loop_id,
+            eval_id=eval_id,
+            command=command,
+        )
     record_audit_event(
         event="engineering_eval_step_ran",
         user_id=actor["user_id"],
@@ -279,6 +338,7 @@ async def run_engineering_eval_step(
         ok,
         "engineering_eval_step_passed" if ok else "engineering_eval_step_failed",
         eval=eval_run.public_payload() if eval_run is not None else None,
+        engineering_loop=_loop_payload(engineering_loop_id),
         command_result=command_result,
         observation=failure_observation,
         recommended_next_action=(
@@ -325,6 +385,68 @@ def _eval_instruction(*, ok: bool, observation: dict[str, Any]) -> str:
     if observation.get("suggest_rollback"):
         actions.append("考虑 patch_rollback")
     return "测试失败；建议：" + "、".join(actions or ["检查输出后决定下一步"])
+
+
+def _bind_engineering_loop_eval(
+    *,
+    engineering_loop_id: str,
+    eval_id: str,
+) -> None:
+    if not engineering_loop_id or not eval_id:
+        return
+    try:
+        from ..engineering_loop import bind_eval
+
+        bind_eval(loop_id=engineering_loop_id, eval_id=eval_id)
+    except Exception:
+        return
+
+
+def _update_engineering_loop_from_eval(
+    *,
+    engineering_loop_id: str,
+    eval_id: str,
+) -> None:
+    if not engineering_loop_id or not eval_id:
+        return
+    try:
+        from ..engineering_loop import update_loop_from_eval
+
+        update_loop_from_eval(loop_id=engineering_loop_id, eval_id=eval_id)
+    except Exception:
+        return
+
+
+def _diagnose_engineering_loop_failure(
+    *,
+    engineering_loop_id: str,
+    eval_id: str,
+    command: str,
+) -> None:
+    if not engineering_loop_id:
+        return
+    try:
+        from ..engineering_loop import diagnose_eval_failure
+
+        diagnose_eval_failure(
+            loop_id=engineering_loop_id,
+            eval_id=eval_id,
+            notes=f"eval command failed: {command}",
+        )
+    except Exception:
+        return
+
+
+def _loop_payload(engineering_loop_id: str) -> dict[str, Any] | None:
+    if not engineering_loop_id:
+        return None
+    try:
+        from ..engineering_loop import get_engineering_loop
+
+        loop = get_engineering_loop(engineering_loop_id)
+        return loop.public_payload(include_events=False) if loop else None
+    except Exception:
+        return None
 
 
 register_superuser_tool(EngineeringEvalPlanTool)

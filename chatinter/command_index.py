@@ -659,7 +659,7 @@ def _base_score_tool(
 
 
 def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema:
-    return PluginCommandSchema(
+    schema = PluginCommandSchema(
         command_id=tool.command_id,
         head=tool.head,
         aliases=tool.aliases,
@@ -678,7 +678,13 @@ def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema
         confidence=tool.confidence,
         matcher_key=tool.matcher_key,
         retrieval_phrases=tool.retrieval_phrases,
+        shortcut_renders=list(
+            tool.meta.get("shortcut_renders", [])
+            if isinstance(tool.meta, dict)
+            else []
+        ),
     )
+    return schema
 
 
 def _unscored_features(

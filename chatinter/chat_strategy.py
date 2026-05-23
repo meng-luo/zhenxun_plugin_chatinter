@@ -55,12 +55,20 @@ def build_dialogue_state_prompt(state: DialogueState | None) -> str:
         "agent": "按超级用户 Agent 任务语气保持清晰、可验证。",
     }.get(state.group_reply_policy, "按当前场景自然回复。")
     topic_rule = f"当前话题线索={state.topic_hint}。" if state.topic_hint else ""
+    previous_rule = ""
+    if state.last_user_message and state.continuity in {"same_topic", "followup"}:
+        previous_rule = (
+            f"上一轮用户大意={state.last_user_message[:80]}；"
+            f"上一轮回复大意={state.last_reply_summary[:80]}。"
+        )
     return (
         "\n当前对话状态："
         f"语气={state.tone}；用户情绪={state.user_emotion}；"
         f"对话目的={state.dialogue_purpose}；回复长度={state.response_length}；"
         f"连续性={state.continuity}；群聊策略={state.group_reply_policy}。"
-        f"{topic_rule}{length_rule}{followup_rule}{group_rule}"
+        f"回复姿态={state.reply_posture}；群聊氛围={state.group_atmosphere}；"
+        f"称呼模式={state.address_mode}。"
+        f"{topic_rule}{previous_rule}{length_rule}{followup_rule}{group_rule}"
     )
 
 

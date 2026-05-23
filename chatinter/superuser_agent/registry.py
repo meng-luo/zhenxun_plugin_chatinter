@@ -217,8 +217,12 @@ def infer_tool_card(tool: ToolExecutable) -> SuperuserToolCard:
             (
                 "artifact_",
                 "background_",
+                "worktree_",
                 "patch_",
                 "engineering_eval_",
+                "engineering_loop_",
+                "engineering_lsp_",
+                "semantic_patch_",
                 "python_",
                 "uv_",
                 "git_",
@@ -227,7 +231,8 @@ def infer_tool_card(tool: ToolExecutable) -> SuperuserToolCard:
             )
         ),
         read_only=read_only,
-        todo_relevant=category in {"patch", "eval", "plugin_dev", "agent_run", "todo"},
+        todo_relevant=category
+        in {"patch", "eval", "engineering_loop", "plugin_dev", "agent_run", "todo"},
         description=str(getattr(tool, "description", "") or ""),
         tags=tuple(_tags_from_name(name)),
         source_of_truth=_source_of_truth_from_category(category),
@@ -262,6 +267,8 @@ def _category_from_name(name: str) -> str:
         return "approval"
     if name.startswith("artifact_"):
         return "artifact"
+    if name.startswith("runtime_event_"):
+        return "runtime"
     if name.startswith("audit_"):
         return "audit"
     if name.startswith("todo_"):
@@ -270,6 +277,8 @@ def _category_from_name(name: str) -> str:
         return "background"
     if name.startswith("engineering_eval_"):
         return "eval"
+    if name.startswith(("engineering_loop_", "engineering_lsp_", "semantic_patch_")):
+        return "engineering_loop"
     if name.startswith(("patch_",)):
         return "patch"
     if name.startswith("plugin_dev_"):
@@ -286,6 +295,8 @@ def _category_from_name(name: str) -> str:
         return "shell"
     if name.startswith("uv_"):
         return "uv"
+    if name.startswith("worktree_"):
+        return "worktree"
     return "general"
 
 
@@ -303,9 +314,16 @@ def _risk_from_name(name: str) -> ToolRisk:
         "python_exec",
         "background_task_start",
         "background_task_cancel",
+        "worktree_remove",
     }:
         return "high"
-    if name in {"git_command", "uv_command", "python_module", "engineering_eval_run"}:
+    if name in {
+        "git_command",
+        "uv_command",
+        "python_module",
+        "engineering_eval_run",
+        "worktree_create",
+    }:
         return "medium"
     return "low"
 
@@ -315,11 +333,16 @@ def _read_only_from_name(name: str) -> bool:
         "agent_run_status",
         "artifact_read",
         "artifact_list",
+        "runtime_event_list",
+        "runtime_event_read",
         "audit_log_query",
         "background_observation_list",
         "background_observation_wait",
         "background_task_status",
+        "engineering_eval_gate",
         "engineering_eval_status",
+        "engineering_loop_status",
+        "engineering_lsp_read",
         "list_dir",
         "list_pending_approvals",
         "patch_show",
@@ -329,6 +352,8 @@ def _read_only_from_name(name: str) -> bool:
         "search_files",
         "server_status",
         "todo_read",
+        "worktree_list",
+        "worktree_status",
     }
 
 
@@ -343,9 +368,19 @@ def _tags_from_name(name: str) -> list[str]:
 
 
 def _source_of_truth_from_category(category: str) -> str:
-    if category in {"shell", "python", "uv", "git", "server", "file", "patch"}:
+    if category in {
+        "shell",
+        "python",
+        "uv",
+        "git",
+        "server",
+        "file",
+        "patch",
+        "worktree",
+        "engineering_loop",
+    }:
         return "local_state"
-    if category in {"background", "agent_run", "todo", "artifact", "audit"}:
+    if category in {"background", "agent_run", "todo", "artifact", "audit", "runtime"}:
         return "local_state"
     if category == "plugin_dev":
         return "local_state"
@@ -355,7 +390,19 @@ def _source_of_truth_from_category(category: str) -> str:
 def _output_mode_from_name(name: str, *, category: str, read_only: bool) -> str:
     if category in {"artifact", "file"}:
         return "file" if not read_only else "text"
-    if category in {"shell", "python", "uv", "git", "server", "background", "eval"}:
+    if category == "runtime":
+        return "text"
+    if category in {
+        "shell",
+        "python",
+        "uv",
+        "git",
+        "server",
+        "background",
+        "eval",
+        "engineering_loop",
+        "worktree",
+    }:
         return "plugin_output"
     if category in {"patch", "plugin_dev"}:
         return "action"
@@ -365,7 +412,17 @@ def _output_mode_from_name(name: str, *, category: str, read_only: bool) -> str:
 
 
 def _entity_scope_from_category(category: str) -> str:
-    if category in {"shell", "python", "uv", "git", "server", "file", "patch"}:
+    if category in {
+        "shell",
+        "python",
+        "uv",
+        "git",
+        "server",
+        "file",
+        "patch",
+        "worktree",
+        "engineering_loop",
+    }:
         return "global"
     if category in {"approval", "agent_run", "todo"}:
         return "actor_user"
@@ -385,7 +442,17 @@ def _initial_reliability_from_name(
         score -= 0.06
     elif risk in {"high", "critical"}:
         score -= 0.12
-    if name.startswith(("patch_", "engineering_eval_", "agent_run_", "artifact_")):
+    if name.startswith(
+        (
+            "patch_",
+            "engineering_eval_",
+            "engineering_loop_",
+            "engineering_lsp_",
+            "semantic_patch_",
+            "agent_run_",
+            "artifact_",
+        )
+    ):
         score += 0.04
     return _clamp01(score)
 
@@ -396,7 +463,17 @@ def _schema_quality_from_name(name: str, *, category: str) -> float:
         score += 0.05
     if category != "general":
         score += 0.08
-    if name.startswith(("patch_", "engineering_eval_", "agent_run_", "background_")):
+    if name.startswith(
+        (
+            "patch_",
+            "engineering_eval_",
+            "engineering_loop_",
+            "engineering_lsp_",
+            "semantic_patch_",
+            "agent_run_",
+            "background_",
+        )
+    ):
         score += 0.05
     return _clamp01(score)
 
@@ -422,12 +499,6 @@ def register_superuser_tool(
     if factory is None:
         return decorator
     return decorator(factory)
-
-
-def build_superuser_agent_tools() -> dict[str, ToolExecutable]:
-    from . import toolsets as _toolsets  # noqa: F401  # import registers toolsets
-
-    return _REGISTRY.build_tools()
 
 
 def build_superuser_agent_tool_bundle() -> SuperuserToolBundle:
@@ -467,18 +538,17 @@ def invalidate_superuser_tool_check_cache() -> None:
 __all__ = [
     "ApprovalMode",
     "RegisteredSuperuserTool",
-    "SuperuserToolRegistry",
-    "SuperuserToolCard",
     "SuperuserToolBundle",
+    "SuperuserToolCard",
+    "SuperuserToolRegistry",
     "ToolCheck",
     "ToolRisk",
     "available_superuser_tool_names",
-    "build_superuser_agent_tools",
     "build_superuser_agent_tool_bundle",
     "get_superuser_tool_card",
     "infer_tool_card",
     "invalidate_superuser_tool_check_cache",
-    "registered_superuser_tool_names",
     "register_superuser_tool",
+    "registered_superuser_tool_names",
     "superuser_tool_cards",
 ]

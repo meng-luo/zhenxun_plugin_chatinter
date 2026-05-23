@@ -40,6 +40,7 @@ class EngineeringEval:
     suggested_tests: list[str] = field(default_factory=list)
     failure_observations: list[dict[str, Any]] = field(default_factory=list)
     recovery_plan: dict[str, Any] = field(default_factory=dict)
+    patch_checkpoints: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     status: str = "planned"
@@ -60,6 +61,7 @@ class EngineeringEval:
             "suggested_tests": list(self.suggested_tests),
             "failure_observations": list(self.failure_observations[-8:]),
             "recovery_plan": dict(self.recovery_plan),
+            "patch_checkpoints": dict(self.patch_checkpoints),
             "created_at": int(self.created_at),
             "updated_at": int(self.updated_at),
             "status": self.status,
@@ -95,6 +97,9 @@ def create_engineering_eval(
         rollback_operation_id=str(rollback_operation_id or ""),
         patch_operation_id=str(patch_operation_id or rollback_operation_id or ""),
         suggested_tests=suggested,
+        patch_checkpoints=_patch_checkpoints_for(
+            patch_operation_id or rollback_operation_id
+        ),
     )
     eval_run.steps = _default_steps(eval_run)
     _EVALS[eval_run.eval_id] = eval_run
@@ -145,7 +150,7 @@ def mark_eval_step(
     eval_run.steps[step_index].status = status
     eval_run.steps[step_index].result = dict(result or {})
     eval_run.updated_at = time.time()
-    if any(step.status == "failed" for step in eval_run.steps):
+    if status == "failed":
         eval_run.status = "failed"
         observation = build_failure_observation(eval_run, step_index=step_index)
         if observation:
@@ -154,7 +159,10 @@ def mark_eval_step(
             eval_run.last_recommended_action = str(
                 observation.get("recommended_next_action", "") or ""
             )
-    elif all(step.status in {"passed", "skipped"} for step in eval_run.steps):
+    elif any(step.status == "failed" for step in eval_run.steps):
+        eval_run.status = "failed"
+        eval_run.last_recommended_action = eval_run.last_recommended_action or "inspect_failure_observation"
+    elif _all_runnable_steps_passed(eval_run):
         eval_run.status = "passed"
         eval_run.last_recommended_action = "continue_or_summarize"
         eval_run.recovery_plan = {}
@@ -245,6 +253,7 @@ def build_failure_observation(
         "eval_id": eval_run.eval_id,
         "step_index": step_index,
         "command": step.command,
+        "failed_step": asdict(step),
         "needs_reread": needs_reread,
         "needs_second_patch": needs_second_patch,
         "suggest_rollback": suggest_rollback,
@@ -259,6 +268,10 @@ def build_failure_observation(
         ),
         "rollback_operation_id": eval_run.rollback_operation_id,
         "patch_operation_id": eval_run.patch_operation_id,
+        "patch_checkpoints": dict(eval_run.patch_checkpoints),
+        "files_to_reread": list(eval_run.files[:12]) if needs_reread else [],
+        "do_not_repeat_failed_command": True,
+        "failed_command_signature": _command_signature(step.command),
         "reason": _failure_reason(
             needs_reread=needs_reread,
             needs_second_patch=needs_second_patch,
@@ -302,6 +315,13 @@ def _default_steps(eval_run: EngineeringEval) -> list[EvalStep]:
     return steps
 
 
+def _all_runnable_steps_passed(eval_run: EngineeringEval) -> bool:
+    runnable = [step for step in eval_run.steps if step.kind == "run_test"]
+    if not runnable:
+        return False
+    return all(step.status in {"passed", "skipped"} for step in runnable)
+
+
 def _ensure_loaded() -> None:
     global _LOADED
     if _LOADED:
@@ -337,6 +357,7 @@ def _eval_from_payload(eval_id: object, payload: object) -> EngineeringEval | No
                 for value in payload.get("failure_observations", []) or []
                 if isinstance(value, dict)
             ],
+            patch_checkpoints=dict(payload.get("patch_checkpoints") or {}),
             created_at=float(payload.get("created_at") or time.time()),
             updated_at=float(payload.get("updated_at") or time.time()),
             status=str(payload.get("status", "") or "planned"),
@@ -438,7 +459,19 @@ def _recovery_plan(
         "next_tools": _dedupe(next_tools),
         "patch_operation_id": eval_run.patch_operation_id,
         "rollback_operation_id": eval_run.rollback_operation_id,
+        "patch_checkpoints": dict(eval_run.patch_checkpoints),
         "files_to_reread": list(eval_run.files[:12]) if needs_reread else [],
+        "failed_command_signature": _command_signature(
+            next(
+                (
+                    step.command
+                    for step in eval_run.steps
+                    if step.status == "failed" and step.command
+                ),
+                "",
+            )
+        ),
+        "do_not_repeat_failed_command": True,
         "suggested_patch_strategy": _patch_strategy(
             needs_reread=needs_reread,
             needs_second_patch=needs_second_patch,
@@ -468,6 +501,34 @@ def _patch_strategy(
     if needs_second_patch:
         return "prepare a small follow-up patch targeted at the failure."
     return "inspect output, then choose reread, second patch, or rollback."
+
+
+def _patch_checkpoints_for(operation_id: str) -> dict[str, str]:
+    if not operation_id:
+        return {}
+    try:
+        from .patch_operations import get_patch_operation
+
+        operation = get_patch_operation(operation_id)
+    except Exception:
+        operation = None
+    if operation is None:
+        return {}
+    return {
+        "pre_checkpoint_id": operation.pre_checkpoint_id,
+        "post_checkpoint_id": operation.post_checkpoint_id,
+        "rollback_checkpoint_id": operation.rollback_checkpoint_id,
+        "failure_checkpoint_id": operation.failure_checkpoint_id,
+    }
+
+
+def _command_signature(command: str) -> str:
+    text = " ".join(str(command or "").split())
+    if not text:
+        return ""
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 __all__ = [

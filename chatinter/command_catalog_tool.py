@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
 
 from .command_index import CommandCandidate
-from .native_command_tools import build_native_command_tools
 from .route_text import normalize_message_text
 from .tool_retriever import CommandToolRetriever
 
@@ -22,7 +20,6 @@ class CommandCatalogState:
     retriever: CommandToolRetriever
     max_command_tools: int = _DEFAULT_COMMAND_TOOL_CAP
     _candidates: dict[str, CommandCandidate] = field(default_factory=dict)
-    _tool_map: dict[str, ToolExecutable] = field(default_factory=dict)
     _command_order: list[str] = field(default_factory=list)
     retrieve_count: int = 0
     last_query: str = ""
@@ -38,53 +35,37 @@ class CommandCatalogState:
         ]
 
     @property
-    def tool_map(self) -> dict[str, ToolExecutable]:
-        return dict(self._tool_map)
-
-    @property
     def injected_count(self) -> int:
-        return len(self._tool_map)
+        return len(self.retriever.registry.executable_tool_map_by_kind("plugin_command"))
 
-    def inject(self, candidates: list[CommandCandidate]) -> list[ToolExecutable]:
-        tools = build_native_command_tools(candidates)
-        for tool in tools:
-            command_id = normalize_message_text(tool.binding.command_id)
+    def inject(self, candidates: list[CommandCandidate]) -> list[Any]:
+        for candidate in candidates:
+            command_id = normalize_message_text(candidate.schema.command_id)
             if not command_id:
                 continue
-            self._candidates[command_id] = tool.binding.candidate
-            self._tool_map[tool.binding.tool_name] = tool
+            self._candidates[command_id] = candidate
             if command_id in self._command_order:
                 self._command_order.remove(command_id)
             self._command_order.append(command_id)
 
         self._trim_to_cap()
         self._sort_stable()
-        self.retriever.registry.sync_command_tools(
+        return self.retriever.registry.inject_plugin_command_candidates(
             self.candidates,
-            self._tool_map,
+            max_command_tools=self.max_command_tools,
         )
-        return [cast(ToolExecutable, tool) for tool in tools]
 
-    def replace(self, candidates: list[CommandCandidate]) -> list[ToolExecutable]:
+    def replace(self, candidates: list[CommandCandidate]) -> list[Any]:
         self._candidates.clear()
-        self._tool_map.clear()
         self._command_order.clear()
+        self.retriever.registry.clear_plugin_command_tools()
         return self.inject(candidates)
 
     def _trim_to_cap(self) -> None:
         cap = max(1, int(self.max_command_tools or _DEFAULT_COMMAND_TOOL_CAP))
-        while len(self._tool_map) > cap and self._command_order:
+        while len(self._command_order) > cap and self._command_order:
             command_id = self._command_order.pop(0)
-            candidate = self._candidates.pop(command_id, None)
-            if candidate is None:
-                continue
-            for tool_name, tool in list(self._tool_map.items()):
-                binding = getattr(tool, "binding", None)
-                if (
-                    normalize_message_text(getattr(binding, "command_id", ""))
-                    == command_id
-                ):
-                    self._tool_map.pop(tool_name, None)
+            self._candidates.pop(command_id, None)
 
     def _sort_stable(self) -> None:
         candidates = [
@@ -105,17 +86,6 @@ class CommandCatalogState:
             for candidate in candidates
             if normalize_message_text(candidate.schema.command_id)
         ]
-        ordered_tools: dict[str, ToolExecutable] = {}
-        for command_id in self._command_order:
-            for tool_name, tool in self._tool_map.items():
-                binding = getattr(tool, "binding", None)
-                if (
-                    normalize_message_text(str(getattr(binding, "command_id", "") or ""))
-                    == command_id
-                ):
-                    ordered_tools[tool_name] = tool
-                    break
-        self._tool_map = ordered_tools
 
 
 class CommandCatalogTool:

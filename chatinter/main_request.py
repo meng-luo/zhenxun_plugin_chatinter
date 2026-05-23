@@ -20,8 +20,8 @@ from zhenxun.services.llm.tools import RunContext
 from zhenxun.services.llm.types.models import ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
-from .agent_runtime import AgentRuntime
 from .agent_complexity import route_agent_complexity
+from .agent_runtime import AgentRuntime
 from .agent_state import AgentRunState, AgentRuntimeResult, AgentRuntimeTimelineItem
 from .command_catalog_tool import (
     COMMAND_CATALOG_TOOL_NAME,
@@ -52,16 +52,12 @@ from .soft_tool_policy import (
     should_catalog_only_candidate,
     sort_exposure_candidates,
 )
-from .superuser_agent import build_superuser_agent_tool_bundle
 from .tool_intent_gate import ToolIntentGate, ToolIntentGateResult
 from .tool_retriever import CommandToolRetriever
 from .turn_runtime import TurnBudgetController
 
 _MAIN_STAGE = "main_request"
 _TOOL_INTENT_GATE_STAGE = "tool_intent_gate"
-_MAX_REQUEST_TOOL_COUNT = 120
-_AUTO_COMMAND_TOOL_CAP = 32
-_REQUIRED_COMMAND_TOOL_CAP = 24
 _NEGATIVE_TOOL_MARKERS = (
     "不是在让你",
     "不是让你",
@@ -345,17 +341,26 @@ async def _run_main_request(
         tools=cast(Any, command_tools),
     )
     capability_registry = retriever.registry
-    agent_bundle = (
-        build_superuser_agent_tool_bundle() if enable_agent_tools else None
-    )
-    agent_tools = agent_bundle.tools if agent_bundle is not None else {}
-    base_tool_count = len(agent_tools) + (1 if enable_plugin_tools else 0)
+    if enable_agent_tools:
+        capability_registry.register_available_superuser_tools()
+        mcp_status = await capability_registry.register_available_mcp_tools(
+            provider_adapter=provider_adapter,
+        )
+    else:
+        mcp_status = None
+    base_tool_count = capability_registry.executable_tool_count(
+        kind="superuser_tool",
+    ) + capability_registry.executable_tool_count(
+        kind="runtime_tool",
+    ) + (1 if enable_plugin_tools else 0)
     command_tool_capacity = provider_adapter.command_tool_capacity(
         reserved_tools=base_tool_count,
     )
     if enable_plugin_tools and command_tool_capacity <= 0:
         enable_plugin_tools = False
-        base_tool_count = len(agent_tools)
+        base_tool_count = capability_registry.executable_tool_count(
+            kind="superuser_tool",
+        )
         command_tool_capacity = provider_adapter.command_tool_capacity(
             reserved_tools=base_tool_count,
         )
@@ -381,12 +386,7 @@ async def _run_main_request(
             tool_name=COMMAND_CATALOG_TOOL_NAME,
             executable=cast(ToolExecutable, catalog_tool),
         )
-    if agent_tools:
-        capability_registry.register_superuser_tools(
-            agent_tools,
-            cards=agent_bundle.cards if agent_bundle is not None else (),
-        )
-    tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
+    tool_map = capability_registry.executable_tool_map()
     if tool_map:
         report.note_tool_pool(len(tool_map))
     command_context = NativeCommandExecutionContext(
@@ -403,7 +403,7 @@ async def _run_main_request(
         )
         catalog_state.inject(list(initial_result.candidates))
         command_context.candidates = catalog_state.candidates
-        tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
+        tool_map = capability_registry.executable_tool_map()
         report.note_prompt_exposure(catalog_state.candidates)
         report.tool_candidates = max(
             report.tool_candidates,
@@ -434,11 +434,12 @@ async def _run_main_request(
             decision=obligation_decision,
             catalog_state=catalog_state,
             command_context=command_context,
-            tool_map=tool_map,
+            capability_registry=capability_registry,
             report=report,
             command_tool_capacity=command_tool_capacity,
+            provider_adapter=provider_adapter,
         )
-        tool_map = _stable_initial_tool_map(capability_registry.executable_tool_map())
+        tool_map = capability_registry.executable_tool_map()
     complexity_decision = route_agent_complexity(
         message_text=message_text,
         tool_map=tool_map,
@@ -451,6 +452,7 @@ async def _run_main_request(
             "command_catalog_state": catalog_state,
             "capability_registry": capability_registry,
             "provider_capability": provider_adapter.profile.to_metadata(),
+            "mcp_status": mcp_status,
             "actor_user_id": session_key or "",
             "agent_mode": "superuser_agent" if enable_agent_tools else "chatinter",
             "enable_agent_tools": enable_agent_tools,
@@ -477,6 +479,12 @@ async def _run_main_request(
         kind="provider_capability",
         metadata=provider_adapter.profile.to_metadata(),
     )
+    if mcp_status is not None:
+        state.append_timeline(
+            role="system",
+            kind="mcp_runtime",
+            metadata=mcp_status,
+        )
     state.append_timeline(
         role="system",
         kind="agent_complexity",
@@ -1064,22 +1072,17 @@ def _cheap_tool_obligation_decision(
         _candidate_obligation_evaluation(message_text, candidate)
         for candidate in actionable
     ]
-    required = [
-        evaluation.candidate
-        for evaluation in evaluations
-        if _evaluation_requires_tool(evaluation)
+    required_evaluations = [
+        evaluation for evaluation in evaluations if _evaluation_requires_tool(evaluation)
     ]
+    required = [evaluation.candidate for evaluation in required_evaluations]
     if required:
-        required.sort(
-            key=lambda candidate: _candidate_obligation_evaluation(
-                message_text,
-                candidate,
-            ).score,
-            reverse=True,
+        ranked_required = _rank_required_candidates(required_evaluations)
+        command_ids = _candidate_command_ids(
+            [evaluation.candidate for evaluation in ranked_required[:8]]
         )
-        command_ids = _candidate_command_ids(required[:8])
         tool_names = _tool_names_for_command_ids(tool_map, tuple(command_ids))
-        best = _candidate_obligation_evaluation(message_text, required[0])
+        best = ranked_required[0]
         return ToolObligationDecision(
             obligation="required" if tool_names else "auto",
             reason=f"cheap:structured_required:{best.reason}",
@@ -1101,6 +1104,36 @@ def _cheap_tool_obligation_decision(
 
     # Ambiguous but non-trivial: keep the LLM gate for the hard middle band.
     return None
+
+
+def _rank_required_candidates(evaluations: list[Any]) -> list[Any]:
+    return sorted(
+        evaluations,
+        key=lambda evaluation: (
+            _candidate_has_constrained_schema(evaluation.candidate),
+            float(getattr(evaluation, "score", 0.0) or 0.0),
+            float(getattr(evaluation.candidate, "score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+def _candidate_has_constrained_schema(candidate: Any) -> bool:
+    schema = getattr(candidate, "schema", None)
+    if schema is None:
+        return False
+    if any(getattr(slot, "choices", None) for slot in getattr(schema, "slots", []) or []):
+        return True
+    shortcut_renders = getattr(schema, "shortcut_renders", None)
+    if shortcut_renders:
+        return True
+    tool = getattr(candidate, "tool", None)
+    meta = getattr(tool, "meta", None)
+    if isinstance(meta, dict) and (
+        meta.get("slot_choices") or meta.get("shortcut_renders")
+    ):
+        return True
+    return False
 
 
 def _candidate_command_ids(candidates: list[Any]) -> list[str]:
@@ -1458,52 +1491,33 @@ def _command_tool_names(tool_map: dict[str, ToolExecutable]) -> tuple[str, ...]:
     return tuple(name for name in names if name)
 
 
-def _stable_initial_tool_map(
-    tool_map: dict[str, ToolExecutable],
-) -> dict[str, ToolExecutable]:
-    return {
-        name: tool_map[name]
-        for name in sorted(
-            tool_map,
-            key=lambda name: _initial_tool_sort_key(name, tool_map[name]),
-        )
-    }
-
-
-def _initial_tool_sort_key(name: str, tool: ToolExecutable) -> tuple[int, int, str]:
-    binding = getattr(tool, "binding", None)
-    if binding is None:
-        return (0, 0, normalize_message_text(name))
-    candidate = getattr(binding, "candidate", None)
-    score = int(float(getattr(candidate, "score", 0.0) or 0.0) * 100)
-    command_id = normalize_message_text(str(getattr(binding, "command_id", "") or ""))
-    return (1, -score, command_id or normalize_message_text(name))
-
-
 def _apply_tool_exposure_policy(
     *,
     message_text: str,
     decision: ToolObligationDecision,
     catalog_state: CommandCatalogState,
     command_context: NativeCommandExecutionContext,
-    tool_map: dict[str, ToolExecutable],
+    capability_registry: Any,
     report: NativeRouteReport,
     command_tool_capacity: int,
+    provider_adapter: ProviderCapabilityAdapter,
 ) -> None:
     """Align first-turn executable tools with the structured gate."""
 
     current_candidates = list(catalog_state.candidates)
     if decision.obligation == "none":
-        _remove_command_tools(tool_map)
         catalog_state.replace([])
         command_context.candidates = []
-        report.note_tool_pool(len(tool_map))
+        report.note_tool_pool(capability_registry.executable_tool_count())
         report.note_candidate_policy(reason="tool_gate_no_command_exposure", limit=0)
         return
     if not current_candidates:
         return
 
-    selected_ids = _command_ids_for_tool_names(tool_map, decision.required_tool_names)
+    selected_ids = _command_ids_for_tool_names(
+        capability_registry.executable_tool_map(),
+        decision.required_tool_names,
+    )
     if decision.gate_result is not None:
         selected_ids.update(
             normalize_message_text(str(command_id or ""))
@@ -1520,10 +1534,9 @@ def _apply_tool_exposure_policy(
         selected_command_ids=selected_ids,
     )
     if not current_candidates:
-        _remove_command_tools(tool_map)
         catalog_state.replace([])
         command_context.candidates = []
-        report.note_tool_pool(len(tool_map))
+        report.note_tool_pool(capability_registry.executable_tool_count())
         report.note_candidate_policy(reason="feedback_catalog_only_exposure", limit=0)
         return
 
@@ -1543,21 +1556,18 @@ def _apply_tool_exposure_policy(
     exposure_cap = _command_exposure_cap(
         decision=decision,
         command_tool_capacity=command_tool_capacity,
+        provider_adapter=provider_adapter,
     )
     filtered = sort_exposure_candidates(
         message_text,
         filtered,
         selected_command_ids=selected_ids,
     )[:exposure_cap]
-    _replace_command_tools(
-        tool_map=tool_map,
-        catalog_state=catalog_state,
-        candidates=filtered,
-    )
+    catalog_state.replace(filtered)
     command_context.candidates = catalog_state.candidates
     report.note_prompt_exposure(catalog_state.candidates)
     report.tool_candidates = max(report.tool_candidates, catalog_state.injected_count)
-    report.note_tool_pool(len(tool_map))
+    report.note_tool_pool(capability_registry.executable_tool_count())
     report.note_candidate_policy(
         reason=f"tool_gate_{decision.obligation}_command_exposure",
         limit=catalog_state.injected_count,
@@ -1568,15 +1578,13 @@ def _command_exposure_cap(
     *,
     decision: ToolObligationDecision,
     command_tool_capacity: int,
+    provider_adapter: ProviderCapabilityAdapter,
 ) -> int:
-    hard_cap = max(1, int(command_tool_capacity or _MAX_REQUEST_TOOL_COUNT))
-    if decision.obligation == "required":
-        policy_cap = _REQUIRED_COMMAND_TOOL_CAP
-    else:
-        policy_cap = _AUTO_COMMAND_TOOL_CAP
-    if decision.required_tool_names:
-        policy_cap = max(policy_cap, len(decision.required_tool_names) + 8)
-    return max(1, min(hard_cap, policy_cap))
+    return provider_adapter.command_exposure_cap(
+        obligation=decision.obligation,
+        required_tool_count=len(decision.required_tool_names),
+        command_tool_capacity=command_tool_capacity,
+    )
 
 
 def _filter_catalog_only_candidates(
@@ -1659,25 +1667,6 @@ def _command_ids_for_tool_names(
         if command_id:
             result.add(command_id)
     return result
-
-
-def _remove_command_tools(tool_map: dict[str, ToolExecutable]) -> None:
-    for name, tool in list(tool_map.items()):
-        binding = getattr(tool, "binding", None)
-        command_id = normalize_message_text(str(getattr(binding, "command_id", "")))
-        if command_id:
-            tool_map.pop(name, None)
-
-
-def _replace_command_tools(
-    *,
-    tool_map: dict[str, ToolExecutable],
-    catalog_state: CommandCatalogState,
-    candidates: list[Any],
-) -> None:
-    _remove_command_tools(tool_map)
-    catalog_state.replace(candidates)
-    tool_map.update(catalog_state.tool_map)
 
 
 def _tool_names_for_command_ids(

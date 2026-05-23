@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from ..persistence import read_json, state_path, write_json
+from ..runtime_events import emit_runtime_event
 from .audit_log import record_audit_event
 
 _APPROVAL_TTL_SECONDS = 300.0
@@ -78,6 +79,7 @@ def create_pending_approval(
     )
     _PENDING_APPROVALS[approval.approval_id] = approval
     _save_approvals()
+    _emit_approval_event(approval, status="waiting", source="approval_created")
     return approval
 
 
@@ -147,6 +149,7 @@ def revoke_pending_approval(
         },
         result={"revoked": True},
     )
+    _emit_approval_event(revoked, status="cancelled", source="approval_revoked")
     return revoked
 
 
@@ -208,6 +211,8 @@ def _pop_pending_approval(
         return None
     popped = _PENDING_APPROVALS.pop(key, None)
     _save_approvals()
+    if popped is not None:
+        _emit_approval_event(popped, status="completed", source="approval_consumed")
     return popped
 
 
@@ -222,9 +227,10 @@ def _purge_expired() -> None:
                 user_id=approval.user_id,
                 session_key=approval.session_key,
                 action=approval.action,
-            payload={"approval_id": approval.approval_id},
-            result={"expired": True},
-        )
+                payload={"approval_id": approval.approval_id},
+                result={"expired": True},
+            )
+            _emit_approval_event(approval, status="expired", source="approval_expired")
     if changed:
         _save_approvals()
 
@@ -303,6 +309,24 @@ def _coerce_ttl(value: float | None) -> float:
     except (TypeError, ValueError):
         seconds = _APPROVAL_TTL_SECONDS
     return max(30.0, min(seconds, 3600.0))
+
+
+def _emit_approval_event(
+    approval: PendingApproval,
+    *,
+    status: str,
+    source: str,
+) -> None:
+    emit_runtime_event(
+        kind="approval",
+        status=status,  # type: ignore[arg-type]
+        source=source,
+        session_key=approval.session_key,
+        user_id=approval.user_id,
+        summary=f"{approval.action}:{approval.approval_id}",
+        payload=approval.to_public_payload(),
+        related_ids={"approval_id": approval.approval_id},
+    )
 
 
 __all__ = [

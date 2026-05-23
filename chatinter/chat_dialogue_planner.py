@@ -2,11 +2,21 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import time
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from .intent_classifier import IntentClassification
 from .persistence import read_json, state_path, utc_now_iso, write_json
-from .route_text import contains_any, normalize_message_text
+
+if TYPE_CHECKING:
+    from .intent_classifier import IntentClassification
+
+
+def normalize_message_text(value: str | None) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    normalized = normalize_message_text(text)
+    return any(item and item in normalized for item in needles)
 
 ChatDialogueKind = Literal[
     "casual_chat",
@@ -62,6 +72,28 @@ GroupReplyPolicy = Literal[
     "support",
     "structured",
     "agent",
+]
+ReplyPosture = Literal[
+    "listen",
+    "answer",
+    "banter",
+    "support",
+    "clarify",
+    "step",
+]
+GroupAtmosphere = Literal[
+    "quiet",
+    "active",
+    "focused",
+    "playful",
+    "tense",
+    "unknown",
+]
+AddressMode = Literal[
+    "direct",
+    "soft",
+    "mention_aware",
+    "group_general",
 ]
 
 _DIALOGUE_STATE_PATH = state_path("chat_dialogue_states.json")
@@ -153,7 +185,14 @@ class DialogueState:
     topic_hint: str = ""
     continuity: DialogueContinuity = "unknown"
     group_reply_policy: GroupReplyPolicy = "brief_react"
+    reply_posture: ReplyPosture = "listen"
+    group_atmosphere: GroupAtmosphere = "unknown"
+    address_mode: AddressMode = "direct"
     relevant_people_count: int = 0
+    persisted_turns: int = 0
+    last_outcome: str = ""
+    last_user_message: str = ""
+    last_reply_summary: str = ""
     reason: str = "default"
 
     def to_xml(self) -> str:
@@ -168,7 +207,14 @@ class DialogueState:
                 f"topic_hint={_xml_escape(self.topic_hint)}",
                 f"continuity={self.continuity}",
                 f"group_reply_policy={self.group_reply_policy}",
+                f"reply_posture={self.reply_posture}",
+                f"group_atmosphere={self.group_atmosphere}",
+                f"address_mode={self.address_mode}",
                 f"relevant_people_count={self.relevant_people_count}",
+                f"persisted_turns={self.persisted_turns}",
+                f"last_outcome={_xml_escape(self.last_outcome)}",
+                f"last_user_message={_xml_escape(self.last_user_message)}",
+                f"last_reply_summary={_xml_escape(self.last_reply_summary)}",
                 f"reason={self.reason}",
                 "</dialogue_state>",
             )
@@ -338,7 +384,36 @@ def build_dialogue_state(
             emotion=emotion,
             response_length=response_length,
         ),
+        reply_posture=_reply_posture(
+            kind=kind,
+            purpose=purpose,
+            emotion=emotion,
+            need_followup=need_followup,
+            continuity=continuity,
+        ),
+        group_atmosphere=_group_atmosphere(
+            normalized,
+            is_group=is_group,
+            emotion=emotion,
+            relevant_people_count=relevant_people_count,
+        ),
+        address_mode=_address_mode(
+            is_group=is_group,
+            has_reply=has_reply,
+            relevant_people_count=relevant_people_count,
+            purpose=purpose,
+        ),
         relevant_people_count=max(int(relevant_people_count or 0), 0),
+        persisted_turns=previous_state.persisted_turns
+        if previous_state is not None
+        else 0,
+        last_outcome=previous_state.last_outcome if previous_state is not None else "",
+        last_user_message=previous_state.last_user_message
+        if previous_state is not None
+        else "",
+        last_reply_summary=previous_state.last_reply_summary
+        if previous_state is not None
+        else "",
         reason=(
             f"{getattr(plan, 'reason', 'no_plan')}:{emotion}:{purpose}:"
             f"{continuity}"
@@ -355,11 +430,18 @@ def load_dialogue_state(
     payload = read_json(_DIALOGUE_STATE_PATH, {})
     if not isinstance(payload, dict):
         return None
-    key = _dialogue_state_key(session_key=session_key, user_id=user_id, group_id=group_id)
+    key = _dialogue_state_key(
+        session_key=session_key,
+        user_id=user_id,
+        group_id=group_id,
+    )
     record = payload.get(key)
     if not isinstance(record, dict):
         return None
-    if time.time() - float(record.get("updated_ts", 0.0) or 0.0) > _DIALOGUE_STATE_TTL_SECONDS:
+    if (
+        time.time() - float(record.get("updated_ts", 0.0) or 0.0)
+        > _DIALOGUE_STATE_TTL_SECONDS
+    ):
         return None
     state_payload = record.get("state")
     if not isinstance(state_payload, dict):
@@ -374,11 +456,17 @@ def persist_dialogue_state(
     group_id: str | None,
     message_text: str,
     state: DialogueState,
+    outcome: str = "chat_completed",
+    reply_text: str = "",
 ) -> None:
     payload = read_json(_DIALOGUE_STATE_PATH, {})
     if not isinstance(payload, dict):
         payload = {}
-    key = _dialogue_state_key(session_key=session_key, user_id=user_id, group_id=group_id)
+    key = _dialogue_state_key(
+        session_key=session_key,
+        user_id=user_id,
+        group_id=group_id,
+    )
     now = time.time()
     payload[key] = {
         "updated_at": utc_now_iso(),
@@ -387,10 +475,30 @@ def persist_dialogue_state(
         "user_id": normalize_message_text(user_id),
         "group_id": normalize_message_text(group_id or ""),
         "last_message": normalize_message_text(message_text)[:240],
-        "state": state.to_record(),
+        "state": _state_record_for_persist(
+            state,
+            message_text=message_text,
+            outcome=outcome,
+            reply_text=reply_text,
+        ),
     }
     _trim_dialogue_state_payload(payload, now=now)
     write_json(_DIALOGUE_STATE_PATH, payload)
+
+
+def _state_record_for_persist(
+    state: DialogueState,
+    *,
+    message_text: str,
+    outcome: str,
+    reply_text: str,
+) -> dict[str, Any]:
+    record = state.to_record()
+    record["persisted_turns"] = max(int(state.persisted_turns or 0), 0) + 1
+    record["last_outcome"] = normalize_message_text(outcome)
+    record["last_user_message"] = normalize_message_text(message_text)[:240]
+    record["last_reply_summary"] = normalize_message_text(reply_text)[:240]
+    return record
 
 
 def dialogue_state_from_payload(payload: dict[str, Any]) -> DialogueState | None:
@@ -413,7 +521,26 @@ def dialogue_state_from_payload(payload: dict[str, Any]) -> DialogueState | None
                 payload.get("group_reply_policy"),
                 "brief_react",
             ),
-            relevant_people_count=max(int(payload.get("relevant_people_count", 0) or 0), 0),
+            reply_posture=_literal_or_default(payload.get("reply_posture"), "listen"),
+            group_atmosphere=_literal_or_default(
+                payload.get("group_atmosphere"),
+                "unknown",
+            ),
+            address_mode=_literal_or_default(payload.get("address_mode"), "direct"),
+            relevant_people_count=max(
+                int(payload.get("relevant_people_count", 0) or 0),
+                0,
+            ),
+            persisted_turns=max(int(payload.get("persisted_turns", 0) or 0), 0),
+            last_outcome=normalize_message_text(
+                str(payload.get("last_outcome", "") or "")
+            ),
+            last_user_message=normalize_message_text(
+                str(payload.get("last_user_message", "") or "")
+            )[:240],
+            last_reply_summary=normalize_message_text(
+                str(payload.get("last_reply_summary", "") or "")
+            )[:240],
             reason=normalize_message_text(str(payload.get("reason", "") or "loaded")),
         )
     except Exception:
@@ -554,6 +681,63 @@ def _dialogue_tone(
     return "casual"
 
 
+def _reply_posture(
+    *,
+    kind: str,
+    purpose: DialoguePurpose,
+    emotion: UserEmotion,
+    need_followup: bool,
+    continuity: DialogueContinuity,
+) -> ReplyPosture:
+    if need_followup:
+        return "clarify"
+    if emotion in {"stressed", "sad", "angry"} or purpose == "support":
+        return "support"
+    if kind == "complex_reasoning" or purpose == "plan":
+        return "step"
+    if purpose in {"answer", "identity", "memory_update"}:
+        return "answer"
+    if continuity in {"same_topic", "followup"}:
+        return "banter"
+    return "listen"
+
+
+def _group_atmosphere(
+    text: str,
+    *,
+    is_group: bool,
+    emotion: UserEmotion,
+    relevant_people_count: int,
+) -> GroupAtmosphere:
+    if not is_group:
+        return "focused"
+    if emotion in {"stressed", "sad", "angry"}:
+        return "tense"
+    if contains_any(text, _PLAYFUL_HINTS):
+        return "playful"
+    if relevant_people_count >= 3:
+        return "active"
+    if contains_any(text, _COMPLEX_HINTS) or contains_any(text, _FACTUAL_HINTS):
+        return "focused"
+    return "quiet"
+
+
+def _address_mode(
+    *,
+    is_group: bool,
+    has_reply: bool,
+    relevant_people_count: int,
+    purpose: DialoguePurpose,
+) -> AddressMode:
+    if not is_group:
+        return "direct"
+    if has_reply or relevant_people_count > 1:
+        return "mention_aware"
+    if purpose in {"chat", "support"}:
+        return "soft"
+    return "group_general"
+
+
 def _need_followup(
     text: str,
     *,
@@ -606,7 +790,10 @@ def _trim_dialogue_state_payload(payload: dict[str, Any], *, now: float) -> None
         if not isinstance(record, dict):
             payload.pop(key, None)
             continue
-        if now - float(record.get("updated_ts", 0.0) or 0.0) > _DIALOGUE_STATE_TTL_SECONDS:
+        if (
+            now - float(record.get("updated_ts", 0.0) or 0.0)
+            > _DIALOGUE_STATE_TTL_SECONDS
+        ):
             payload.pop(key, None)
     if len(payload) <= _DIALOGUE_STATE_MAX:
         return
@@ -634,13 +821,16 @@ def _xml_escape(value: str) -> str:
 
 
 __all__ = [
+    "AddressMode",
     "ChatDialogueKind",
     "ChatDialoguePlan",
     "ChatDialogueStyle",
     "DialoguePurpose",
     "DialogueState",
     "DialogueTone",
+    "GroupAtmosphere",
     "GroupReplyPolicy",
+    "ReplyPosture",
     "ResponseLength",
     "UserEmotion",
     "build_dialogue_state",

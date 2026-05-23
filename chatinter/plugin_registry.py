@@ -11,6 +11,7 @@ from datetime import datetime
 import importlib
 import inspect
 import re
+import traceback
 from typing import Any, ClassVar, Literal, cast
 
 import nonebot
@@ -279,9 +280,11 @@ class PluginRegistry:
             if not text:
                 continue
             head_part = cls._command_placeholder_pattern.split(text, maxsplit=1)[0]
-            candidate = cls._normalize_command(head_part.split(maxsplit=1)[0])
+            head_tokens = head_part.split(maxsplit=1)
+            candidate = cls._normalize_command(head_tokens[0]) if head_tokens else ""
             if not candidate:
-                candidate = cls._normalize_command(text.split(maxsplit=1)[0])
+                text_tokens = text.split(maxsplit=1)
+                candidate = cls._normalize_command(text_tokens[0]) if text_tokens else ""
             if not candidate:
                 continue
             if candidate.casefold() == primary:
@@ -478,6 +481,9 @@ class PluginRegistry:
         image_min: int | None = None,
         image_max: int | None = None,
         allow_at: bool | None = None,
+        choices: dict[str, list[str]] | None = None,
+        slot_choices: dict[str, list[str]] | None = None,
+        shortcut_renders: list[dict[str, object]] | None = None,
         actor_scope: object = None,
         target_requirement: object = None,
         target_sources: object = None,
@@ -488,6 +494,8 @@ class PluginRegistry:
         access_level: object = None,
     ) -> PluginInfo.PluginCommandMeta:
         normalized_command = str(command or "").strip()
+        if slot_choices is None:
+            slot_choices = choices
         normalized_params = cls._merge_unique_strings(params, [])
         normalized_examples = cls._merge_unique_strings(examples, [])
         normalized_aliases = cls._merge_unique_strings(
@@ -525,6 +533,8 @@ class PluginRegistry:
             aliases=normalized_aliases,
             prefixes=cls._merge_unique_strings(prefixes, []),
             params=normalized_params,
+            choices=dict(slot_choices or {}),
+            shortcut_renders=list(shortcut_renders or []),
             description=str(description or "").strip(),
             examples=normalized_examples,
             text_min=text_min,
@@ -562,6 +572,12 @@ class PluginRegistry:
             "aliases": list(getattr(meta, "aliases", []) or []),
             "prefixes": list(getattr(meta, "prefixes", []) or []),
             "params": list(getattr(meta, "params", []) or []),
+            "slot_choices": dict(
+                getattr(meta, "choices", None)
+                or getattr(meta, "slot_choices", None)
+                or {}
+            ),
+            "shortcut_renders": list(getattr(meta, "shortcut_renders", []) or []),
             "description": str(getattr(meta, "description", "") or "").strip(),
             "examples": list(getattr(meta, "examples", []) or []),
             "text_min": cls._safe_int(getattr(meta, "text_min", None)),
@@ -602,6 +618,59 @@ class PluginRegistry:
                     result.append(text)
         return result
 
+    @classmethod
+    def _merge_slot_choices(cls, *values: object) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for raw_key, raw_choices in value.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                if isinstance(raw_choices, str):
+                    choices = [raw_choices]
+                elif isinstance(raw_choices, list | tuple | set | frozenset):
+                    choices = [str(choice) for choice in raw_choices]
+                else:
+                    continue
+                merged[key] = cls._merge_unique_strings(merged.get(key), choices)
+        return merged
+
+    @classmethod
+    def _merge_shortcut_renders(cls, *values: object) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for value in values:
+            if not isinstance(value, list | tuple):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                alias = str(item.get("alias") or "").strip()
+                render = str(item.get("render") or "").strip()
+                if not alias or not render:
+                    continue
+                marker = (alias.casefold(), render.casefold())
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                args = item.get("args")
+                merged.append(
+                    {
+                        "alias": alias,
+                        "render": render,
+                        "args": [
+                            str(arg).strip()
+                            for arg in args
+                            if str(arg or "").strip()
+                        ]
+                        if isinstance(args, list | tuple)
+                        else [],
+                    }
+                )
+        return merged
+
     @staticmethod
     def _merge_text_fields(*values: object) -> str:
         parts: list[str] = []
@@ -641,6 +710,12 @@ class PluginRegistry:
                     ),
                     params=cls._merge_unique_strings(
                         left.get("params"), right.get("params")
+                    ),
+                    slot_choices=cls._merge_slot_choices(
+                        left.get("slot_choices"), right.get("slot_choices")
+                    ),
+                    shortcut_renders=cls._merge_shortcut_renders(
+                        left.get("shortcut_renders"), right.get("shortcut_renders")
                     ),
                     description=cls._merge_text_fields(
                         left.get("description"), right.get("description")
@@ -999,6 +1074,8 @@ class PluginRegistry:
                 str(prefix).strip() for prefix in prefixes if str(prefix or "").strip()
             ],
             params=[str(param).strip() for param in params if str(param or "").strip()],
+            slot_choices=item.get("slot_choices", schema.get("slot_choices")),
+            shortcut_renders=item.get("shortcut_renders", schema.get("shortcut_renders")),
             examples=normalized_examples,
             text_min=cls._safe_int(item.get("text_min"))
             if item.get("text_min") is not None
@@ -1184,10 +1261,12 @@ class PluginRegistry:
                 "",
             )
             if not matched_head and cls._command_placeholder_pattern.search(command_part):
-                matched_head = cls._normalize_command(
-                    cls._command_placeholder_pattern.split(command_part, maxsplit=1)[0]
-                    .split(maxsplit=1)[0]
-                )
+                before_placeholder = cls._command_placeholder_pattern.split(
+                    command_part, maxsplit=1
+                )[0]
+                head_parts = before_placeholder.split(maxsplit=1)
+                if head_parts:
+                    matched_head = cls._normalize_command(head_parts[0])
             if not matched_head:
                 continue
             if len(matched_head) > 32 or any(mark in matched_head for mark in "，。！？；"):
@@ -1945,7 +2024,10 @@ class PluginRegistry:
             )
 
         except Exception as e:
-            logger.error(f"预加载知识库缓存失败：{e}")
+            logger.error(
+                "预加载知识库缓存失败："
+                f"{e}\n{traceback.format_exc(limit=8)}"
+            )
 
 
 async def get_user_plugin_knowledge(

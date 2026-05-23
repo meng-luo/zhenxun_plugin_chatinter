@@ -69,6 +69,8 @@ class PatchOperation:
     pre_checkpoint_id: str = ""
     post_checkpoint_id: str = ""
     rollback_checkpoint_id: str = ""
+    failure_checkpoint_id: str = ""
+    last_recovery_plan: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str = ""
@@ -88,6 +90,8 @@ class PatchOperation:
             "pre_checkpoint_id": self.pre_checkpoint_id,
             "post_checkpoint_id": self.post_checkpoint_id,
             "rollback_checkpoint_id": self.rollback_checkpoint_id,
+            "failure_checkpoint_id": self.failure_checkpoint_id,
+            "last_recovery_plan": dict(self.last_recovery_plan),
             "created_at": int(self.created_at),
             "updated_at": int(self.updated_at),
             "error": self.error,
@@ -136,6 +140,8 @@ class PatchOperation:
             "pre_checkpoint_id": self.pre_checkpoint_id,
             "post_checkpoint_id": self.post_checkpoint_id,
             "rollback_checkpoint_id": self.rollback_checkpoint_id,
+            "failure_checkpoint_id": self.failure_checkpoint_id,
+            "last_recovery_plan": dict(self.last_recovery_plan),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
@@ -211,6 +217,12 @@ def apply_patch_operation(
             False,
             "patch_operation_failed_needs_reprepare",
             operation=operation.public_payload(),
+            recovery_plan=operation.last_recovery_plan
+            or _patch_recovery_plan(
+                operation,
+                phase="apply",
+                error=operation.error or "operation already failed",
+            ),
             instruction="该 patch operation 已失败。为避免旧快照误写，请重读文件后重新 patch_prepare。",
         )
     try:
@@ -263,11 +275,14 @@ def apply_patch_operation(
             },
             result={"ok": True},
         )
+        checkpoints = _checkpoint_payload(operation)
         return tool_result(
             True,
             "patch_operation_applied",
             operation=operation.public_payload(),
             eval=eval_run.public_payload() if eval_run is not None else None,
+            checkpoints=checkpoints,
+            next_tool="engineering_eval_run" if eval_run is not None else "engineering_eval_plan",
             instruction=(
                 "patch 已应用并绑定工程 eval。下一步调用 engineering_eval_run "
                 "执行建议测试；如果失败，根据 observation 决定重读、二次 patch 或 rollback。"
@@ -277,6 +292,16 @@ def apply_patch_operation(
         _restore_snapshots(locals().get("touched", []))
         operation.status = "failed"
         operation.error = str(exc)
+        operation.failure_checkpoint_id = _write_checkpoint(
+            operation,
+            phase="apply_failed",
+            error=str(exc),
+        )
+        operation.last_recovery_plan = _patch_recovery_plan(
+            operation,
+            phase="apply",
+            error=str(exc),
+        )
         operation.updated_at = time.time()
         _save_operations()
         record_audit_event(
@@ -291,7 +316,16 @@ def apply_patch_operation(
             False,
             "patch_operation_apply_failed",
             operation_id=operation.operation_id,
+            operation=operation.public_payload(),
             error=str(exc),
+            recovery_plan=operation.last_recovery_plan,
+            checkpoints=_checkpoint_payload(operation),
+            retryable=True,
+            need_continue=True,
+            instruction=(
+                "patch_apply 失败。不要重复应用同一个 stale operation；按 recovery_plan "
+                "重读冲突文件，重新 patch_prepare，必要时先检查 checkpoint。"
+            ),
         )
 
 
@@ -354,17 +388,34 @@ def rollback_patch_operation(
             True,
             "patch_operation_rolled_back",
             operation=operation.public_payload(),
+            checkpoints=_checkpoint_payload(operation),
+            instruction="回滚已完成。如需继续工程任务，请重读相关文件并准备新的 patch/eval。",
         )
     except Exception as exc:
         operation.status = "failed"
         operation.error = str(exc)
+        operation.failure_checkpoint_id = _write_checkpoint(
+            operation,
+            phase="rollback_failed",
+            error=str(exc),
+        )
+        operation.last_recovery_plan = _patch_recovery_plan(
+            operation,
+            phase="rollback",
+            error=str(exc),
+        )
         operation.updated_at = time.time()
         _save_operations()
         return tool_result(
             False,
             "patch_operation_rollback_failed",
             operation_id=operation.operation_id,
+            operation=operation.public_payload(),
             error=str(exc),
+            recovery_plan=operation.last_recovery_plan,
+            checkpoints=_checkpoint_payload(operation),
+            retryable=True,
+            need_continue=True,
         )
 
 
@@ -544,6 +595,8 @@ def _operation_from_payload(
             pre_checkpoint_id=str(payload.get("pre_checkpoint_id", "") or ""),
             post_checkpoint_id=str(payload.get("post_checkpoint_id", "") or ""),
             rollback_checkpoint_id=str(payload.get("rollback_checkpoint_id", "") or ""),
+            failure_checkpoint_id=str(payload.get("failure_checkpoint_id", "") or ""),
+            last_recovery_plan=dict(payload.get("last_recovery_plan") or {}),
             created_at=float(payload.get("created_at") or time.time()),
             updated_at=float(payload.get("updated_at") or time.time()),
             error=str(payload.get("error", "") or ""),
@@ -611,6 +664,8 @@ def _workspace_lock_details_for_snapshots(
             "before_size": snapshot.before_size,
             "before_mtime_ns": snapshot.before_mtime_ns,
             "parent_exists": Path(snapshot.path).parent.exists(),
+            "parent_mtime_ns": _mtime_ns(Path(snapshot.path).parent),
+            "path_kind": _path_kind(Path(snapshot.path)),
         }
         for snapshot in snapshots
     }
@@ -618,15 +673,30 @@ def _workspace_lock_details_for_snapshots(
 
 def _workspace_lock_error(operation: PatchOperation) -> str:
     for snapshot in operation.snapshots:
+        target = Path(snapshot.path)
         if not snapshot.existed_before:
-            if Path(snapshot.path).exists():
-                return f"workspace dirty lock failed: new file already exists: {snapshot.path}"
+            if target.exists():
+                return _lock_error_message(
+                    operation,
+                    snapshot,
+                    phase="before_apply",
+                    reason="new_file_already_exists",
+                )
             continue
         if not _snapshot_matches_current(snapshot):
-            return f"workspace dirty lock failed: file changed before apply: {snapshot.path}"
-        target = Path(snapshot.path)
+            return _lock_error_message(
+                operation,
+                snapshot,
+                phase="before_apply",
+                reason="content_changed_since_prepare",
+            )
         if snapshot.before_size and _file_size(target) != snapshot.before_size:
-            return f"workspace dirty lock failed: file size changed before apply: {snapshot.path}"
+            return _lock_error_message(
+                operation,
+                snapshot,
+                phase="before_apply",
+                reason="size_changed_since_prepare",
+            )
     return ""
 
 
@@ -635,7 +705,12 @@ def _rollback_lock_error(operation: PatchOperation) -> str:
         if not snapshot.existed_before and not Path(snapshot.path).exists():
             continue
         if not _snapshot_matches_after(snapshot):
-            return f"workspace dirty lock failed: file changed after apply: {snapshot.path}"
+            return _lock_error_message(
+                operation,
+                snapshot,
+                phase="before_rollback",
+                reason="content_changed_after_apply",
+            )
     return ""
 
 
@@ -648,9 +723,11 @@ def _bind_eval_after_apply(
         try:
             from .engineering_eval import get_engineering_eval
 
-            return get_engineering_eval(operation.bound_eval_id)
+            eval_run = get_engineering_eval(operation.bound_eval_id)
+            if eval_run is not None:
+                return eval_run
         except Exception:
-            return None
+            pass
     try:
         from .engineering_eval import create_engineering_eval, suggest_test_commands
 
@@ -667,7 +744,21 @@ def _bind_eval_after_apply(
         operation.updated_at = time.time()
         _save_operations()
         return eval_run
-    except Exception:
+    except Exception as exc:
+        operation.last_recovery_plan = {
+            "phase": "bind_eval_after_apply",
+            "operation_id": operation.operation_id,
+            "error": str(exc),
+            "recommended_next_action": "call_engineering_eval_plan_manually",
+            "next_tools": ["engineering_eval_plan", "engineering_eval_status"],
+            "files_to_validate": [snapshot.path for snapshot in operation.snapshots],
+            "instruction": (
+                "Patch applied but automatic eval binding failed. Create an "
+                "engineering_eval_plan for the changed files before finalizing."
+            ),
+        }
+        operation.updated_at = time.time()
+        _save_operations()
         return None
 
 
@@ -732,7 +823,12 @@ def _prepared_operation_conflict(
     return ""
 
 
-def _write_checkpoint(operation: PatchOperation, *, phase: str) -> str:
+def _write_checkpoint(
+    operation: PatchOperation,
+    *,
+    phase: str,
+    error: str = "",
+) -> str:
     checkpoint_id = f"{operation.operation_id}_{phase}_{uuid.uuid4().hex[:8]}"
     write_json(
         state_path("patch_checkpoints", f"{checkpoint_id}.json"),
@@ -744,8 +840,13 @@ def _write_checkpoint(operation: PatchOperation, *, phase: str) -> str:
             "status": operation.status,
             "action": operation.action,
             "reason": operation.reason,
+            "error": error,
             "approval_id": operation.approval_id,
             "workspace_lock_details": operation.workspace_lock_details,
+            "current_workspace": {
+                snapshot.path: _current_file_state(snapshot.path)
+                for snapshot in operation.snapshots
+            },
             "files": [
                 {
                     "path": snapshot.path,
@@ -765,6 +866,117 @@ def _write_checkpoint(operation: PatchOperation, *, phase: str) -> str:
         },
     )
     return checkpoint_id
+
+
+def _checkpoint_payload(operation: PatchOperation) -> dict[str, str]:
+    return {
+        "pre_checkpoint_id": operation.pre_checkpoint_id,
+        "post_checkpoint_id": operation.post_checkpoint_id,
+        "rollback_checkpoint_id": operation.rollback_checkpoint_id,
+        "failure_checkpoint_id": operation.failure_checkpoint_id,
+    }
+
+
+def _patch_recovery_plan(
+    operation: PatchOperation,
+    *,
+    phase: str,
+    error: str,
+) -> dict[str, Any]:
+    files = [snapshot.path for snapshot in operation.snapshots]
+    lower = str(error or "").lower()
+    dirty_lock = "workspace dirty lock failed" in lower or "file changed" in lower
+    rollback = phase == "rollback"
+    next_tools = ["patch_show"]
+    if dirty_lock or rollback:
+        next_tools.extend(["read_file", "search_files"])
+    if not rollback:
+        next_tools.extend(["patch_prepare", "patch_apply"])
+    else:
+        next_tools.extend(["read_file", "patch_prepare"])
+    return {
+        "phase": phase,
+        "error": str(error or ""),
+        "operation_id": operation.operation_id,
+        "status": operation.status,
+        "dirty_lock_failed": dirty_lock,
+        "files_to_reread": files[:20],
+        "checkpoint_ids": _checkpoint_payload(operation),
+        "next_tools": _dedupe(next_tools),
+        "recommended_next_action": (
+            "reread_changed_files_then_reprepare_patch"
+            if dirty_lock
+            else "inspect_checkpoint_then_reprepare_patch"
+        ),
+        "instruction": (
+            "Treat this patch operation as stale. Do not retry the same operation "
+            "unchanged. Use patch_show/read_file to inspect current files, then "
+            "prepare a new focused patch. If rollback failed, avoid overwriting "
+            "unknown user changes until the current content has been reviewed."
+        ),
+    }
+
+
+def _lock_error_message(
+    operation: PatchOperation,
+    snapshot: FileSnapshot,
+    *,
+    phase: str,
+    reason: str,
+) -> str:
+    current = _current_file_state(snapshot.path)
+    return (
+        "workspace dirty lock failed: "
+        f"{reason}: {snapshot.path} "
+        f"(operation_id={operation.operation_id}, phase={phase}, "
+        f"expected_before_sha256={snapshot.before_sha256}, "
+        f"expected_after_sha256={snapshot.after_sha256}, "
+        f"current_sha256={current.get('sha256', '')}, "
+        f"current_size={current.get('size', 0)}, "
+        f"current_mtime_ns={current.get('mtime_ns', 0)})"
+    )
+
+
+def _current_file_state(path: str) -> dict[str, Any]:
+    target = Path(path)
+    existed = target.exists()
+    content = ""
+    if existed and target.is_file():
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            content = ""
+    return {
+        "exists": existed,
+        "kind": _path_kind(target),
+        "sha256": _sha256(content) if existed and target.is_file() else "",
+        "size": _file_size(target) if existed else 0,
+        "mtime_ns": _mtime_ns(target) if existed else 0,
+        "parent_exists": target.parent.exists(),
+        "parent_mtime_ns": _mtime_ns(target.parent),
+    }
+
+
+def _path_kind(path: Path) -> str:
+    try:
+        if path.is_file():
+            return "file"
+        if path.is_dir():
+            return "dir"
+        if path.exists():
+            return "other"
+    except Exception:
+        return "unknown"
+    return "missing"
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _compact_text(value: str, *, max_chars: int) -> str:

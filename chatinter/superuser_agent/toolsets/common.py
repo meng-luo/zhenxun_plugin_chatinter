@@ -19,6 +19,13 @@ def project_root() -> Path:
     return Path.cwd()
 
 
+def worktree_id_from_context(context: Any | None) -> str:
+    extra = getattr(context, "extra", None)
+    if isinstance(extra, dict):
+        return str(extra.get("worktree_id", "") or "")
+    return ""
+
+
 def tool_result(ok: bool, status: str, **payload: Any) -> ToolResult:
     output = {"ok": ok, "status": status, **payload}
     return ToolResult(output=output, display_content=status)
@@ -152,4 +159,5 @@ __all__ = [
     "permission_denied_result",
     "project_root",
     "tool_result",
+    "worktree_id_from_context",
 ]

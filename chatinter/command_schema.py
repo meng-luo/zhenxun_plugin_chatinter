@@ -54,6 +54,7 @@ def _slot(
     default: Any = None,
     aliases: list[str] | None = None,
     description: str = "",
+    choices: list[str] | None = None,
 ) -> CommandSlotSpec:
     return CommandSlotSpec(
         name=name,
@@ -62,6 +63,7 @@ def _slot(
         default=default,
         aliases=list(aliases or []),
         description=description,
+        choices=_normalize_choices(choices or []),
     )
 
 
@@ -357,6 +359,36 @@ def _slot_type_from_name(name: str) -> str:
     return "text"
 
 
+def _normalize_choices(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _slot_choices_from_requirement(requirement: CommandRequirement) -> dict[str, list[str]]:
+    raw = getattr(requirement, "choices", None) or getattr(requirement, "slot_choices", None)
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for key, values in raw.items():
+        name = normalize_message_text(str(key or ""))
+        if not name:
+            continue
+        if isinstance(values, str):
+            choices = [values]
+        elif isinstance(values, list | tuple | set | frozenset):
+            choices = [str(value) for value in values]
+        else:
+            continue
+        normalized = _normalize_choices(choices)
+        if normalized:
+            result[name] = normalized
+    return result
+
+
 def _slot_type_from_examples(name: str, values: list[str]) -> str:
     by_name = _slot_type_from_name(name)
     if by_name != "text":
@@ -558,6 +590,15 @@ def _slot_description(name: str, slot_type: str) -> str:
     return f"{normalized}文本"
 
 
+def _description_with_choices(description: str, choices: list[str]) -> str:
+    normalized_choices = _normalize_choices(choices)
+    if not normalized_choices:
+        return description
+    choices_text = "可选值: " + "/".join(normalized_choices[:16])
+    base = normalize_message_text(description)
+    return normalize_message_text("；".join(part for part in (base, choices_text) if part))
+
+
 def _command_description(
     command: CommandCapability,
     head: str,
@@ -701,13 +742,17 @@ def schema_from_capability(
         text_min=text_min,
         requirement=requirement,
     )
+    slot_choices = _slot_choices_from_requirement(requirement)
     example_rows = _example_argument_rows(command, head=head, usage_lines=usage_lines)
     inferred_from_examples = bool(example_rows and not requirement.params)
     for index, slot_name in enumerate(raw_params):
+        choices = slot_choices.get(normalize_message_text(slot_name), [])
         slot_type = _slot_type_from_examples(
             slot_name,
             _example_values_for_slot(example_rows, index),
         )
+        if choices and slot_type not in {"int", "float", "bool"}:
+            slot_type = "text"
         text_slot_index = sum(
             1
             for previous in raw_params[:index]
@@ -747,7 +792,11 @@ def schema_from_capability(
                     )
                 ),
                 aliases=_slot_aliases_from_name(slot_name),
-                description=_slot_description(slot_name, slot_type),
+                description=_description_with_choices(
+                    _slot_description(slot_name, slot_type),
+                    choices,
+                ),
+                choices=choices,
             )
         )
     render = head
@@ -806,7 +855,7 @@ def schema_from_capability(
         requires["image"] = True
     if any(slot.type == "at" for slot in slots):
         requires["at"] = True
-    return _schema(
+    schema = _schema(
         _command_id(module, head),
         head,
         aliases=list(dict.fromkeys(alias for alias in aliases if alias)),
@@ -839,6 +888,8 @@ def schema_from_capability(
             if normalize_message_text(phrase)
         ],
     )
+    schema.shortcut_renders = list(command.shortcut_renders or [])
+    return schema
 
 
 def build_command_schemas(

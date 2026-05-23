@@ -401,6 +401,11 @@ def _slot_to_property(
     ]
     if slot.aliases:
         description_parts.append("aliases: " + _join_values(slot.aliases))
+    choices = list(getattr(slot, "choices", []) or [])
+    if choices:
+        description_parts.append(
+            "可选值: " + _join_values([str(choice) for choice in choices], limit=160)
+        )
     if slot.default is not None:
         description_parts.append(f"默认: {slot.default}")
     if slot.type == "at":
@@ -415,12 +420,18 @@ def _slot_to_property(
         description_parts.append(
             "input_requirements: " + _join_values(snapshot.input_requirements)
         )
-    return {
+    payload: dict[str, Any] = {
         "type": schema_type,
         "description": "；".join(
             normalize_message_text(item) for item in description_parts if item
         ),
     }
+    if choices and json_type == "string":
+        enum_values = [normalize_message_text(str(choice)) for choice in choices]
+        if not slot.required:
+            enum_values = [*enum_values, None]
+        payload["enum"] = enum_values
+    return payload
 
 
 def _build_parameter_root_description(

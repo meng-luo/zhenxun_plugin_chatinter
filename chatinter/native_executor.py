@@ -145,6 +145,11 @@ class NativeCommandExecutionContext:
             target_hint=target_hint,
             task_text=task_text,
         )
+        shortcut_command = _shortcut_command_for_task(
+            candidate,
+            task_text=task_text,
+            ambient_message=self.message_text,
+        )
         self.task_count += 1
         task_frame = TaskFrame(
             task_index=self.task_count,
@@ -161,6 +166,10 @@ class NativeCommandExecutionContext:
             _merge_task_frame_hints(task_frame),
             self.message_text,
         )
+        if shortcut_command:
+            route_message_text = shortcut_command
+            slots = _slots_from_shortcut_command(candidate.schema, shortcut_command, slots)
+            task_frame = replace(task_frame, slots=dict(slots))
         selection = NativeCommandSelection(
             action="execute",
             command_id=binding.command_id,
@@ -183,6 +192,12 @@ class NativeCommandExecutionContext:
         if route is None:
             return None
         decision, route_result = route
+        if shortcut_command and route_result is not None:
+            decision.command = shortcut_command
+            route_result = replace(
+                route_result,
+                decision=replace(route_result.decision, command=shortcut_command),
+            )
         return NativeValidatedRoute(
             decision=decision,
             route_result=route_result,
@@ -378,7 +393,67 @@ def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
         except (TypeError, ValueError):
             return None
 
-    return normalize_message_text(text)
+    normalized = normalize_message_text(text)
+    choices = [
+        normalize_message_text(str(choice or ""))
+        for choice in getattr(slot, "choices", []) or []
+        if normalize_message_text(str(choice or ""))
+    ]
+    if choices and normalized not in choices:
+        # Constrained parser slots must not receive natural-language aliases.
+        # Returning the raw text would render commands the plugin parser rejects;
+        # the shortcut renderer can still recover from user-facing shortcut text.
+        return None
+    return normalized
+
+
+def _shortcut_command_for_task(
+    candidate: CommandCandidate,
+    *,
+    task_text: str,
+    ambient_message: str,
+) -> str:
+    schema = candidate.schema
+    shortcuts = getattr(schema, "shortcut_renders", None)
+    if not shortcuts:
+        meta = getattr(candidate.tool, "meta", None) if candidate.tool is not None else None
+        shortcuts = meta.get("shortcut_renders") if isinstance(meta, dict) else None
+    if not isinstance(shortcuts, list):
+        return ""
+    haystack = normalize_message_text(" ".join([task_text, ambient_message]))
+    if not haystack:
+        return ""
+    best_alias = ""
+    best_render = ""
+    for item in shortcuts:
+        if not isinstance(item, dict):
+            continue
+        alias = normalize_message_text(str(item.get("alias") or ""))
+        render = normalize_message_text(str(item.get("render") or ""))
+        if not alias or not render:
+            continue
+        if alias and alias in haystack and len(alias) > len(best_alias):
+            best_alias = alias
+            best_render = render
+    return best_render
+
+
+def _slots_from_shortcut_command(
+    schema: Any,
+    shortcut_command: str,
+    existing_slots: dict[str, str],
+) -> dict[str, str]:
+    parts = normalize_message_text(shortcut_command).split()
+    if len(parts) <= 1:
+        return existing_slots
+    slots = dict(existing_slots)
+    values = parts[1:]
+    slot_specs = list(getattr(schema, "slots", []) or [])
+    for slot, value in zip(slot_specs, values, strict=False):
+        coerced = _coerce_slot_value(slot, value)
+        if coerced is not None:
+            slots[slot.name] = coerced
+    return slots
 
 
 def _failure_tool_result(

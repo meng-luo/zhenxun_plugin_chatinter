@@ -24,11 +24,13 @@ from ..permission_policy import (
     decide_uv,
 )
 from ..registry import register_superuser_tool
+from ..workspace_isolation import resolve_cwd
 from .common import (
     actor_from_context,
     approval_required_result,
     permission_denied_result,
     tool_result,
+    worktree_id_from_context,
 )
 
 _COMMAND_TYPES = {"shell", "git", "uv", "python_module", "server"}
@@ -79,6 +81,13 @@ class BackgroundTaskStartTool:
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
         actor = actor_from_context(context)
         payload = _normalize_start_payload(kwargs)
+        payload["cwd"], payload["isolation"] = resolve_cwd(
+            payload.get("cwd"),
+            actor=actor,
+            worktree_id=worktree_id_from_context(context),
+        )
+        if payload["isolation"].get("invalid_worktree") or payload["isolation"].get("escaped_worktree"):
+            return tool_result(False, "worktree_resolution_failed", **payload)
         if payload["command_type"] not in _COMMAND_TYPES:
             return tool_result(False, "background_invalid_command_type", **payload)
         command = _render_command(payload)
@@ -375,6 +384,7 @@ async def start_background_task(
     cwd: str | None,
     reason: str,
     rendered_command: str,
+    isolation: dict[str, Any] | None = None,
     approval_id: str | None = None,
 ) -> ToolResult:
     task = start_background_command(
@@ -390,6 +400,7 @@ async def start_background_task(
         True,
         "background_task_started",
         task=task.public_payload(include_output=False),
+        isolation=isolation or {},
         observation_event=getattr(
             getattr(task, "last_observation_event", None),
             "public_payload",

@@ -9,12 +9,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-import time
 from pathlib import Path
+import time
 from typing import Any
 
 from .agent_state import AgentObservation, AgentRunState, AgentRuntimeTimelineItem
-from .persistence import append_jsonl, read_json, state_path, to_jsonable, utc_now_iso, write_json
+from .persistence import (
+    append_jsonl,
+    read_json,
+    state_path,
+    to_jsonable,
+    utc_now_iso,
+    write_json,
+)
 from .route_text import normalize_message_text
 
 SCHEMA_VERSION = "chatinter.trajectory.v1"
@@ -46,6 +53,7 @@ def record_agent_trajectory(
     append_jsonl(path, record)
     write_json(state_path("trajectories", "latest.json"), record)
     _record_feedback_projection(record)
+    _record_eval_projection(record)
     return path
 
 
@@ -75,6 +83,11 @@ def build_agent_trajectory_record(
         "schema_version": SCHEMA_VERSION,
         "trace_id": state.trace_id,
         "run_id": state.run_id,
+        "eval_case_id": normalize_message_text(str(extra.get("eval_case_id", "") or "")),
+        "eval_layer": normalize_message_text(str(extra.get("eval_layer", "") or "")),
+        "eval_expectation": normalize_message_text(
+            str(extra.get("eval_expectation", "") or "")
+        ),
         "session_key": state.session_key or "",
         "created_at": utc_now_iso(),
         "started_at": _iso_from_timestamp(started_at),
@@ -140,7 +153,7 @@ def load_trajectory_records(
     scenario_filter = normalize_message_text(scenario or "")
     records: list[dict[str, Any]] = []
     for line in source.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+        line = line.strip().lstrip("\ufeff")
         if not line:
             continue
         try:
@@ -413,6 +426,15 @@ def _record_feedback_projection(record: dict[str, Any]) -> None:
         from .feedback import record_trajectory_eval_feedback
 
         record_trajectory_eval_feedback(record)
+    except Exception:
+        return
+
+
+def _record_eval_projection(record: dict[str, Any]) -> None:
+    try:
+        from .trajectory_eval import record_trajectory_eval
+
+        record_trajectory_eval(record)
     except Exception:
         return
 

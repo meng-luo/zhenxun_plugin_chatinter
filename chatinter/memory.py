@@ -165,8 +165,23 @@ class ChatMemory:
                     f"user_emotion={dialogue_state.user_emotion}",
                     f"dialogue_purpose={dialogue_state.dialogue_purpose}",
                     f"need_followup={int(dialogue_state.need_followup)}",
+                    f"continuity={dialogue_state.continuity}",
+                    f"group_reply_policy={dialogue_state.group_reply_policy}",
+                    f"reply_posture={dialogue_state.reply_posture}",
+                    f"group_atmosphere={dialogue_state.group_atmosphere}",
+                    f"address_mode={dialogue_state.address_mode}",
                 )
             )
+            if dialogue_state.last_user_message:
+                lines.append(
+                    "previous_user_message="
+                    f"{self._normalize_context_text(dialogue_state.last_user_message)[:120]}"
+                )
+            if dialogue_state.last_reply_summary:
+                lines.append(
+                    "previous_reply_summary="
+                    f"{self._normalize_context_text(dialogue_state.last_reply_summary)[:120]}"
+                )
         lines.append("</conversation_focus>")
         return lines
 
@@ -521,6 +536,11 @@ class ChatMemory:
             query=current_message_text,
             recall_context=recall_context,
         )
+        if dialogue_context is not None:
+            try:
+                setattr(dialogue_context, "layered_memory", layered_memory)
+            except Exception:
+                pass
         (
             person_fact_lines,
             relationship_fact_lines,
