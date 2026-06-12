@@ -185,8 +185,64 @@ def route_agent_complexity(
     )
 
 
+@dataclass(frozen=True)
+class AgentRunBudget:
+    """Resolved per-run budget: steps + cumulative estimated prompt tokens."""
+
+    max_steps: int
+    max_total_tokens: int
+    max_step_refunds: int
+    scenario: str
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "scenario": self.scenario,
+            "max_steps": self.max_steps,
+            "max_total_tokens": self.max_total_tokens,
+            "max_step_refunds": self.max_step_refunds,
+        }
+
+
+def resolve_agent_run_budget(
+    *,
+    mode: AgentComplexityMode | str,
+    enable_agent_tools: bool,
+    enable_plugin_tools: bool,
+) -> AgentRunBudget:
+    """Resolve max_steps / token budget by scenario + complexity mode.
+
+    Scenario precedence mirrors scenario_router: superuser agent >
+    group plugin selector > private chat.
+    """
+    from .config import (
+        AGENT_STEP_BUDGETS,
+        AGENT_STEP_REFUND_RATIO,
+        AGENT_TOKEN_BUDGETS,
+    )
+
+    if enable_agent_tools:
+        scenario = "superuser_agent"
+    elif enable_plugin_tools:
+        scenario = "group_plugin_selector"
+    else:
+        scenario = "private_chat"
+    steps_by_mode = AGENT_STEP_BUDGETS.get(scenario) or {}
+    normalized_mode = str(mode or "chat")
+    max_steps = int(steps_by_mode.get(normalized_mode) or steps_by_mode.get("chat") or 5)
+    max_total_tokens = int(AGENT_TOKEN_BUDGETS.get(scenario) or 0)
+    max_step_refunds = max(int(max_steps * AGENT_STEP_REFUND_RATIO), 0)
+    return AgentRunBudget(
+        max_steps=max(max_steps, 1),
+        max_total_tokens=max(max_total_tokens, 0),
+        max_step_refunds=max_step_refunds,
+        scenario=scenario,
+    )
+
+
 __all__ = [
     "AgentComplexityDecision",
     "AgentComplexityMode",
+    "AgentRunBudget",
+    "resolve_agent_run_budget",
     "route_agent_complexity",
 ]

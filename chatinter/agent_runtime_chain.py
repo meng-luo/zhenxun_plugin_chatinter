@@ -74,7 +74,13 @@ class AgentRuntimeChain:
 
         self.guardrails = RuntimeGuardrails(
             session_id=state.session_key,
-            max_elapsed_seconds=max(float(timeout or 0) * 3.0, 45.0),
+            # 墙钟随步数预算缩放(P0-1):深循环 run 需要按每步留出
+            # 模型调用时间,否则 40 步预算会被旧的 timeout*3 截断。
+            max_elapsed_seconds=max(
+                float(timeout or 0) * 3.0,
+                45.0,
+                float(getattr(state, "max_steps", 5)) * 15.0,
+            ),
         )
         self.coverage_judge = TaskCoverageJudge(
             trace_id=state.trace_id,

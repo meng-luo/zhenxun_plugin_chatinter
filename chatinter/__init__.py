@@ -112,6 +112,17 @@ __plugin_meta__ = PluginMetadata(
                 default_value="MEDIUM",
                 type=str,
             ),
+            RegisterConfig(
+                module="chatinter",
+                key="FALLBACK_MODELS",
+                value="",
+                help=(
+                    "主模型请求失败时的降级模型链，逗号分隔，按顺序尝试。"
+                    "留空表示不降级。"
+                ),
+                default_value="",
+                type=str,
+            ),
         ],
         commands=[
             Command(

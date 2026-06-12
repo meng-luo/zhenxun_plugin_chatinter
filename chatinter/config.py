@@ -24,12 +24,33 @@ ROUTE_OBSERVER_MAX_RECORDS = 400
 SESSION_CONTEXT_LIMIT = 20
 USE_SIGN_IN_IMPRESSION = True
 
+# Agent 循环预算(P0-1):max_steps 按场景与复杂度动态解析;
+# token 预算为整个 run 的累计估算 prompt token 上限(0 表示不限)。
+AGENT_STEP_BUDGETS: dict[str, dict[str, int]] = {
+    "superuser_agent": {"chat": 8, "single_tool_fast": 12, "complex_pev": 40},
+    "group_plugin_selector": {"chat": 6, "single_tool_fast": 8, "complex_pev": 10},
+    "private_chat": {"chat": 5, "single_tool_fast": 6, "complex_pev": 8},
+}
+AGENT_TOKEN_BUDGETS: dict[str, int] = {
+    "superuser_agent": 240_000,
+    "group_plugin_selector": 80_000,
+    "private_chat": 60_000,
+}
+# 读类工具步数退款上限系数:refund 总数 <= max_steps * 系数
+AGENT_STEP_REFUND_RATIO = 0.5
+
+# Schema 质量门(P0-4):fallback 档(头部命令反射失败后的兜底推断)
+# 可信度过低,默认不暴露给 LLM 工具池;确需暴露的插件加入白名单。
+EXPOSE_FALLBACK_SCHEMAS = False
+SCHEMA_FALLBACK_ALLOWLIST: frozenset[str] = frozenset()
+
 DEFAULTS = {
     "ENABLE_FALLBACK": True,
     "INTENT_TIMEOUT": 20,
     "CHAT_STYLE": "",
     "CUSTOM_PROMPT": "",
     "REASONING_EFFORT": "MEDIUM",
+    "FALLBACK_MODELS": "",
 }
 
 
@@ -55,6 +76,16 @@ def get_model_name() -> str | None:
     model_name = Config.get_config(AI_GROUP, "DEFAULT_MODEL_NAME", "")
     model_name = str(model_name or "").strip()
     return model_name or None
+
+
+def get_fallback_models() -> tuple[str, ...]:
+    """P0-3:主模型失败后的降级模型链(chatinter.FALLBACK_MODELS,逗号分隔)。"""
+    raw = Config.get_config(CHATINTER_GROUP, "FALLBACK_MODELS", "")
+    names = [part.strip() for part in str(raw or "").split(",")]
+    primary = get_model_name()
+    return tuple(
+        name for name in names if name and name != primary
+    )
 
 
 def _fallback_timeout() -> int:

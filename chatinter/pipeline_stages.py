@@ -1395,6 +1395,10 @@ async def stage_agent_run(
         )
         return replace_mention_ids_with_names(finalized_text, frame.mention_name_map)
 
+    async def _agent_progress_hook(progress_text: str) -> None:
+        # P0-2 最小落地:超级用户长任务的步级进度回显。
+        await MessageUtils.build_message(progress_text).send()
+
     main_result = await run_chatinter_main_request(
         frame.route_message or frame.current_message,
         knowledge_base,
@@ -1409,6 +1413,7 @@ async def stage_agent_run(
         enable_plugin_tools=frame.allow_plugin_tools,
         initial_command_exposure=_should_initial_command_exposure(frame),
         enable_agent_tools=frame.allow_agent_tools,
+        progress_hook=_agent_progress_hook if frame.allow_agent_tools else None,
     )
     frame.main_result = main_result
     envelope = TurnChannelEnvelope()

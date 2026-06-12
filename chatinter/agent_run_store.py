@@ -42,6 +42,31 @@ from .task_ledger import (
 )
 
 
+# In-process cancel signals (P0-1): the cancel tool flips a flag here so the
+# runtime loop can react without re-reading the persisted snapshot every step.
+_CANCEL_SIGNALS: set[str] = set()
+_CANCEL_SIGNALS_MAX = 512
+
+
+def signal_agent_run_cancel(run_id: str) -> None:
+    safe = _safe_trace_id(str(run_id or ""))
+    if not safe:
+        return
+    if len(_CANCEL_SIGNALS) >= _CANCEL_SIGNALS_MAX:
+        _CANCEL_SIGNALS.clear()
+    _CANCEL_SIGNALS.add(safe)
+
+
+def is_agent_run_cancel_signaled(run_id: str) -> bool:
+    safe = _safe_trace_id(str(run_id or ""))
+    return bool(safe) and safe in _CANCEL_SIGNALS
+
+
+def clear_agent_run_cancel_signal(run_id: str) -> None:
+    safe = _safe_trace_id(str(run_id or ""))
+    _CANCEL_SIGNALS.discard(safe)
+
+
 def persist_agent_run_state(
     state: Any,
     *,
@@ -111,6 +136,8 @@ def update_agent_run_status(
     reason: str = "",
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if str(status or "") == "cancelled":
+        signal_agent_run_cancel(run_id)
     snapshot = get_agent_run_snapshot(run_id)
     if not isinstance(snapshot, dict):
         return None

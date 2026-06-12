@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from hashlib import sha1
 import re
+from typing import Any
 
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -265,6 +266,18 @@ def build_plugin_references(
     return references
 
 
+def _schema_blocked_by_quality_gate(schema: Any, *, module: str) -> bool:
+    """Schema quality gate (P0-4): fallback-source schemas are too unreliable
+    to expose to the LLM tool pool unless explicitly allowlisted."""
+    from .config import EXPOSE_FALLBACK_SCHEMAS, SCHEMA_FALLBACK_ALLOWLIST
+
+    if str(getattr(schema, "source", "") or "") != "fallback":
+        return False
+    if EXPOSE_FALLBACK_SCHEMAS:
+        return False
+    return module not in SCHEMA_FALLBACK_ALLOWLIST
+
+
 def build_command_tool_snapshots(
     graph: CapabilityGraphSnapshot,
     *,
@@ -281,6 +294,8 @@ def build_command_tool_snapshots(
         reference = build_plugin_reference(plugin)
         plugin_usage = normalize_message_text(plugin.usage or "") or None
         for schema in reference.command_schemas:
+            if _schema_blocked_by_quality_gate(schema, module=reference.module):
+                continue
             family = _command_family(schema, plugin_module=reference.module)
             task_verbs = _infer_task_verbs(schema, reference)
             input_requirements = _input_requirements(schema)

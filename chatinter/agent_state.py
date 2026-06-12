@@ -127,6 +127,9 @@ class AgentRunState:
     recovery_action: str | None = None
     step: int = 0
     max_steps: int = 5
+    max_total_tokens: int = 0
+    steps_refunded: int = 0
+    max_step_refunds: int = 0
     budget: AgentBudgetState = field(default_factory=AgentBudgetState)
     timeline: list[AgentRuntimeTimelineItem] = field(default_factory=list)
     final_text: str = ""
@@ -154,6 +157,8 @@ class AgentRunState:
         tool_map: dict[str, ToolExecutable],
         current_message: str,
         max_steps: int,
+        max_total_tokens: int = 0,
+        max_step_refunds: int = 0,
         budget_controller: Any | None = None,
         tool_obligation: str = "none",
         tool_obligation_reason: str = "",
@@ -168,6 +173,8 @@ class AgentRunState:
             messages=list(messages),
             tool_map=dict(tool_map),
             max_steps=max(1, int(max_steps or 1)),
+            max_total_tokens=max(int(max_total_tokens or 0), 0),
+            max_step_refunds=max(int(max_step_refunds or 0), 0),
             tool_obligation=tool_obligation,
             tool_obligation_reason=normalize_message_text(tool_obligation_reason),
             required_tool_names=tuple(
@@ -188,6 +195,25 @@ class AgentRunState:
     def start_step(self) -> int:
         self.step += 1
         return self.step
+
+    def refund_step(self) -> bool:
+        """Refund one loop step for cheap read-only tool batches (P0-1).
+
+        Bounded by max_step_refunds so a read-tool loop cannot run forever;
+        wall-clock guardrails still apply regardless.
+        """
+        if self.max_step_refunds <= 0 or self.steps_refunded >= self.max_step_refunds:
+            return False
+        if self.step <= 0:
+            return False
+        self.step -= 1
+        self.steps_refunded += 1
+        return True
+
+    def token_budget_exceeded(self) -> bool:
+        if self.max_total_tokens <= 0:
+            return False
+        return self.budget.prompt_tokens >= self.max_total_tokens
 
     def append_timeline(
         self,

@@ -20,7 +20,7 @@ from zhenxun.services.llm.tools import RunContext
 from zhenxun.services.llm.types.models import ToolResult
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
-from .agent_complexity import route_agent_complexity
+from .agent_complexity import resolve_agent_run_budget, route_agent_complexity
 from .agent_runtime import AgentRuntime
 from .agent_state import AgentRunState, AgentRuntimeResult, AgentRuntimeTimelineItem
 from .command_catalog_tool import (
@@ -257,6 +257,7 @@ async def run_chatinter_main_request(
     enable_plugin_tools: bool = True,
     initial_command_exposure: bool = False,
     enable_agent_tools: bool = False,
+    progress_hook: Any | None = None,
 ) -> MainRequestResult:
     normalized_message = normalize_message_text(message_text)
     report = NativeRouteReport(helper_mode=is_usage_question(normalized_message))
@@ -290,6 +291,7 @@ async def run_chatinter_main_request(
             enable_plugin_tools=enable_plugin_tools,
             initial_command_exposure=initial_command_exposure,
             enable_agent_tools=enable_agent_tools,
+            progress_hook=progress_hook,
         )
         return await _finalize_result(
             result,
@@ -330,6 +332,7 @@ async def _run_main_request(
     enable_plugin_tools: bool,
     initial_command_exposure: bool,
     enable_agent_tools: bool,
+    progress_hook: Any | None = None,
 ) -> MainRequestResult:
     model_name = get_model_name()
     provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
@@ -445,6 +448,11 @@ async def _run_main_request(
         tool_map=tool_map,
         enable_agent_tools=enable_agent_tools,
     )
+    run_budget = resolve_agent_run_budget(
+        mode=complexity_decision.mode,
+        enable_agent_tools=enable_agent_tools,
+        enable_plugin_tools=enable_plugin_tools,
+    )
     run_context = RunContext(
         session_id=session_key,
         extra={
@@ -466,7 +474,9 @@ async def _run_main_request(
         messages=messages,
         tool_map=tool_map,
         current_message=message_text,
-        max_steps=8 if enable_agent_tools else 5,
+        max_steps=run_budget.max_steps,
+        max_total_tokens=run_budget.max_total_tokens,
+        max_step_refunds=run_budget.max_step_refunds,
         budget_controller=budget_controller,
         tool_obligation=obligation_decision.obligation,
         tool_obligation_reason=obligation_decision.reason,
@@ -492,6 +502,11 @@ async def _run_main_request(
     )
     state.append_timeline(
         role="system",
+        kind="agent_run_budget",
+        metadata=run_budget.to_metadata(),
+    )
+    state.append_timeline(
+        role="system",
         kind="tool_intent_gate",
         metadata=_tool_obligation_metadata(obligation_decision),
     )
@@ -503,6 +518,7 @@ async def _run_main_request(
         generation_config=build_reasoning_generation_config(),
         timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
         budget_controller=budget_controller,
+        progress_hook=progress_hook if enable_agent_tools else None,
     )
     agent_result = await runtime.run()
     timeline = _convert_runtime_timeline(agent_result.timeline)

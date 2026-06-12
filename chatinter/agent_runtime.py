@@ -7,6 +7,7 @@ LLM -> tool_calls -> execute -> observations -> LLM ... -> final text.
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 from typing import Any
 
@@ -19,7 +20,14 @@ from zhenxun.services.llm.types.models import (
 )
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
-from .agent_run_store import get_agent_run_snapshot, persist_agent_run_state
+from .agent_run_store import (
+    clear_agent_run_cancel_signal,
+    get_agent_run_snapshot,
+    is_agent_run_cancel_signaled,
+    persist_agent_run_state,
+)
+from .config import get_fallback_models
+from .provider_failover import request_with_failover
 from .agent_runtime_chain import AgentRuntimeChain
 from .agent_state import (
     AgentRunState,
@@ -38,6 +46,7 @@ from .trajectory_store import record_agent_trajectory
 from .turn_runtime import TurnBudgetController, estimate_text_tokens
 
 _MAIN_STAGE = "main_request"
+_PROGRESS_TASKS: set[asyncio.Task] = set()
 
 class AgentRuntime:
     """State-machine ReAct loop around ChatInter command tools."""
@@ -52,6 +61,7 @@ class AgentRuntime:
         generation_config: Any,
         timeout: float,
         budget_controller: TurnBudgetController | None = None,
+        progress_hook: Any | None = None,
     ) -> None:
         self.state = state
         self.run_context = run_context
@@ -76,22 +86,72 @@ class AgentRuntime:
             persist_state=self._persist_state,
         )
         self._trajectory_recorded = False
+        self._progress_hook = progress_hook
+        self._run_started_monotonic = 0.0
+        self._last_progress_sent = 0.0
+
+    # 进度回显(P0-2 最小落地):长任务期间向用户播报步数与当前工具,
+    # 首次播报延迟 + 播报间隔节流,避免刷屏。
+    _PROGRESS_FIRST_DELAY = 10.0
+    _PROGRESS_MIN_INTERVAL = 12.0
+
+    def _emit_progress(self) -> None:
+        if self._progress_hook is None:
+            return
+        now = time.monotonic()
+        elapsed = now - self._run_started_monotonic
+        if elapsed < self._PROGRESS_FIRST_DELAY:
+            return
+        if now - self._last_progress_sent < self._PROGRESS_MIN_INTERVAL:
+            return
+        self._last_progress_sent = now
+        last_tool = ""
+        for observation in reversed(self.state.observations):
+            last_tool = normalize_message_text(str(observation.tool_name or ""))
+            if last_tool:
+                break
+        text = (
+            f"⏳ 执行中 第{self.state.step}/{self.state.max_steps}步"
+            + (f" · 上一步: {last_tool}" if last_tool else "")
+        )
+
+        async def _safe_send() -> None:
+            try:
+                await self._progress_hook(text)
+            except Exception:
+                pass
+
+        task = asyncio.ensure_future(_safe_send())
+        _PROGRESS_TASKS.add(task)
+        task.add_done_callback(_PROGRESS_TASKS.discard)
 
     async def run(self) -> AgentRuntimeResult:
         started_at = time.time()
         started_perf = time.perf_counter()
+        self._run_started_monotonic = time.monotonic()
         if self.state.status != "running":
             self.state.status = "running"
             self.state.paused_reason = ""
+        clear_agent_run_cancel_signal(self.state.run_id or self.state.trace_id)
         self._persist_state("started")
         try:
             await self.chain.initialize()
-            for _ in range(self.state.max_steps):
+            while self.state.step < self.state.max_steps:
                 if self._cancelled_externally():
                     self.state.cancel(reason="cancelled_by_agent_run_cancel")
                     self._persist_state("cancelled")
                     return self.state.to_result()
+                if self.state.token_budget_exceeded():
+                    self._persist_state(
+                        "guardrail",
+                        reason="token_budget_exhausted",
+                    )
+                    await self._force_final_response(
+                        reason="token_budget_exhausted"
+                    )
+                    return self.state.to_result()
                 self.state.start_step()
+                self._emit_progress()
                 self._sync_dynamic_tools()
                 self._persist_state("step_started")
                 self._compress_context_if_needed()
@@ -168,6 +228,7 @@ class AgentRuntime:
 
                 started = time.perf_counter()
                 force_final_reason = ""
+                batch_all_read_only = bool(tool_calls)
                 for tool_call in tool_calls:
                     tool_call_started = time.perf_counter()
                     pre_guardrail = (
@@ -210,6 +271,13 @@ class AgentRuntime:
                         resolved_call,
                         tool_result,
                     )
+                    if batch_all_read_only and (
+                        pre_guardrail is not None
+                        or not self._is_read_only_tool(
+                            str(resolved_call.function.name or "")
+                        )
+                    ):
+                        batch_all_read_only = False
                     self._record_tool_feedback(
                         resolved_call,
                         tool_result,
@@ -243,6 +311,14 @@ class AgentRuntime:
                         force_final_reason = post_observation.stop_reason
                 self._record_tool_batch(time.perf_counter() - started)
                 self.chain.flush_post_batch_guardrails()
+                if (
+                    batch_all_read_only
+                    and not force_final_reason
+                    and self.state.refund_step()
+                ):
+                    self._persist_state(
+                        "step_refunded", reason="read_only_tool_batch"
+                    )
                 if force_final_reason:
                     await self._force_final_response(reason=force_final_reason)
                     return self.state.to_result()
@@ -279,21 +355,49 @@ class AgentRuntime:
         tools: dict[str, ToolExecutable] | None,
         tool_choice: str | dict[str, Any] | None,
     ) -> LLMResponse:
-        request = self.provider_adapter.prepare_model_request(
-            messages=self.state.messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            required_tool_names=self.state.required_tool_names,
-            generation_config=self.generation_config,
+        async def _do_request(model: str | None) -> LLMResponse:
+            # 每次尝试都重新 prepare:上下文压缩(context_overflow 恢复)
+            # 修改的是 state.messages,需要重新展开进请求。
+            request = self.provider_adapter.prepare_model_request(
+                messages=self.state.messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                required_tool_names=self.state.required_tool_names,
+                generation_config=self.generation_config,
+            )
+            return await self.ai.generate_internal(
+                request.messages,
+                model=model,
+                config=request.generation_config,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                timeout=self.timeout,
+            )
+
+        outcome = await request_with_failover(
+            primary_model=self.model_name,
+            fallback_models=get_fallback_models(),
+            request_fn=_do_request,
+            compress_fn=self._compress_context_if_needed,
+            trace_id=self.state.trace_id,
         )
-        return await self.ai.generate_internal(
-            request.messages,
-            model=self.model_name,
-            config=request.generation_config,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            timeout=self.timeout,
-        )
+        if outcome.attempts:
+            self.state.append_timeline(
+                role="system",
+                kind="provider_failover",
+                metadata={
+                    "used_model": outcome.used_model or "<default>",
+                    "attempts": [
+                        {
+                            "model": item.model,
+                            "kind": item.kind,
+                            "error": item.error,
+                        }
+                        for item in outcome.attempts
+                    ],
+                },
+            )
+        return outcome.response
 
     async def _force_final_response(self, *, reason: str) -> None:
         self.state.transition_force_final(reason)
@@ -412,8 +516,31 @@ class AgentRuntime:
         persist_agent_run_state(self.state, stage=stage, metadata=metadata)
 
     def _cancelled_externally(self) -> bool:
-        snapshot = get_agent_run_snapshot(self.state.run_id or self.state.trace_id)
+        run_key = self.state.run_id or self.state.trace_id
+        if is_agent_run_cancel_signaled(run_key):
+            return True
+        snapshot = get_agent_run_snapshot(run_key)
         return isinstance(snapshot, dict) and str(snapshot.get("status", "")) == "cancelled"
+
+    _READ_ONLY_TOOL_NAMES = frozenset(
+        {
+            "retrieve_plugin_commands",
+        }
+    )
+
+    def _is_read_only_tool(self, tool_name: str) -> bool:
+        """Read-only tools refund their loop step (P0-1, Hermes-style)."""
+        if not tool_name:
+            return False
+        if tool_name in self._READ_ONLY_TOOL_NAMES:
+            return True
+        try:
+            from .superuser_agent.registry import get_superuser_tool_card
+
+            card = get_superuser_tool_card(tool_name)
+        except Exception:
+            return False
+        return bool(card is not None and getattr(card, "read_only", False))
 
     def _compress_context_if_needed(self) -> None:
         result = get_context_engine().compress(

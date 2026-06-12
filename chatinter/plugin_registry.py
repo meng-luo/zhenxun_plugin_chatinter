@@ -66,6 +66,13 @@ class PluginRegistry:
     _cache: ClassVar[dict[str, tuple[PluginKnowledgeBase, datetime]]] = {}
     _cache_ttl: ClassVar[int] = 300  # 缓存有效期（秒）
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    @classmethod
+    def invalidate_knowledge_cache(cls) -> None:
+        """插件安装/卸载/更新后调用,强制下一次访问重建知识库与命令 schema
+        (P0-4 schema 重建触发;常规时效仍由 _cache_ttl 兜底)。"""
+        cls._cache.clear()
+
     _max_matcher_commands: ClassVar[int] = 800
     _max_discovered_commands: ClassVar[int] = 2000
     _command_discovery_entrypoints: ClassVar[tuple[str, ...]] = (
