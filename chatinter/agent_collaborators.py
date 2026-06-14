@@ -7,25 +7,14 @@ ToolIntentGate -> TaskLedger -> Observation -> FinalValidator -> Guardrails.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
 import json
+from typing import Any, Protocol
 
-from zhenxun.services.llm import LLMMessage
-from zhenxun.services.llm.tools import RunContext
-from zhenxun.services.llm.types.models import ToolResult
-
-from .agent_planner import AgentPlanner
 from .agent_state import AgentObservation, AgentRunState
-from .agent_verifier import AgentVerifier
 from .completion_validator import validate_final_reply
+from .llm_compat import LLMMessage, RunContext, ToolResult
 from .route_text import normalize_message_text
-from .task_coverage_judge import TaskCoverageJudge
 from .task_ledger import TaskLedger, TaskLedgerEntry
-from .superuser_agent.background_tasks import (
-    ObservationEvent,
-    wait_for_observation_event,
-)
-from .superuser_agent.todo_store import update_todo_from_observation
 
 DIRECT_ANSWER_INTERCEPT_LIMIT = 1
 FINAL_VALIDATION_INTERCEPT_LIMIT = 1
@@ -41,9 +30,9 @@ class RuntimeView(Protocol):
     state: AgentRunState
     run_context: RunContext
     message_text: str
-    coverage_judge: TaskCoverageJudge
-    planner: AgentPlanner
-    verifier: AgentVerifier
+    coverage_judge: Any
+    planner: Any
+    verifier: Any
 
     def _available_tool_summaries(self, *, limit: int = 16) -> list[dict[str, Any]]: ...
     def _has_available_required_tools(self) -> bool: ...
@@ -172,12 +161,8 @@ class RuntimeTaskLedgerCoordinator:
                     goal=goal,
                     intent_type=normalize_message_text(item.intent_type) or "unknown",
                     requires_real_tool=bool(item.requires_real_tool),
-                    expected_capabilities=_normalized_tasks(
-                        item.expected_capabilities
-                    ),
-                    acceptance_criteria=_normalized_tasks(
-                        item.acceptance_criteria
-                    ),
+                    expected_capabilities=_normalized_tasks(item.expected_capabilities),
+                    acceptance_criteria=_normalized_tasks(item.acceptance_criteria),
                     reason=normalize_message_text(item.reason),
                 )
             )
@@ -197,7 +182,8 @@ class RuntimeTaskLedgerCoordinator:
             LLMMessage.user(
                 "TaskLedger initialized by semantic task listing:\n"
                 + json.dumps(ledger.to_public_payload(), ensure_ascii=False)
-                + "\nComplete tasks by calling real tools when requires_real_tool=true. "
+                + "\nComplete tasks by calling real tools when "
+                "requires_real_tool=true. "
                 "Do not rely on local connector words; each tool call should map to "
                 "one listed task when possible. If no visible command schema can "
                 "cover a ledger task, call retrieve_plugin_commands first instead "
@@ -231,10 +217,18 @@ class RuntimeTaskLedgerCoordinator:
 
     def looks_like_multi_task_turn(self) -> bool:
         runtime = self.runtime
+        extra = getattr(runtime.run_context, "extra", None)
+        if isinstance(extra, dict):
+            task_plan = extra.get("task_planner_lite")
+            if isinstance(task_plan, dict) and isinstance(task_plan.get("tasks"), list):
+                return len(task_plan["tasks"]) >= 2
         text = runtime.message_text
         if not text:
             return False
-        if any(marker in text for marker in ("然后", "最后", "顺便", "接着", "同时", "以及")):
+        if any(
+            marker in text
+            for marker in ("然后", "最后", "顺便", "接着", "同时", "以及")
+        ):
             return True
         return (
             text.count("，") + text.count(",") >= 2
@@ -319,7 +313,9 @@ class RuntimeFinalGate:
             not allow_retry
             or runtime.state.coverage_interceptions >= TASK_COVERAGE_INTERCEPT_LIMIT
         ):
-            runtime.state.replace_pending_tasks(missing_goals, source="task_ledger_final")
+            runtime.state.replace_pending_tasks(
+                missing_goals, source="task_ledger_final"
+            )
             return "partial_final"
         runtime.state.coverage_interceptions += 1
         runtime.state.replace_pending_tasks(missing_goals, source="task_ledger_final")
@@ -366,7 +362,8 @@ class RuntimeFinalGate:
             return ""
         if (
             not allow_retry
-            or runtime.state.direct_answer_interceptions >= DIRECT_ANSWER_INTERCEPT_LIMIT
+            or runtime.state.direct_answer_interceptions
+            >= DIRECT_ANSWER_INTERCEPT_LIMIT
         ):
             return "safe_final"
         runtime.state.direct_answer_interceptions += 1
@@ -458,8 +455,10 @@ class RuntimeObservationCoordinator:
                 output.get("approval_id"),
                 _nested_get(output, "approval", "approval_id"),
             )
-            approval_ids = [approval_id] if approval_id else list(
-                self.runtime.state.waiting_approval_ids[-3:]
+            approval_ids = (
+                [approval_id]
+                if approval_id
+                else list(self.runtime.state.waiting_approval_ids[-3:])
             )
             self.runtime.state.pause(
                 reason="approval_required",
@@ -489,6 +488,8 @@ class RuntimeObservationCoordinator:
         if status != "background_task_started" or not task_id:
             return False
         actor = self.actor_from_run_context()
+        from .superuser_agent.background_tasks import wait_for_observation_event
+
         event = await wait_for_observation_event(
             task_id=task_id,
             user_id=actor["user_id"],
@@ -528,7 +529,7 @@ class RuntimeObservationCoordinator:
         )
         return True
 
-    def append_background_observation_event(self, event: ObservationEvent) -> None:
+    def append_background_observation_event(self, event: Any) -> None:
         payload = event.public_payload()
         if event.event_id not in self.runtime.state.observation_event_ids:
             self.runtime.state.observation_event_ids.append(event.event_id)
@@ -550,8 +551,11 @@ class RuntimeObservationCoordinator:
             tool_name="background_task",
             task_text=f"background task {event.task_id}",
             ok=event.status == "completed",
-            need_continue=event.status not in {"completed", "failed", "cancelled", "error"},
-            error=event.error or event.stderr_tail if event.status != "completed" else "",
+            need_continue=event.status
+            not in {"completed", "failed", "cancelled", "error"},
+            error=event.error or event.stderr_tail
+            if event.status != "completed"
+            else "",
             artifacts=tuple(payload.get("artifacts", []) or []),
             step=self.runtime.state.step,
             output={
@@ -592,6 +596,8 @@ class RuntimeObservationCoordinator:
             "artifacts": list(observation.artifacts),
         }
         try:
+            from .superuser_agent.todo_store import update_todo_from_observation
+
             todo_list = update_todo_from_observation(
                 user_id=actor["user_id"],
                 session_key=actor["session_key"],
@@ -641,7 +647,9 @@ def should_complete_after_plugin_observation(
     if not runtime.state.observations:
         return False
     recent_commands = [
-        observation for observation in runtime.state.observations if observation.command_id
+        observation
+        for observation in runtime.state.observations
+        if observation.command_id
     ]
     if not recent_commands:
         return False
@@ -737,9 +745,7 @@ def _approval_pause_reply(
     approval_ids: list[str],
 ) -> str:
     raw_approval = output.get("approval")
-    approval: dict[str, Any] = (
-        raw_approval if isinstance(raw_approval, dict) else {}
-    )
+    approval: dict[str, Any] = raw_approval if isinstance(raw_approval, dict) else {}
     action = normalize_message_text(str(approval.get("action", "") or ""))
     reason = normalize_message_text(
         str(

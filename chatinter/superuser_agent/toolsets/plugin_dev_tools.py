@@ -1,9 +1,9 @@
-﻿"""Plugin development automation tools for the superuser private Agent scenario."""
+"""Plugin development automation tools for the superuser private Agent scenario."""
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
+import re
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
@@ -35,7 +35,8 @@ class PluginDevInspectTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "超级用户私聊专用：检查真寻插件目录结构、__init__.py 摘要和命令/元数据线索。"
+                "超级用户私聊专用：检查真寻插件目录结构、"
+                "__init__.py 摘要和命令/元数据线索。"
                 "用于改插件前先了解现状。"
             ),
             parameters={
@@ -109,10 +110,15 @@ class PluginDevScaffoldTool:
                 "properties": {
                     "plugin_name": {
                         "type": "string",
-                        "description": "Python 包名，例如 my_plugin，只允许字母数字下划线。",
+                        "description": (
+                            "Python 包名，例如 my_plugin，" "只允许字母数字下划线。"
+                        ),
                     },
                     "display_name": {"type": "string", "description": "插件展示名。"},
-                    "command": {"type": "string", "description": "主命令头，例如 今日运势。"},
+                    "command": {
+                        "type": "string",
+                        "description": "主命令头，例如 今日运势。",
+                    },
                     "description": {"type": "string", "description": "插件描述。"},
                     "author": {
                         "type": ["string", "null"],
@@ -240,15 +246,22 @@ class PluginDevWriteFileTool:
             "relative_path": str(kwargs.get("relative_path", "") or "").strip(),
             "content": str(kwargs.get("content", "") or ""),
             "plugin_root": str(kwargs.get("plugin_root", "") or "").strip() or None,
-            "create_dirs": True if kwargs.get("create_dirs") is None else bool(kwargs.get("create_dirs")),
-            "overwrite": True if kwargs.get("overwrite") is None else bool(kwargs.get("overwrite")),
+            "create_dirs": True
+            if kwargs.get("create_dirs") is None
+            else bool(kwargs.get("create_dirs")),
+            "overwrite": True
+            if kwargs.get("overwrite") is None
+            else bool(kwargs.get("overwrite")),
             "reason": str(kwargs.get("reason", "") or ""),
             "worktree_id": worktree_id_from_context(context),
         }
         decision = decide_plugin_dev(
             f"plugin_dev_write_file {payload['plugin_name']} {payload['relative_path']}"
         )
-        safe_payload = {**payload, "content": compact_text(payload["content"], max_chars=240)}
+        safe_payload = {
+            **payload,
+            "content": compact_text(payload["content"], max_chars=240),
+        }
         if decision.decision == "deny":
             return permission_denied_result(
                 actor=actor,
@@ -289,7 +302,11 @@ async def inspect_plugin(
         if not target.exists():
             return tool_result(False, "plugin_path_not_found", path=str(target))
         files: list[dict[str, Any]] = []
-        candidates = [target] if target.is_file() else sorted(target.rglob("*"), key=lambda p: p.as_posix())
+        candidates = (
+            [target]
+            if target.is_file()
+            else sorted(target.rglob("*"), key=lambda p: p.as_posix())
+        )
         for item in candidates:
             if len(files) >= max_files:
                 break
@@ -297,7 +314,9 @@ async def inspect_plugin(
                 continue
             files.append(
                 {
-                    "path": item.relative_to(root).as_posix() if _is_relative_to(item, root) else item.as_posix(),
+                    "path": item.relative_to(root).as_posix()
+                    if _is_relative_to(item, root)
+                    else item.as_posix(),
                     "type": "dir" if item.is_dir() else "file",
                     "size": item.stat().st_size if item.is_file() else None,
                 }
@@ -309,14 +328,22 @@ async def inspect_plugin(
         if init_path.exists() and init_path.is_file():
             text = init_path.read_text(encoding="utf-8", errors="replace")
             init_summary = compact_text(text, max_chars=2400)
-            commands = sorted(set(re.findall(r"Alconna\((?:\n\s*)?[\"']([^\"']+)[\"']", text)))[:30]
-            metadata_names = sorted(set(re.findall(r"name\s*=\s*[\"']([^\"']+)[\"']", text)))[:10]
+            commands = sorted(
+                set(re.findall(r"Alconna\((?:\n\s*)?[\"']([^\"']+)[\"']", text))
+            )[:30]
+            metadata_names = sorted(
+                set(re.findall(r"name\s*=\s*[\"']([^\"']+)[\"']", text))
+            )[:10]
         record_audit_event(
             event="operation_executed",
             user_id=actor["user_id"],
             session_key=actor["session_key"],
             action="plugin_dev_inspect",
-            payload={"plugin_name": plugin_name, "plugin_root": plugin_root, "approval_id": approval_id},
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "approval_id": approval_id,
+            },
             result={"ok": True, "files": len(files)},
         )
         return tool_result(
@@ -336,7 +363,11 @@ async def inspect_plugin(
         return audited_error_result(
             actor=actor,
             action="plugin_dev_inspect",
-            payload={"plugin_name": plugin_name, "plugin_root": plugin_root, "approval_id": approval_id},
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "approval_id": approval_id,
+            },
             status="plugin_inspect_error",
             error=str(exc),
         )
@@ -362,7 +393,9 @@ async def scaffold_plugin(
             return tool_result(False, "plugin_display_name_required")
         if not command:
             return tool_result(False, "plugin_command_required")
-        plugin_dir = _plugin_dir(plugin_name, plugin_root, actor=actor, worktree_id=worktree_id)
+        plugin_dir = _plugin_dir(
+            plugin_name, plugin_root, actor=actor, worktree_id=worktree_id
+        )
         init_path = plugin_dir / "__init__.py"
         if init_path.exists() and not overwrite:
             return tool_result(False, "plugin_already_exists", path=str(init_path))
@@ -394,7 +427,11 @@ async def scaffold_plugin(
             user_id=actor["user_id"],
             session_key=actor["session_key"],
             action="plugin_dev_scaffold",
-            payload={"plugin_name": plugin_name, "plugin_root": plugin_root, "approval_id": approval_id},
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "approval_id": approval_id,
+            },
             result={"ok": True, "path": str(init_path)},
         )
         return tool_result(
@@ -403,7 +440,9 @@ async def scaffold_plugin(
             plugin_name=plugin_name,
             path=str(init_path),
             approval_id=approval_id,
-            patch_operation=result.output.get("operation") if isinstance(result.output, dict) else None,
+            patch_operation=result.output.get("operation")
+            if isinstance(result.output, dict)
+            else None,
             files=[str(init_path)],
             next_steps=[
                 "根据需求补充业务逻辑和参数 schema。",
@@ -415,7 +454,11 @@ async def scaffold_plugin(
         return audited_error_result(
             actor=actor,
             action="plugin_dev_scaffold",
-            payload={"plugin_name": plugin_name, "plugin_root": plugin_root, "approval_id": approval_id},
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "approval_id": approval_id,
+            },
             status="plugin_scaffold_error",
             error=str(exc),
         )
@@ -438,7 +481,9 @@ async def write_plugin_file(
         _validate_plugin_name(plugin_name)
         if not relative_path:
             return tool_result(False, "plugin_relative_path_required")
-        plugin_dir = _plugin_dir(plugin_name, plugin_root, actor=actor, worktree_id=worktree_id)
+        plugin_dir = _plugin_dir(
+            plugin_name, plugin_root, actor=actor, worktree_id=worktree_id
+        )
         target = _safe_child(plugin_dir, relative_path)
         if target.exists() and not overwrite:
             return tool_result(False, "plugin_file_exists", path=str(target))
@@ -478,7 +523,9 @@ async def write_plugin_file(
             path=str(target),
             relative_path=relative_path,
             approval_id=approval_id,
-            patch_operation=result.output.get("operation") if isinstance(result.output, dict) else None,
+            patch_operation=result.output.get("operation")
+            if isinstance(result.output, dict)
+            else None,
             bytes_written=len(content.encode("utf-8")),
         )
     except Exception as exc:
@@ -527,8 +574,7 @@ def _plugin_dir(
 ) -> Path:
     _validate_plugin_name(plugin_name)
     return (
-        _plugin_root(plugin_root, actor=actor, worktree_id=worktree_id)
-        / plugin_name
+        _plugin_root(plugin_root, actor=actor, worktree_id=worktree_id) / plugin_name
     ).resolve()
 
 
@@ -562,7 +608,37 @@ def _render_plugin_init(
     menu_type: str,
 ) -> str:
     command_head = command.split()[0]
-    return f'''from nonebot.plugin import PluginMetadata\nfrom nonebot_plugin_alconna import Alconna, Arparma, on_alconna\n\nfrom zhenxun.configs.utils import Command, PluginExtraData\nfrom zhenxun.services.log import logger\nfrom zhenxun.utils.message import MessageUtils\n\n__plugin_meta__ = PluginMetadata(\n    name={display_name!r},\n    description={description!r},\n    usage="""\n    {command}\n    """.strip(),\n    extra=PluginExtraData(\n        author={author!r},\n        version="0.1.0",\n        menu_type={menu_type!r},\n        commands=[Command(command={command!r})],\n    ).to_dict(),\n)\n\n_matcher = on_alconna(Alconna({command_head!r}), priority=5, block=True)\n\n\n@_matcher.handle()\nasync def _(arparma: Arparma):\n    await MessageUtils.build_message("插件已创建，请补充具体业务逻辑。").send(reply_to=True)\n    logger.info({display_name!r}, arparma.header_result)\n'''
+    return f'''from nonebot.plugin import PluginMetadata
+from nonebot_plugin_alconna import Alconna, Arparma, on_alconna
+
+from zhenxun.configs.utils import Command, PluginExtraData
+from zhenxun.services.log import logger
+from zhenxun.utils.message import MessageUtils
+
+__plugin_meta__ = PluginMetadata(
+    name={display_name!r},
+    description={description!r},
+    usage="""
+    {command}
+    """.strip(),
+    extra=PluginExtraData(
+        author={author!r},
+        version="0.1.0",
+        menu_type={menu_type!r},
+        commands=[Command(command={command!r})],
+    ).to_dict(),
+)
+
+_matcher = on_alconna(Alconna({command_head!r}), priority=5, block=True)
+
+
+@_matcher.handle()
+async def _(arparma: Arparma):
+    await MessageUtils.build_message(
+        "插件已创建，请补充具体业务逻辑。"
+    ).send(reply_to=True)
+    logger.info({display_name!r}, arparma.header_result)
+'''
 
 
 def _coerce_int(value: Any, *, default: int, lower: int, upper: int) -> int:

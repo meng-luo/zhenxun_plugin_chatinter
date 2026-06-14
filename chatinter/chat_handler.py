@@ -28,6 +28,7 @@ from zhenxun.services.send_queue import (
 )
 
 from .artifact_store import get_artifact_store
+from .event_signals import set_event_signal
 from .route_text import normalize_message_text
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
@@ -102,11 +103,16 @@ def _captured_send_observations(
                 raw = _message_payload_to_text(payload.get(key))
                 if raw:
                     break
-        if not raw and isinstance(payload, dict) and str(api or "") in {
-            "send_msg",
-            "send_group_msg",
-            "send_private_msg",
-        }:
+        if (
+            not raw
+            and isinstance(payload, dict)
+            and str(api or "")
+            in {
+                "send_msg",
+                "send_group_msg",
+                "send_private_msg",
+            }
+        ):
             raw = "[plugin visible send]"
         outputs.append(
             SendObservation(
@@ -131,7 +137,7 @@ def _message_payload_to_text(message: Any) -> str:
                 return plain
         except Exception:
             pass
-    if isinstance(message, (list, tuple)):
+    if isinstance(message, list | tuple):
         parts = [_message_payload_to_text(item) for item in message]
         return " ".join(part for part in parts if part).strip()
     if isinstance(message, dict):
@@ -348,14 +354,16 @@ async def reroute_to_plugin_with_result(
                 error=f"unsupported event type: {type(event)}",
             )
 
-        setattr(new_event, "_ai_triggered", True)
-        setattr(new_event, "_ai_trace_id", trace_key)
+        set_event_signal(new_event, "_ai_triggered", True)
+        set_event_signal(new_event, "_ai_trace_id", trace_key)
         expanded_target_modules = _expand_reroute_target_modules(target_modules)
         if expanded_target_modules:
-            setattr(new_event, "_ai_route_modules", frozenset(expanded_target_modules))
+            set_event_signal(
+                new_event, "_ai_route_modules", frozenset(expanded_target_modules)
+            )
         route_heads = _extract_reroute_heads(command_text)
         if route_heads:
-            setattr(new_event, "_ai_route_heads", frozenset(route_heads))
+            set_event_signal(new_event, "_ai_route_heads", frozenset(route_heads))
 
         handle_event = cast(Any, bot.handle_event)
         if wait:

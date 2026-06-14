@@ -100,7 +100,11 @@ class EngineeringLoopStatusTool:
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         if loop_id:
             loop = get_engineering_loop(loop_id)
-            if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+            if (
+                loop is None
+                or loop.user_id != actor["user_id"]
+                or loop.session_key != actor["session_key"]
+            ):
                 return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
             return tool_result(
                 True,
@@ -134,7 +138,10 @@ class EngineeringLspReadTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "loop_id": {"type": "string", "description": "engineering_loop_start 返回的 loop_id。"},
+                    "loop_id": {
+                        "type": "string",
+                        "description": "engineering_loop_start 返回的 loop_id。",
+                    },
                     "files": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
@@ -158,7 +165,11 @@ class EngineeringLspReadTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         requested_files = _text_list(kwargs.get("files")) or loop.files
         resolved_files, isolation = _resolve_files(
@@ -171,7 +182,9 @@ class EngineeringLspReadTool:
         symbols, diagnostics = read_code_symbols(
             files=resolved_files,
             query=str(kwargs.get("query", "") or loop.task),
-            max_symbols=_coerce_limit(kwargs.get("max_symbols"), default=120, max_value=300),
+            max_symbols=_coerce_limit(
+                kwargs.get("max_symbols"), default=120, max_value=300
+            ),
         )
         loop = record_lsp_read(
             loop_id=loop_id,
@@ -222,7 +235,11 @@ class SemanticPatchPlanTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         if not loop.symbols:
             return tool_result(
@@ -230,7 +247,10 @@ class SemanticPatchPlanTool:
                 "engineering_lsp_read_required",
                 loop=loop.public_payload(include_events=False),
                 next_tool="engineering_lsp_read",
-                instruction="还没有读代码证据。先调用 engineering_lsp_read，再生成 semantic patch plan。",
+                instruction=(
+                    "还没有读代码证据。先调用 engineering_lsp_read，"
+                    "再生成 semantic patch plan。"
+                ),
             )
         plan = build_semantic_patch_plan(
             task=loop.task,
@@ -289,7 +309,11 @@ class EngineeringLoopBindTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         operation_id = str(kwargs.get("operation_id", "") or "").strip()
         eval_id = str(kwargs.get("eval_id", "") or "").strip()
@@ -329,19 +353,28 @@ class EngineeringEvalGateTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         gate = eval_gate(loop_id=loop_id)
         return tool_result(
             bool(gate.get("ok")),
-            "engineering_eval_gate_passed" if gate.get("ok") else "engineering_eval_gate_blocked",
+            "engineering_eval_gate_passed"
+            if gate.get("ok")
+            else "engineering_eval_gate_blocked",
             gate=gate,
             retryable=not bool(gate.get("ok")),
             need_continue=not bool(gate.get("ok")),
             instruction=(
                 "验收通过，可以总结。"
                 if gate.get("ok")
-                else "验收未通过。按 gate.next_tools/recovery_plan 继续，不要声称工程任务完成。"
+                else (
+                    "验收未通过。按 gate.next_tools/recovery_plan 继续，"
+                    "不要声称工程任务完成。"
+                )
             ),
         )
 
@@ -378,7 +411,11 @@ class EngineeringFailureDiagnoseTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         loop = diagnose_eval_failure(
             loop_id=loop_id,
@@ -430,7 +467,11 @@ class EngineeringLoopCompleteTool:
         actor = actor_from_context(context)
         loop_id = str(kwargs.get("loop_id", "") or "").strip()
         loop = get_engineering_loop(loop_id)
-        if loop is None or loop.user_id != actor["user_id"] or loop.session_key != actor["session_key"]:
+        if (
+            loop is None
+            or loop.user_id != actor["user_id"]
+            or loop.session_key != actor["session_key"]
+        ):
             return tool_result(False, "engineering_loop_not_found", loop_id=loop_id)
         loop = complete_engineering_loop(
             loop_id=loop_id,
@@ -439,7 +480,9 @@ class EngineeringLoopCompleteTool:
         ok = bool(loop and loop.stage == "completed")
         return tool_result(
             ok,
-            "engineering_loop_completed" if ok else "engineering_loop_completion_blocked",
+            "engineering_loop_completed"
+            if ok
+            else "engineering_loop_completion_blocked",
             loop=loop.public_payload() if loop else None,
             gate=eval_gate(loop_id=loop_id),
             retryable=not ok,
@@ -463,10 +506,14 @@ def _resolve_files(
         )
         payloads.append(payload)
         resolved.append(resolved_path)
-    merged = dict(payloads[0]) if payloads else {"isolated": False}
+    merged: dict[str, Any] = dict(payloads[0]) if payloads else {"isolated": False}
     merged["files"] = payloads
-    merged["invalid_worktree"] = any(bool(item.get("invalid_worktree")) for item in payloads)
-    merged["escaped_worktree"] = any(bool(item.get("escaped_worktree")) for item in payloads)
+    merged["invalid_worktree"] = any(
+        bool(item.get("invalid_worktree")) for item in payloads
+    )
+    merged["escaped_worktree"] = any(
+        bool(item.get("escaped_worktree")) for item in payloads
+    )
     return resolved, merged
 
 

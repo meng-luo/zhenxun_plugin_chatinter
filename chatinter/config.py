@@ -27,9 +27,24 @@ USE_SIGN_IN_IMPRESSION = True
 # Agent 循环预算(P0-1):max_steps 按场景与复杂度动态解析;
 # token 预算为整个 run 的累计估算 prompt token 上限(0 表示不限)。
 AGENT_STEP_BUDGETS: dict[str, dict[str, int]] = {
-    "superuser_agent": {"chat": 8, "single_tool_fast": 12, "complex_pev": 40},
-    "group_plugin_selector": {"chat": 6, "single_tool_fast": 8, "complex_pev": 10},
-    "private_chat": {"chat": 5, "single_tool_fast": 6, "complex_pev": 8},
+    "superuser_agent": {
+        "chat": 8,
+        "single_tool_fast": 12,
+        "multi_tool_fast": 16,
+        "complex_pev": 40,
+    },
+    "group_plugin_selector": {
+        "chat": 6,
+        "single_tool_fast": 8,
+        "multi_tool_fast": 10,
+        "complex_pev": 10,
+    },
+    "private_chat": {
+        "chat": 5,
+        "single_tool_fast": 6,
+        "multi_tool_fast": 8,
+        "complex_pev": 8,
+    },
 }
 AGENT_TOKEN_BUDGETS: dict[str, int] = {
     "superuser_agent": 240_000,
@@ -44,11 +59,24 @@ AGENT_STEP_REFUND_RATIO = 0.5
 EXPOSE_FALLBACK_SCHEMAS = False
 SCHEMA_FALLBACK_ALLOWLIST: frozenset[str] = frozenset()
 
+# P1-1 两阶段工具选择:候选池过大时首轮只暴露轻量 capability card,
+# 由模型先选能力,再二次请求完整 schema。这样保留插件零改造调用能力,
+# 同时避免一次性塞入大量完整参数 schema。
+COMMAND_TWO_STAGE_THRESHOLD = 30
+COMMAND_INITIAL_EXPOSURE_CAP = 40
+COMMAND_TWO_STAGE_PLUGIN_CAP = 4
+
+# P1-2 向量底座:0 表示不再硬限制记忆向量条数;如需压内存可设软上限,
+# 淘汰顺序按重要度+LRU,不是旧版纯 oldest 1024 硬截断。
+MEMORY_VECTOR_MAX_ITEMS = 0
+
 DEFAULTS = {
     "ENABLE_FALLBACK": True,
     "INTENT_TIMEOUT": 20,
     "CHAT_STYLE": "",
     "CUSTOM_PROMPT": "",
+    "PERSONA_FILE": "",
+    "QUALITY_SHADOW_SAMPLE_RATE": 0.0,
     "REASONING_EFFORT": "MEDIUM",
     "FALLBACK_MODELS": "",
 }
@@ -83,9 +111,7 @@ def get_fallback_models() -> tuple[str, ...]:
     raw = Config.get_config(CHATINTER_GROUP, "FALLBACK_MODELS", "")
     names = [part.strip() for part in str(raw or "").split(",")]
     primary = get_model_name()
-    return tuple(
-        name for name in names if name and name != primary
-    )
+    return tuple(name for name in names if name and name != primary)
 
 
 def _fallback_timeout() -> int:
@@ -115,7 +141,13 @@ def get_config_value(key: str, default: Any = None):
             return timeout
         return _fallback_timeout()
 
-    if key in {"CHAT_STYLE", "CUSTOM_PROMPT"}:
+    if key == "QUALITY_SHADOW_SAMPLE_RATE":
+        try:
+            return max(0.0, min(float(raw_value or 0.0), 1.0))
+        except (TypeError, ValueError):
+            return float(default or 0.0)
+
+    if key in {"CHAT_STYLE", "CUSTOM_PROMPT", "PERSONA_FILE"}:
         return str(raw_value or "").strip()
 
     if key == "REASONING_EFFORT":

@@ -7,12 +7,9 @@ ToolIntentGate -> TaskLedger -> Observation -> FinalValidator -> Guardrails.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
-
-from zhenxun.services.llm.tools import RunContext
-from zhenxun.services.llm.types.models import LLMToolCall, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
+from typing import Any, Literal
 
 from .agent_collaborators import (
     SAFE_NO_TOOL_RESULT_REPLY,
@@ -21,13 +18,10 @@ from .agent_collaborators import (
     RuntimeTaskLedgerCoordinator,
     should_complete_after_plugin_observation,
 )
-from .agent_planner import AgentPlanner
 from .agent_state import AgentRunState
-from .agent_verifier import AgentVerifier
-from .provider_capability import ProviderCapabilityAdapter
+from .llm_compat import LLMToolCall, RunContext, ToolExecutable, ToolResult
 from .route_text import normalize_message_text
 from .runtime_guardrails import RuntimeGuardrailDecision, RuntimeGuardrails
-from .task_coverage_judge import TaskCoverageJudge
 
 
 @dataclass(frozen=True)
@@ -59,7 +53,7 @@ class AgentRuntimeChain:
         model_name: str | None,
         generation_config: Any,
         timeout: float,
-        provider_adapter: ProviderCapabilityAdapter,
+        provider_adapter: Any,
         sync_tools: Callable[[], None],
         persist_state: Callable[..., None],
     ) -> None:
@@ -82,6 +76,10 @@ class AgentRuntimeChain:
                 float(getattr(state, "max_steps", 5)) * 15.0,
             ),
         )
+        from .agent_planner import AgentPlanner
+        from .agent_verifier import AgentVerifier
+        from .task_coverage_judge import TaskCoverageJudge
+
         self.coverage_judge = TaskCoverageJudge(
             trace_id=state.trace_id,
             model_name=model_name,
@@ -291,16 +289,16 @@ class AgentRuntimeChain:
             "task_graph_verified",
             tool_name=str(tool_call.function.name or ""),
         )
-        if self.observation_coordinator.pause_if_needed_after_observation(
-            tool_result
-        ):
+        if self.observation_coordinator.pause_if_needed_after_observation(tool_result):
             if self.state.task_graph is not None:
                 self.state.task_graph.refresh_status()
             self._persist_state("paused", reason=self.state.paused_reason)
             return PostObservationAction(paused=True)
-        if await self.observation_coordinator.background_pause_if_needed_after_observation(
-            tool_result
-        ):
+        background_pause = (
+            self.observation_coordinator.background_pause_if_needed_after_observation
+        )
+        should_pause = await background_pause(tool_result)
+        if should_pause:
             if self.state.task_graph is not None:
                 self.state.task_graph.refresh_status()
             self._persist_state("paused", reason=self.state.paused_reason)
@@ -421,15 +419,13 @@ class AgentRuntimeChain:
         }
         if required:
             return any(
-                normalize_message_text(name) in required
-                for name in self.state.tool_map
+                normalize_message_text(name) in required for name in self.state.tool_map
             )
         return self._has_actionable_command_tools()
 
     def _has_command_observation(self) -> bool:
         return any(
-            bool(observation.command_id)
-            for observation in self.state.observations
+            bool(observation.command_id) for observation in self.state.observations
         )
 
     def _has_actionable_command_tools(self) -> bool:

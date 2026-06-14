@@ -10,9 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
-
 from .capability_card import (
     CapabilityCard,
     CapabilityEntityScope,
@@ -30,10 +27,10 @@ from .command_index import (
     retrieve_command_candidates,
 )
 from .feedback import get_command_feedback_profile
+from .llm_compat import ToolDefinition, ToolExecutable, ToolResult
 from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
 from .native_command_tools import build_native_command_tools
 from .plugin_reference import build_command_tool_snapshots
-from .provider_capability import ProviderCapabilityAdapter
 from .route_text import normalize_message_text
 
 
@@ -340,6 +337,47 @@ class CapabilityRegistry:
             card=card,
         )
 
+    def register_session_search_tool(self) -> None:
+        """Expose current-session history search as a read-only runtime tool."""
+
+        from .session_search import SessionSearchTool
+
+        tool = SessionSearchTool()
+        normalized_name = normalize_message_text(tool.name)
+        card = CapabilityCard(
+            command_id=normalized_name,
+            plugin_module="chatinter.session_search",
+            plugin_name="ChatInter Session Search",
+            family="memory",
+            description="检索当前 ChatInter 会话历史，支持关键词、锚点滑窗和时序浏览。",
+            use_cases=(
+                "用户询问上次聊到哪里、之前提到的报错、历史上下文时使用",
+                "需要围绕某条历史消息继续查看上下文时使用",
+            ),
+            output_mode="text",
+            side_effect="query",
+            risk_level="low",
+            risk="low",
+            source_of_truth="local_state",
+            requires_real_tool=True,
+            entity_scope="global",
+            reliability=0.82,
+            schema_quality=0.86,
+            soft_tool=False,
+            intent_types=("memory", "history", "query"),
+            requires_real_result=True,
+            execution_policy="normal",
+            permission_tags=("public", "current_session"),
+            capability_kind="runtime_tool",
+            tool_name=normalized_name,
+        )
+        self.register_executable_tool(
+            tool_name=normalized_name,
+            executable=cast(ToolExecutable, tool),
+            kind="runtime_tool",
+            card=card,
+        )
+
     def register_superuser_tools(
         self,
         tools: dict[str, ToolExecutable],
@@ -385,7 +423,7 @@ class CapabilityRegistry:
         self,
         tools: dict[str, ToolExecutable],
         *,
-        provider_adapter: ProviderCapabilityAdapter,
+        provider_adapter: Any,
         namespace: str = "external",
         source: str = "mcp",
     ) -> None:
@@ -427,7 +465,7 @@ class CapabilityRegistry:
     async def register_available_mcp_tools(
         self,
         *,
-        provider_adapter: ProviderCapabilityAdapter,
+        provider_adapter: Any,
         force: bool = False,
     ) -> dict[str, Any]:
         """Discover configured MCP servers and register available tools.
@@ -494,8 +532,8 @@ class CapabilityRegistry:
                 kind="plugin_command",
                 card=card,
                 command_record=command_record,
-            feedback_profile=feedback,
-        )
+                feedback_profile=feedback,
+            )
 
     def inject_plugin_command_candidates(
         self,
@@ -609,6 +647,25 @@ class CapabilityRegistry:
 
     def tool_record_for(self, tool_name: str) -> ToolCapabilityRecord | None:
         return self.tool_records.get(normalize_message_text(tool_name))
+
+    def remove_executable_tool(
+        self,
+        tool_name: str,
+        *,
+        kind: str | None = None,
+    ) -> bool:
+        normalized_name = normalize_message_text(tool_name)
+        if not normalized_name:
+            return False
+        record = self.tool_records.get(normalized_name)
+        if record is None:
+            return False
+        normalized_kind = normalize_message_text(kind or "")
+        if normalized_kind and record.kind != normalized_kind:
+            return False
+        self.tool_records.pop(normalized_name, None)
+        self.generation += 1
+        return True
 
     def tool_payloads(
         self,
@@ -775,9 +832,15 @@ def _capability_card_from_superuser_tool(
     risk = _normalize_risk(getattr(raw_card, "risk", "medium"))
     read_only = bool(getattr(raw_card, "read_only", False))
     description = normalize_message_text(
-        str(getattr(raw_card, "description", "") or getattr(executable, "description", "") or "")
+        str(
+            getattr(raw_card, "description", "")
+            or getattr(executable, "description", "")
+            or ""
+        )
     )
-    approval_mode = normalize_message_text(str(getattr(raw_card, "approval_mode", "") or "policy"))
+    approval_mode = normalize_message_text(
+        str(getattr(raw_card, "approval_mode", "") or "policy")
+    )
     output_mode = _normalize_output_mode(
         getattr(raw_card, "output_mode", "plugin_output")
     )
@@ -790,7 +853,9 @@ def _capability_card_from_superuser_tool(
     if approval_mode == "deny":
         execution_policy = "confirmation_required"
     elif approval_mode == "ask" or risk == "high" or not read_only:
-        execution_policy = "confirmation_required" if risk == "high" else "strong_intent"
+        execution_policy = (
+            "confirmation_required" if risk == "high" else "strong_intent"
+        )
     tags = tuple(
         normalize_message_text(str(tag or ""))
         for tag in tuple(getattr(raw_card, "tags", ()) or ())
@@ -856,7 +921,7 @@ class ProviderExternalTool:
         *,
         name: str,
         executable: ToolExecutable,
-        adapter: ProviderCapabilityAdapter,
+        adapter: Any,
     ) -> None:
         self.name = normalize_message_text(name)
         self.executable = executable
@@ -888,12 +953,14 @@ def _capability_card_from_external_tool(
     executable: ToolExecutable,
     namespace: str,
     source: str,
-    provider_adapter: ProviderCapabilityAdapter,
+    provider_adapter: Any,
 ) -> CapabilityCard:
     description = normalize_message_text(
         str(getattr(executable, "description", "") or "")
     )
-    source_of_truth = "external_service" if source in {"mcp", "external"} else "local_state"
+    source_of_truth = (
+        "external_service" if source in {"mcp", "external"} else "local_state"
+    )
     return CapabilityCard(
         command_id=tool_name,
         plugin_module=f"chatinter.{source}",
@@ -919,7 +986,11 @@ def _capability_card_from_external_tool(
         generative=False,
         execution_policy="strong_intent",
         risk_tags=("external", source),
-        permission_tags=("runtime", source, f"provider:{provider_adapter.profile.family}"),
+        permission_tags=(
+            "runtime",
+            source,
+            f"provider:{provider_adapter.profile.family}",
+        ),
         search_text=normalize_message_text(
             " ".join([tool_name, namespace, source, description])
         ),

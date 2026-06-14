@@ -7,8 +7,8 @@ tool call before a final answer.
 
 from __future__ import annotations
 
-from typing import Any, Literal
 import json
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -106,7 +106,9 @@ def _normalize_result(
     candidates: list[Any],
 ) -> ToolIntentGateResult:
     known_ids = {
-        normalize_message_text(str(getattr(getattr(item, "schema", None), "command_id", "") or ""))
+        normalize_message_text(
+            str(getattr(getattr(item, "schema", None), "command_id", "") or "")
+        )
         for item in candidates
     }
     known_ids.discard("")
@@ -198,8 +200,12 @@ def _candidate_can_satisfy_required_tool(candidate: Any) -> bool:
     if bool(getattr(snapshot, "soft_tool", False)) and policy == "explicit_only":
         return False
     risk_level = normalize_message_text(str(getattr(snapshot, "risk_level", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
     source_of_truth = normalize_message_text(
         str(getattr(snapshot, "source_of_truth", "") or "")
     )
@@ -212,11 +218,7 @@ def _candidate_can_satisfy_required_tool(candidate: Any) -> bool:
     }
     score = float(getattr(candidate, "score", 0.0) or 0.0)
     return (
-        (
-            score >= 120.0
-            and reliability >= 0.38
-            and schema_quality >= 0.35
-        )
+        (score >= 120.0 and reliability >= 0.38 and schema_quality >= 0.35)
         or risk_level in {"medium", "high"}
         or side_effect in {"query", "send", "mutate"}
         or output_mode in {"image", "file", "action"}
@@ -225,7 +227,9 @@ def _candidate_can_satisfy_required_tool(candidate: Any) -> bool:
         or bool(getattr(snapshot, "requires_real_result", False))
         or bool(getattr(snapshot, "generative", False))
         or policy in {"strong_intent", "confirmation_required"}
-        or bool(intent_types & {"query", "status", "generate", "media", "random", "play"})
+        or bool(
+            intent_types & {"query", "status", "generate", "media", "random", "play"}
+        )
     )
 
 
@@ -342,13 +346,23 @@ def _candidate_summary(candidate: Any, *, index: int) -> dict[str, Any]:
         "features": {
             "exact": round(float(getattr(features, "exact_score", 0.0) or 0.0), 2),
             "lexical": round(float(getattr(features, "lexical_score", 0.0) or 0.0), 2),
-            "semantic": round(float(getattr(features, "semantic_score", 0.0) or 0.0), 2),
+            "semantic": round(
+                float(getattr(features, "semantic_score", 0.0) or 0.0), 2
+            ),
             "context": round(float(getattr(features, "context_score", 0.0) or 0.0), 2),
-            "feedback": round(float(getattr(features, "feedback_score", 0.0) or 0.0), 2),
+            "feedback": round(
+                float(getattr(features, "feedback_score", 0.0) or 0.0), 2
+            ),
             "schema": round(float(getattr(features, "schema_score", 0.0) or 0.0), 2),
-            "reliability": round(float(getattr(features, "reliability_score", 0.0) or 0.0), 2),
-            "false_trigger": round(float(getattr(features, "false_trigger_score", 0.0) or 0.0), 2),
-            "param_failure": round(float(getattr(features, "param_failure_score", 0.0) or 0.0), 2),
+            "reliability": round(
+                float(getattr(features, "reliability_score", 0.0) or 0.0), 2
+            ),
+            "false_trigger": round(
+                float(getattr(features, "false_trigger_score", 0.0) or 0.0), 2
+            ),
+            "param_failure": round(
+                float(getattr(features, "param_failure_score", 0.0) or 0.0), 2
+            ),
             "latency": round(float(getattr(features, "latency_score", 0.0) or 0.0), 2),
         },
         "request_strength": _request_strength_summary(candidate),
@@ -365,12 +379,17 @@ def _clip(value: Any, *, limit: int = _MAX_TEXT_CHARS) -> str:
 
 
 _TOOL_INTENT_GATE_INSTRUCTION = """
-你是 ChatInter 的工具意图门控器。你只判断“这条消息是否需要真实插件工具执行”，不执行任何任务。
+你是 ChatInter 的工具意图门控器。
+你只判断“这条消息是否需要真实插件工具执行”，不执行任何任务。
 
 分类：
-- chat：寒暄、闲聊、安慰、讨论概念、解释词义、常识回答、写作建议、对插件/命令的泛泛讨论；不需要真实插件结果。
-- plugin_optional：候选工具可能有帮助，但用户意图不够明确，允许主模型看到工具并自行决定。
-- plugin_required：用户明确要求机器人执行、查询、生成、翻译、抽取、制作、发送、签到、查看个人/群状态，或自然语言需求明显只能由候选插件给出真实结果。
+- chat：寒暄、闲聊、安慰、讨论概念、解释词义、常识回答。
+- chat 还包括写作建议、对插件/命令的泛泛讨论；不需要真实插件结果。
+- plugin_optional：候选工具可能有帮助，但用户意图不够明确。
+- plugin_optional 时允许主模型看到工具并自行决定。
+- plugin_required：用户明确要求机器人执行、查询、生成、翻译。
+- plugin_required 还包括抽取、制作、发送、签到、查看个人/群状态。
+- 如果自然语言需求明显只能由候选插件给出真实结果，也用 plugin_required。
 - unsupported：用户有工具/插件意图，但候选命令都不合适。
 
 同时输出 request_strength：
@@ -381,8 +400,10 @@ _TOOL_INTENT_GATE_INSTRUCTION = """
 - explicit：直接命令、精确命令头、或明确说“调用/执行这个插件”。
 
 同时输出 mention_only：
-- true：用户只是提到命令词、插件名、能力名，或讨论它们；不是让机器人执行。
-- false：用户在请求真实动作、真实查询、真实生成，或候选能力与当前任务直接相关。
+- true：用户只是提到命令词、插件名、能力名，或讨论它们。
+- true 表示不是让机器人执行。
+- false：用户在请求真实动作、真实查询、真实生成。
+- false 也用于候选能力与当前任务直接相关的情况。
 
 同时输出 obligation：
 - none：纯聊天，不暴露/不要求命令工具。
@@ -391,15 +412,24 @@ _TOOL_INTENT_GATE_INSTRUCTION = """
 
 关键规则：
 - 本地候选分数和 rank 只是召回信号，不是执行决策。
-- candidates 里 capability_card.execution_policy=explicit_only 的低上下文或生成工具，默认不要升为 plugin_required；只有用户明确点名执行、请求随机/生成/查看其真实结果时才升为 plugin_required。
-- capability_card 描述的是工具 source_of_truth、requires_real_tool、output_mode、entity_scope、risk、reliability、schema_quality、intent_types 和适用/不适用场景；优先按这些属性判断，不按插件名判断。
-- 如果用户只是问某个词、命令名、插件能力的含义，或在普通聊天中提到候选词，通常是 chat。
-- 如果用户说“帮我/给我/查/查询/看一下/生成/制作/抽/翻译/签到/发/调用”，且有匹配候选，通常是 plugin_required。
-- 如果需要图片、文件、外部状态、群成员状态、随机抽取或插件内部数据，不能直接代答；应判为 plugin_required。
+- explicit_only 的低上下文或生成工具，默认不要升为 plugin_required。
+- 只有用户明确点名执行、请求随机/生成/查看真实结果时才升为 required。
+- capability_card 描述工具的 source_of_truth、requires_real_tool。
+- capability_card 还描述 output_mode、entity_scope、risk、reliability。
+- capability_card 也描述 schema_quality、intent_types 和适用/不适用场景。
+- 优先按这些属性判断，不按插件名判断。
+- 如果用户只是问词义、命令含义、插件能力，通常是 chat。
+- 普通聊天中提到候选词，也通常是 chat。
+- 如果用户说“帮我/给我/查/查询/看一下/生成/制作/抽/翻译/签到/发/调用”。
+- 且有匹配候选，通常是 plugin_required。
+- 如果需要图片、文件、外部状态、群成员状态、随机抽取。
+- 或需要插件内部数据，不能直接代答；应判为 plugin_required。
 - mention_only=true 时 obligation 通常不能是 required。
-- needs_real_execution=true 表示这件事如果要回答“完成/查到/生成了”，必须先有真实工具 observation。
-- required_command_ids 只填最匹配、应真实执行的 command_id；不确定时留空并用 plugin_optional。
-- candidate_intent_types 填通用能力类型，如 chat/query/generate/image/template/translate/random/status/help，不要填插件名。
+- needs_real_execution=true 表示回答“完成/查到/生成了”前必须有 observation。
+- required_command_ids 只填最匹配、应真实执行的 command_id。
+- 不确定时留空并用 plugin_optional。
+- candidate_intent_types 填通用能力类型。
+- 例如 chat/query/generate/image/template/translate/random/status/help，不要填插件名。
 
 只返回 JSON：
 {
@@ -438,9 +468,7 @@ def _capability_card_summary(snapshot: Any | None) -> dict[str, Any]:
         ),
         "soft_tool": bool(getattr(snapshot, "soft_tool", False)),
         "intent_types": list(getattr(snapshot, "intent_types", []) or [])[:8],
-        "requires_real_result": bool(
-            getattr(snapshot, "requires_real_result", True)
-        ),
+        "requires_real_result": bool(getattr(snapshot, "requires_real_result", True)),
         "generative": bool(getattr(snapshot, "generative", False)),
         "execution_policy": _clip(
             getattr(snapshot, "execution_policy", ""),
@@ -448,9 +476,7 @@ def _capability_card_summary(snapshot: Any | None) -> dict[str, Any]:
         ),
     }
     return {
-        key: value
-        for key, value in payload.items()
-        if value not in ("", [], {}, None)
+        key: value for key, value in payload.items() if value not in ("", [], {}, None)
     }
 
 
@@ -467,9 +493,9 @@ def _request_strength_summary(candidate: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "RequestStrengthKind",
     "ToolIntentGate",
     "ToolIntentGateResult",
     "ToolIntentType",
-    "RequestStrengthKind",
     "ToolObligationKind",
 ]

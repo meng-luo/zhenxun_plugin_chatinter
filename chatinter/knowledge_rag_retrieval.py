@@ -13,9 +13,17 @@ from zhenxun.services.llm import embed_documents, embed_query, list_embedding_mo
 from zhenxun.services.log import logger
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
-from .target_policy import get_target_policy
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy
+from .target_policy import get_target_policy
+from .vector_store import (
+    BM25LexicalIndex,
+    VectorDocument,
+    VectorStore,
+    create_vector_store,
+    normalize_scores,
+    reciprocal_rank_fusion,
+)
 
 _TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+")
 _RAG_STOPWORDS = {
@@ -65,6 +73,7 @@ _SESSION_PREF_WEIGHT = 0.10
 _SESSION_REASON_WEIGHT = 0.08
 _SESSION_SLOT_WEIGHT = 0.10
 _PREFERRED_MODULE_WEIGHT = 0.08
+_RRF_WEIGHT = 0.06
 _QUERY_CACHE_TTL = 90.0
 _QUERY_CACHE_MAX_SIZE = 256
 _DEFAULT_FETCH_K = 24
@@ -313,6 +322,8 @@ class PluginRAGRetrievalMixin:
     _index_meta: ClassVar[dict[str, str]] = {}
     _cache_version: ClassVar[int] = 0
     _query_cache: ClassVar[dict[str, tuple[float, list[str]]]] = {}
+    _vector_store: ClassVar[VectorStore] = create_vector_store("plugin_rag")
+    _lexical_index: ClassVar[BM25LexicalIndex] = BM25LexicalIndex()
 
     @classmethod
     def _session_pref_scores(cls, session_id: str | None) -> dict[str, float]:
@@ -592,6 +603,7 @@ class PluginRAGRetrievalMixin:
                 for module, doc in cls._docs.items()
             }
         cls._rebuild_module_graph()
+        cls._rebuild_search_indexes()
 
     @classmethod
     def _rebuild_module_graph(cls) -> None:
@@ -628,6 +640,25 @@ class PluginRAGRetrievalMixin:
                 target: score / max_score for target, score in links.items()
             }
         cls._module_graph = normalized
+
+    @classmethod
+    def _rebuild_search_indexes(cls) -> None:
+        cls._vector_store.load_documents(
+            VectorDocument(
+                doc_id=module,
+                vector=doc.vector,
+                vector_type=doc.vector_type,
+                text=_doc_text(doc.plugin),
+                metadata=doc.metadata,
+            )
+            for module, doc in cls._docs.items()
+        )
+        cls._lexical_index.rebuild(
+            {
+                module: _tokenize(_doc_text(doc.plugin))
+                for module, doc in cls._docs.items()
+            }
+        )
 
     @classmethod
     def _preferred_module_scores(
@@ -729,28 +760,76 @@ class PluginRAGRetrievalMixin:
             if not query_vector:
                 return []
 
+            query_tokens = _tokenize(f"{query} {context_text}".strip())
             token_weights = _build_token_weights(f"{query} {context_text}".strip())
             vector_scores: dict[str, float] = {}
-            lexical_scores: dict[str, float] = {}
+            vector_results = cls._vector_store.search(
+                query_vector,
+                top_k=min(max(options.fetch_k, options.top_k), len(cls._docs)),
+                filter_fn=lambda doc: _matches_metadata_filters(
+                    cls._docs[str(doc.doc_id)],
+                    options.metadata_filters,
+                )
+                if str(doc.doc_id) in cls._docs
+                else False,
+            )
+            for result in vector_results:
+                vector_scores[result.doc_id] = result.score
+            lexical_scores = normalize_scores(
+                cls._lexical_index.score_all(
+                    query_tokens,
+                    filter_ids={
+                        module
+                        for module, doc in cls._docs.items()
+                        if _matches_metadata_filters(doc, options.metadata_filters)
+                    },
+                )
+            )
 
             for module, doc in cls._docs.items():
                 if not _matches_metadata_filters(doc, options.metadata_filters):
                     continue
-                vector_scores[module] = _cosine_score(query_vector, doc.vector)
-                lexical_scores[module] = sum(
-                    token_weights.get(token, 0.0) * doc.token_weights.get(token, 0.0)
-                    for token in token_weights
-                )
-            if not vector_scores:
+                if module not in lexical_scores:
+                    lexical_scores[module] = sum(
+                        token_weights.get(token, 0.0)
+                        * doc.token_weights.get(
+                            token,
+                            0.0,
+                        )
+                        for token in token_weights
+                    )
+            if not vector_scores and not lexical_scores:
                 return []
+
+            vector_rank = [
+                module
+                for module, _ in sorted(
+                    vector_scores.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ]
+            lexical_rank = [
+                module
+                for module, _ in sorted(
+                    lexical_scores.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ]
+            rrf_scores = normalize_scores(
+                reciprocal_rank_fusion((vector_rank, lexical_rank))
+            )
 
             base_rank = sorted(
                 (
                     (
                         module,
-                        vector_scores[module] * 0.75 + lexical_scores[module] * 0.25,
+                        vector_scores.get(module, 0.0) * 0.75
+                        + lexical_scores.get(module, 0.0) * 0.25
+                        + _RRF_WEIGHT * rrf_scores.get(module, 0.0),
                     )
-                    for module in vector_scores
+                    for module in set(vector_scores) | set(lexical_scores)
                 ),
                 key=lambda item: item[1],
                 reverse=True,
@@ -777,14 +856,18 @@ class PluginRAGRetrievalMixin:
                 vector_weight = max(_VECTOR_WEIGHT - 0.08, 0.50)
 
             ranked_modules: list[tuple[str, float]] = []
-            for module in vector_scores:
+            for module in set(vector_scores) | set(lexical_scores):
+                doc = cls._docs.get(module)
+                if doc is None:
+                    continue
                 command_score = _command_relevance_score(
-                    cls._docs[module].plugin,
+                    doc.plugin,
                     query,
                 )
                 base_score = (
                     vector_weight * vector_scores.get(module, 0.0)
                     + lexical_weight * lexical_scores.get(module, 0.0)
+                    + _RRF_WEIGHT * rrf_scores.get(module, 0.0)
                     + command_score
                 )
                 if options.rerank:

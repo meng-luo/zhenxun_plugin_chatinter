@@ -1,4 +1,4 @@
-﻿"""Artifact references and context-safe payload compaction for ChatInter.
+"""Artifact references and context-safe payload compaction for ChatInter.
 
 Long tool outputs, logs, diffs, and media references should never be pasted
 verbatim into the next LLM request.  They are stored as bounded artifacts and
@@ -123,6 +123,10 @@ class ArtifactStore:
             trace_id=trace_id,
             text=raw,
         )
+        existing = self._items.get(artifact_id)
+        if existing is not None:
+            self._items.move_to_end(artifact_id)
+            return existing
         inline_text = ""
         path = ""
         if force_file or len(raw) > _INLINE_TEXT_LIMIT:
@@ -175,12 +179,17 @@ class ArtifactStore:
     ) -> ArtifactRef:
         self._ensure_loaded()
         text = " ".join([summary, path, mime_type, str(size)])
+        artifact_id = _artifact_id(
+            artifact_type=artifact_type,
+            trace_id=trace_id,
+            text=text,
+        )
+        existing = self._items.get(artifact_id)
+        if existing is not None:
+            self._items.move_to_end(artifact_id)
+            return existing
         ref = ArtifactRef(
-            artifact_id=_artifact_id(
-                artifact_type=artifact_type,
-                trace_id=trace_id,
-                text=text,
-            ),
+            artifact_id=artifact_id,
             type=artifact_type,
             summary=summarize_artifact_text(summary),
             size=max(int(size or 0), 0),
@@ -443,7 +452,11 @@ def _compact_string(
     if lowered == "artifact_content" and "artifact_read" in source:
         limit = 4000
     else:
-        limit = _MODEL_LONG_FIELD_LIMIT if lowered in _LONG_TEXT_KEYS else _MODEL_STRING_LIMIT
+        limit = (
+            _MODEL_LONG_FIELD_LIMIT
+            if lowered in _LONG_TEXT_KEYS
+            else _MODEL_STRING_LIMIT
+        )
     if _looks_like_image_reference(raw):
         ref = get_artifact_store().store_reference(
             artifact_type="image",
@@ -458,7 +471,11 @@ def _compact_string(
         return f"[image_artifact:{ref.artifact_id}] {ref.summary}"
     if len(raw) <= limit:
         return raw
-    artifact_type: ArtifactType = "log" if lowered in {"stdout", "stderr", "log", "logs", "traceback"} else "plugin_output"
+    artifact_type: ArtifactType = (
+        "log"
+        if lowered in {"stdout", "stderr", "log", "logs", "traceback"}
+        else "plugin_output"
+    )
     ref = get_artifact_store().store_text(
         raw,
         artifact_type=artifact_type,
@@ -487,7 +504,9 @@ def _compact_list(
         raw_text = json.dumps(values, ensure_ascii=False, default=str)
     except Exception:
         raw_text = str(values)
-    should_store_full = len(values) > _MODEL_LIST_ITEMS or len(raw_text) > _MODEL_STRING_LIMIT * 2
+    should_store_full = (
+        len(values) > _MODEL_LIST_ITEMS or len(raw_text) > _MODEL_STRING_LIMIT * 2
+    )
     compacted = [
         _compact_value(
             item,
@@ -539,7 +558,9 @@ def _store_complex_value(
     return summarize_artifact_text(str(value))
 
 
-def _compact_existing_artifacts(values: list[Any] | tuple[Any, ...]) -> list[dict[str, Any]]:
+def _compact_existing_artifacts(
+    values: list[Any] | tuple[Any, ...],
+) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     for item in values:
         if not isinstance(item, dict) or not item.get("artifact_id"):
@@ -553,7 +574,11 @@ def _compact_existing_artifacts(values: list[Any] | tuple[Any, ...]) -> list[dic
         for key in ("mime_type", "path", "source", "inline_text"):
             value = str(item.get(key, "") or "")
             if value:
-                payload[key] = summarize_artifact_text(value, limit=240) if key == "inline_text" else normalize_message_text(value)
+                payload[key] = (
+                    summarize_artifact_text(value, limit=240)
+                    if key == "inline_text"
+                    else normalize_message_text(value)
+                )
         compacted.append(payload)
     return compacted
 

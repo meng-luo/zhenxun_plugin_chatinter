@@ -77,6 +77,7 @@ class TurnFrame:
     middleware_state: TurnMiddlewareState | None = None
     main_result: Any | None = None
     final_envelope: Any | None = None
+    response_quality_result: Any | None = None
     chat_execution_frame: Any | None = None
     post_gate_callback: Any | None = None
     turn_finished: bool = False

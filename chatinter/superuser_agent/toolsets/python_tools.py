@@ -68,7 +68,9 @@ class PythonExecTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not code.strip():
             return tool_result(False, "python_empty_code")
         decision = decide_python("python_exec " + code[:240].replace("\n", " "))
@@ -115,7 +117,10 @@ class PythonModuleTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "module": {"type": "string", "description": "模块名，例如 pytest。"},
+                    "module": {
+                        "type": "string",
+                        "description": "模块名，例如 pytest。",
+                    },
                     "args": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
@@ -152,7 +157,9 @@ class PythonModuleTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not module:
             return tool_result(False, "python_empty_module")
         command_preview = "python -m " + " ".join([module, *args])

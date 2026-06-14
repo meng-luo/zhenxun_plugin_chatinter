@@ -1,4 +1,4 @@
-﻿"""Background task tools for the superuser private Agent scenario."""
+"""Background task tools for the superuser private Agent scenario."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 from ..background_tasks import (
     cancel_background_task,
     get_background_task,
-    list_observation_events,
     list_background_tasks,
+    list_observation_events,
     start_background_command,
     wait_for_observation_event,
 )
@@ -57,7 +57,10 @@ class BackgroundTaskStartTool:
                     },
                     "command": {
                         "type": "string",
-                        "description": "命令文本。git/uv 可传参数或完整命令；python_module 传模块名。",
+                        "description": (
+                            "命令文本。git/uv 可传参数或完整命令；"
+                            "python_module 传模块名。"
+                        ),
                     },
                     "args": {
                         "type": ["array", "null"],
@@ -86,7 +89,9 @@ class BackgroundTaskStartTool:
             actor=actor,
             worktree_id=worktree_id_from_context(context),
         )
-        if payload["isolation"].get("invalid_worktree") or payload["isolation"].get("escaped_worktree"):
+        if payload["isolation"].get("invalid_worktree") or payload["isolation"].get(
+            "escaped_worktree"
+        ):
             return tool_result(False, "worktree_resolution_failed", **payload)
         if payload["command_type"] not in _COMMAND_TYPES:
             return tool_result(False, "background_invalid_command_type", **payload)
@@ -94,7 +99,9 @@ class BackgroundTaskStartTool:
         if not command:
             return tool_result(False, "background_empty_command", **payload)
         payload["rendered_command"] = command
-        background_decision = decide_background("background_task_start " + payload["command_type"])
+        background_decision = decide_background(
+            "background_task_start " + payload["command_type"]
+        )
         command_decision = _decide_command(payload["command_type"], command)
         for decision in (background_decision, command_decision):
             if decision.decision == "deny":
@@ -155,9 +162,19 @@ class BackgroundTaskStatusTool:
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
         actor = actor_from_context(context)
         task_id = str(kwargs.get("task_id", "") or "").strip()
-        include_output = True if kwargs.get("include_output") is None else bool(kwargs.get("include_output"))
-        include_finished = True if kwargs.get("include_finished") is None else bool(kwargs.get("include_finished"))
-        tail_only = True if kwargs.get("tail_only") is None else bool(kwargs.get("tail_only"))
+        include_output = (
+            True
+            if kwargs.get("include_output") is None
+            else bool(kwargs.get("include_output"))
+        )
+        include_finished = (
+            True
+            if kwargs.get("include_finished") is None
+            else bool(kwargs.get("include_finished"))
+        )
+        tail_only = (
+            True if kwargs.get("tail_only") is None else bool(kwargs.get("tail_only"))
+        )
         if task_id:
             task = get_background_task(
                 task_id=task_id,
@@ -211,12 +228,16 @@ class BackgroundTaskCancelTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "超级用户私聊专用：取消后台任务。默认需要确认，确认后会 terminate/kill 兜底。"
+                "超级用户私聊专用：取消后台任务。默认需要确认，"
+                "确认后会 terminate/kill 兜底。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "要取消的后台任务 ID。"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "要取消的后台任务 ID。",
+                    },
                     "reason": {
                         "type": ["string", "null"],
                         "description": "为什么要取消该任务。",
@@ -311,7 +332,10 @@ class BackgroundObservationWaitTool:
                 task_id=task_id,
                 retryable=True,
                 need_continue=True,
-                instruction="稍后再次调用 background_observation_wait 或 background_task_status。",
+                instruction=(
+                    "稍后再次调用 background_observation_wait "
+                    "或 background_task_status。"
+                ),
             )
         return tool_result(
             event.status == "completed",
@@ -321,7 +345,8 @@ class BackgroundObservationWaitTool:
             event_id=event.event_id,
             artifacts=list(event.artifacts),
             retryable=event.status not in {"completed", "failed", "cancelled", "error"},
-            need_continue=event.status not in {"completed", "failed", "cancelled", "error"},
+            need_continue=event.status
+            not in {"completed", "failed", "cancelled", "error"},
         )
 
 
@@ -483,7 +508,9 @@ def _coerce_limit(value: Any) -> int:
         return 20
 
 
-def _task_payload(task: Any, *, include_output: bool, tail_only: bool) -> dict[str, Any]:
+def _task_payload(
+    task: Any, *, include_output: bool, tail_only: bool
+) -> dict[str, Any]:
     payload = task.public_payload(include_output=include_output)
     if include_output and tail_only:
         payload.pop("stdout", None)

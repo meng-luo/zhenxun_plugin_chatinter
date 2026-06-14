@@ -103,7 +103,7 @@ class ChatInterChatHistory(Model):
         bot_id: str | None = None,
     ) -> "ChatInterChatHistory":
         """添加一次完整 ChatInter message timeline。"""
-        return await cls.create(
+        dialog = await cls.create(
             session_id=session_id,
             user_id=user_id,
             group_id=group_id,
@@ -113,6 +113,13 @@ class ChatInterChatHistory(Model):
             timeline=json.dumps(list(timeline), ensure_ascii=False, default=str),
             bot_id=bot_id,
         )
+        try:
+            from ..session_search import upsert_session_search_dialog
+
+            await upsert_session_search_dialog(dialog)
+        except Exception:
+            pass
+        return dialog
 
     def get_timeline(self) -> list[dict]:
         raw = str(self.timeline or "").strip()
@@ -141,7 +148,6 @@ class ChatInterChatHistory(Model):
                 }
             )
         return fallback
-
 
     @classmethod
     async def prune_old_dialogs(cls, session_id: str, max_limit: int):

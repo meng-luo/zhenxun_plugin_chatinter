@@ -307,7 +307,9 @@ def decide_file_write(path: str) -> PermissionResult:
     )
 
 
-def _decide_command(section: str, command: str, *, default: Decision) -> PermissionResult:
+def _decide_command(
+    section: str, command: str, *, default: Decision
+) -> PermissionResult:
     policy = _policy_section(section)
     return _decide_by_patterns(
         value=_normalize_text(command),

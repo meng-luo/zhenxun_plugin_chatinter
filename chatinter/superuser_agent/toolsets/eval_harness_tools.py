@@ -1,4 +1,4 @@
-﻿"""Eval Harness inspection tools for superuser Agent."""
+"""Eval Harness inspection tools for superuser Agent."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from typing import Any
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
 from ...eval_runner import (
+    build_trend_report,
     ensure_eval_harness_files,
     eval_harness_paths,
-    build_trend_report,
     render_eval_report_markdown,
     run_eval_harness,
 )
@@ -33,7 +33,9 @@ class EvalHarnessRunTool:
                 "properties": {
                     "trajectory_path": {
                         "type": ["string", "null"],
-                        "description": "可选 trajectory JSONL 路径；为空使用当天默认轨迹。",
+                        "description": (
+                            "可选 trajectory JSONL 路径；" "为空使用当天默认轨迹。"
+                        ),
                     },
                     "dataset_path": {
                         "type": ["string", "null"],
@@ -117,7 +119,10 @@ class EvalHarnessStatusTool:
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="超级用户私聊专用：查看 Eval Harness 固定测试集、阈值、最新报告和 baseline 状态。",
+            description=(
+                "超级用户私聊专用：查看 Eval Harness 固定测试集、"
+                "阈值、最新报告和 baseline 状态。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -157,10 +162,16 @@ class EvalHarnessStatusTool:
             "thresholds": thresholds,
             "latest_summary": latest.get("summary") if isinstance(latest, dict) else {},
             "latest_run_id": latest.get("run_id") if isinstance(latest, dict) else "",
-            "latest_quality_verdict": latest.get("quality_verdict") if isinstance(latest, dict) else "",
+            "latest_quality_verdict": latest.get("quality_verdict")
+            if isinstance(latest, dict)
+            else "",
             "latest_trend": latest.get("trend") if isinstance(latest, dict) else {},
-            "baseline_run_id": baseline.get("run_id") if isinstance(baseline, dict) else "",
-            "report_json": latest.get("report_json") if isinstance(latest, dict) else "",
+            "baseline_run_id": baseline.get("run_id")
+            if isinstance(baseline, dict)
+            else "",
+            "report_json": latest.get("report_json")
+            if isinstance(latest, dict)
+            else "",
             "report_md": latest.get("report_md") if isinstance(latest, dict) else "",
             "trend_json": latest.get("trend_json") if isinstance(latest, dict) else "",
             "trend_md": latest.get("trend_md") if isinstance(latest, dict) else "",
@@ -176,7 +187,10 @@ class EvalHarnessTrendTool:
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="超级用户私聊专用：查看 Eval Harness token/latency/准确率趋势，用于判断能力提升还是 prompt 更激进。",
+            description=(
+                "超级用户私聊专用：查看 Eval Harness token/latency/"
+                "准确率趋势，用于判断能力提升还是 prompt 更激进。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {

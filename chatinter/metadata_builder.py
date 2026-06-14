@@ -7,8 +7,7 @@ import re
 import sys
 from typing import Any, ClassVar, cast
 
-from zhenxun.services.log import logger
-
+from .log_compat import logger
 from .route_text import normalize_message_text
 
 
@@ -678,7 +677,9 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(shortcuts, [])
 
     @classmethod
-    def _extract_parser_shortcut_renders(cls, parser: object) -> list[dict[str, object]]:
+    def _extract_parser_shortcut_renders(
+        cls, parser: object
+    ) -> list[dict[str, object]]:
         renders: list[dict[str, object]] = []
         for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
             labels = cls._extract_shortcut_labels(
@@ -698,6 +699,7 @@ class AutoMetadataBuilder:
     @classmethod
     def _extract_parser_schema(cls, parser: object) -> dict[str, Any]:
         params: list[str] = []
+        optional_params: list[str] = []
         slot_choices: dict[str, list[str]] = {}
         text_min = 0
         text_max: int | None = 0
@@ -725,18 +727,29 @@ class AutoMetadataBuilder:
             arg_repr = f"{arg_name} {getattr(arg, 'value', None)!r}".lower()
             is_optional = cls._is_optional_arg(arg)
             is_variadic = cls._is_variadic_arg(arg)
-            if cls._contains_any(arg_repr, cls._image_type_hints):
+            if is_optional and arg_name:
+                optional_params.append(arg_name)
+            has_image = cls._contains_any(arg_repr, cls._image_type_hints)
+            has_at = cls._contains_any(arg_repr, cls._at_type_hints)
+            has_text = cls._contains_any(arg_repr, ("text", "str", "string"))
+            if has_image:
                 image_min += 0 if is_optional else 1
                 if image_max is not None:
                     image_max = None if is_variadic else image_max + 1
                 if "reply" not in target_sources:
                     target_sources.append("reply")
-                continue
-            if cls._contains_any(arg_repr, cls._at_type_hints):
+            if has_at:
                 allow_at = True
                 for source in ("at", "reply", "nickname"):
                     if source not in target_sources:
                         target_sources.append(source)
+            if has_text or not (has_image or has_at):
+                text_min += 0 if is_optional else 1
+                if text_max is not None:
+                    text_max = None if is_variadic else text_max + 1
+                sample_text = cls._build_sample_text(arg_name, arg_repr)
+                continue
+            if has_image or has_at:
                 continue
 
             text_min += 0 if is_optional else 1
@@ -749,6 +762,7 @@ class AutoMetadataBuilder:
             image_max = 0
         return {
             "params": cls._merge_unique_strings(params, []),
+            "optional_params": cls._merge_unique_strings(optional_params, []),
             "slot_choices": slot_choices,
             "shortcut_renders": cls._extract_parser_shortcut_renders(parser),
             "text_min": text_min,
@@ -829,6 +843,12 @@ class AutoMetadataBuilder:
     @staticmethod
     def _is_optional_arg(arg: object) -> bool:
         if bool(getattr(arg, "optional", False)):
+            return True
+        if str(getattr(arg, "nargs", "") or "").strip() == "*":
+            return True
+        value = getattr(arg, "value", None)
+        value_text = f"{type(value).__name__} {value!r}".lower()
+        if "*" in value_text and "multivar" in value_text:
             return True
         field = getattr(arg, "field", None)
         if field is None:
@@ -1166,7 +1186,9 @@ class AutoMetadataBuilder:
         if not isinstance(item, dict):
             return None
 
-        command = cls._normalize_command(str(item.get("command") or item.get("head") or ""))
+        command = cls._normalize_command(
+            str(item.get("command") or item.get("head") or "")
+        )
         if not command:
             return None
 
@@ -1224,10 +1246,7 @@ class AutoMetadataBuilder:
                 not related_name
                 or related_module is None
                 or id(related_module) in seen_ids
-                or (
-                    related_name != module_name
-                    and not related_name.startswith(prefix)
-                )
+                or (related_name != module_name and not related_name.startswith(prefix))
             ):
                 continue
             seen_ids.add(id(related_module))
@@ -1278,7 +1297,9 @@ class AutoMetadataBuilder:
             module_obj = getattr(matcher, "module", None)
             if module_obj is None:
                 continue
-            for command, renders in cls._load_module_shortcut_render_map(module_obj).items():
+            for command, renders in cls._load_module_shortcut_render_map(
+                module_obj
+            ).items():
                 merged[command] = cls._merge_shortcut_renders(
                     merged.get(command),
                     renders,
@@ -1872,8 +1893,12 @@ class AutoMetadataBuilder:
             )
             cls._merge_numeric_requirement(current, payload, "text_min", prefer="max")
             cls._merge_numeric_requirement(current, payload, "image_min", prefer="max")
-            cls._merge_numeric_requirement(current, payload, "text_max", prefer="min_positive")
-            cls._merge_numeric_requirement(current, payload, "image_max", prefer="min_positive")
+            cls._merge_numeric_requirement(
+                current, payload, "text_max", prefer="min_positive"
+            )
+            cls._merge_numeric_requirement(
+                current, payload, "image_max", prefer="min_positive"
+            )
             if payload.get("allow_at") is not None:
                 current["allow_at"] = bool(current.get("allow_at")) or bool(
                     payload.get("allow_at")

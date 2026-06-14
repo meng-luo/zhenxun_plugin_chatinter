@@ -151,9 +151,13 @@ def _schema_meta(schema: PluginCommandSchema) -> dict[str, object]:
     shortcut_renders = getattr(schema, "shortcut_renders", None)
     meta = {
         "text_min": sum(1 for slot in text_slots if slot.required),
-        "text_max": len(text_slots) if text_slots else (1 if requires.get("text") else 0),
+        "text_max": len(text_slots)
+        if text_slots
+        else (1 if requires.get("text") else 0),
         "image_min": 1 if requires.get("image") else 0,
-        "image_max": len(image_slots) if image_slots else (1 if requires.get("image") else 0),
+        "image_max": len(image_slots)
+        if image_slots
+        else (1 if requires.get("image") else 0),
         "target_accepts_at": bool(requires.get("at") or schema.allow_at),
     }
     if isinstance(shortcut_renders, list) and shortcut_renders:

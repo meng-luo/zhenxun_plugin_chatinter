@@ -7,6 +7,7 @@ false triggers, multi-task coverage, cost and latency instead of anecdotes.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ EVAL_SCHEMA_VERSION = "chatinter.trajectory_eval.v1"
 _MAX_RECENT_FAILURES = 50
 _MAX_RECENT_RECORDS = 200
 _MAX_PLUGIN_ROWS = 200
+_MAX_QUALITY_EVAL_TASKS = 16
+_QUALITY_EVAL_TASKS: set[asyncio.Task[None]] = set()
 
 
 @dataclass
@@ -47,46 +50,63 @@ class MetricBucket:
     steps_total: int = 0
     tool_calls_total: int = 0
     observation_total: int = 0
+    quality_known: int = 0
+    quality_issue: int = 0
+    quality_revised: int = 0
+    quality_blocked: int = 0
+    quality_shadow_flagged: int = 0
 
     def add(self, metrics: dict[str, Any]) -> None:
-        self.total += 1
-        if metrics["hit"] is not None:
-            self.hit_known += 1
-            if metrics["hit"]:
-                self.hit += 1
-            else:
-                self.failed += 1
-        if metrics["false_trigger"]:
-            self.false_trigger += 1
-        obligation = metrics["tool_obligation"]
-        if obligation == "required":
-            self.required_total += 1
-            if metrics["hit"]:
-                self.required_hit += 1
-        elif obligation == "auto":
-            self.optional_total += 1
-            if metrics["hit"]:
-                self.optional_hit += 1
-        elif obligation == "none":
-            self.none_total += 1
-            if not metrics["false_trigger"]:
-                self.none_clean += 1
-        if metrics["multi_task_covered"] is not None:
-            self.multi_known += 1
-            if metrics["multi_task_covered"]:
-                self.multi_covered += 1
-        if metrics["scenario"] == "superuser_agent":
-            self.superuser_total += 1
-            if metrics["status"] == "completed":
-                self.superuser_completed += 1
-            elif metrics["status"] == "paused":
-                self.superuser_paused += 1
-        self.token_prompt_total += metrics["prompt_tokens"]
-        self.latency_total_ms += metrics["latency_ms"]
-        self.latency_max_ms = max(self.latency_max_ms, metrics["latency_ms"])
-        self.steps_total += metrics["steps"]
-        self.tool_calls_total += metrics["tool_call_count"]
-        self.observation_total += metrics["observation_count"]
+        is_quality_projection = metrics["record_type"] == "response_quality"
+        if not is_quality_projection:
+            self.total += 1
+            if metrics["hit"] is not None:
+                self.hit_known += 1
+                if metrics["hit"]:
+                    self.hit += 1
+                else:
+                    self.failed += 1
+            if metrics["false_trigger"]:
+                self.false_trigger += 1
+            obligation = metrics["tool_obligation"]
+            if obligation == "required":
+                self.required_total += 1
+                if metrics["hit"]:
+                    self.required_hit += 1
+            elif obligation == "auto":
+                self.optional_total += 1
+                if metrics["hit"]:
+                    self.optional_hit += 1
+            elif obligation == "none":
+                self.none_total += 1
+                if not metrics["false_trigger"]:
+                    self.none_clean += 1
+            if metrics["multi_task_covered"] is not None:
+                self.multi_known += 1
+                if metrics["multi_task_covered"]:
+                    self.multi_covered += 1
+            if metrics["scenario"] == "superuser_agent":
+                self.superuser_total += 1
+                if metrics["status"] == "completed":
+                    self.superuser_completed += 1
+                elif metrics["status"] == "paused":
+                    self.superuser_paused += 1
+            self.token_prompt_total += metrics["prompt_tokens"]
+            self.latency_total_ms += metrics["latency_ms"]
+            self.latency_max_ms = max(self.latency_max_ms, metrics["latency_ms"])
+            self.steps_total += metrics["steps"]
+            self.tool_calls_total += metrics["tool_call_count"]
+            self.observation_total += metrics["observation_count"]
+        if metrics["quality_action"]:
+            self.quality_known += 1
+            if metrics["quality_action"] != "ok" or metrics["quality_reason"]:
+                self.quality_issue += 1
+            if metrics["quality_action"] == "revise":
+                self.quality_revised += 1
+            elif metrics["quality_action"] == "block":
+                self.quality_blocked += 1
+        if metrics["quality_shadow_verdict"] in {"minor_issue", "bad", "unsafe"}:
+            self.quality_shadow_flagged += 1
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -117,6 +137,13 @@ class MetricBucket:
             "avg_steps": _avg(self.steps_total, self.total),
             "avg_tool_calls": _avg(self.tool_calls_total, self.total),
             "avg_observations": _avg(self.observation_total, self.total),
+            "quality_issue_rate": _rate(self.quality_issue, self.quality_known),
+            "quality_revise_rate": _rate(self.quality_revised, self.quality_known),
+            "quality_block_rate": _rate(self.quality_blocked, self.quality_known),
+            "quality_shadow_flag_rate": _rate(
+                self.quality_shadow_flagged,
+                self.quality_known,
+            ),
         }
 
     @classmethod
@@ -192,9 +219,7 @@ class TrajectoryEvalState:
             or utc_now_iso(),
             updated_at=normalize_message_text(str(payload.get("updated_at") or ""))
             or utc_now_iso(),
-            total=MetricBucket.from_payload(
-                _raw_bucket_payload(payload.get("total"))
-            ),
+            total=MetricBucket.from_payload(_raw_bucket_payload(payload.get("total"))),
             by_scenario=_bucket_map_from_payload(payload.get("by_scenario")),
             by_layer=_bucket_map_from_payload(payload.get("by_layer")),
             by_obligation=_bucket_map_from_payload(payload.get("by_obligation")),
@@ -251,48 +276,143 @@ def latest_trajectory_eval() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def schedule_response_quality_eval(
+    *,
+    quality_result: Any,
+    final_text: str,
+    original_message: str,
+    scenario: str,
+    session_key: str,
+    trace_id: str = "",
+) -> None:
+    """Project chat-only response quality into trajectory eval asynchronously."""
+
+    if quality_result is None or len(_QUALITY_EVAL_TASKS) >= _MAX_QUALITY_EVAL_TASKS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(
+        _record_response_quality_eval_safely(
+            quality_result=quality_result,
+            final_text=final_text,
+            original_message=original_message,
+            scenario=scenario,
+            session_key=session_key,
+            trace_id=trace_id,
+        )
+    )
+    _QUALITY_EVAL_TASKS.add(task)
+    task.add_done_callback(_QUALITY_EVAL_TASKS.discard)
+
+
+def record_response_quality_eval(
+    *,
+    quality_result: Any | None,
+    final_text: str,
+    original_message: str,
+    scenario: str,
+    session_key: str,
+    trace_id: str = "",
+    shadow_verdict: str = "",
+    shadow_reason: str = "",
+) -> Path:
+    """Record a lightweight quality-only eval sample.
+
+    This intentionally does not append to trajectory JSONL.  It only updates the
+    aggregate trajectory_eval summaries, so local quality feedback can be
+    inspected without changing Agent trajectory storage or plugin behavior.
+    """
+
+    record = {
+        "schema_version": EVAL_SCHEMA_VERSION,
+        "record_type": "response_quality",
+        "trace_id": normalize_message_text(trace_id),
+        "run_id": normalize_message_text(trace_id),
+        "session_key": normalize_message_text(session_key),
+        "created_at": utc_now_iso(),
+        "scenario": normalize_message_text(scenario) or "chat",
+        "agent_mode": "quality_judge",
+        "status": "completed",
+        "tool_obligation": "none",
+        "hit": None,
+        "false_trigger": False,
+        "multi_task_covered": None,
+        "latency": {"total_ms": 0},
+        "token": {"prompt_estimated": 0},
+        "steps": 0,
+        "selected_tools": [],
+        "observations": [],
+        "evaluation": {"tool_call_count": 0, "observation_count": 0},
+        "response_quality": _quality_result_record(
+            quality_result,
+            shadow_verdict=shadow_verdict,
+            shadow_reason=shadow_reason,
+        ),
+        "input_message": _clip(original_message, limit=180),
+        "final_reply": _clip(final_text, limit=180),
+    }
+    return record_trajectory_eval(record)
+
+
 def trajectory_metrics(record: dict[str, Any]) -> dict[str, Any]:
-    evaluation = record.get("evaluation") if isinstance(record.get("evaluation"), dict) else {}
-    latency = record.get("latency") if isinstance(record.get("latency"), dict) else {}
-    token = record.get("token") if isinstance(record.get("token"), dict) else {}
+    evaluation = _dict_payload(record.get("evaluation"))
+    latency = _dict_payload(record.get("latency"))
+    token = _dict_payload(record.get("token"))
     scenario = normalize_message_text(str(record.get("scenario") or "unknown"))
     obligation = normalize_message_text(str(record.get("tool_obligation") or "none"))
     selected_tools = _text_list(record.get("selected_tools"))
     observations = _dict_list(record.get("observations"))
-    task_ledger = record.get("task_ledger") if isinstance(record.get("task_ledger"), dict) else {}
+    task_ledger = _dict_payload(record.get("task_ledger"))
     metrics = {
+        "record_type": normalize_message_text(str(record.get("record_type") or "")),
         "trace_id": normalize_message_text(str(record.get("trace_id") or "")),
         "run_id": normalize_message_text(str(record.get("run_id") or "")),
         "scenario": scenario or "unknown",
         "layer": _layer_for_record(record, scenario=scenario),
         "agent_mode": normalize_message_text(str(record.get("agent_mode") or "")),
         "status": normalize_message_text(str(record.get("status") or "")),
-        "tool_obligation": obligation if obligation in {"none", "auto", "required"} else "none",
+        "tool_obligation": obligation
+        if obligation in {"none", "auto", "required"}
+        else "none",
         "hit": _optional_bool(record.get("hit", evaluation.get("hit"))),
-        "false_trigger": bool(record.get("false_trigger", evaluation.get("false_trigger", False))),
+        "false_trigger": bool(
+            record.get("false_trigger", evaluation.get("false_trigger", False))
+        ),
         "multi_task_covered": _optional_bool(
             record.get("multi_task_covered", evaluation.get("multi_task_covered"))
         ),
         "latency_ms": _int(latency.get("total_ms")),
         "prompt_tokens": _int(token.get("prompt_estimated")),
         "steps": _int(record.get("steps")),
-        "tool_call_count": _int(evaluation.get("tool_call_count"), fallback=len(selected_tools)),
-        "observation_count": _int(evaluation.get("observation_count"), fallback=len(observations)),
+        "tool_call_count": _int(
+            evaluation.get("tool_call_count"), fallback=len(selected_tools)
+        ),
+        "observation_count": _int(
+            evaluation.get("observation_count"), fallback=len(observations)
+        ),
         "selected_tools": selected_tools,
         "plugins": _plugins_for_record(record, observations),
         "task_count": _task_count(task_ledger),
+        "quality_action": _quality_field(record, "action"),
+        "quality_reason": _quality_field(record, "reason"),
+        "quality_shadow_verdict": _quality_field(record, "shadow_verdict"),
     }
     return metrics
 
 
 def _layer_for_record(record: dict[str, Any], *, scenario: str) -> str:
+    if (
+        normalize_message_text(str(record.get("record_type") or ""))
+        == "response_quality"
+    ):
+        return "response_quality"
     if scenario == "superuser_agent":
         return "superuser_long_task"
     obligation = normalize_message_text(str(record.get("tool_obligation") or "none"))
     selected_tools = _text_list(record.get("selected_tools"))
-    task_count = _task_count(
-        record.get("task_ledger") if isinstance(record.get("task_ledger"), dict) else {}
-    )
+    task_count = _task_count(_dict_payload(record.get("task_ledger")))
     if task_count > 1:
         return "multi_tool"
     if scenario in {"group_plugin_selector", "tool_run"}:
@@ -325,6 +445,7 @@ def _plugins_for_record(
 def _compact_record(record: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
     return {
         "created_at": normalize_message_text(str(record.get("created_at") or "")),
+        "record_type": metrics["record_type"],
         "trace_id": metrics["trace_id"],
         "run_id": metrics["run_id"],
         "scenario": metrics["scenario"],
@@ -341,6 +462,9 @@ def _compact_record(record: dict[str, Any], metrics: dict[str, Any]) -> dict[str
         "observation_count": metrics["observation_count"],
         "selected_tools": metrics["selected_tools"][:8],
         "plugins": metrics["plugins"][:8],
+        "quality_action": metrics["quality_action"],
+        "quality_reason": metrics["quality_reason"],
+        "quality_shadow_verdict": metrics["quality_shadow_verdict"],
         "input_message": _clip(str(record.get("input_message") or ""), limit=180),
         "stop_reason": normalize_message_text(str(record.get("stop_reason") or "")),
         "paused_reason": normalize_message_text(str(record.get("paused_reason") or "")),
@@ -353,6 +477,8 @@ def _is_failure(metrics: dict[str, Any]) -> bool:
         or bool(metrics["false_trigger"])
         or metrics["multi_task_covered"] is False
         or metrics["status"] == "failed"
+        or metrics["quality_action"] in {"revise", "block"}
+        or metrics["quality_shadow_verdict"] in {"bad", "unsafe"}
     )
 
 
@@ -438,6 +564,86 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in value if isinstance(item, dict)]
 
 
+def _dict_payload(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _quality_field(record: dict[str, Any], key: str) -> str:
+    payload = record.get("response_quality")
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        if value is not None:
+            return normalize_message_text(str(value))
+    flat_keys = {
+        "action": ("quality_action", "response_quality_action"),
+        "reason": ("quality_reason", "response_quality_reason"),
+        "shadow_verdict": ("quality_shadow_verdict", "response_quality_shadow_verdict"),
+    }
+    for flat_key in flat_keys.get(key, ()):
+        value = record.get(flat_key)
+        if value is not None:
+            return normalize_message_text(str(value))
+    return ""
+
+
+async def _record_response_quality_eval_safely(
+    *,
+    quality_result: Any,
+    final_text: str,
+    original_message: str,
+    scenario: str,
+    session_key: str,
+    trace_id: str,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            record_response_quality_eval,
+            quality_result=quality_result,
+            final_text=final_text,
+            original_message=original_message,
+            scenario=scenario,
+            session_key=session_key,
+            trace_id=trace_id,
+        )
+    except Exception:
+        return
+
+
+def _quality_result_record(
+    result: Any,
+    *,
+    shadow_verdict: str = "",
+    shadow_reason: str = "",
+) -> dict[str, Any]:
+    if result is None:
+        payload: dict[str, Any] = {}
+    else:
+        payload = {}
+        for key in (
+            "action",
+            "reason",
+            "revised_text",
+            "instruction",
+            "severity",
+            "shadow_verdict",
+            "shadow_reason",
+        ):
+            value = getattr(result, key, "")
+            if value:
+                payload[key] = value
+        rule_hits = getattr(result, "rule_hits", ())
+        if rule_hits:
+            payload["rule_hits"] = [str(item) for item in rule_hits]
+        ok = getattr(result, "ok", None)
+        if isinstance(ok, bool):
+            payload["ok"] = ok
+    if shadow_verdict:
+        payload["shadow_verdict"] = normalize_message_text(shadow_verdict)
+    if shadow_reason:
+        payload["shadow_reason"] = normalize_message_text(shadow_reason)
+    return payload
+
+
 def _optional_bool(value: Any) -> bool | None:
     if value is None:
         return None
@@ -485,7 +691,9 @@ __all__ = [
     "TrajectoryEvalState",
     "latest_trajectory_eval",
     "load_trajectory_eval",
+    "record_response_quality_eval",
     "record_trajectory_eval",
+    "schedule_response_quality_eval",
     "trajectory_eval_path",
     "trajectory_metrics",
 ]

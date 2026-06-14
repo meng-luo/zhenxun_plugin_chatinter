@@ -73,7 +73,9 @@ class ShellCommandTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not command:
             return tool_result(False, "shell_empty_command", command=command)
         decision = decide_shell(command)
@@ -148,7 +150,9 @@ async def run_shell_command(
             payload={"command": command, "cwd": cwd, "approval_id": approval_id},
             result={"ok": ok, "returncode": process.returncode},
         )
-        status = "shell_completed" if action == "shell_command" else f"{action}_completed"
+        status = (
+            "shell_completed" if action == "shell_command" else f"{action}_completed"
+        )
         return tool_result(ok, status, **output)
     except asyncio.TimeoutError:
         return audited_error_result(

@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-
 from .command_index import CommandCandidate
+from .llm_compat import ToolDefinition, ToolResult
 from .route_text import normalize_message_text
 from .tool_retriever import CommandToolRetriever
 
@@ -36,7 +35,9 @@ class CommandCatalogState:
 
     @property
     def injected_count(self) -> int:
-        return len(self.retriever.registry.executable_tool_map_by_kind("plugin_command"))
+        return len(
+            self.retriever.registry.executable_tool_map_by_kind("plugin_command")
+        )
 
     def inject(self, candidates: list[CommandCandidate]) -> list[Any]:
         for candidate in candidates:
@@ -187,11 +188,7 @@ def _candidate_payload(
         capability_raw if isinstance(capability_raw, dict) else {}
     )
     target_policy_raw = capability.get("target_policy")
-    target_policy = (
-        target_policy_raw
-        if isinstance(target_policy_raw, dict)
-        else {}
-    )
+    target_policy = target_policy_raw if isinstance(target_policy_raw, dict) else {}
     compact: dict[str, Any] = {
         "rank": raw.get("rank", index),
         "score": raw.get("score"),
@@ -229,9 +226,7 @@ def _candidate_payload(
     if description:
         compact["description"] = description[:160]
     return {
-        key: value
-        for key, value in compact.items()
-        if value not in (None, "", [], {})
+        key: value for key, value in compact.items() if value not in (None, "", [], {})
     }
 
 
@@ -258,16 +253,18 @@ def _compact_slots(value: Any) -> list[dict[str, Any]]:
         if description:
             slot["description"] = description[:80]
         slots.append(
-            {key: item_value for key, item_value in slot.items() if item_value not in (None, "", [])}
+            {
+                key: item_value
+                for key, item_value in slot.items()
+                if item_value not in (None, "", [])
+            }
         )
     return slots
 
 
 def _guardrail_hint(*, retrieved: int, active_tools: int) -> str:
     if retrieved <= 0:
-        return (
-            "catalog_no_result: 如果换查询词后仍无结果，应直接回复没有合适插件。"
-        )
+        return "catalog_no_result: 如果换查询词后仍无结果，应直接回复没有合适插件。"
     if active_tools >= 72:
         return (
             "catalog_over_injected: 当前已注入较多命令，应优先选择已有工具，"

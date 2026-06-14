@@ -1,21 +1,10 @@
 """
 ChatInter - 数据模型
 
-包含:
-- Tortoise ORM 模型 (数据库表)
-- Pydantic 模型 (结构化输出)
+包含 Pydantic 模型。ORM 模型由插件入口显式导入，避免纯逻辑模块
+裸导入时触发数据库/NoneBot 服务初始化。
 """
 
-from zhenxun.models.chat_history import ChatHistory as _ChatHistory  # noqa: F401
-
-# Pydantic 模型（结构化输出）
-from .chat_history import (
-    ChatInterChatHistory,
-    ChatInterMemory,
-    ChatInterPersonProfile,
-    ChatInterThread,
-    ChatInterThreadMessage,
-)
 from .pydantic_models import (
     CapabilityGraphSnapshot,
     CommandCandidateFeatures,
@@ -33,11 +22,6 @@ from .pydantic_models import (
 
 __all__ = [
     "CapabilityGraphSnapshot",
-    "ChatInterChatHistory",
-    "ChatInterMemory",
-    "ChatInterPersonProfile",
-    "ChatInterThread",
-    "ChatInterThreadMessage",
     "CommandCandidateFeatures",
     "CommandCandidateSnapshot",
     "CommandCapability",

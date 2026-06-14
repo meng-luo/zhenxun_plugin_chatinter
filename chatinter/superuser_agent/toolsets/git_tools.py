@@ -28,7 +28,8 @@ class GitCommandTool:
             name=self.name,
             description=(
                 "超级用户私聊专用：执行 git 操作。只传 git 后面的参数，例如 "
-                "'status --short'、'diff'、'add path'、'commit -m msg'、'push origin main'。"
+                "'status --short'、'diff'、'add path'、"
+                "'commit -m msg'、'push origin main'。"
                 "执行前经过 git.allow/ask/deny；不要用 shell_command 执行 git。"
             ),
             parameters={
@@ -68,7 +69,9 @@ class GitCommandTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not args:
             return tool_result(False, "git_empty_args")
         command = git_command_from_args(args)

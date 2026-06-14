@@ -11,11 +11,9 @@ import json
 import time
 from typing import Any, Literal
 
-from zhenxun.services.llm.types.models import LLMToolCall, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
-
 from .command_catalog_tool import COMMAND_CATALOG_TOOL_NAME
 from .feedback import FeedbackStore
+from .llm_compat import LLMToolCall, ToolExecutable, ToolResult
 from .route_text import normalize_message_text
 from .task_frame import TASK_TEXT_FIELD
 
@@ -34,6 +32,8 @@ _NO_OUTPUT_TASK_STOP_LIMIT = 3
 _EXCESSIVE_CATALOG_TOOLS = 72
 _EXCESSIVE_CATALOG_CALLS = 2
 _REPEAT_SUCCESS_STOP_LIMIT = 2
+_SAME_EXTERNAL_TOOL_OBSERVE_LIMIT = 3
+_SAME_EXTERNAL_TOOL_STOP_LIMIT = 5
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,8 @@ class RuntimeGuardrails:
         self.no_visible_output_streak = 0
         self.no_output_task_commands: dict[str, set[str]] = {}
         self.blocked_call_counts: dict[str, int] = {}
+        self.external_tool_streak_name = ""
+        self.external_tool_streak_count = 0
 
     def filter_tool_map(
         self,
@@ -230,9 +232,7 @@ class RuntimeGuardrails:
 
         if failed_count >= _REPEAT_FAILURE_BLOCK_LIMIT:
             severity = (
-                "heavy"
-                if failed_count >= _REPEAT_FAILURE_STOP_LIMIT
-                else "medium"
+                "heavy" if failed_count >= _REPEAT_FAILURE_STOP_LIMIT else "medium"
             )
             return self._decision(
                 reason="repeated_failed_tool_call",
@@ -278,6 +278,12 @@ class RuntimeGuardrails:
             task_text=task_text,
             has_output=has_output,
         )
+        external_tool_decision = self._record_external_tool_streak(
+            tool_name=tool_name,
+            command_id=command_id,
+            task_text=task_text,
+            has_output=has_output,
+        )
 
         if not ok:
             count = self.failed_call_counts.get(signature, 0) + 1
@@ -312,9 +318,7 @@ class RuntimeGuardrails:
             bucket.add(command_id)
             if len(bucket) >= _NO_OUTPUT_TASK_BLOCK_LIMIT:
                 severity = (
-                    "heavy"
-                    if len(bucket) >= _NO_OUTPUT_TASK_STOP_LIMIT
-                    else "medium"
+                    "heavy" if len(bucket) >= _NO_OUTPUT_TASK_STOP_LIMIT else "medium"
                 )
                 return self._decision(
                     reason="same_task_no_output_loop",
@@ -329,7 +333,7 @@ class RuntimeGuardrails:
                     task_text=task_text,
                     payload={"tried_commands": sorted(bucket)},
                 )
-        return no_visible_output_decision
+        return no_visible_output_decision or external_tool_decision
 
     def on_budget_exhausted(self, *, call_count: int) -> RuntimeGuardrailDecision:
         return self._decision(
@@ -467,6 +471,43 @@ class RuntimeGuardrails:
             payload={"no_visible_output_streak": self.no_visible_output_streak},
         )
 
+    def _record_external_tool_streak(
+        self,
+        *,
+        tool_name: str,
+        command_id: str,
+        task_text: str,
+        has_output: bool,
+    ) -> RuntimeGuardrailDecision | None:
+        if command_id or has_output:
+            self.external_tool_streak_name = ""
+            self.external_tool_streak_count = 0
+            return None
+        if tool_name != self.external_tool_streak_name:
+            self.external_tool_streak_name = tool_name
+            self.external_tool_streak_count = 1
+            return None
+        self.external_tool_streak_count += 1
+        if self.external_tool_streak_count < _SAME_EXTERNAL_TOOL_OBSERVE_LIMIT:
+            return None
+        severity: GuardrailSeverity = (
+            "heavy"
+            if self.external_tool_streak_count >= _SAME_EXTERNAL_TOOL_STOP_LIMIT
+            else "medium"
+        )
+        return self._decision(
+            reason="same_tool_streak",
+            message=(
+                "同一个外部工具已经连续多次调用但没有可见输出。请换工具，"
+                "或基于现有结果给最终回复。"
+            ),
+            severity=severity,
+            action="stop" if severity == "heavy" else "observe",
+            tool_name=tool_name,
+            task_text=task_text,
+            payload={"same_tool_streak": self.external_tool_streak_count},
+        )
+
     def _decision(
         self,
         *,
@@ -510,7 +551,9 @@ def _tool_call_signature(
     executable: ToolExecutable | None,
 ) -> str:
     command_id = _command_id_from_executable(executable) or _tool_name(tool_call)
-    arguments = _parse_arguments(str(getattr(tool_call.function, "arguments", "") or ""))
+    arguments = _parse_arguments(
+        str(getattr(tool_call.function, "arguments", "") or "")
+    )
     return "|".join([command_id, _normalized_argument_fingerprint(arguments)])
 
 
@@ -547,7 +590,9 @@ def _command_id_from_executable(executable: ToolExecutable | None) -> str:
 
 
 def _task_text_from_tool_call(tool_call: LLMToolCall) -> str:
-    arguments = _parse_arguments(str(getattr(tool_call.function, "arguments", "") or ""))
+    arguments = _parse_arguments(
+        str(getattr(tool_call.function, "arguments", "") or "")
+    )
     return normalize_message_text(str(arguments.get(TASK_TEXT_FIELD, "") or ""))
 
 

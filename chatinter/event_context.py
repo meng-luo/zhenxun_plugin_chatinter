@@ -9,6 +9,7 @@ from nonebot.adapters import Bot, Event, Message
 from nonebot_plugin_alconna.uniseg import UniMessage
 from nonebot_plugin_uninfo import Uninfo
 
+from .event_signals import get_event_signal
 from .route_text import normalize_message_text
 from .utils.unimsg_utils import (
     extract_reply_from_message,
@@ -186,12 +187,14 @@ def build_event_context(
     bot_id = str(bot.self_id) if hasattr(bot, "self_id") else None
     user_id = str(session.user.id)
     group_id = str(session.group.id) if session.group else None
-    turn_messages = _coerce_text_list(getattr(event, "_chatinter_turn_messages", []))
+    turn_messages = _coerce_text_list(
+        get_event_signal(event, "_chatinter_turn_messages", [])
+    )
     pending_human_updates = _coerce_text_list(
-        getattr(event, "_chatinter_pending_human_updates", [])
+        get_event_signal(event, "_chatinter_pending_human_updates", [])
     )
     try:
-        turn_priority = int(getattr(event, "_chatinter_turn_priority", 0) or 0)
+        turn_priority = int(get_event_signal(event, "_chatinter_turn_priority", 0) or 0)
     except (TypeError, ValueError):
         turn_priority = 0
 

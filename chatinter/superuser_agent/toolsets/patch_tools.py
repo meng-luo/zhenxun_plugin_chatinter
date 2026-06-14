@@ -39,7 +39,9 @@ class PatchPrepareTool:
         )
         schema["properties"][_ENGINEERING_LOOP_ID_FIELD] = {
             "type": ["string", "null"],
-            "description": "可选：engineering_loop_start 返回的 loop_id，用于固定工程闭环。",
+            "description": (
+                "可选：engineering_loop_start 返回的 loop_id，" "用于固定工程闭环。"
+            ),
         }
         schema["required"].append(_ENGINEERING_LOOP_ID_FIELD)
         return ToolDefinition(
@@ -187,7 +189,9 @@ class PatchApplyTool:
                     },
                     _ENGINEERING_LOOP_ID_FIELD: {
                         "type": ["string", "null"],
-                        "description": "可选工程闭环 loop_id；传入后自动绑定 operation/eval。",
+                        "description": (
+                            "可选工程闭环 loop_id；传入后自动绑定 " "operation/eval。"
+                        ),
                     },
                 },
                 "required": ["operation_id", "reason", _ENGINEERING_LOOP_ID_FIELD],
@@ -230,7 +234,9 @@ class PatchRollbackTool:
                     },
                     _ENGINEERING_LOOP_ID_FIELD: {
                         "type": ["string", "null"],
-                        "description": "可选工程闭环 loop_id；传入后记录 rollback 阶段。",
+                        "description": (
+                            "可选工程闭环 loop_id；" "传入后记录 rollback 阶段。"
+                        ),
                     },
                 },
                 "required": ["operation_id", "reason", _ENGINEERING_LOOP_ID_FIELD],
@@ -286,9 +292,16 @@ class PatchShowTool:
         if operation_id:
             operation = get_patch_operation(operation_id)
             if operation is None:
-                return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
-            if operation.user_id != actor["user_id"] or operation.session_key != actor["session_key"]:
-                return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
+                return tool_result(
+                    False, "patch_operation_not_found", operation_id=operation_id
+                )
+            if (
+                operation.user_id != actor["user_id"]
+                or operation.session_key != actor["session_key"]
+            ):
+                return tool_result(
+                    False, "patch_operation_not_found", operation_id=operation_id
+                )
             return tool_result(
                 True,
                 "patch_operation",
@@ -322,7 +335,9 @@ def _patch_changes_schema(*, include_reason: bool, description: str) -> dict[str
                     "mode": {
                         "type": "string",
                         "enum": ["write", "append", "replace"],
-                        "description": "write 覆盖全文；append 追加；replace 精确替换。",
+                        "description": (
+                            "write 覆盖全文；append 追加；" "replace 精确替换。"
+                        ),
                     },
                     "content": {
                         "type": ["string", "null"],
@@ -459,9 +474,16 @@ async def apply_prepared_patch(
 ) -> ToolResult:
     operation = get_patch_operation(operation_id)
     if operation is None:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
-    if operation.user_id != actor["user_id"] or operation.session_key != actor["session_key"]:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
+    if (
+        operation.user_id != actor["user_id"]
+        or operation.session_key != actor["session_key"]
+    ):
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
     permission_result = _authorize_patch_mutation(
         actor=actor,
         action="patch_apply",
@@ -496,9 +518,16 @@ async def rollback_prepared_patch(
 ) -> ToolResult:
     operation = get_patch_operation(operation_id)
     if operation is None:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
-    if operation.user_id != actor["user_id"] or operation.session_key != actor["session_key"]:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
+    if (
+        operation.user_id != actor["user_id"]
+        or operation.session_key != actor["session_key"]
+    ):
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
     permission_result = _authorize_patch_mutation(
         actor=actor,
         action="patch_rollback",
@@ -557,20 +586,25 @@ def _enforce_engineering_loop_patch_protocol(
     if loop is None:
         return
     if loop.stage in {"created", "eval_failed"}:
-        raise RuntimeError(
+        instruction = (
             "engineering loop protocol violation: call engineering_lsp_read and "
             "semantic_patch_plan before patch_prepare"
             if loop.stage == "created"
-            else "engineering loop protocol violation: call engineering_failure_diagnose "
-            "before preparing a second patch after eval failure"
+            else (
+                "engineering loop protocol violation: call "
+                "engineering_failure_diagnose before preparing a second patch "
+                "after eval failure"
+            )
         )
+        raise RuntimeError(instruction)
     if loop.diagnosis and not _loop_has_event_after(
         loop,
         event_kind="lsp_code_read",
         after_kind="failure_diagnosed",
     ):
         raise RuntimeError(
-            "engineering loop protocol violation: reread code with engineering_lsp_read "
+            "engineering loop protocol violation: reread code with "
+            "engineering_lsp_read "
             "after engineering_failure_diagnose before second patch"
         )
     if loop.diagnosis and not _loop_has_event_after(
@@ -584,14 +618,18 @@ def _enforce_engineering_loop_patch_protocol(
         )
     if not loop.semantic_patch_plan:
         raise RuntimeError(
-            "engineering loop protocol violation: semantic_patch_plan is required before patch_prepare"
+            "engineering loop protocol violation: semantic_patch_plan is "
+            "required before patch_prepare"
         )
     if loop.diagnosis:
-        allowed = {str(path) for path in loop.diagnosis.get("files_to_reread", []) or []}
+        allowed = {
+            str(path) for path in loop.diagnosis.get("files_to_reread", []) or []
+        }
         changed = {str(change.path) for change in changes if str(change.path)}
         if allowed and not changed <= allowed:
             raise RuntimeError(
-                "engineering loop protocol violation: second patch touches files outside diagnosis "
+                "engineering loop protocol violation: second patch touches "
+                "files outside diagnosis "
                 f"scope: {sorted(changed - allowed)}"
             )
 

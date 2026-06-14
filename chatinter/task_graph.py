@@ -94,7 +94,9 @@ class TaskGraph:
 
     @property
     def incomplete_tasks(self) -> list[TaskGraphTask]:
-        return [task for task in self.tasks if task.status not in TERMINAL_TASK_STATUSES]
+        return [
+            task for task in self.tasks if task.status not in TERMINAL_TASK_STATUSES
+        ]
 
     @property
     def completed_tasks(self) -> list[TaskGraphTask]:
@@ -168,7 +170,8 @@ def fallback_task_graph(
     tools = [
         normalize_message_text(str(item.get("tool", "") or ""))
         for item in (available_tools or [])[:8]
-        if isinstance(item, dict) and normalize_message_text(str(item.get("tool", "") or ""))
+        if isinstance(item, dict)
+        and normalize_message_text(str(item.get("tool", "") or ""))
     ]
     goal = normalize_message_text(original_goal)
     if not goal:
@@ -222,7 +225,9 @@ def task_graph_from_payload(payload: Any) -> TaskGraph | None:
         )
     graph = TaskGraph.create(
         graph_id=normalize_message_text(str(payload.get("graph_id", "") or "")) or None,
-        original_goal=normalize_message_text(str(payload.get("original_goal", "") or "")),
+        original_goal=normalize_message_text(
+            str(payload.get("original_goal", "") or "")
+        ),
         tasks=tasks,
     )
     status = _normalize_status(str(payload.get("status", "") or ""))

@@ -64,7 +64,9 @@ class MCPRuntimeReloadTool:
                     "server_names": {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
-                        "description": "可选 server 名列表；为空则重载全部 MCP server。",
+                        "description": (
+                            "可选 server 名列表；" "为空则重载全部 MCP server。"
+                        ),
                     },
                     "reason": {
                         "type": ["string", "null"],
@@ -83,7 +85,9 @@ class MCPRuntimeReloadTool:
             for item in (kwargs.get("server_names") or [])
             if str(item or "").strip()
         ]
-        command = "mcp_runtime_reload " + (" ".join(server_names) if server_names else "*")
+        command = "mcp_runtime_reload " + (
+            " ".join(server_names) if server_names else "*"
+        )
         permission = decide_server(command)
         payload = {"server_names": server_names, "reason": kwargs.get("reason") or ""}
         if permission.decision == "deny":
@@ -100,7 +104,9 @@ class MCPRuntimeReloadTool:
                 payload=payload,
                 permission=permission,
             )
-        result = await get_mcp_runtime_manager().reload(server_names=server_names or None)
+        result = await get_mcp_runtime_manager().reload(
+            server_names=server_names or None
+        )
         return tool_result(True, "mcp_runtime_reloaded", **result.to_payload())
 
 

@@ -262,9 +262,13 @@ def build_capability_card(
     text = _search_text(tool, description=description)
     task_verbs = _tuple_texts(getattr(tool, "task_verbs", None) or ())
     input_requirements = _tuple_texts(getattr(tool, "input_requirements", None) or ())
-    output_mode = _infer_output_mode(tool, text=text, input_requirements=input_requirements)
+    output_mode = _infer_output_mode(
+        tool, text=text, input_requirements=input_requirements
+    )
     side_effect = _infer_side_effect(tool, text=text, output_mode=output_mode)
-    risk_tags = _risk_tags(tool, text=text, output_mode=output_mode, side_effect=side_effect)
+    risk_tags = _risk_tags(
+        tool, text=text, output_mode=output_mode, side_effect=side_effect
+    )
     permission_tags = _permission_tags(tool, text=text)
     risk_level = _risk_level(risk_tags=risk_tags, side_effect=side_effect)
     intent_types = _infer_intent_types(
@@ -408,7 +412,9 @@ def _infer_output_mode(
     text: str,
     input_requirements: tuple[str, ...],
 ) -> CapabilityOutputMode:
-    payload_policy = normalize_message_text(str(getattr(tool, "payload_policy", "") or ""))
+    payload_policy = normalize_message_text(
+        str(getattr(tool, "payload_policy", "") or "")
+    )
     role = normalize_message_text(str(getattr(tool, "command_role", "") or ""))
     requirements = " ".join(input_requirements)
     lowered = text.casefold()
@@ -425,9 +431,9 @@ def _infer_output_mode(
             "表情包",
         )
     )
-    media_generation = any(term.casefold() in lowered for term in _GENERATE_TERMS) and any(
-        term.casefold() in lowered for term in _IMAGE_TERMS
-    )
+    media_generation = any(
+        term.casefold() in lowered for term in _GENERATE_TERMS
+    ) and any(term.casefold() in lowered for term in _IMAGE_TERMS)
     if role == "template" or explicit_image_output or media_generation:
         return "image"
     if any(term.casefold() in lowered for term in _FILE_TERMS):
@@ -481,19 +487,28 @@ def _infer_intent_types(
         if value and value not in intents:
             intents.append(value)
 
-    if role in {"helper", "usage", "catalog"} or any(term in lowered for term in _HELP_TERMS):
+    if role in {"helper", "usage", "catalog"} or any(
+        term in lowered for term in _HELP_TERMS
+    ):
         add("help")
     if role == "random" or any(term.casefold() in lowered for term in _RANDOM_TERMS):
         add("random")
-    if role == "template" or any(term.casefold() in lowered for term in _GENERATE_TERMS):
+    if role == "template" or any(
+        term.casefold() in lowered for term in _GENERATE_TERMS
+    ):
         add("generate")
     if output_mode in {"image", "file"} or any(
         term.casefold() in lowered for term in _IMAGE_TERMS + _FILE_TERMS
     ):
         add("media")
-    if any(term.casefold() in lowered for term in _TRANSFORM_TERMS) or "翻译" in joined_verbs:
+    if (
+        any(term.casefold() in lowered for term in _TRANSFORM_TERMS)
+        or "翻译" in joined_verbs
+    ):
         add("transform")
-    if side_effect == "query" or any(term.casefold() in lowered for term in _QUERY_TERMS):
+    if side_effect == "query" or any(
+        term.casefold() in lowered for term in _QUERY_TERMS
+    ):
         add("query")
     if any(term.casefold() in lowered for term in _STATUS_TERMS):
         add("status")
@@ -619,8 +634,7 @@ def _source_of_truth(
     ):
         return "model_knowledge"
     if any(term.casefold() in lowered for term in _BOT_STATE_TERMS) and (
-        {"help", "status", "query"} & set(intent_types)
-        or side_effect == "query"
+        {"help", "status", "query"} & set(intent_types) or side_effect == "query"
     ):
         return "bot_state"
     if side_effect == "mutate":
@@ -793,9 +807,14 @@ def _is_soft_tool(
 
 def _has_required_user_input(tool: Any) -> bool:
     requires = dict(getattr(tool, "requires", {}) or {})
-    if any(bool(requires.get(key)) for key in ("text", "image", "reply", "at", "private", "to_me")):
+    if any(
+        bool(requires.get(key))
+        for key in ("text", "image", "reply", "at", "private", "to_me")
+    ):
         return True
-    payload_policy = normalize_message_text(str(getattr(tool, "payload_policy", "") or ""))
+    payload_policy = normalize_message_text(
+        str(getattr(tool, "payload_policy", "") or "")
+    )
     if payload_policy not in {"", "none"}:
         return True
     slots = list(getattr(tool, "slots", None) or [])
@@ -826,11 +845,9 @@ def _risk_tags(
         tags.append("media" if output_mode == "image" else "file")
     if side_effect == "mutate":
         tags.append("state_mutation")
-    if (
-        normalize_message_text(str(getattr(tool, "target_requirement", "") or ""))
-        != "none"
-        or bool(getattr(tool, "allow_at", False))
-    ):
+    if normalize_message_text(
+        str(getattr(tool, "target_requirement", "") or "")
+    ) != "none" or bool(getattr(tool, "allow_at", False)):
         tags.append("targeted")
     return tuple(dict.fromkeys(tags))
 
@@ -838,7 +855,9 @@ def _risk_tags(
 def _permission_tags(tool: Any, *, text: str) -> tuple[str, ...]:
     lowered = text.casefold()
     tags = ["public"]
-    if any(term in lowered for term in ("admin", "superuser", "管理员", "超级用户", "群管")):
+    if any(
+        term in lowered for term in ("admin", "superuser", "管理员", "超级用户", "群管")
+    ):
         tags.append("sensitive_permission")
     requires = dict(getattr(tool, "requires", {}) or {})
     if requires.get("private"):
@@ -905,12 +924,12 @@ def _anti_use_cases(
 
 __all__ = [
     "CapabilityCard",
+    "CapabilityEntityScope",
     "CapabilityExecutionPolicy",
     "CapabilityKind",
     "CapabilityOutputMode",
     "CapabilityRiskLevel",
-    "CapabilitySourceOfTruth",
-    "CapabilityEntityScope",
     "CapabilitySideEffect",
+    "CapabilitySourceOfTruth",
     "build_capability_card",
 ]

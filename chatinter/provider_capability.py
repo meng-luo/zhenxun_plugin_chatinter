@@ -14,15 +14,23 @@ from dataclasses import dataclass
 import re
 from typing import Any, Literal
 
-from zhenxun.services.llm import LLMContentPart, LLMMessage
 from zhenxun.services.llm.types.capabilities import (
     ModelModality,
     get_model_capabilities,
 )
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
+from zhenxun.services.llm.types.models import (
+    LLMContentPart as HostLLMContentPart,
+)
+from zhenxun.services.llm.types.models import LLMMessage as HostLLMMessage
 
-from .config import build_tool_generation_config
+from .config import COMMAND_TWO_STAGE_THRESHOLD, build_tool_generation_config
+from .llm_compat import (
+    LLMContentPart,
+    LLMMessage,
+    ToolDefinition,
+    ToolExecutable,
+    ToolResult,
+)
 from .native_command_tools import compact_command_tool_view
 from .provider_protocol import (
     MCPToolProtocolProfile,
@@ -52,6 +60,7 @@ _DEFAULT_UNSUPPORTED_SCHEMA_KEYS = frozenset(
         "writeOnly",
     }
 )
+
 
 @dataclass(frozen=True)
 class ProviderCapabilityProfile:
@@ -338,7 +347,8 @@ class ProviderCapabilityAdapter:
         )
         request_tools = {
             name: compact_command_tool_view(tool)
-            if _is_command_tool(tool) and schema_plan.schema_modes.get(name) == "compact"
+            if _is_command_tool(tool)
+            and schema_plan.schema_modes.get(name) == "compact"
             else tool
             for name, tool in sorted_tools.items()
         }
@@ -362,8 +372,7 @@ class ProviderCapabilityAdapter:
 
         request_tools: dict[str, ToolExecutable] | None
         if tools and all(
-            str(getattr(tool, "chatinter_schema_mode", "") or "")
-            in {"full", "compact"}
+            str(getattr(tool, "chatinter_schema_mode", "") or "") in {"full", "compact"}
             for tool in tools.values()
         ):
             request_tools = self.limit_tool_map(
@@ -457,13 +466,22 @@ class ProviderCapabilityAdapter:
                 reason="after_command_observation_full_schema",
             )
 
-        full_names = self._full_schema_tool_names(
-            tools,
-            required_tool_names=required,
+        two_stage = (
+            len(command_names) > COMMAND_TWO_STAGE_THRESHOLD
+            and tool_obligation != "required"
+            and tool_choice != "required"
         )
+        if two_stage:
+            full_names = set(required)
+        else:
+            full_names = self._full_schema_tool_names(
+                tools,
+                required_tool_names=required,
+            )
         use_compact = self._should_use_compact_command_schema(
             tools,
             full_schema_names=full_names,
+            force=two_stage,
         )
         schema_modes: dict[str, Literal["full", "compact"]] = {}
         for name, tool in tools.items():
@@ -471,11 +489,12 @@ class ProviderCapabilityAdapter:
                 schema_modes[name] = "compact"
             else:
                 schema_modes[name] = "full"
-        reason = (
-            "provider_compact_schema_policy"
-            if use_compact
-            else "provider_full_schema_policy"
-        )
+        if two_stage and use_compact:
+            reason = "skills_like_two_stage_compact"
+        elif use_compact:
+            reason = "provider_compact_schema_policy"
+        else:
+            reason = "provider_full_schema_policy"
         return ProviderToolSchemaPlan(
             use_compact_schema=use_compact,
             full_schema_names=frozenset(full_names),
@@ -484,15 +503,16 @@ class ProviderCapabilityAdapter:
         )
 
     def adapt_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
+        host_messages = _to_host_messages(messages)
         if self.profile.supports_image_input:
-            return messages
+            return host_messages
         changed = False
-        adapted: list[LLMMessage] = []
-        for message in messages:
+        adapted: list[HostLLMMessage] = []
+        for message in host_messages:
             if not isinstance(message.content, list):
                 adapted.append(message)
                 continue
-            parts: list[LLMContentPart] = []
+            parts: list[HostLLMContentPart] = []
             for part in message.content:
                 if part.type == "text":
                     parts.append(part)
@@ -505,7 +525,7 @@ class ProviderCapabilityAdapter:
                     )
                 )
             adapted.append(message.model_copy(update={"content": parts}))
-        return adapted if changed else messages
+        return adapted if changed else host_messages
 
     def sanitize_tool_definition(self, definition: ToolDefinition) -> ToolDefinition:
         protocol = self.profile.protocol
@@ -696,10 +716,13 @@ class ProviderCapabilityAdapter:
         tools: dict[str, ToolExecutable],
         *,
         full_schema_names: set[str],
+        force: bool = False,
     ) -> bool:
         command_tool_count = sum(1 for tool in tools.values() if _is_command_tool(tool))
         if command_tool_count <= len(full_schema_names):
             return False
+        if force:
+            return True
         if self.should_use_compact_schema(tool_count=command_tool_count):
             return command_tool_count > self.profile.full_schema_tool_cap
         return any(
@@ -752,8 +775,10 @@ class ProviderCapabilityAdapter:
             score >= 90.0 or exact_score > 0 or schema_score + context_score >= 12.0
         ):
             return True
-        return exact_score > 0 or score >= 180.0 or (
-            score >= 120.0 and schema_score + context_score >= 8.0
+        return (
+            exact_score > 0
+            or score >= 180.0
+            or (score >= 120.0 and schema_score + context_score >= 8.0)
         )
 
     def _is_compact_schema_candidate(self, tool: ToolExecutable) -> bool:
@@ -850,9 +875,8 @@ def _sanitize_schema_node(
                 _sanitize_schema_node(item, dialect=dialect, protocol=protocol)
                 for item in raw
             ]
-            if (
-                (key == "oneOf" and compose_oneof_as_anyof)
-                or (key == "allOf" and compose_allof_as_anyof)
+            if (key == "oneOf" and compose_oneof_as_anyof) or (
+                key == "allOf" and compose_allof_as_anyof
             ):
                 if variants:
                     result["anyOf"] = variants
@@ -896,6 +920,49 @@ def _clip_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(limit - 3, 0)] + "..."
+
+
+def _to_host_messages(messages: list[LLMMessage]) -> list[HostLLMMessage]:
+    """Convert lightweight ChatInter message shims before calling host LLM.
+
+    Several core modules use ``llm_compat`` so they remain importable before
+    NoneBot services are initialized.  The real LLM service validates against
+    its own Pydantic ``LLMMessage`` class, so normalize at this boundary instead
+    of forcing every lightweight module to import runtime services.
+    """
+
+    return [_to_host_message(message) for message in messages]
+
+
+def _to_host_message(message: Any) -> HostLLMMessage:
+    if isinstance(message, HostLLMMessage):
+        return message
+    return HostLLMMessage(
+        role=str(getattr(message, "role", "") or "user"),
+        content=_to_host_content(getattr(message, "content", "")),
+        name=getattr(message, "name", None),
+        tool_calls=getattr(message, "tool_calls", None),
+        tool_call_id=getattr(message, "tool_call_id", None),
+        thought_signature=getattr(message, "thought_signature", None),
+    )
+
+
+def _to_host_content(value: Any) -> str | list[HostLLMContentPart]:
+    if not isinstance(value, list):
+        return str(value)
+    return [_to_host_content_part(part) for part in value]
+
+
+def _to_host_content_part(part: Any) -> HostLLMContentPart:
+    if isinstance(part, HostLLMContentPart):
+        return part
+    return HostLLMContentPart(
+        type=str(getattr(part, "type", "") or "text"),
+        text=getattr(part, "text", None),
+        thought_text=getattr(part, "thought_text", None),
+        image_source=getattr(part, "image_source", None),
+        mime_type=getattr(part, "mime_type", None),
+    )
 
 
 def _is_command_tool(tool: ToolExecutable) -> bool:

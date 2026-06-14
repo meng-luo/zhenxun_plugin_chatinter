@@ -7,10 +7,9 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any
 
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-
 from .command_index import CommandCandidate
 from .command_observation import build_command_observation
+from .llm_compat import ToolDefinition, ToolResult
 from .models.pydantic_models import (
     CommandSlotSpec,
     CommandToolSnapshot,
@@ -241,7 +240,9 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
 def _build_compact_tool_description(candidate: CommandCandidate) -> str:
     schema = candidate.schema
     snapshot = candidate.tool
-    description = _clip_text(schema.description or getattr(snapshot, "capability_text", ""), 90)
+    description = _clip_text(
+        schema.description or getattr(snapshot, "capability_text", ""), 90
+    )
     parts = [
         "Compact capability card; selecting it only asks runtime for full schema.",
         f"command_id: {schema.command_id}",
@@ -258,9 +259,7 @@ def _build_compact_tool_description(candidate: CommandCandidate) -> str:
     if schema.aliases:
         parts.append("aliases: " + _join_values(schema.aliases[:3], limit=80))
     if schema.retrieval_phrases:
-        parts.append(
-            "phrases: " + _join_values(schema.retrieval_phrases[:3], limit=80)
-        )
+        parts.append("phrases: " + _join_values(schema.retrieval_phrases[:3], limit=80))
     if schema.slots:
         parts.append(
             "slots_summary: "
@@ -299,8 +298,7 @@ def _capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
     if snapshot.intent_types:
         lines.append("intent_types: " + _join_values(snapshot.intent_types))
     lines.append(
-        "requires_real_result: "
-        + str(bool(snapshot.requires_real_result)).lower()
+        "requires_real_result: " + str(bool(snapshot.requires_real_result)).lower()
     )
     lines.append(f"generative: {str(bool(snapshot.generative)).lower()}")
     if snapshot.execution_policy:
@@ -327,11 +325,15 @@ def _compact_capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
     if risk:
         lines.append(f"risk: {risk}")
     if snapshot.intent_types:
-        lines.append("intent_types: " + _join_values(snapshot.intent_types[:4], limit=80))
+        lines.append(
+            "intent_types: " + _join_values(snapshot.intent_types[:4], limit=80)
+        )
     if snapshot.use_cases:
         lines.append("use_cases: " + _join_values(snapshot.use_cases[:2], limit=96))
     if snapshot.anti_use_cases:
-        lines.append("anti_use_cases: " + _join_values(snapshot.anti_use_cases[:1], limit=96))
+        lines.append(
+            "anti_use_cases: " + _join_values(snapshot.anti_use_cases[:1], limit=96)
+        )
     return lines
 
 
@@ -355,7 +357,7 @@ def _build_parameters(
         "payload_hint": {
             "type": ["string", "null"],
             "description": _payload_hint_description(schema),
-        }
+        },
     }
     required: list[str] = [TASK_TEXT_FIELD, "target_hint", "payload_hint"]
     seen: set[str] = {TASK_TEXT_FIELD, "target_hint", "payload_hint"}

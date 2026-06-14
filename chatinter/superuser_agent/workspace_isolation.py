@@ -14,8 +14,8 @@ import re
 import shutil
 import subprocess
 import time
-import uuid
 from typing import Any
+import uuid
 
 from ..persistence import read_json, state_path, write_json
 from .audit_log import record_audit_event
@@ -273,7 +273,10 @@ def remove_worktree_session(
     session = get_worktree_session(worktree_id)
     if session is None:
         return None
-    if session.user_id != actor["user_id"] or session.session_key != actor["session_key"]:
+    if (
+        session.user_id != actor["user_id"]
+        or session.session_key != actor["session_key"]
+    ):
         return None
     args = ["worktree", "remove"]
     if force:
@@ -457,8 +460,7 @@ def _run_git(args: list[str], *, cwd: Path) -> str:
         ["git", *args],
         cwd=str(cwd),
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=60,
         check=False,
     )

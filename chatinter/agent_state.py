@@ -4,16 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import Any
-
-from zhenxun.services.llm import LLMMessage
-from zhenxun.services.llm.types.models import LLMToolCall, LLMToolFunction, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
+import re
+from typing import Any, cast
 
 from .artifact_store import get_artifact_store, summarize_artifact_text
-from .provider_capability import ProviderCapabilityAdapter
+from .llm_compat import (
+    LLMMessage,
+    LLMToolCall,
+    LLMToolFunction,
+    ToolExecutable,
+    ToolResult,
+)
 from .route_text import normalize_message_text
-from .runtime_events import emit_runtime_event_from_state
+from .runtime_events import (
+    RuntimeEventKind,
+    RuntimeEventStatus,
+    emit_runtime_event_from_state,
+)
 from .task_frame import TASK_TEXT_FIELD
 from .task_graph import TaskGraph
 from .task_ledger import CapabilityLedger, TaskLedger
@@ -313,7 +320,7 @@ class AgentRunState:
         tool_call: LLMToolCall,
         tool_result: ToolResult,
         model_payload: dict[str, Any],
-        provider_adapter: ProviderCapabilityAdapter | None = None,
+        provider_adapter: Any | None = None,
     ) -> None:
         observation = self._build_observation(
             tool_call=tool_call,
@@ -325,18 +332,16 @@ class AgentRunState:
         self._update_capability_ledger(observation)
         self._update_task_state(observation)
         self.messages.append(
-            (
-                provider_adapter.tool_result_message(
-                    tool_call=tool_call,
-                    function_name=tool_call.function.name,
-                    result=model_payload,
-                )
-                if provider_adapter is not None
-                else LLMMessage.tool_response(
-                    tool_call_id=tool_call.id,
-                    function_name=tool_call.function.name,
-                    result=model_payload,
-                )
+            provider_adapter.tool_result_message(
+                tool_call=tool_call,
+                function_name=tool_call.function.name,
+                result=model_payload,
+            )
+            if provider_adapter is not None
+            else LLMMessage.tool_response(
+                tool_call_id=tool_call.id,
+                function_name=tool_call.function.name,
+                result=model_payload,
             )
         )
         self.append_timeline(
@@ -627,7 +632,9 @@ class AgentRunState:
             rendered_command=normalize_message_text(
                 str(output.get("rendered_command", ""))
             ),
-            matched_plugin=normalize_message_text(str(output.get("matched_plugin", ""))),
+            matched_plugin=normalize_message_text(
+                str(output.get("matched_plugin", ""))
+            ),
             task_text=task_text,
             ok=bool(output.get("ok")),
             need_continue=bool(output.get("need_continue")),
@@ -815,7 +822,10 @@ def _compact_tool_argument_string(
     payload = {
         "artifact_id": ref.artifact_id,
         "summary": ref.summary,
-        "note": "tool arguments were compressed; original arguments are stored in ArtifactStore",
+        "note": (
+            "tool arguments were compressed; original arguments are stored "
+            "in ArtifactStore"
+        ),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -956,7 +966,9 @@ def _emit_task_state_runtime_event(
         kind="task_ledger" if state.task_ledger is not None else "task_graph",
         status="progress",
         source="task_state:observation_update",
-        summary=observation.task_text or observation.command_id or observation.tool_name,
+        summary=observation.task_text
+        or observation.command_id
+        or observation.tool_name,
         payload=payload,
         artifacts=list(observation.artifacts),
         related_ids={
@@ -968,31 +980,43 @@ def _emit_task_state_runtime_event(
 
 def _runtime_kind_status_from_timeline(
     timeline_kind: str,
-) -> tuple[str, str]:
+) -> tuple[RuntimeEventKind, RuntimeEventStatus]:
     kind = normalize_message_text(timeline_kind)
     if kind == "model_request":
-        return "model_request", "started"
+        return cast(RuntimeEventKind, "model_request"), cast(
+            RuntimeEventStatus, "started"
+        )
     if kind == "tool_call":
-        return "tool_call", "started"
+        return cast(RuntimeEventKind, "tool_call"), cast(RuntimeEventStatus, "started")
     if kind in {"tool_result", "background_observation_event"}:
-        return "tool_observation", "completed"
+        return cast(RuntimeEventKind, "tool_observation"), cast(
+            RuntimeEventStatus, "completed"
+        )
     if kind in {"task_graph", "task_graph_verification"}:
-        return "task_graph", "progress"
+        return cast(RuntimeEventKind, "task_graph"), cast(
+            RuntimeEventStatus, "progress"
+        )
     if kind.startswith("task_ledger"):
-        return "task_ledger", "progress"
+        return cast(RuntimeEventKind, "task_ledger"), cast(
+            RuntimeEventStatus, "progress"
+        )
     if kind == "runtime_guardrail":
-        return "guardrail", "blocked"
+        return cast(RuntimeEventKind, "guardrail"), cast(RuntimeEventStatus, "blocked")
     if kind in {"agent_paused"}:
-        return "agent_run", "waiting"
+        return cast(RuntimeEventKind, "agent_run"), cast(RuntimeEventStatus, "waiting")
     if kind in {"agent_resumed"}:
-        return "agent_run", "started"
+        return cast(RuntimeEventKind, "agent_run"), cast(RuntimeEventStatus, "started")
     if kind in {"agent_cancelled"}:
-        return "agent_run", "cancelled"
+        return cast(RuntimeEventKind, "agent_run"), cast(
+            RuntimeEventStatus, "cancelled"
+        )
     if kind == "assistant_text":
-        return "agent_run", "completed"
+        return cast(RuntimeEventKind, "agent_run"), cast(
+            RuntimeEventStatus, "completed"
+        )
     if kind == "todo_sync":
-        return "todo", "progress"
-    return "system", "info"
+        return cast(RuntimeEventKind, "todo"), cast(RuntimeEventStatus, "progress")
+    return cast(RuntimeEventKind, "system"), cast(RuntimeEventStatus, "info")
 
 
 def _artifacts_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1086,8 +1110,31 @@ def _covered_ledger_task_ids(
     ledger: TaskLedger,
     observation: AgentObservation,
 ) -> list[str]:
-    task_id = _best_matching_ledger_task_id(ledger, observation)
-    return [task_id] if task_id else []
+    command_id = normalize_message_text(observation.command_id)
+    candidates = [
+        observation.task_text,
+        observation.rendered_command,
+        observation.command_id,
+        observation.matched_plugin,
+        _observation_messages_summary(observation),
+    ]
+    result: list[str] = []
+    for task in ledger.tasks:
+        goal = normalize_message_text(task.goal)
+        expected = {normalize_message_text(item) for item in task.expected_capabilities}
+        if any(_same_or_nested_task(goal, item) for item in candidates if item):
+            result.append(task.task_id)
+            continue
+        if (
+            command_id
+            and command_id in expected
+            and _observation_mentions_goal(
+                goal,
+                candidates,
+            )
+        ):
+            result.append(task.task_id)
+    return list(dict.fromkeys(result))
 
 
 def _best_matching_ledger_task_id(
@@ -1112,6 +1159,44 @@ def _best_matching_ledger_task_id(
         }:
             return task.task_id
     return ""
+
+
+def _observation_messages_summary(observation: AgentObservation) -> str:
+    output = observation.output or {}
+    return normalize_message_text(str(output.get("messages_sent_summary", "") or ""))
+
+
+def _observation_mentions_goal(goal: str, candidates: list[str]) -> bool:
+    haystack = normalize_message_text(" ".join(candidates))
+    if not haystack:
+        return False
+    shared_terms = [
+        term
+        for term in (
+            "项目",
+            "开源",
+            "仓库",
+            "文档",
+            "帮助",
+            "入口",
+            "bot",
+            "机器人",
+            "身份",
+            "版本",
+            "作者",
+        )
+        if term in goal and term in haystack
+    ]
+    if len(shared_terms) >= 1 and "bot" in shared_terms:
+        return True
+    if len(shared_terms) >= 2:
+        return True
+    goal_tokens = [
+        token
+        for token in re.findall(r"[0-9A-Za-z_.-]+|[\u4e00-\u9fff]{2,}", goal)
+        if len(token.strip()) >= 2
+    ]
+    return any(token in haystack for token in goal_tokens)
 
 
 __all__ = [

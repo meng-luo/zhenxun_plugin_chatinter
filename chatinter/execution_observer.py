@@ -273,7 +273,6 @@ class ExecutionObserver:
             pass
 
 
-
 def start_execution_observation(**kwargs: Any) -> ExecutionFrame:
     return ExecutionObserver.start(**kwargs)
 

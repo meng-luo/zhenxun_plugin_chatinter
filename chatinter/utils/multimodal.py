@@ -15,6 +15,40 @@ from zhenxun.services.llm.types import LLMContentPart
 from zhenxun.utils.http_utils import AsyncHttpx
 
 
+def _detect_image_mime(data: bytes, hint: str = "") -> str:
+    """按文件头魔数探测图片 MIME(补强2:取代硬编码 image/png)。
+
+    优先看二进制魔数,其次看路径/URL 扩展名,最终兜底 image/png。
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    lowered = (hint or "").lower()
+    for ext, mime in (
+        (".png", "image/png"),
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".gif", "image/gif"),
+        (".webp", "image/webp"),
+        (".bmp", "image/bmp"),
+    ):
+        if ext in lowered:
+            return mime
+    return "image/png"
+
+
+def _image_part_from_bytes(content: bytes, hint: str = "") -> LLMContentPart:
+    b64_data = base64.b64encode(content).decode("utf-8")
+    return LLMContentPart.image_base64_part(b64_data, _detect_image_mime(content, hint))
+
+
 async def extract_images_from_message(
     raw_message: str | UniMessage | AdapterMessage,
 ) -> list[LLMContentPart]:
@@ -94,8 +128,7 @@ async def _process_adapter_image_segment(seg) -> LLMContentPart | None:
     if url:
         try:
             media_bytes = await AsyncHttpx.get_content(str(url))
-            b64_data = base64.b64encode(media_bytes).decode("utf-8")
-            return LLMContentPart.image_base64_part(b64_data, "image/png")
+            return _image_part_from_bytes(media_bytes, str(url))
         except Exception:
             pass
 
@@ -106,8 +139,7 @@ async def _process_adapter_image_segment(seg) -> LLMContentPart | None:
             if path.exists() and path.is_file():
                 async with aiofiles.open(path, "rb") as f:
                     content = await f.read()
-                b64_data = base64.b64encode(content).decode("utf-8")
-                return LLMContentPart.image_base64_part(b64_data, "image/png")
+                return _image_part_from_bytes(content, str(file_value))
         except Exception:
             pass
 
@@ -125,8 +157,7 @@ async def _process_image_segment(seg: Image) -> LLMContentPart | None:
     """
     if hasattr(seg, "raw") and seg.raw:
         if isinstance(seg.raw, bytes):
-            b64_data = base64.b64encode(seg.raw).decode("utf-8")
-            return LLMContentPart.image_base64_part(b64_data, "image/png")
+            return _image_part_from_bytes(seg.raw)
 
     if getattr(seg, "path", None):
         try:
@@ -134,16 +165,14 @@ async def _process_image_segment(seg: Image) -> LLMContentPart | None:
             if path.exists():
                 async with aiofiles.open(path, "rb") as f:
                     content = await f.read()
-                b64_data = base64.b64encode(content).decode("utf-8")
-                return LLMContentPart.image_base64_part(b64_data, "image/png")
+                return _image_part_from_bytes(content, str(seg.path))
         except Exception:
             pass
 
     if getattr(seg, "url", None):
         try:
             media_bytes = await AsyncHttpx.get_content(str(seg.url))
-            b64_data = base64.b64encode(media_bytes).decode("utf-8")
-            return LLMContentPart.image_base64_part(b64_data, "image/png")
+            return _image_part_from_bytes(media_bytes, str(seg.url))
         except Exception:
             pass
 

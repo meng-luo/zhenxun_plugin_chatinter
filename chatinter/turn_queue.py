@@ -20,6 +20,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.services.log import logger
 
 from .event_runtime import is_already_handled, mark_as_handled
+from .event_signals import set_event_signal
 from .route_text import normalize_message_text
 
 COLLECT_WINDOW_SECONDS = 1.2
@@ -406,11 +407,7 @@ class TurnQueue:
         pending_updates = _unique_normalized_texts(
             [
                 *turn.pending_human_updates,
-                *(
-                    msg.raw_message
-                    for msg in turn.messages
-                    if msg.pending_human_update
-                ),
+                *(msg.raw_message for msg in turn.messages if msg.pending_human_update),
             ]
         )
         active_updates[:] = pending_updates
@@ -531,7 +528,9 @@ def _has_dedupe_locked(state: _ConversationState, dedupe_key: str) -> bool:
         dedupe_key,
     ):
         return True
-    if any(_turn_has_dedupe(turn, dedupe_key) for turn in state.current_by_user.values()):
+    if any(
+        _turn_has_dedupe(turn, dedupe_key) for turn in state.current_by_user.values()
+    ):
         return True
     return any(_turn_has_dedupe(turn, dedupe_key) for turn in state.pending)
 
@@ -617,7 +616,9 @@ def _looks_like_command(text: str) -> bool:
 def _can_merge(turn: QueuedTurn, item: QueuedMessage) -> bool:
     if turn.user_id != item.user_id:
         return False
-    if item.source != "message" or any(msg.source != "message" for msg in turn.messages):
+    if item.source != "message" or any(
+        msg.source != "message" for msg in turn.messages
+    ):
         return False
     if _turn_has_dedupe(turn, item.dedupe_key):
         return False
@@ -633,9 +634,7 @@ def _can_merge(turn: QueuedTurn, item: QueuedMessage) -> bool:
 
 def _drop_pending_at(pending: deque[QueuedTurn], index: int) -> None:
     kept = [
-        turn
-        for current_index, turn in enumerate(pending)
-        if current_index != index
+        turn for current_index, turn in enumerate(pending) if current_index != index
     ]
     pending.clear()
     pending.extend(kept)
@@ -680,14 +679,11 @@ def _attach_turn_metadata(
     pending_human_updates: list[str],
     priority: int,
 ) -> None:
-    try:
-        setattr(event, "_chatinter_turn_queued", True)
-        setattr(event, "_chatinter_turn_merged", len(turn_messages) > 1)
-        setattr(event, "_chatinter_turn_messages", list(turn_messages))
-        setattr(event, "_chatinter_pending_human_updates", pending_human_updates)
-        setattr(event, "_chatinter_turn_priority", int(priority))
-    except Exception:
-        pass
+    set_event_signal(event, "_chatinter_turn_queued", True)
+    set_event_signal(event, "_chatinter_turn_merged", len(turn_messages) > 1)
+    set_event_signal(event, "_chatinter_turn_messages", list(turn_messages))
+    set_event_signal(event, "_chatinter_pending_human_updates", pending_human_updates)
+    set_event_signal(event, "_chatinter_turn_priority", int(priority))
 
 
 _TURN_QUEUE = TurnQueue()

@@ -19,6 +19,7 @@ from .chat_dialogue_planner import (
     plan_chat_dialogue,
 )
 from .group_chat_policy import GroupChatPolicyDecision, decide_group_chat_policy
+from .persona import PersonaSelection, resolve_persona
 
 if TYPE_CHECKING:
     from .thread_resolver import ThreadContext
@@ -36,6 +37,7 @@ class ChatRuntimeProfile:
     preference_facts: tuple[str, ...] = ()
     thread_facts: tuple[str, ...] = ()
     group_policy: GroupChatPolicyDecision | None = None
+    persona_selection: PersonaSelection | None = None
     reason: str = "chat_runtime_profile"
 
     def to_context_xml(self) -> str:
@@ -72,12 +74,19 @@ class ChatRuntimeProfile:
             lines.append("</thread_facts>")
         if self.group_policy is not None:
             lines.append(self.group_policy.to_xml())
+        if self.persona_selection is not None:
+            lines.append(self.persona_selection.persona.to_context_xml())
         lines.append(
             "rule=This profile is for direct chat wording only; it must not "
             "select tools, fill tool arguments, or override plugin execution."
         )
         lines.append("</chat_runtime_profile>")
         return "\n".join(lines)
+
+    def persona_prompt_fragment(self) -> str:
+        if self.persona_selection is None:
+            return ""
+        return self.persona_selection.persona.prompt_fragment()
 
 
 def build_chat_runtime_profile(
@@ -90,6 +99,7 @@ def build_chat_runtime_profile(
     has_images: bool = False,
     has_reply: bool = False,
     is_group: bool = False,
+    intent: Any | None = None,
     previous_state: DialogueState | None = None,
     dialogue_context_pack: Any | None = None,
     thread_context: "ThreadContext | None" = None,
@@ -103,21 +113,19 @@ def build_chat_runtime_profile(
             user_id=user_id,
             group_id=group_id,
         )
-    relevant_people = tuple(
-        getattr(dialogue_context_pack, "relevant_people", ()) or ()
-    )
+    relevant_people = tuple(getattr(dialogue_context_pack, "relevant_people", ()) or ())
     thread = thread_context or getattr(dialogue_context_pack, "thread", None)
     thread_topic = normalize_message_text(str(getattr(thread, "topic_key", "") or ""))
     plan = plan_chat_dialogue(
         message_text=message_text,
-        intent=None,
+        intent=intent,
         has_images=has_images,
         has_reply=has_reply,
     )
     state = build_dialogue_state(
         message_text=message_text,
         plan=plan,
-        intent=None,
+        intent=intent,
         scenario=scenario,
         has_images=has_images,
         has_reply=has_reply,
@@ -133,6 +141,12 @@ def build_chat_runtime_profile(
         dialogue_state=state,
         thread_context=thread,
     )
+    persona_selection = resolve_persona(
+        session_key=session_key,
+        user_id=user_id,
+        group_id=group_id,
+        scenario=scenario,
+    )
     person_facts, relationship_facts, preference_facts = _person_fact_layers(
         dialogue_context_pack
     )
@@ -145,6 +159,7 @@ def build_chat_runtime_profile(
         preference_facts=tuple(preference_facts),
         thread_facts=_thread_facts(thread),
         group_policy=group_policy,
+        persona_selection=persona_selection,
         reason=f"{plan.reason}:{state.reason}",
     )
 
@@ -173,9 +188,7 @@ def _person_fact_layers(
     if dialogue_context_pack is None:
         return [], [], []
     append(getattr(dialogue_context_pack, "speaker_profile", None), prefix="speaker")
-    relevant_people = tuple(
-        getattr(dialogue_context_pack, "relevant_people", ()) or ()
-    )
+    relevant_people = tuple(getattr(dialogue_context_pack, "relevant_people", ()) or ())
     for index, person in enumerate(relevant_people[:6], 1):
         profile = getattr(person, "profile", None)
         append(profile, prefix=f"person_{index}")
@@ -242,11 +255,7 @@ def _profile_aliases(profile: Any) -> tuple[str, ...]:
     if isinstance(aliases, str):
         aliases = aliases.replace("，", "、").split("、")
     normalized = (normalize_message_text(str(value)) for value in aliases)
-    return tuple(
-        item
-        for item in dict.fromkeys(normalized)
-        if item
-    )[:8]
+    return tuple(item for item in dict.fromkeys(normalized) if item)[:8]
 
 
 def _profile_known_facts(profile: Any) -> tuple[str, ...]:
@@ -254,11 +263,7 @@ def _profile_known_facts(profile: Any) -> tuple[str, ...]:
     if isinstance(facts, str):
         facts = facts.replace("；", "、").split("、")
     normalized = (normalize_message_text(str(value)) for value in facts)
-    return tuple(
-        item
-        for item in dict.fromkeys(normalized)
-        if item
-    )[:8]
+    return tuple(item for item in dict.fromkeys(normalized) if item)[:8]
 
 
 def _thread_facts(thread: Any | None) -> tuple[str, ...]:
@@ -279,10 +284,14 @@ def _thread_facts(thread: Any | None) -> tuple[str, ...]:
         facts.append(f"confidence={float(confidence or 0.0):.2f}")
     except Exception:
         pass
-    participants = tuple(getattr(thread, "related_user_ids", ()) or ())
+    raw_participants = getattr(thread, "related_user_ids", ()) or ()
+    participants = (
+        list(raw_participants) if not isinstance(raw_participants, str) else []
+    )
     if participants:
         facts.append("participants=" + ",".join(str(item) for item in participants[:8]))
-    pending = tuple(getattr(thread, "pending_entities", ()) or ())
+    raw_pending = getattr(thread, "pending_entities", ()) or ()
+    pending = list(raw_pending) if not isinstance(raw_pending, str) else []
     if pending:
         facts.append("pending_entities=" + "、".join(str(item) for item in pending[:6]))
     return tuple(facts)

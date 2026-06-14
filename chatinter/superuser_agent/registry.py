@@ -175,7 +175,9 @@ class SuperuserToolRegistry:
             if self._card_available(entry.card)
         )
 
-    def tool_cards(self, *, available_only: bool = False) -> tuple[SuperuserToolCard, ...]:
+    def tool_cards(
+        self, *, available_only: bool = False
+    ) -> tuple[SuperuserToolCard, ...]:
         cards: list[SuperuserToolCard] = []
         for entry in self._entries.values():
             if available_only and not self._card_available(entry.card):
@@ -237,9 +239,13 @@ def infer_tool_card(tool: ToolExecutable) -> SuperuserToolCard:
         tags=tuple(_tags_from_name(name)),
         source_of_truth=_source_of_truth_from_category(category),
         requires_real_tool=True,
-        output_mode=_output_mode_from_name(name, category=category, read_only=read_only),
+        output_mode=_output_mode_from_name(
+            name, category=category, read_only=read_only
+        ),
         entity_scope=_entity_scope_from_category(category),
-        reliability=_initial_reliability_from_name(name, risk=risk, read_only=read_only),
+        reliability=_initial_reliability_from_name(
+            name, risk=risk, read_only=read_only
+        ),
         schema_quality=_schema_quality_from_name(name, category=category),
         soft_tool=False,
     )
@@ -283,7 +289,16 @@ def _category_from_name(name: str) -> str:
         return "patch"
     if name.startswith("plugin_dev_"):
         return "plugin_dev"
-    if name.startswith(("read_file", "list_dir", "search_files", "write_file", "append_file", "replace_in_file")):
+    if name.startswith(
+        (
+            "read_file",
+            "list_dir",
+            "search_files",
+            "write_file",
+            "append_file",
+            "replace_in_file",
+        )
+    ):
         return "file"
     if name.startswith("git_"):
         return "git"
@@ -525,7 +540,9 @@ def get_superuser_tool_card(name: str) -> SuperuserToolCard | None:
     return _REGISTRY.tool_card(name)
 
 
-def superuser_tool_cards(*, available_only: bool = False) -> tuple[SuperuserToolCard, ...]:
+def superuser_tool_cards(
+    *, available_only: bool = False
+) -> tuple[SuperuserToolCard, ...]:
     from . import toolsets as _toolsets  # noqa: F401  # import registers toolsets
 
     return _REGISTRY.tool_cards(available_only=available_only)

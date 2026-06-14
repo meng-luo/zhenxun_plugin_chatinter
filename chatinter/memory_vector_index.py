@@ -10,8 +10,10 @@ import re
 import time
 from typing import Any, ClassVar, cast
 
+from .config import MEMORY_VECTOR_MAX_ITEMS
 from .memory_recall_context import MemoryRecallContext, split_memory_participants
 from .route_text import normalize_message_text
+from .vector_store import VectorDocument, VectorStore, create_vector_store
 
 _INDEX_PATH = Path("data/cache/chatinter/memory_vector_index.json")
 _FALLBACK_DIM = 384
@@ -19,7 +21,6 @@ _EMBEDDING_COOLDOWN = 120.0
 _TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+")
 _INDEXABLE_TYPES = {"group_digest", "thread_digest", "person_profile_summary"}
 _SEARCH_LIMIT = 16
-_MAX_VECTOR_DOCS = 1024
 
 
 @dataclass(frozen=True)
@@ -51,12 +52,15 @@ class _MemoryVectorDoc:
     vector_type: str
     metadata: MemoryVectorMetadata
     updated_at: float = 0.0
+    accessed_at: float = 0.0
+    importance: float = 0.0
 
 
 class MemoryVectorIndex:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _loaded: ClassVar[bool] = False
     _docs: ClassVar[dict[int, _MemoryVectorDoc]] = {}
+    _store: ClassVar[VectorStore] = create_vector_store("memory")
     _embedding_supported: ClassVar[bool | None] = None
     _embedding_disabled_until: ClassVar[float] = 0.0
 
@@ -93,7 +97,10 @@ class MemoryVectorIndex:
                 vector_type=vector_type,
                 metadata=metadata,
                 updated_at=time.time(),
+                accessed_at=time.time(),
+                importance=_memory_importance(metadata),
             )
+            cls._store.upsert(_doc_to_vector_document(cls._docs[memory_id]))
             cls._prune_nolock()
             await cls._save()
             return True
@@ -116,29 +123,45 @@ class MemoryVectorIndex:
             query_vector = await cls._embed_query(normalized_query)
             if not query_vector:
                 return []
+            limit = max(int(top_k or 0), 0)
+            store_results = cls._store.search(
+                query_vector,
+                top_k=limit,
+                filter_fn=lambda doc: _matches_context(
+                    _metadata_for_store_doc(cls._docs, doc),
+                    recall_context,
+                ),
+                boost_fn=lambda doc: _structured_boost(
+                    _metadata_for_store_doc(cls._docs, doc),
+                    recall_context,
+                ),
+            )
+            now = time.time()
             ranked: list[MemoryVectorSearchResult] = []
-            for doc in cls._docs.values():
-                if not _matches_context(doc.metadata, recall_context):
+            for result in store_results:
+                try:
+                    memory_id = int(result.doc_id)
+                except (TypeError, ValueError):
                     continue
-                score = _cosine_score(query_vector, doc.vector)
-                score += _structured_boost(doc.metadata, recall_context)
-                if score <= 0:
+                doc = cls._docs.get(memory_id)
+                if doc is None:
                     continue
+                doc.accessed_at = now
                 ranked.append(
                     MemoryVectorSearchResult(
-                        memory_id=doc.memory_id,
-                        score=score,
-                        vector_type=doc.vector_type,
+                        memory_id=memory_id,
+                        score=result.score,
+                        vector_type=result.vector_type,
                     )
                 )
-            ranked.sort(key=lambda item: item.score, reverse=True)
-            return ranked[: max(int(top_k or 0), 0)]
+            return ranked
 
     @classmethod
     async def delete_memory_vector(cls, memory_id: int) -> None:
         async with cls._lock:
             await cls._load()
             if cls._docs.pop(int(memory_id), None) is not None:
+                cls._store.delete(str(memory_id))
                 await cls._save()
 
     @classmethod
@@ -174,10 +197,15 @@ class MemoryVectorIndex:
                         vector_type=str(item.get("vector_type", "fallback")),
                         metadata=metadata,
                         updated_at=float(item.get("updated_at", 0.0) or 0.0),
+                        accessed_at=float(item.get("accessed_at", 0.0) or 0.0),
+                        importance=float(
+                            item.get("importance", _memory_importance(metadata)) or 0.0
+                        ),
                     )
                 except Exception:
                     continue
         cls._prune_nolock()
+        cls._rebuild_store_nolock()
         cls._loaded = True
 
     @classmethod
@@ -191,6 +219,8 @@ class MemoryVectorIndex:
                     "vector_type": doc.vector_type,
                     "metadata": _metadata_to_payload(doc.metadata),
                     "updated_at": doc.updated_at,
+                    "accessed_at": doc.accessed_at,
+                    "importance": doc.importance,
                 }
                 for memory_id, doc in cls._docs.items()
             },
@@ -255,18 +285,28 @@ class MemoryVectorIndex:
 
     @classmethod
     def _prune_nolock(cls) -> None:
-        if len(cls._docs) <= _MAX_VECTOR_DOCS:
+        max_docs = max(int(MEMORY_VECTOR_MAX_ITEMS or 0), 0)
+        if max_docs <= 0 or len(cls._docs) <= max_docs:
             return
-        overflow = len(cls._docs) - _MAX_VECTOR_DOCS
+        overflow = len(cls._docs) - max_docs
         oldest_ids = sorted(
             cls._docs,
             key=lambda memory_id: (
+                cls._docs[memory_id].importance,
+                cls._docs[memory_id].accessed_at or cls._docs[memory_id].updated_at,
                 cls._docs[memory_id].updated_at,
                 memory_id,
             ),
         )[:overflow]
         for memory_id in oldest_ids:
             cls._docs.pop(memory_id, None)
+            cls._store.delete(str(memory_id))
+
+    @classmethod
+    def _rebuild_store_nolock(cls) -> None:
+        cls._store.load_documents(
+            _doc_to_vector_document(doc) for doc in cls._docs.values()
+        )
 
 
 def build_memory_vector_text(
@@ -358,6 +398,44 @@ def _structured_boost(
         score += 0.12
     score += min(max(metadata.confidence, 0.0), 1.0) * 0.05
     return score
+
+
+def _memory_importance(metadata: MemoryVectorMetadata) -> float:
+    type_weight = {
+        "person_profile_summary": 0.35,
+        "thread_digest": 0.25,
+        "group_digest": 0.15,
+    }.get(normalize_message_text(metadata.memory_type), 0.0)
+    scope_weight = 0.1 if metadata.scope in {"user", "thread"} else 0.0
+    confidence_weight = min(max(metadata.confidence, 0.0), 1.0) * 0.25
+    participant_weight = min(len(metadata.participants), 4) * 0.02
+    return type_weight + scope_weight + confidence_weight + participant_weight
+
+
+def _doc_to_vector_document(doc: _MemoryVectorDoc) -> VectorDocument:
+    return VectorDocument(
+        doc_id=str(doc.memory_id),
+        vector=doc.vector,
+        vector_type=doc.vector_type,
+        metadata=_metadata_to_payload(doc.metadata),
+        updated_at=doc.updated_at,
+        accessed_at=doc.accessed_at or doc.updated_at,
+        importance=doc.importance,
+    )
+
+
+def _metadata_for_store_doc(
+    docs: dict[int, _MemoryVectorDoc],
+    store_doc: VectorDocument,
+) -> MemoryVectorMetadata:
+    try:
+        memory_id = int(store_doc.doc_id)
+    except (TypeError, ValueError):
+        memory_id = 0
+    doc = docs.get(memory_id)
+    if doc is not None:
+        return doc.metadata
+    return _metadata_from_payload(store_doc.metadata)
 
 
 def _tokenize(text: str) -> list[str]:

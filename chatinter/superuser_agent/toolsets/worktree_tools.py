@@ -30,7 +30,8 @@ class WorktreeCreateTool:
             name=self.name,
             description=(
                 "超级用户私聊专用：为工程修改创建隔离 git worktree。之后文件、"
-                "shell、git、patch、eval 工具默认在该 worktree 中执行，避免污染主工作区。"
+                "shell、git、patch、eval 工具默认在该 worktree 中执行，"
+                "避免污染主工作区。"
             ),
             parameters={
                 "type": "object",
@@ -112,7 +113,9 @@ class WorktreeStatusTool:
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="超级用户私聊专用：查看当前或指定隔离 worktree 的状态和 diff 摘要。",
+            description=(
+                "超级用户私聊专用：查看当前或指定隔离 worktree " "的状态和 diff 摘要。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -213,7 +216,9 @@ class WorktreeRemoveTool:
         reason = str(kwargs.get("reason", "") or "")
         if not worktree_id:
             return tool_result(False, "worktree_id_required")
-        decision = decide_git("git worktree remove --force" if force else "git worktree remove")
+        decision = decide_git(
+            "git worktree remove --force" if force else "git worktree remove"
+        )
         payload = {"worktree_id": worktree_id, "force": force, "reason": reason}
         if decision.decision == "deny":
             return permission_denied_result(

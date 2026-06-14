@@ -8,6 +8,7 @@ schemas, tool obligation, AgentRuntime or route execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from .chat_dialogue_planner import (
@@ -63,7 +64,10 @@ class ChatRuntime:
                 reason="private_chat",
             )
         if scenario == "group_plugin_selector":
-            if allow_plugin_tools and exposure_state in {"unknown", "plugin_tools_exposed"}:
+            if allow_plugin_tools and exposure_state in {
+                "unknown",
+                "plugin_tools_exposed",
+            }:
                 return ChatIsolationDecision(
                     allow_prompt_profile=False,
                     allow_memory_profile=False,
@@ -109,6 +113,7 @@ class ChatRuntime:
                     )
                 ),
                 is_group=bool(getattr(frame, "group_id", None)),
+                intent=getattr(frame, "intent_profile", None),
                 previous_state=getattr(frame, "previous_dialogue_state", None),
                 dialogue_context_pack=getattr(frame, "dialogue_context_pack", None),
                 thread_context=getattr(frame, "thread_context", None),
@@ -118,14 +123,45 @@ class ChatRuntime:
 
     @classmethod
     def attach_profile(cls, frame: Any) -> ChatRuntimeProfile | None:
-        profile = getattr(frame, "chat_runtime_profile", None) or cls.build_profile(frame)
+        fingerprint = cls._profile_fingerprint(frame)
+        cached_fingerprint = getattr(frame, "_chat_runtime_profile_fingerprint", "")
+        profile = getattr(frame, "chat_runtime_profile", None)
+        if profile is None or cached_fingerprint != fingerprint:
+            profile = cls.build_profile(frame)
         if profile is None:
             return None
         frame.chat_runtime_profile = profile
+        frame._chat_runtime_profile_fingerprint = fingerprint
         frame.dialogue_plan = profile.dialogue_plan
         frame.dialogue_state = profile.dialogue_state
         frame.previous_dialogue_state = profile.previous_state
         return profile
+
+    @staticmethod
+    def _profile_fingerprint(frame: Any) -> str:
+        intent = getattr(frame, "intent_profile", None)
+        intent_payload = {
+            "kind": getattr(intent, "kind", ""),
+            "reason": getattr(intent, "reason", ""),
+            "chat_subkind": getattr(intent, "chat_subkind", ""),
+            "chat_target_hint": getattr(intent, "chat_target_hint", ""),
+            "confidence": getattr(intent, "confidence", ""),
+        }
+        return json.dumps(
+            {
+                "message": (
+                    getattr(frame, "current_message", "")
+                    or getattr(frame, "raw_message", "")
+                ),
+                "scenario": getattr(frame, "scenario", ""),
+                "group_id": getattr(frame, "group_id", None),
+                "user_id": getattr(frame, "user_id", ""),
+                "intent": intent_payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
 
     @classmethod
     def memory_dialogue_state(cls, frame: Any) -> DialogueState | None:
@@ -161,7 +197,15 @@ class ChatRuntime:
         state_prompt = build_dialogue_state_prompt(profile.dialogue_state)
         if state_prompt:
             fragments.append(state_prompt)
+        persona_prompt = profile.persona_prompt_fragment()
+        if persona_prompt:
+            fragments.append("\n当前人格设定：\n" + persona_prompt)
         fragments.append(profile.to_context_xml())
+        persona = (
+            profile.persona_selection.persona
+            if profile.persona_selection is not None
+            else None
+        )
         return ChatPromptContext(
             system_fragments=tuple(fragments),
             context_xml=replace_dialogue_state_context(
@@ -177,6 +221,7 @@ class ChatRuntime:
                 "dialogue_purpose": profile.dialogue_state.dialogue_purpose,
                 "reply_posture": profile.dialogue_state.reply_posture,
                 "group_atmosphere": profile.dialogue_state.group_atmosphere,
+                "persona": getattr(persona, "persona_id", ""),
             },
         )
 
@@ -189,7 +234,7 @@ class ChatRuntime:
     ) -> ResponseQualityResult:
         decision = cls.isolation_for_frame(frame)
         if not decision.allow_quality_judge:
-            return ResponseQualityResult(action="ok", reason=decision.reason)
+            return ResponseQualityResult(action="ok")
         return ResponseQualityJudge.judge_chat_only(
             final_text=final_text,
             original_message=getattr(frame, "current_message", ""),
@@ -207,7 +252,10 @@ class ChatRuntime:
         output = getattr(main_result, "output", None)
         if output is None or not bool(getattr(output, "record_chat_feedback", False)):
             return False
-        if normalize_message_text(str(getattr(output, "outcome", "") or "")) != "chat_completed":
+        if (
+            normalize_message_text(str(getattr(output, "outcome", "") or ""))
+            != "chat_completed"
+        ):
             return False
         if bool(getattr(main_result, "handled_by_tools", False)):
             return False
@@ -233,7 +281,10 @@ class ChatRuntime:
         return True
 
 
-def replace_dialogue_state_context(context_xml: str, dialogue_state: DialogueState) -> str:
+def replace_dialogue_state_context(
+    context_xml: str,
+    dialogue_state: DialogueState,
+) -> str:
     block = dialogue_state.to_xml()
     base = _strip_dialogue_state_block(context_xml)
     return f"{base}\n{block}".strip() if base else block

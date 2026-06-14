@@ -1,4 +1,4 @@
-﻿"""Productized trajectory eval harness for ChatInter.
+"""Productized trajectory eval harness for ChatInter.
 
 This module turns recorded trajectories into repeatable regression reports:
 fixed layered test cases, thresholds, failure archives and baseline comparison.
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sys
 from typing import Any
 import uuid
 
@@ -23,8 +24,6 @@ try:
         THRESHOLD_SCHEMA_VERSION,
     )
 except ImportError:  # Allows `py zhenxun/plugins/chatinter/eval_runner.py`.
-    import sys
-
     sys.path.append(str(Path(__file__).resolve().parent))
     from eval_dataset import (  # type: ignore[no-redef]
         DATASET_SCHEMA_VERSION,
@@ -40,10 +39,14 @@ _DEFAULT_COMPARE_KEYS = (
     "case_coverage",
     "pass_rate",
     "hit_rate",
+    "retrieval_hit_rate",
     "false_trigger_rate",
     "multi_coverage_rate",
+    "task_coverage_rate",
     "tool_call_pressure",
+    "avg_steps",
     "avg_latency_ms",
+    "p95_latency_ms",
     "avg_prompt_tokens",
 )
 
@@ -85,7 +88,9 @@ def ensure_eval_harness_files(
 
     paths = eval_harness_paths()
     dataset = Path(dataset_path) if dataset_path is not None else paths.dataset
-    thresholds = Path(thresholds_path) if thresholds_path is not None else paths.thresholds
+    thresholds = (
+        Path(thresholds_path) if thresholds_path is not None else paths.thresholds
+    )
     if not dataset.exists():
         _write_json(
             dataset,
@@ -136,12 +141,16 @@ def run_eval_harness(
 ) -> dict[str, Any]:
     """Evaluate recorded trajectories against the fixed layered dataset."""
 
-    ensure_eval_harness_files(dataset_path=dataset_path, thresholds_path=thresholds_path)
+    ensure_eval_harness_files(
+        dataset_path=dataset_path, thresholds_path=thresholds_path
+    )
     cases = load_eval_dataset(dataset_path)
     thresholds = load_eval_thresholds(thresholds_path)
     default_trajectory_path = _trajectory_jsonl_path()
     records = _load_trajectory_records(
-        path=Path(trajectory_path) if trajectory_path is not None else default_trajectory_path,
+        path=Path(trajectory_path)
+        if trajectory_path is not None
+        else default_trajectory_path,
         limit=max(1, int(limit or _DEFAULT_LIMIT)),
     )
     report = build_eval_report(
@@ -175,7 +184,10 @@ def build_eval_report(
     run_name: str = "",
     trajectory_path: str = "",
 ) -> dict[str, Any]:
-    run_id = f"eval_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    run_id = (
+        f"eval_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:6]}"
+    )
     normalized_cases = [_normalize_case(case) for case in cases]
     records_by_input = _records_by_input(records)
     case_results = [
@@ -213,6 +225,13 @@ def build_eval_report(
         "summary": summary,
         "layers": layers,
         "cost_latency": _cost_latency_summary(case_results),
+        "ci_summary": _ci_summary(
+            summary=summary,
+            layers=layers,
+            checks=checks,
+            failures=failures,
+            missing_cases=missing_cases,
+        ),
         "checks": checks,
         "passed": bool(checks.get("passed")) and not failures,
         "case_results": case_results,
@@ -228,7 +247,10 @@ def build_eval_report(
                 "cost_or_latency_regression",
                 "missing_trajectory",
             ],
-            "purpose": "preserve failed examples for regression triage without changing runtime policy",
+            "purpose": (
+                "preserve failed examples for regression triage without changing "
+                "runtime policy"
+            ),
         },
     }
     report["passed"] = bool(checks.get("passed")) and all(
@@ -278,8 +300,10 @@ def evaluate_case(
         "status": metrics.get("status", ""),
         "tool_obligation": metrics.get("tool_obligation", ""),
         "hit": metrics.get("hit"),
+        "retrieval_hit": metrics.get("retrieval_hit"),
         "false_trigger": bool(metrics.get("false_trigger")),
         "multi_task_covered": metrics.get("multi_task_covered"),
+        "task_covered": metrics.get("task_covered"),
         "latency_ms": metrics.get("latency_ms", 0),
         "prompt_tokens": metrics.get("prompt_tokens", 0),
         "steps": metrics.get("steps", 0),
@@ -312,7 +336,9 @@ def evaluate_thresholds(
         for layer, spec in layer_thresholds.items():
             if not isinstance(spec, dict):
                 continue
-            checks.extend(_threshold_checks(f"layer:{layer}", layers.get(layer, {}), spec))
+            checks.extend(
+                _threshold_checks(f"layer:{layer}", layers.get(layer, {}), spec)
+            )
     failed = [check for check in checks if not check.get("passed")]
     return {
         "passed": not failed,
@@ -326,16 +352,18 @@ def compare_eval_reports(
     current: dict[str, Any],
     baseline: dict[str, Any],
 ) -> dict[str, Any]:
-    current_summary = current.get("summary") if isinstance(current.get("summary"), dict) else {}
-    baseline_summary = baseline.get("summary") if isinstance(baseline.get("summary"), dict) else {}
+    current_summary = _dict_or_empty(current.get("summary"))
+    baseline_summary = _dict_or_empty(baseline.get("summary"))
     summary_delta = _metric_delta(current_summary, baseline_summary)
     layer_delta: dict[str, Any] = {}
-    current_layers = current.get("layers") if isinstance(current.get("layers"), dict) else {}
-    baseline_layers = baseline.get("layers") if isinstance(baseline.get("layers"), dict) else {}
+    current_layers = _dict_or_empty(current.get("layers"))
+    baseline_layers = _dict_or_empty(baseline.get("layers"))
     for layer in sorted(set(current_layers) | set(baseline_layers)):
+        current_layer = _dict_or_empty(current_layers.get(layer))
+        baseline_layer = _dict_or_empty(baseline_layers.get(layer))
         layer_delta[layer] = _metric_delta(
-            current_layers.get(layer, {}) if isinstance(current_layers.get(layer), dict) else {},
-            baseline_layers.get(layer, {}) if isinstance(baseline_layers.get(layer), dict) else {},
+            current_layer,
+            baseline_layer,
         )
     regressions = _comparison_regressions(summary_delta, layer_delta)
     interpretation = _comparison_interpretation(
@@ -360,9 +388,7 @@ def build_trend_report(
     history_limit: int = 12,
 ) -> dict[str, Any]:
     history = _load_report_history(limit=max(int(history_limit or 12), 2))
-    previous = [
-        item for item in history if item.get("run_id") != current.get("run_id")
-    ]
+    previous = [item for item in history if item.get("run_id") != current.get("run_id")]
     if not previous:
         return {"available": False, "reason": "not_enough_history"}
     window = [*previous[-(history_limit - 1) :], _history_entry(current)]
@@ -377,8 +403,8 @@ def build_trend_report(
 
 
 def classify_quality_change(report: dict[str, Any]) -> str:
-    comparison = report.get("comparison") if isinstance(report.get("comparison"), dict) else {}
-    trend = report.get("trend") if isinstance(report.get("trend"), dict) else {}
+    comparison = _dict_or_empty(report.get("comparison"))
+    trend = _dict_or_empty(report.get("trend"))
     if comparison.get("available"):
         interpretation = str(comparison.get("interpretation") or "")
         if interpretation in {
@@ -388,7 +414,10 @@ def classify_quality_change(report: dict[str, Any]) -> str:
             return interpretation
         if "prompt_pressure" in interpretation:
             return "prompt_more_aggressive_not_clear_gain"
-        if "cost_regression" in interpretation or "latency_regression" in interpretation:
+        if (
+            "cost_regression" in interpretation
+            or "latency_regression" in interpretation
+        ):
             return "cost_or_latency_regression_without_clear_gain"
         if comparison.get("regression_count"):
             return "metric_regression"
@@ -400,7 +429,7 @@ def classify_quality_change(report: dict[str, Any]) -> str:
 
 
 def render_eval_report_markdown(report: dict[str, Any]) -> str:
-    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    summary = _dict_or_empty(report.get("summary"))
     lines = [
         f"# ChatInter Eval Report {report.get('run_id', '')}",
         "",
@@ -409,18 +438,26 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
         f"- case_coverage: {summary.get('case_coverage')}",
         f"- pass_rate: {summary.get('pass_rate')}",
         f"- hit_rate: {summary.get('hit_rate')}",
+        f"- retrieval_hit_rate: {summary.get('retrieval_hit_rate')}",
         f"- false_trigger_rate: {summary.get('false_trigger_rate')}",
+        f"- task_coverage_rate: {summary.get('task_coverage_rate')}",
         f"- tool_call_pressure: {summary.get('tool_call_pressure')}",
+        f"- avg_steps: {summary.get('avg_steps')}",
         f"- avg_latency_ms: {summary.get('avg_latency_ms')}",
+        f"- p95_latency_ms: {summary.get('p95_latency_ms')}",
         f"- avg_prompt_tokens: {summary.get('avg_prompt_tokens')}",
         f"- quality_verdict: {report.get('quality_verdict', '')}",
         "",
         "## Layers",
         "",
-        "| layer | cases | matched | pass_rate | hit_rate | false_trigger_rate | tool_pressure | avg_latency_ms | avg_prompt_tokens |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        (
+            "| layer | cases | matched | pass_rate | hit_rate | "
+            "retrieval_hit_rate | false_trigger_rate | task_coverage_rate | "
+            "tool_pressure | avg_steps | p95_latency_ms | avg_prompt_tokens |"
+        ),
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    layers = report.get("layers") if isinstance(report.get("layers"), dict) else {}
+    layers = _dict_or_empty(report.get("layers"))
     for layer, payload in sorted(layers.items()):
         if not isinstance(payload, dict):
             continue
@@ -433,15 +470,20 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
                     str(payload.get("matched_count", 0)),
                     str(payload.get("pass_rate")),
                     str(payload.get("hit_rate")),
+                    str(payload.get("retrieval_hit_rate")),
                     str(payload.get("false_trigger_rate")),
+                    str(payload.get("task_coverage_rate")),
                     str(payload.get("tool_call_pressure")),
-                    str(payload.get("avg_latency_ms")),
+                    str(payload.get("avg_steps")),
+                    str(payload.get("p95_latency_ms")),
                     str(payload.get("avg_prompt_tokens")),
                 ]
             )
             + " |"
         )
-    failures = report.get("failures") if isinstance(report.get("failures"), list) else []
+    failures = (
+        report.get("failures") if isinstance(report.get("failures"), list) else []
+    )
     missing_cases = (
         report.get("missing_cases")
         if isinstance(report.get("missing_cases"), list)
@@ -456,7 +498,8 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
                 continue
             lines.append(
                 f"- `{failure.get('case_id', '')}` [{failure.get('layer', '')}] "
-                f"{failure.get('reason', '')} / input: {failure.get('input_message', '')}"
+                f"{failure.get('reason', '')} / input: "
+                f"{failure.get('input_message', '')}"
             )
             evidence = failure.get("failure_evidence")
             if isinstance(evidence, dict):
@@ -478,8 +521,12 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
                 f"- `{item.get('case_id', '')}` [{item.get('layer', '')}] "
                 f"input: {item.get('input_message', '')}"
             )
-    comparison = report.get("comparison") if isinstance(report.get("comparison"), dict) else {}
-    regressions = comparison.get("regressions") if isinstance(comparison.get("regressions"), list) else []
+    comparison = _dict_or_empty(report.get("comparison"))
+    regressions = (
+        comparison.get("regressions")
+        if isinstance(comparison.get("regressions"), list)
+        else []
+    )
     lines.extend(["", "## Comparison", ""])
     if not comparison.get("available"):
         lines.append(str(comparison.get("reason", "baseline_not_found")))
@@ -498,14 +545,16 @@ def render_eval_report_markdown(report: dict[str, Any]) -> str:
                 f"{item.get('baseline')} -> {item.get('current')} "
                 f"(delta {item.get('delta')})"
             )
-    trend = report.get("trend") if isinstance(report.get("trend"), dict) else {}
+    trend = _dict_or_empty(report.get("trend"))
     lines.extend(["", "## Trend", ""])
     if not trend.get("available"):
         lines.append(str(trend.get("reason", "trend_history_not_available")))
     else:
         lines.append(f"window_size: {trend.get('window_size')}")
         lines.append(f"interpretation: {trend.get('interpretation')}")
-        for item in trend.get("signals", []) if isinstance(trend.get("signals"), list) else []:
+        for item in (
+            trend.get("signals", []) if isinstance(trend.get("signals"), list) else []
+        ):
             if isinstance(item, dict):
                 lines.append(
                     f"- `{item.get('metric')}`: {item.get('first')} -> "
@@ -563,7 +612,11 @@ def _case_passed(
         return True, "continuation_handled"
     if expectation == "superuser_task":
         allow_paused = bool(case.get("allow_paused"))
-        if status == "paused" and allow_paused and tool_call_count >= max(1, min_tool_calls):
+        if (
+            status == "paused"
+            and allow_paused
+            and tool_call_count >= max(1, min_tool_calls)
+        ):
             return True, "superuser_task_paused_safely"
         if status != "completed":
             return False, "superuser_task_not_completed"
@@ -591,14 +644,21 @@ def _summarize_bucket(case_results: list[dict[str, Any]]) -> dict[str, Any]:
     hit_known = [item for item in matched if item.get("hit") is not None]
     hit_ok = [item for item in hit_known if item.get("hit") is True]
     false_triggers = [item for item in matched if item.get("false_trigger")]
-    multi_known = [item for item in matched if item.get("multi_task_covered") is not None]
+    multi_known = [
+        item for item in matched if item.get("multi_task_covered") is not None
+    ]
     multi_ok = [item for item in multi_known if item.get("multi_task_covered")]
+    retrieval_known = [
+        item for item in matched if item.get("retrieval_hit") is not None
+    ]
+    retrieval_ok = [item for item in retrieval_known if item.get("retrieval_hit")]
+    task_known = [item for item in matched if item.get("task_covered") is not None]
+    task_ok = [item for item in task_known if item.get("task_covered")]
     superuser = [item for item in matched if item.get("layer") == "superuser_long_task"]
     superuser_ok_or_paused = [
-        item
-        for item in superuser
-        if item.get("status") in {"completed", "paused"}
+        item for item in superuser if item.get("status") in {"completed", "paused"}
     ]
+    latencies = sorted(_int(item.get("latency_ms")) for item in matched)
     return {
         "case_count": total,
         "matched_count": len(matched),
@@ -608,8 +668,10 @@ def _summarize_bucket(case_results: list[dict[str, Any]]) -> dict[str, Any]:
         "case_coverage": _rate(len(matched), total),
         "pass_rate": _rate(len(passed), len(matched)),
         "hit_rate": _rate(len(hit_ok), len(hit_known)),
+        "retrieval_hit_rate": _rate(len(retrieval_ok), len(retrieval_known)),
         "false_trigger_rate": _rate(len(false_triggers), len(matched)),
         "multi_coverage_rate": _rate(len(multi_ok), len(multi_known)),
+        "task_coverage_rate": _rate(len(task_ok), len(task_known)),
         "superuser_completion_or_pause_rate": _rate(
             len(superuser_ok_or_paused),
             len(superuser),
@@ -618,8 +680,13 @@ def _summarize_bucket(case_results: list[dict[str, Any]]) -> dict[str, Any]:
             sum(_int(item.get("latency_ms")) for item in matched),
             len(matched),
         ),
+        "p95_latency_ms": _percentile(latencies, 0.95),
         "avg_prompt_tokens": _avg(
             sum(_int(item.get("prompt_tokens")) for item in matched),
+            len(matched),
+        ),
+        "avg_steps": _avg(
+            sum(_int(item.get("steps")) for item in matched),
             len(matched),
         ),
         "avg_tool_calls": _avg(
@@ -661,6 +728,7 @@ def _cost_latency_bucket(items: list[dict[str, Any]]) -> dict[str, Any]:
             "avg": _avg(sum(latencies), len(latencies)),
             "p50": _percentile(latencies, 0.50),
             "p90": _percentile(latencies, 0.90),
+            "p95": _percentile(latencies, 0.95),
             "max": latencies[-1] if latencies else None,
         },
         "prompt_tokens": {
@@ -713,6 +781,53 @@ def _threshold_checks(
             }
         )
     return checks
+
+
+def _ci_summary(
+    *,
+    summary: dict[str, Any],
+    layers: dict[str, dict[str, Any]],
+    checks: dict[str, Any],
+    failures: list[dict[str, Any]],
+    missing_cases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failed_checks = _list_or_empty(checks.get("failed"))
+    return {
+        "passed": bool(checks.get("passed")) and not failures,
+        "key_metrics": {
+            key: summary.get(key)
+            for key in (
+                "case_coverage",
+                "pass_rate",
+                "hit_rate",
+                "retrieval_hit_rate",
+                "false_trigger_rate",
+                "task_coverage_rate",
+                "avg_steps",
+                "p95_latency_ms",
+            )
+        },
+        "layers": {
+            layer: {
+                key: payload.get(key)
+                for key in (
+                    "case_coverage",
+                    "pass_rate",
+                    "hit_rate",
+                    "retrieval_hit_rate",
+                    "false_trigger_rate",
+                    "task_coverage_rate",
+                    "avg_steps",
+                    "p95_latency_ms",
+                )
+            }
+            for layer, payload in sorted(layers.items())
+            if isinstance(payload, dict)
+        },
+        "failure_count": len(failures),
+        "missing_count": len(missing_cases),
+        "failed_checks": failed_checks[:20],
+    }
 
 
 def _records_by_input(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -776,7 +891,11 @@ def _ok_action_observation_count(observations: list[dict[str, Any]]) -> int:
         command_id = _normalize_text(str(item.get("command_id") or ""))
         tool_name = _normalize_text(str(item.get("tool_name") or ""))
         status = _normalize_text(str(item.get("status") or ""))
-        if tool_name in {"retrieve_plugin_commands", "runtime_event_list", "runtime_event_read"}:
+        if tool_name in {
+            "retrieve_plugin_commands",
+            "runtime_event_list",
+            "runtime_event_read",
+        }:
             continue
         if command_id or status not in {"retrieved", "capability_candidates_retrieved"}:
             count += 1
@@ -820,11 +939,21 @@ def _persist_eval_report(
         failure_summary_path = paths.failures / f"{run_id}_summary.json"
         latest_failure_index = paths.failures / "latest_failure_summary.json"
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for failure in report.get("failures", []) if isinstance(report.get("failures"), list) else []:
+        for failure in (
+            report.get("failures", [])
+            if isinstance(report.get("failures"), list)
+            else []
+        ):
             payload = {"kind": "failure", **failure}
             _append_jsonl(failure_path, payload)
-            grouped.setdefault(str(failure.get("reason") or "unknown"), []).append(payload)
-        for missing in report.get("missing_cases", []) if isinstance(report.get("missing_cases"), list) else []:
+            grouped.setdefault(str(failure.get("reason") or "unknown"), []).append(
+                payload
+            )
+        for missing in (
+            report.get("missing_cases", [])
+            if isinstance(report.get("missing_cases"), list)
+            else []
+        ):
             payload = {"kind": "missing", **missing}
             _append_jsonl(failure_path, payload)
             grouped.setdefault("missing_trajectory", []).append(payload)
@@ -894,10 +1023,8 @@ def _load_report_history(*, limit: int = 20) -> list[dict[str, Any]]:
 
 
 def _history_entry(report: dict[str, Any]) -> dict[str, Any]:
-    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
-    comparison = (
-        report.get("comparison") if isinstance(report.get("comparison"), dict) else {}
-    )
+    summary = _dict_or_empty(report.get("summary"))
+    comparison = _dict_or_empty(report.get("comparison"))
     return {
         "schema_version": HARNESS_SCHEMA_VERSION,
         "run_id": report.get("run_id"),
@@ -911,10 +1038,14 @@ def _history_entry(report: dict[str, Any]) -> dict[str, Any]:
                 "case_coverage",
                 "pass_rate",
                 "hit_rate",
+                "retrieval_hit_rate",
                 "false_trigger_rate",
                 "multi_coverage_rate",
+                "task_coverage_rate",
                 "tool_call_pressure",
+                "avg_steps",
                 "avg_latency_ms",
+                "p95_latency_ms",
                 "avg_prompt_tokens",
             ]
         },
@@ -928,8 +1059,8 @@ def _history_entry(report: dict[str, Any]) -> dict[str, Any]:
 def _trend_signals(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(history) < 2:
         return []
-    first = history[0].get("summary") if isinstance(history[0].get("summary"), dict) else {}
-    latest = history[-1].get("summary") if isinstance(history[-1].get("summary"), dict) else {}
+    first = _dict_or_empty(history[0].get("summary"))
+    latest = _dict_or_empty(history[-1].get("summary"))
     signals: list[dict[str, Any]] = []
     for metric in _DEFAULT_COMPARE_KEYS:
         old = first.get(metric)
@@ -993,8 +1124,16 @@ def _render_trend_markdown(trend: dict[str, Any]) -> str:
         return "\n".join(lines) + "\n"
     lines.append(f"- window_size: {trend.get('window_size')}")
     lines.append(f"- interpretation: {trend.get('interpretation')}")
-    lines.extend(["", "| metric | first | latest | delta | direction |", "|---|---:|---:|---:|---|"])
-    for item in trend.get("signals", []) if isinstance(trend.get("signals"), list) else []:
+    lines.extend(
+        [
+            "",
+            "| metric | first | latest | delta | direction |",
+            "|---|---:|---:|---:|---|",
+        ]
+    )
+    for item in (
+        trend.get("signals", []) if isinstance(trend.get("signals"), list) else []
+    ):
         if not isinstance(item, dict):
             continue
         lines.append(
@@ -1022,7 +1161,10 @@ def _comparison_regressions(
     layer_delta: dict[str, Any],
 ) -> list[dict[str, Any]]:
     regressions: list[dict[str, Any]] = []
-    for scope, delta_map in [("global", summary_delta), *[(f"layer:{k}", v) for k, v in layer_delta.items()]]:
+    for scope, delta_map in [
+        ("global", summary_delta),
+        *[(f"layer:{k}", v) for k, v in layer_delta.items()],
+    ]:
         if not isinstance(delta_map, dict):
             continue
         for metric, payload in delta_map.items():
@@ -1064,9 +1206,15 @@ def _comparison_interpretation(
     token_delta = _delta_value(summary_delta, "avg_prompt_tokens")
     if regressions:
         if pressure_delta > 0.5 and pass_delta <= 0.02:
-            return "possible_prompt_pressure: more tool calls without meaningful pass-rate gain"
+            return (
+                "possible_prompt_pressure: more tool calls without meaningful "
+                "pass-rate gain"
+            )
         if token_delta > 1500 and pass_delta <= 0.02:
-            return "possible_cost_regression: higher token spend without clear ability gain"
+            return (
+                "possible_cost_regression: higher token spend without clear ability "
+                "gain"
+            )
         if latency_delta > 1500 and pass_delta <= 0.02:
             return "possible_latency_regression: slower without clear ability gain"
         return "metric_regression_detected"
@@ -1113,7 +1261,9 @@ def _failure_evidence(
     return {
         "trace_id": _normalize_text(str(record.get("trace_id", "") or "")),
         "selected_tools": _text_list(record.get("selected_tools"))[:6],
-        "tool_obligation": _normalize_text(str(record.get("tool_obligation", "") or "")),
+        "tool_obligation": _normalize_text(
+            str(record.get("tool_obligation", "") or "")
+        ),
         "stop_reason": _normalize_text(str(record.get("stop_reason", "") or "")),
         "errors": errors[:3],
         "final_reply": _clip(str(record.get("final_reply", "") or ""), limit=180),
@@ -1125,7 +1275,11 @@ def _normalize_case(payload: dict[str, Any]) -> dict[str, Any]:
     input_message = _normalize_text(str(payload.get("input_message") or ""))
     layer = _normalize_text(str(payload.get("layer") or "unknown")) or "unknown"
     expectation = _normalize_text(str(payload.get("expectation") or "")) or layer
-    tags = [_normalize_text(str(tag or "")) for tag in payload.get("tags", []) if _normalize_text(str(tag or ""))]
+    tags = [
+        _normalize_text(str(tag or ""))
+        for tag in payload.get("tags", [])
+        if _normalize_text(str(tag or ""))
+    ]
     return {
         **payload,
         "id": case_id or uuid.uuid5(uuid.NAMESPACE_URL, input_message).hex[:12],
@@ -1178,7 +1332,9 @@ def _merge_default_thresholds(path: Path) -> None:
     _write_json(path, merged)
 
 
-def _merge_thresholds(default: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+def _merge_thresholds(
+    default: dict[str, Any], override: dict[str, Any]
+) -> dict[str, Any]:
     result = json.loads(json.dumps(default, ensure_ascii=False))
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
@@ -1221,14 +1377,15 @@ def _load_trajectory_records(*, path: Path, limit: int) -> list[dict[str, Any]]:
 
 
 def _trajectory_metrics(record: dict[str, Any]) -> dict[str, Any]:
-    evaluation = record.get("evaluation") if isinstance(record.get("evaluation"), dict) else {}
-    latency = record.get("latency") if isinstance(record.get("latency"), dict) else {}
-    token = record.get("token") if isinstance(record.get("token"), dict) else {}
+    evaluation = _dict_or_empty(record.get("evaluation"))
+    latency = _dict_or_empty(record.get("latency"))
+    token = _dict_or_empty(record.get("token"))
     scenario = _normalize_text(str(record.get("scenario") or "unknown"))
     obligation = _normalize_text(str(record.get("tool_obligation") or "none"))
     selected_tools = _text_list(record.get("selected_tools"))
     observations = _dict_list(record.get("observations"))
-    task_ledger = record.get("task_ledger") if isinstance(record.get("task_ledger"), dict) else {}
+    task_ledger = _dict_or_empty(record.get("task_ledger"))
+    coverage = _task_coverage(record, task_ledger)
     return {
         "trace_id": _normalize_text(str(record.get("trace_id") or "")),
         "run_id": _normalize_text(str(record.get("run_id") or "")),
@@ -1236,17 +1393,27 @@ def _trajectory_metrics(record: dict[str, Any]) -> dict[str, Any]:
         "layer": _layer_for_record(record, scenario=scenario),
         "agent_mode": _normalize_text(str(record.get("agent_mode") or "")),
         "status": _normalize_text(str(record.get("status") or "")),
-        "tool_obligation": obligation if obligation in {"none", "auto", "required"} else "none",
+        "tool_obligation": obligation
+        if obligation in {"none", "auto", "required"}
+        else "none",
         "hit": _optional_bool(record.get("hit", evaluation.get("hit"))),
-        "false_trigger": bool(record.get("false_trigger", evaluation.get("false_trigger", False))),
+        "false_trigger": bool(
+            record.get("false_trigger", evaluation.get("false_trigger", False))
+        ),
         "multi_task_covered": _optional_bool(
             record.get("multi_task_covered", evaluation.get("multi_task_covered"))
         ),
         "latency_ms": _int(latency.get("total_ms")),
         "prompt_tokens": _int(token.get("prompt_estimated")),
         "steps": _int(record.get("steps")),
-        "tool_call_count": _int(evaluation.get("tool_call_count"), fallback=len(selected_tools)),
-        "observation_count": _int(evaluation.get("observation_count"), fallback=len(observations)),
+        "tool_call_count": _int(
+            evaluation.get("tool_call_count"), fallback=len(selected_tools)
+        ),
+        "observation_count": _int(
+            evaluation.get("observation_count"), fallback=len(observations)
+        ),
+        "retrieval_hit": _retrieval_hit(record, selected_tools, observations),
+        "task_covered": coverage,
         "selected_tools": selected_tools,
         "plugins": _plugins_for_record(record, observations),
         "task_count": _task_count(task_ledger),
@@ -1258,9 +1425,7 @@ def _layer_for_record(record: dict[str, Any], *, scenario: str) -> str:
         return "superuser_long_task"
     obligation = _normalize_text(str(record.get("tool_obligation") or "none"))
     selected_tools = _text_list(record.get("selected_tools"))
-    task_count = _task_count(
-        record.get("task_ledger") if isinstance(record.get("task_ledger"), dict) else {}
-    )
+    task_count = _task_count(_dict_or_empty(record.get("task_ledger")))
     if task_count > 1:
         return "multi_tool"
     if scenario in {"group_plugin_selector", "tool_run"}:
@@ -1293,6 +1458,54 @@ def _plugins_for_record(
 def _task_count(task_ledger: dict[str, Any]) -> int:
     tasks = task_ledger.get("tasks") if isinstance(task_ledger, dict) else None
     return len(tasks) if isinstance(tasks, list) else 0
+
+
+def _retrieval_hit(
+    record: dict[str, Any],
+    selected_tools: list[str],
+    observations: list[dict[str, Any]],
+) -> bool | None:
+    exposed_tools = _dict_list(record.get("exposed_tools"))
+    expected = _normalize_text(str(record.get("eval_expected_tool") or ""))
+    if not expected:
+        required = _text_list(record.get("required_tool_names"))
+        expected = required[0] if required else ""
+    if expected:
+        names = set(selected_tools)
+        for observation in observations:
+            for key in ("tool_name", "command_id", "matched_plugin"):
+                value = _normalize_text(str(observation.get(key) or ""))
+                if value:
+                    names.add(value)
+        for item in exposed_tools:
+            value = _normalize_text(str(item.get("tool_name") or ""))
+            if value:
+                names.add(value)
+        return expected in names
+    if record.get("hit") is not None:
+        return _optional_bool(record.get("hit"))
+    if selected_tools:
+        return True
+    if exposed_tools:
+        return True
+    return None
+
+
+def _task_coverage(record: dict[str, Any], task_ledger: dict[str, Any]) -> bool | None:
+    value = record.get("multi_task_covered")
+    if value is not None:
+        return _optional_bool(value)
+    tasks = task_ledger.get("tasks") if isinstance(task_ledger, dict) else None
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    terminal = {"completed", "unsupported", "blocked"}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = _normalize_text(str(task.get("status") or ""))
+        if status and status not in terminal:
+            return False
+    return True
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -1373,13 +1586,25 @@ def _normalize_text(value: Any) -> str:
 def _text_list(value: Any) -> list[str]:
     if not isinstance(value, list | tuple):
         return []
-    return [_normalize_text(str(item or "")) for item in value if _normalize_text(str(item or ""))]
+    return [
+        _normalize_text(str(item or ""))
+        for item in value
+        if _normalize_text(str(item or ""))
+    ]
 
 
 def _dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list | tuple):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _list_or_empty(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list | tuple) else []
 
 
 def _int(value: Any, *, fallback: int = 0) -> int:
@@ -1426,7 +1651,9 @@ def _clip(value: str, *, limit: int) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run ChatInter trajectory eval harness")
+    parser = argparse.ArgumentParser(
+        description="Run ChatInter trajectory eval harness"
+    )
     parser.add_argument("--trajectory-path", default="")
     parser.add_argument("--dataset", default="")
     parser.add_argument("--thresholds", default="")
@@ -1435,6 +1662,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-name", default="")
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--no-archive-failures", action="store_true")
+    parser.add_argument("--ci-summary", default="")
     args = parser.parse_args(argv)
     report = run_eval_harness(
         trajectory_path=args.trajectory_path or None,
@@ -1446,7 +1674,11 @@ def main(argv: list[str] | None = None) -> int:
         write_baseline=args.write_baseline,
         archive_failures=not args.no_archive_failures,
     )
-    print(json.dumps(_to_jsonable(report["summary"]), ensure_ascii=False, indent=2))
+    if args.ci_summary:
+        _write_json(Path(args.ci_summary), report.get("ci_summary", {}))
+    sys.stdout.write(
+        json.dumps(_to_jsonable(report["summary"]), ensure_ascii=False, indent=2) + "\n"
+    )
     return 0 if report.get("passed") else 1
 
 
@@ -1457,9 +1689,9 @@ if __name__ == "__main__":
 __all__ = [
     "HARNESS_SCHEMA_VERSION",
     "build_eval_report",
-    "compare_eval_reports",
     "build_trend_report",
     "classify_quality_change",
+    "compare_eval_reports",
     "ensure_eval_harness_files",
     "eval_harness_paths",
     "evaluate_case",

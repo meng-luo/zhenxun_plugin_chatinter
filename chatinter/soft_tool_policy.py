@@ -152,9 +152,15 @@ def soft_tool_policy_reason(candidate: Any) -> str:
     schema = getattr(candidate, "schema", None)
     snapshot = getattr(candidate, "tool", None)
     if snapshot is not None:
-        side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
-        output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-        risk_level = normalize_message_text(str(getattr(snapshot, "risk_level", "") or ""))
+        side_effect = normalize_message_text(
+            str(getattr(snapshot, "side_effect", "") or "")
+        )
+        output_mode = normalize_message_text(
+            str(getattr(snapshot, "output_mode", "") or "")
+        )
+        risk_level = normalize_message_text(
+            str(getattr(snapshot, "risk_level", "") or "")
+        )
         if side_effect or output_mode or risk_level:
             return (
                 "explicit_request_only:"
@@ -269,20 +275,18 @@ def request_strength_for_candidate(
     normalized = normalize_message_text(message_text)
     stripped = normalize_message_text(strip_invoke_prefix(normalized))
     if not stripped:
-        return ToolRequestStrength(score=0.0, explicit=False, direct_mention=False, exact_command=False)
-    request_text = normalize_message_text(
-        " ".join(
-            part
-            for part in (normalized, stripped)
-            if part and part != stripped
+        return ToolRequestStrength(
+            score=0.0, explicit=False, direct_mention=False, exact_command=False
         )
+    request_text = normalize_message_text(
+        " ".join(part for part in (normalized, stripped) if part and part != stripped)
         or stripped
     )
 
     phrases = _candidate_phrases(candidate)
-    exact_command = any(_matches_exact_command(stripped, phrase) for phrase in phrases) or bool(
-        getattr(candidate, "exact_protected", False)
-    )
+    exact_command = any(
+        _matches_exact_command(stripped, phrase) for phrase in phrases
+    ) or bool(getattr(candidate, "exact_protected", False))
     snapshot = getattr(candidate, "tool", None)
     intent_types = _candidate_intent_types(candidate)
     matched_intents = _matched_request_intents(
@@ -290,7 +294,9 @@ def request_strength_for_candidate(
         intent_types,
         task_verbs=_candidate_task_verbs(candidate),
     )
-    direct_mention = any(_phrase_mentions_command(request_text, phrase) for phrase in phrases)
+    direct_mention = any(
+        _phrase_mentions_command(request_text, phrase) for phrase in phrases
+    )
     action_aligned_mention = bool(
         direct_mention
         and (
@@ -463,13 +469,10 @@ def should_catalog_only_candidate(
         candidate,
         message_text=message_text,
     )
-    if (
-        context_profile.total_count >= 2
-        and (
-            context_profile.false_trigger_rate >= 0.35
-            or context_profile.param_failure_rate >= 0.5
-            or context_profile.success_rate < 0.35
-        )
+    if context_profile.total_count >= 2 and (
+        context_profile.false_trigger_rate >= 0.35
+        or context_profile.param_failure_rate >= 0.5
+        or context_profile.success_rate < 0.35
     ):
         return True
     if normalize_message_text(message_text):
@@ -482,16 +485,10 @@ def should_catalog_only_candidate(
             if false_trigger_score > -8.0:
                 return False
     profile = _candidate_feedback_profile(candidate)
-    return (
-        profile.total_count >= 5
-        and (
-            profile.param_failure_rate >= 0.45
-            or profile.false_trigger_rate >= 0.22
-            or (
-                profile.avg_latency_ms >= 18000.0
-                and profile.success_rate < 0.68
-            )
-        )
+    return profile.total_count >= 5 and (
+        profile.param_failure_rate >= 0.45
+        or profile.false_trigger_rate >= 0.22
+        or (profile.avg_latency_ms >= 18000.0 and profile.success_rate < 0.68)
     )
 
 
@@ -507,7 +504,9 @@ def _schema_strength(schema: Any, *, snapshot: Any | None = None) -> float:
     requires = dict(getattr(schema, "requires", {}) or {})
     if any(bool(requires.get(key)) for key in ("text", "image", "reply", "at")):
         strength += 2.0
-    payload_policy = normalize_message_text(str(getattr(schema, "payload_policy", "") or ""))
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    )
     if payload_policy not in {"", "none"}:
         strength += 1.5
     source = normalize_message_text(str(getattr(schema, "source", "") or ""))
@@ -544,8 +543,12 @@ def _risk_bonus(snapshot: Any | None) -> float:
     # Higher risk/capability tools are not "more desirable"; the bonus only keeps
     # concrete external-action tools above vague soft text tools when already
     # recalled for an explicit user request.
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
     bonus = 0.0
     if output_mode in {"image", "file", "action"}:
         bonus += 1.0
@@ -571,8 +574,12 @@ def _candidate_is_visible_real_output(candidate: Any) -> bool:
     snapshot = getattr(candidate, "tool", None)
     if snapshot is None:
         return False
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
     return (
         output_mode in {"image", "file", "plugin_output", "action"}
         or side_effect in {"query", "send", "mutate"}
@@ -623,7 +630,7 @@ def _matched_request_intents(
         "help": _GENERIC_HELP_TERMS,
         "transform": ("翻译", "转换", "转成", "识别", "解析"),
         "mutate": ("添加", "新增", "创建", "设置", "修改", "删除", "绑定"),
-        "send": _GENERIC_GENERATE_TERMS + ("发给", "通知", "推送"),
+        "send": (*_GENERIC_GENERATE_TERMS, "发给", "通知", "推送"),
         "execute": _GENERIC_EXECUTION_TERMS,
         "play": _GENERIC_PLAY_TERMS,
     }
@@ -755,7 +762,7 @@ __all__ = [
     "is_soft_command_schema",
     "request_strength_for_candidate",
     "should_catalog_only_candidate",
-    "sort_exposure_candidates",
     "soft_tool_allowed_for_message",
     "soft_tool_policy_reason",
+    "sort_exposure_candidates",
 ]

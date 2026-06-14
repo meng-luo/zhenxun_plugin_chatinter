@@ -230,7 +230,9 @@ def bind_patch_operation(
     previous_operation_id = loop.patch_operation_id
     loop.patch_operation_id = str(operation_id or "")
     if operation is not None:
-        loop.files = _dedupe([*loop.files, *[item.path for item in operation.snapshots]])
+        loop.files = _dedupe(
+            [*loop.files, *[item.path for item in operation.snapshots]]
+        )
         if (
             (
                 loop.stage in {"eval_failed", "diagnosed", "second_patch_prepared"}
@@ -258,10 +260,14 @@ def bind_patch_operation(
             loop.stage = "second_patch_prepared"
         elif loop.attempt > 0 and operation.status == "applied":
             loop.stage = "second_patch_applied"
-        elif loop.attempt > 0 or previous_operation_id != loop.patch_operation_id and loop.diagnosis:
+        elif loop.attempt > 0 or (
+            previous_operation_id != loop.patch_operation_id and loop.diagnosis
+        ):
             loop.stage = "second_patch_prepared"
         else:
-            loop.stage = "patch_applied" if operation.status == "applied" else "patch_prepared"
+            loop.stage = (
+                "patch_applied" if operation.status == "applied" else "patch_prepared"
+            )
     else:
         loop.stage = "patch_prepared"
     loop.append_event(
@@ -351,9 +357,7 @@ def diagnose_eval_failure(
     failure: dict[str, Any] = {}
     if eval_run is not None:
         failure = (
-            eval_run.failure_observations[-1]
-            if eval_run.failure_observations
-            else {}
+            eval_run.failure_observations[-1] if eval_run.failure_observations else {}
         )
         loop.recovery_plan = dict(
             eval_run.recovery_plan or failure.get("recovery_plan") or {}
@@ -410,7 +414,9 @@ def mark_loop_rolled_back(
     return loop
 
 
-def complete_engineering_loop(*, loop_id: str, reason: str = "") -> EngineeringLoop | None:
+def complete_engineering_loop(
+    *, loop_id: str, reason: str = ""
+) -> EngineeringLoop | None:
     loop = get_engineering_loop(loop_id)
     if loop is None:
         return None
@@ -468,7 +474,8 @@ def eval_gate(*, loop_id: str) -> dict[str, Any]:
             ),
             "protocol_hint": (
                 "先调用 engineering_failure_diagnose 固化失败诊断，再根据 diagnosis "
-                "选择 engineering_lsp_read、semantic_patch_plan、patch_prepare 或 patch_rollback。"
+                "选择 engineering_lsp_read、semantic_patch_plan、"
+                "patch_prepare 或 patch_rollback。"
                 if not loop.diagnosis
                 else "按 diagnosis.allowed_next_tools 执行，不要重复无变化测试。"
             ),
@@ -574,9 +581,7 @@ def build_failure_diagnosis(
     notes: str = "",
 ) -> dict[str, Any]:
     recovery = dict(
-        failure_observation.get("recovery_plan")
-        or loop.recovery_plan
-        or {}
+        failure_observation.get("recovery_plan") or loop.recovery_plan or {}
     )
     recommended = str(
         recovery.get("recommended_action")

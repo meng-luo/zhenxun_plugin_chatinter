@@ -1,4 +1,4 @@
-﻿"""ChatInter event entrypoint."""
+"""ChatInter event entrypoint."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.services import logger
 
 from .config import get_config_value, get_model_name
+from .event_signals import get_event_signal, set_event_signal
 from .event_runtime import (
     get_nickname,
     is_already_handled,
@@ -81,7 +82,9 @@ async def handle_fallback(
         scenario_reason=scenario_route.reason,
     )
     frame.turn_messages = _coerce_text_list(
-        turn_messages if turn_messages is not None else getattr(
+        turn_messages
+        if turn_messages is not None
+        else getattr(
             event,
             "_chatinter_turn_messages",
             [],
@@ -90,7 +93,7 @@ async def handle_fallback(
     pending_updates_value = (
         pending_human_updates
         if pending_human_updates is not None
-        else getattr(event, "_chatinter_pending_human_updates", [])
+        else get_event_signal(event, "_chatinter_pending_human_updates", [])
     )
     frame.pending_human_updates = (
         pending_updates_value
@@ -98,7 +101,9 @@ async def handle_fallback(
         else _coerce_text_list(pending_updates_value)
     )
     try:
-        frame.turn_priority = int(getattr(event, "_chatinter_turn_priority", 0) or 0)
+        frame.turn_priority = int(
+            get_event_signal(event, "_chatinter_turn_priority", 0) or 0
+        )
     except (TypeError, ValueError):
         frame.turn_priority = 0
     if not queued:
@@ -156,19 +161,16 @@ def _attach_turn_runtime_attrs(
 ) -> None:
     if turn_messages is None and pending_human_updates is None:
         return
-    try:
-        if turn_messages is not None:
-            setattr(event, "_chatinter_turn_queued", True)
-            setattr(event, "_chatinter_turn_merged", len(turn_messages) > 1)
-            setattr(event, "_chatinter_turn_messages", list(turn_messages))
-        if pending_human_updates is not None:
-            setattr(
-                event,
-                "_chatinter_pending_human_updates",
-                pending_human_updates,
-            )
-    except Exception:
-        pass
+    if turn_messages is not None:
+        set_event_signal(event, "_chatinter_turn_queued", True)
+        set_event_signal(event, "_chatinter_turn_merged", len(turn_messages) > 1)
+        set_event_signal(event, "_chatinter_turn_messages", list(turn_messages))
+    if pending_human_updates is not None:
+        set_event_signal(
+            event,
+            "_chatinter_pending_human_updates",
+            pending_human_updates,
+        )
 
 
 def _coerce_text_list(value) -> list[str]:

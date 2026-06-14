@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
 import json
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -44,8 +44,9 @@ class AgentVerifier:
         model_name: str | None,
         generation_config: Any,
         timeout: float,
+        ai: Any | None = None,
     ) -> None:
-        self.ai = AI(session_id=f"chatinter-verifier:{trace_id}")
+        self.ai = ai or AI(session_id=f"chatinter-verifier:{trace_id}")
         self.model_name = model_name
         self.generation_config = generation_config
         self.timeout = max(4.0, min(float(timeout or 10.0), 16.0))
@@ -59,6 +60,13 @@ class AgentVerifier:
     ) -> TaskVerificationResult:
         if graph is None or not graph.tasks:
             return TaskVerificationResult(reason="no_task_graph")
+        local_result = _local_verify_observation(
+            graph=graph,
+            observation=observation,
+            available_tools=available_tools,
+        )
+        if local_result is not None:
+            return local_result
         payload = {
             "mode": "after_observation",
             "task_graph": graph.to_public_payload(),
@@ -66,6 +74,10 @@ class AgentVerifier:
             "available_tools": available_tools[:40],
         }
         result = await self._judge(payload)
+        _complete_exact_observation_task(
+            graph=graph,
+            observation=observation,
+        )
         _apply_updates(graph, result, observation=observation)
         return result
 
@@ -134,6 +146,86 @@ def _apply_updates(
         if observation is not None:
             task.add_observation(_observation_payload(observation))
     graph.refresh_status()
+
+
+def _local_verify_observation(
+    *,
+    graph: TaskGraph,
+    observation: AgentObservation,
+    available_tools: list[dict[str, Any]],
+) -> TaskVerificationResult | None:
+    if not observation.ok or observation.need_continue:
+        return None
+    tool_name = normalize_message_text(observation.tool_name)
+    if not tool_name:
+        return None
+    matching_tasks = [
+        task
+        for task in graph.incomplete_tasks
+        if tool_name in {normalize_message_text(item) for item in task.required_tools}
+    ]
+    if len(matching_tasks) != 1:
+        return None
+    if not _tool_summary_is_local_exact_match(tool_name, available_tools):
+        return None
+    task = matching_tasks[0]
+    task.status = TASK_STATUS_COMPLETED
+    task.reason = "local_required_tool_match"
+    task.add_observation(_observation_payload(observation))
+    graph.refresh_status()
+    return TaskVerificationResult(
+        updates=[
+            TaskVerificationItem(
+                task_id=task.task_id,
+                status=TASK_STATUS_COMPLETED,
+                reason="local_required_tool_match",
+            )
+        ],
+        reason="local_required_tool_match",
+    )
+
+
+def _complete_exact_observation_task(
+    *,
+    graph: TaskGraph,
+    observation: AgentObservation,
+) -> None:
+    if not observation.ok or observation.need_continue:
+        return
+    task_text = normalize_message_text(observation.task_text)
+    tool_name = normalize_message_text(observation.tool_name)
+    if not task_text:
+        return
+    for task in graph.incomplete_tasks:
+        required = {normalize_message_text(item) for item in task.required_tools}
+        if tool_name and required and tool_name not in required:
+            continue
+        goal = normalize_message_text(task.goal)
+        if goal and (goal in task_text or task_text in goal):
+            task.status = TASK_STATUS_COMPLETED
+            task.reason = task.reason or "local_observation_text_match"
+            task.add_observation(_observation_payload(observation))
+            break
+    graph.refresh_status()
+
+
+def _tool_summary_is_local_exact_match(
+    tool_name: str,
+    available_tools: list[dict[str, Any]],
+) -> bool:
+    for item in available_tools:
+        if not isinstance(item, dict):
+            continue
+        if normalize_message_text(str(item.get("tool", "") or "")) != tool_name:
+            continue
+        source = normalize_message_text(str(item.get("source_of_truth", "") or ""))
+        output_mode = normalize_message_text(str(item.get("output_mode", "") or ""))
+        return source in {"bot_state", "local_state"} and output_mode in {
+            "text",
+            "plugin_output",
+            "",
+        }
+    return False
 
 
 def _observation_payload(observation: AgentObservation) -> dict[str, Any]:
@@ -205,7 +297,8 @@ _VERIFIER_INSTRUCTION = """
 - after_observation：根据 observation 判断它证明了哪些 task 的 acceptance_criteria。
 - final_check：返回仍未完成、未被 observation 证明的任务。
 - 如果工具返回 approval_required，相关任务通常是 blocked/in_progress，而不是 completed。
-- 如果后台任务刚 started，相关任务是 in_progress，直到 status completed 且 returncode=0。
+- 如果后台任务刚 started，相关任务是 in_progress。
+- 直到 status completed 且 returncode=0，才算完成。
 - 如果工具失败但可重试，任务保持 in_progress；不可重试或权限拒绝可 blocked/failed。
 - 不要创造新任务；missing_tasks 只来自 task_graph 中未完成的 goal。
 

@@ -29,6 +29,11 @@ from .command_catalog_tool import (
     CommandCatalogTool,
 )
 from .config import build_reasoning_generation_config, get_config_value, get_model_name
+from .local_direct_command import (
+    LocalDirectCommandPlan,
+    plan_local_direct_command,
+    plan_local_direct_command_batch,
+)
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_executor import (
     ExecuteNativeRoute,
@@ -52,12 +57,23 @@ from .soft_tool_policy import (
     should_catalog_only_candidate,
     sort_exposure_candidates,
 )
+from .task_coverage import (
+    TaskCoverageReport,
+    build_task_coverage_report,
+    synthesize_task_coverage_reply,
+)
+from .task_execution_queue import (
+    TaskExecutionQueue,
+)
+from .task_planner_lite import plan_task_items, task_items_to_payload
+from .task_router import TaskRouter
 from .tool_intent_gate import ToolIntentGate, ToolIntentGateResult
 from .tool_retriever import CommandToolRetriever
 from .turn_runtime import TurnBudgetController
 
 _MAIN_STAGE = "main_request"
 _TOOL_INTENT_GATE_STAGE = "tool_intent_gate"
+_DELEGATE_TASK_TOOL_NAME = "delegate_task"
 _NEGATIVE_TOOL_MARKERS = (
     "不是在让你",
     "不是让你",
@@ -261,22 +277,8 @@ async def run_chatinter_main_request(
 ) -> MainRequestResult:
     normalized_message = normalize_message_text(message_text)
     report = NativeRouteReport(helper_mode=is_usage_question(normalized_message))
-
-    if budget_controller is not None and not budget_controller.allow_classifier(
-        _MAIN_STAGE
-    ):
-        return await _finalize_result(
-            _fallback_result(
-                report=report,
-                reason="main_request_budget_exhausted",
-                reply="我现在有点忙，稍后再试试吧。",
-                timeline=[_user_timeline_item(normalized_message)],
-            ),
-            route_completed_hook=route_completed_hook,
-            reply_hook=reply_hook,
-        )
-
     started = time.perf_counter()
+
     try:
         result = await _run_main_request(
             normalized_message,
@@ -312,10 +314,7 @@ async def run_chatinter_main_request(
         )
     finally:
         if budget_controller is not None:
-            budget_controller.record_classifier(
-                _MAIN_STAGE,
-                time.perf_counter() - started,
-            )
+            budget_controller.record_stage(_MAIN_STAGE, time.perf_counter() - started)
 
 
 async def _run_main_request(
@@ -336,7 +335,9 @@ async def _run_main_request(
 ) -> MainRequestResult:
     model_name = get_model_name()
     provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
-    enable_plugin_tools = enable_plugin_tools and provider_adapter.profile.supports_tools
+    enable_plugin_tools = (
+        enable_plugin_tools and provider_adapter.profile.supports_tools
+    )
     enable_agent_tools = enable_agent_tools and provider_adapter.profile.supports_tools
     retriever = CommandToolRetriever(
         knowledge_base,
@@ -344,6 +345,8 @@ async def _run_main_request(
         tools=cast(Any, command_tools),
     )
     capability_registry = retriever.registry
+    if provider_adapter.profile.supports_tools:
+        capability_registry.register_session_search_tool()
     if enable_agent_tools:
         capability_registry.register_available_superuser_tools()
         mcp_status = await capability_registry.register_available_mcp_tools(
@@ -351,11 +354,32 @@ async def _run_main_request(
         )
     else:
         mcp_status = None
-    base_tool_count = capability_registry.executable_tool_count(
-        kind="superuser_tool",
-    ) + capability_registry.executable_tool_count(
-        kind="runtime_tool",
-    ) + (1 if enable_plugin_tools else 0)
+    task_items = plan_task_items(message_text)
+    tool_map = capability_registry.executable_tool_map()
+    complexity_decision = route_agent_complexity(
+        message_text=message_text,
+        tool_map=tool_map,
+        enable_agent_tools=enable_agent_tools,
+        local_task_count=len(task_items),
+    )
+    if _should_hide_delegate_task(
+        enable_agent_tools=enable_agent_tools,
+        complexity_mode=complexity_decision.mode,
+    ):
+        capability_registry.remove_executable_tool(
+            _DELEGATE_TASK_TOOL_NAME,
+            kind="superuser_tool",
+        )
+        tool_map = capability_registry.executable_tool_map()
+    base_tool_count = (
+        capability_registry.executable_tool_count(
+            kind="superuser_tool",
+        )
+        + capability_registry.executable_tool_count(
+            kind="runtime_tool",
+        )
+        + (1 if enable_plugin_tools else 0)
+    )
     command_tool_capacity = provider_adapter.command_tool_capacity(
         reserved_tools=base_tool_count,
     )
@@ -382,7 +406,6 @@ async def _run_main_request(
         report.candidate_total = max(report.candidate_total, retriever.total_commands)
     report.note_tool_pool(1 if enable_plugin_tools else 0)
 
-    tool_map: dict[str, ToolExecutable] = {}
     if enable_plugin_tools:
         catalog_tool = CommandCatalogTool(catalog_state)
         capability_registry.register_catalog_tool(
@@ -399,6 +422,17 @@ async def _run_main_request(
         route_executor=route_executor,
         message_text=message_text,
     )
+    direct_result = await _try_local_direct_command(
+        message_text=message_text,
+        retriever=retriever,
+        command_context=command_context,
+        report=report,
+        route_executor=route_executor,
+        budget_controller=budget_controller,
+    )
+    if direct_result is not None:
+        return direct_result
+    task_router_result = None
     if enable_plugin_tools and initial_command_exposure:
         initial_result = retriever.initial_command_exposure(
             message_text,
@@ -443,11 +477,39 @@ async def _run_main_request(
             provider_adapter=provider_adapter,
         )
         tool_map = capability_registry.executable_tool_map()
-    complexity_decision = route_agent_complexity(
-        message_text=message_text,
-        tool_map=tool_map,
-        enable_agent_tools=enable_agent_tools,
-    )
+    if task_items and enable_plugin_tools:
+        task_router_result = await TaskRouter(
+            retriever=retriever,
+            trace_id=trace_id,
+            model_name=model_name,
+            generation_config=build_reasoning_generation_config(),
+            timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
+        ).route_tasks(task_items)
+        task_queue_candidates = _candidates_for_task_routes(
+            retriever=retriever,
+            routes=list(task_router_result.routes),
+        )
+        if task_queue_candidates:
+            catalog_state.inject(task_queue_candidates)
+            command_context.candidates = catalog_state.candidates
+        task_queue_result = await TaskExecutionQueue(
+            command_context=command_context,
+            candidates=task_queue_candidates,
+        ).execute(task_router_result)
+        task_coverage_report = build_task_coverage_report(
+            task_router_result,
+            task_queue_result,
+        )
+        return _result_from_task_execution_queue(
+            message_text=message_text,
+            report=report,
+            command_context=command_context,
+            task_router_payload=task_router_result.to_payload(),
+            task_queue_payload=task_queue_result.to_payload(),
+            task_coverage_report=task_coverage_report,
+            tool_results=list(task_queue_result.tool_results),
+            final_text=synthesize_task_coverage_reply(task_coverage_report),
+        )
     run_budget = resolve_agent_run_budget(
         mode=complexity_decision.mode,
         enable_agent_tools=enable_agent_tools,
@@ -465,6 +527,12 @@ async def _run_main_request(
             "agent_mode": "superuser_agent" if enable_agent_tools else "chatinter",
             "enable_agent_tools": enable_agent_tools,
             "agent_complexity": complexity_decision.to_metadata(),
+            "task_planner_lite": task_items_to_payload(task_items)
+            if task_items
+            else None,
+            "task_router": task_router_result.to_payload()
+            if task_router_result is not None
+            else None,
         },
     )
     state = AgentRunState.create(
@@ -500,6 +568,18 @@ async def _run_main_request(
         kind="agent_complexity",
         metadata=complexity_decision.to_metadata(),
     )
+    if task_items:
+        state.append_timeline(
+            role="system",
+            kind="task_planner_lite",
+            metadata=task_items_to_payload(task_items),
+        )
+    if task_router_result is not None:
+        state.append_timeline(
+            role="system",
+            kind="task_router",
+            metadata=task_router_result.to_payload(),
+        )
     state.append_timeline(
         role="system",
         kind="agent_run_budget",
@@ -536,6 +616,143 @@ async def _run_main_request(
         executions=command_context.executions,
         agent_result=agent_result,
         timeline=timeline,
+    )
+
+
+async def _try_local_direct_command(
+    *,
+    message_text: str,
+    retriever: CommandToolRetriever,
+    command_context: NativeCommandExecutionContext,
+    report: NativeRouteReport,
+    route_executor: ExecuteNativeRoute,
+    budget_controller: TurnBudgetController | None,
+) -> MainRequestResult | None:
+    del route_executor
+    started = time.perf_counter()
+    candidates = retriever.retrieve(message_text, limit=32).candidates
+    batch_plan = plan_local_direct_command_batch(
+        message_text=message_text,
+        candidates=list(candidates),
+        tool_map={},
+    )
+    if batch_plan is not None:
+        return await _execute_local_direct_plans(
+            message_text=message_text,
+            plans=batch_plan.steps,
+            candidates=list(candidates),
+            command_context=command_context,
+            report=report,
+            budget_controller=budget_controller,
+            started=started,
+            reason=batch_plan.reason,
+        )
+    plan = plan_local_direct_command(
+        message_text=message_text,
+        candidates=list(candidates),
+        tool_map={},
+    )
+    if plan is None:
+        return None
+
+    return await _execute_local_direct_plans(
+        message_text=message_text,
+        plans=[plan],
+        candidates=list(candidates),
+        command_context=command_context,
+        report=report,
+        budget_controller=budget_controller,
+        started=started,
+        reason=plan.reason,
+    )
+
+
+async def _execute_local_direct_plans(
+    *,
+    message_text: str,
+    plans: list[LocalDirectCommandPlan],
+    candidates: list[Any],
+    command_context: NativeCommandExecutionContext,
+    report: NativeRouteReport,
+    budget_controller: TurnBudgetController | None,
+    started: float,
+    reason: str,
+) -> MainRequestResult | None:
+    if not plans:
+        return None
+    from .native_command_tools import build_native_command_tools
+
+    tools = build_native_command_tools([plan.candidate for plan in plans])
+    if not tools:
+        return None
+    tools_by_command = {tool.binding.command_id: tool for tool in tools}
+    command_context.candidates = candidates
+    tool_results: list[ToolResult] = []
+    timeline_items: list[MainRequestTimelineItem] = [_user_timeline_item(message_text)]
+    latest_execution: NativeToolExecutionResult | None = None
+    for plan in plans:
+        tool = tools_by_command.get(plan.candidate.schema.command_id)
+        if tool is None:
+            continue
+        result = await command_context.execute_tool(
+            binding=tool.binding,
+            raw_slots=dict(plan.raw_slots),
+        )
+        tool_results.append(result)
+        execution = (
+            command_context.executions[-1] if command_context.executions else None
+        )
+        if execution is None:
+            execution = NativeToolExecutionResult(
+                success=False,
+                route_result=None,
+                output=result.output if isinstance(result.output, dict) else {},
+                display_text=result.display_content or "",
+                reason="local_direct_no_execution",
+            )
+        latest_execution = execution
+        timeline_items.append(
+            MainRequestTimelineItem(
+                role="tool",
+                kind="local_direct_command",
+                content=execution.display_text or execution.reason,
+                tool_name=tool.binding.tool_name,
+                metadata=execution.output,
+            )
+        )
+    if budget_controller is not None:
+        budget_controller.record_tool_batch(
+            batch_kind="local_direct_command",
+            duration=time.perf_counter() - started,
+        )
+    if not tool_results:
+        return None
+    if latest_execution is None:
+        return None
+    timeline = tuple(timeline_items)
+    final_text = _fallback_final_reply(command_context.executions)
+    return MainRequestResult(
+        decision=NativeRouteDecision(
+            action="execute",
+            confidence=0.92,
+            reason=reason,
+        ),
+        route_result=latest_execution.route_result,
+        report=report,
+        executions=tuple(command_context.executions),
+        tool_results=tuple(tool_results),
+        timeline=timeline,
+        output=MainRequestOutput(
+            final_text=final_text,
+            memory_text=_timeline_memory_text(timeline, fallback=final_text),
+            should_send=bool(final_text),
+            outcome="tool_completed",
+            feedback_kind="tool_completed",
+            record_chat_feedback=False,
+            observation_reason="route_success"
+            if latest_execution.success
+            else "reroute_failed",
+        ),
     )
 
 
@@ -622,12 +839,124 @@ def _result_from_agent_runtime(
     )
 
 
+def _result_from_task_execution_queue(
+    *,
+    message_text: str,
+    report: NativeRouteReport,
+    command_context: NativeCommandExecutionContext,
+    task_router_payload: dict[str, Any],
+    task_queue_payload: dict[str, Any],
+    task_coverage_report: TaskCoverageReport,
+    tool_results: list[ToolResult],
+    final_text: str,
+) -> MainRequestResult:
+    executions = list(command_context.executions)
+    reason = "main_request:task_execution_queue"
+    if report.final_reason == "init":
+        first_route = _first_route(executions)
+        report.finalize(
+            reason=reason,
+            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
+            plugin_name=first_route.decision.plugin_name
+            if first_route is not None
+            else None,
+            plugin_module=first_route.decision.plugin_module
+            if first_route is not None
+            else None,
+            command=first_route.decision.command if first_route is not None else None,
+        )
+    timeline: tuple[MainRequestTimelineItem, ...] = (
+        _user_timeline_item(message_text),
+        MainRequestTimelineItem(
+            role="system",
+            kind="task_router",
+            metadata=task_router_payload,
+        ),
+        MainRequestTimelineItem(
+            role="system",
+            kind="task_execution_queue",
+            metadata=task_queue_payload,
+        ),
+        MainRequestTimelineItem(
+            role="system",
+            kind="task_coverage",
+            metadata=task_coverage_report.to_payload(),
+        ),
+    )
+    reply = normalize_message_text(final_text) or _fallback_final_reply(executions)
+    if not reply:
+        reply = "没有可执行的明确任务。"
+    return MainRequestResult(
+        decision=NativeRouteDecision(
+            action="execute",
+            confidence=0.94,
+            reason=reason,
+        ),
+        route_result=_first_route(executions),
+        report=report,
+        executions=tuple(executions),
+        tool_results=tuple(tool_results),
+        timeline=timeline,
+        output=MainRequestOutput(
+            final_text=reply,
+            memory_text=_timeline_memory_text(timeline, fallback=reply),
+            should_send=bool(reply),
+            outcome="tool_completed"
+            if task_coverage_report.all_completed
+            else "tool_failed",
+            feedback_kind="tool_completed"
+            if task_coverage_report.all_completed
+            else "tool_failed",
+            record_chat_feedback=False,
+            observation_reason="route_success"
+            if task_coverage_report.all_completed
+            else "reroute_failed",
+        ),
+    )
+
+
 def _is_catalog_tool_result(result: ToolResult) -> bool:
     output = result.output if isinstance(result.output, dict) else {}
     return output.get("status") in {
         "retrieved",
         "capability_candidates_retrieved",
     }
+
+
+def _candidates_for_task_routes(
+    *,
+    retriever: CommandToolRetriever,
+    routes: list[Any],
+) -> list[Any]:
+    by_command_id: dict[str, Any] = {}
+    for route in routes:
+        command_id = normalize_message_text(str(getattr(route, "command_id", "") or ""))
+        if not command_id or getattr(route, "status", "") != "selected":
+            continue
+        for candidate in retriever.retrieve(
+            str(getattr(route, "text", "") or ""),
+            limit=24,
+        ).candidates:
+            if normalize_message_text(candidate.schema.command_id) == command_id:
+                by_command_id[command_id] = candidate
+                break
+    return list(by_command_id.values())
+
+
+def _should_hide_delegate_task(
+    *,
+    enable_agent_tools: bool,
+    complexity_mode: str,
+) -> bool:
+    """Keep sub-agent delegation out of fast paths.
+
+    ``delegate_task`` is useful for long superuser engineering tasks, but it is
+    too expensive and uncertain for normal plugin routing or light private
+    commands.  The scenario router already prevents group plugin calls from
+    registering superuser tools; this guard keeps the superuser fast path small.
+    """
+
+    return bool(enable_agent_tools and complexity_mode != "complex_pev")
 
 
 async def _finalize_result(
@@ -724,7 +1053,9 @@ def _timeline_item_summary(item: MainRequestTimelineItem) -> str:
         prefix = f"{prefix}:{normalize_message_text(item.tool_name)}"
     content = normalize_message_text(item.content)
     if not content:
-        output = item.metadata.get("output") if isinstance(item.metadata, dict) else None
+        output = (
+            item.metadata.get("output") if isinstance(item.metadata, dict) else None
+        )
         content = _compact_output_summary(output)
     if not content:
         arguments = (
@@ -961,9 +1292,8 @@ def _has_discussion_only_constraint(text: str) -> bool:
         return True
     if _has_strong_execution_request(normalized):
         return False
-    return (
-        any(marker in normalized for marker in _DISCUSSION_INTENT_MARKERS)
-        and any(term in normalized for term in _DISCUSSION_META_TERMS)
+    return any(marker in normalized for marker in _DISCUSSION_INTENT_MARKERS) and any(
+        term in normalized for term in _DISCUSSION_META_TERMS
     )
 
 
@@ -1084,12 +1414,22 @@ def _cheap_tool_obligation_decision(
             required_tool_names=tool_names,
         )
 
+    media_edit_decision = _media_edit_alignment_decision(
+        message_text=message_text,
+        candidates=actionable,
+        tool_map=tool_map,
+    )
+    if media_edit_decision is not None:
+        return media_edit_decision
+
     evaluations = [
         _candidate_obligation_evaluation(message_text, candidate)
         for candidate in actionable
     ]
     required_evaluations = [
-        evaluation for evaluation in evaluations if _evaluation_requires_tool(evaluation)
+        evaluation
+        for evaluation in evaluations
+        if _evaluation_requires_tool(evaluation)
     ]
     required = [evaluation.candidate for evaluation in required_evaluations]
     if required:
@@ -1122,6 +1462,90 @@ def _cheap_tool_obligation_decision(
     return None
 
 
+def _media_edit_alignment_decision(
+    *,
+    message_text: str,
+    candidates: list[Any],
+    tool_map: dict[str, ToolExecutable],
+) -> ToolObligationDecision | None:
+    text = normalize_message_text(message_text)
+    if not text or not _looks_like_media_edit_request(text):
+        return None
+    aligned = [
+        candidate
+        for candidate in candidates
+        if _candidate_matches_media_edit_request(text, candidate)
+    ]
+    if not aligned:
+        return None
+    aligned.sort(
+        key=lambda candidate: (
+            _candidate_confidence_score(candidate),
+            float(getattr(candidate, "score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    command_ids = _candidate_command_ids(aligned[:3])
+    tool_names = _tool_names_for_command_ids(tool_map, tuple(command_ids))
+    if not tool_names:
+        return None
+    return ToolObligationDecision(
+        obligation="required",
+        reason="cheap:media_edit_alignment",
+        required_tool_names=tool_names,
+    )
+
+
+def _looks_like_media_edit_request(text: str) -> bool:
+    return any(term in text for term in ("图", "图片", "照片", "背景")) and any(
+        term in text
+        for term in (
+            "去掉",
+            "去除",
+            "移除",
+            "抠",
+            "抠掉",
+            "抠图",
+            "透明",
+            "去背景",
+            "背景去",
+        )
+    )
+
+
+def _candidate_matches_media_edit_request(text: str, candidate: Any) -> bool:
+    snapshot = getattr(candidate, "tool", None)
+    schema = getattr(candidate, "schema", None)
+    intent_types = {
+        normalize_message_text(str(intent or ""))
+        for intent in list(getattr(snapshot, "intent_types", []) or [])
+        if normalize_message_text(str(intent or ""))
+    }
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    payload_policy = normalize_message_text(
+        str(getattr(schema, "payload_policy", "") or "")
+    )
+    text_blob = " ".join(
+        normalize_message_text(str(value or ""))
+        for value in (
+            getattr(snapshot, "capability_text", ""),
+            getattr(snapshot, "description", ""),
+            getattr(schema, "head", ""),
+        )
+    )
+    if "media" not in intent_types and output_mode not in {"image", "file"}:
+        return False
+    if payload_policy not in {"text_or_image", "image", "reply_or_image"}:
+        return False
+    if not any(term in text_blob for term in ("抠图", "去背景", "背景", "透明")):
+        return False
+    if "背景" in text and not any(term in text_blob for term in ("背景", "抠图")):
+        return False
+    return True
+
+
 def _rank_required_candidates(evaluations: list[Any]) -> list[Any]:
     return sorted(
         evaluations,
@@ -1138,7 +1562,9 @@ def _candidate_has_constrained_schema(candidate: Any) -> bool:
     schema = getattr(candidate, "schema", None)
     if schema is None:
         return False
-    if any(getattr(slot, "choices", None) for slot in getattr(schema, "slots", []) or []):
+    if any(
+        getattr(slot, "choices", None) for slot in getattr(schema, "slots", []) or []
+    ):
         return True
     shortcut_renders = getattr(schema, "shortcut_renders", None)
     if shortcut_renders:
@@ -1172,8 +1598,12 @@ def _candidate_is_actionable(candidate: Any) -> bool:
 def _candidate_is_concrete_or_external(candidate: Any) -> bool:
     schema = getattr(candidate, "schema", None)
     snapshot = getattr(candidate, "tool", None)
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
     if output_mode in {"image", "file", "action", "plugin_output"}:
         return True
     if side_effect in {"query", "send", "mutate"}:
@@ -1210,8 +1640,12 @@ def _candidate_capability_factor(candidate: Any) -> float:
     source = normalize_message_text(
         str(getattr(snapshot, "source_of_truth", "") or "unknown")
     )
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
     risk = normalize_message_text(
         str(
             getattr(snapshot, "risk", "")
@@ -1373,16 +1807,14 @@ def _evaluation_requires_tool(evaluation: CandidateObligationEvaluation) -> bool
         return True
     if (
         evaluation.request_strength.explicit
-        and "play" in set(getattr(evaluation.request_strength, "matched_intents", ()) or ())
+        and "play"
+        in set(getattr(evaluation.request_strength, "matched_intents", ()) or ())
         and evaluation.real_output_factor >= 1.12
         and evaluation.score >= 2.0
         and evaluation.recall_factor >= 0.45
     ):
         return True
-    return (
-        evaluation.request_strength.exact_command
-        and evaluation.score >= 1.9
-    )
+    return evaluation.request_strength.exact_command and evaluation.score >= 1.9
 
 
 def _evaluation_allows_auto(evaluation: CandidateObligationEvaluation) -> bool:
@@ -1419,9 +1851,7 @@ def _candidate_recall_factor(candidate: Any) -> float:
 def _candidate_reliability_factor(candidate: Any) -> float:
     features = getattr(candidate, "features", None)
     snapshot = getattr(candidate, "tool", None)
-    feedback_reliability = float(
-        getattr(features, "reliability_score", 0.0) or 0.0
-    )
+    feedback_reliability = float(getattr(features, "reliability_score", 0.0) or 0.0)
     false_trigger = float(getattr(features, "false_trigger_score", 0.0) or 0.0)
     param_failure = float(getattr(features, "param_failure_score", 0.0) or 0.0)
     latency = float(getattr(features, "latency_score", 0.0) or 0.0)
@@ -1449,11 +1879,13 @@ def _candidate_real_output_factor(candidate: Any) -> float:
     snapshot = getattr(candidate, "tool", None)
     if snapshot is None:
         return 1.0
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
-    source = normalize_message_text(
-        str(getattr(snapshot, "source_of_truth", "") or "")
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
     )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
+    source = normalize_message_text(str(getattr(snapshot, "source_of_truth", "") or ""))
     intent_types = {
         normalize_message_text(str(intent or "")).lower()
         for intent in list(getattr(snapshot, "intent_types", []) or [])
@@ -1466,7 +1898,9 @@ def _candidate_real_output_factor(candidate: Any) -> float:
         factor *= 1.08
     if side_effect in {"query", "send", "mutate"}:
         factor *= 1.08
-    if bool(intent_types & {"generate", "media", "transform", "random", "query", "play"}):
+    if bool(
+        intent_types & {"generate", "media", "transform", "random", "query", "play"}
+    ):
         factor *= 1.06
     if source in {"bot_state", "external_service", "local_state", "plugin_runtime"}:
         factor *= 1.06
@@ -1494,7 +1928,9 @@ def _all_candidates_are_weak(candidates: list[Any]) -> bool:
     best = max(_candidate_confidence_score(candidate) for candidate in candidates)
     if best >= 90.0:
         return False
-    return all(not _candidate_is_concrete_or_external(candidate) for candidate in candidates)
+    return all(
+        not _candidate_is_concrete_or_external(candidate) for candidate in candidates
+    )
 
 
 def _command_tool_names(tool_map: dict[str, ToolExecutable]) -> tuple[str, ...]:

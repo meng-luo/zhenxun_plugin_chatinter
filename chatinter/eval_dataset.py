@@ -1,4 +1,4 @@
-﻿"""Fixed layered eval dataset for ChatInter trajectory regression.
+"""Fixed layered eval dataset for ChatInter trajectory regression.
 
 The dataset is intentionally product-level, not runtime policy.  It gives the
 Eval Harness stable cases and thresholds without adding plugin-specific routing
@@ -124,7 +124,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "direct-chat-001",
         "layer": "direct_chat",
-        "input_message": "真寻，今天写代码写到一半突然卡住了，你觉得我该先休息还是继续啃？",
+        "input_message": (
+            "真寻，今天写代码写到一半突然卡住了，你觉得我该先休息还是继续啃？"
+        ),
         "expectation": "direct_chat",
         "scenario": "group_plugin_selector",
         "tags": ["chat", "advice"],
@@ -148,7 +150,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "direct-chat-004",
         "layer": "direct_chat",
-        "input_message": "如果一个插件名字叫塔罗，那我们聊塔罗文化时是不是不该触发插件？",
+        "input_message": (
+            "如果一个插件名字叫塔罗，那我们聊塔罗文化时是不是不该触发插件？"
+        ),
         "expectation": "direct_chat",
         "scenario": "group_plugin_selector",
         "tags": ["chat", "plugin_mention_only"],
@@ -172,7 +176,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "no-tool-001",
         "layer": "no_tool_available",
-        "input_message": "帮我调用一个不存在的月球天气占卜插件，如果没有就说明没有可用工具",
+        "input_message": (
+            "帮我调用一个不存在的月球天气占卜插件，如果没有就说明没有可用工具"
+        ),
         "expectation": "no_tool_available",
         "scenario": "group_plugin_selector",
         "tags": ["unsupported", "catalog"],
@@ -205,7 +211,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "multi-tool-002",
         "layer": "multi_tool",
-        "input_message": "先把 hello bot 翻译成中文，再来一条网易云热评，最后看一下今天的小猪",
+        "input_message": (
+            "先把 hello bot 翻译成中文，再来一条网易云热评，最后看一下今天的小猪"
+        ),
         "expectation": "multi_tool",
         "scenario": "group_plugin_selector",
         "min_tool_calls": 3,
@@ -269,7 +277,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "superuser-002",
         "layer": "superuser_long_task",
-        "input_message": "读取 chatinter 的主要入口文件，判断当前 AgentRuntime 的主链路是否清晰",
+        "input_message": (
+            "读取 chatinter 的主要入口文件，判断当前 AgentRuntime 的主链路是否清晰"
+        ),
         "expectation": "superuser_task",
         "scenario": "superuser_agent",
         "min_tool_calls": 1,
@@ -279,7 +289,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "superuser-003",
         "layer": "superuser_long_task",
-        "input_message": "创建一个最小 echo 插件草稿，跑一次编译检查，如果失败给出修复建议",
+        "input_message": (
+            "创建一个最小 echo 插件草稿，跑一次编译检查，如果失败给出修复建议"
+        ),
         "expectation": "superuser_task",
         "scenario": "superuser_agent",
         "min_tool_calls": 3,
@@ -289,7 +301,9 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "superuser-004",
         "layer": "superuser_long_task",
-        "input_message": "检查当前工作区是否有未提交改动，如果有只总结风险，不要修改文件",
+        "input_message": (
+            "检查当前工作区是否有未提交改动，如果有只总结风险，不要修改文件"
+        ),
         "expectation": "superuser_task",
         "scenario": "superuser_agent",
         "min_tool_calls": 1,
@@ -299,7 +313,10 @@ DEFAULT_EVAL_CASES: tuple[dict[str, Any], ...] = (
     {
         "id": "superuser-005",
         "layer": "superuser_long_task",
-        "input_message": "走工程闭环检查一个小改动方案：先读代码，再给 patch/eval/rollback 计划，不要直接改",
+        "input_message": (
+            "走工程闭环检查一个小改动方案：先读代码，再给 patch/eval/rollback 计划，"
+            "不要直接改"
+        ),
         "expectation": "superuser_task",
         "scenario": "superuser_agent",
         "min_tool_calls": 2,
@@ -315,7 +332,9 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
         "min_pass_rate": 0.82,
         "max_false_trigger_rate": 0.08,
         "max_avg_latency_ms": 18000,
+        "max_p95_latency_ms": 45000,
         "max_avg_prompt_tokens": 18000,
+        "max_avg_steps": 6.0,
         "max_tool_call_pressure": 4.5,
         "max_over_tooling_rate": 0.18,
     },
@@ -324,7 +343,9 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
             "min_case_coverage": 0.70,
             "min_pass_rate": 0.86,
             "min_hit_rate": 0.86,
+            "min_retrieval_hit_rate": 0.80,
             "max_avg_latency_ms": 16000,
+            "max_p95_latency_ms": 36000,
         },
         "direct_chat": {
             "min_case_coverage": 0.70,
@@ -342,8 +363,10 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
             "min_case_coverage": 0.60,
             "min_pass_rate": 0.78,
             "min_multi_coverage_rate": 0.75,
+            "min_task_coverage_rate": 0.75,
             "max_tool_call_pressure": 6.0,
             "max_avg_latency_ms": 28000,
+            "max_avg_steps": 8.0,
         },
         "native_continuation": {
             "min_case_coverage": 0.60,
@@ -356,7 +379,9 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
             "min_superuser_completion_or_pause_rate": 0.85,
             "max_tool_call_pressure": 8.0,
             "max_avg_latency_ms": 45000,
+            "max_p95_latency_ms": 90000,
             "max_avg_prompt_tokens": 26000,
+            "max_avg_steps": 12.0,
         },
     },
 }

@@ -113,11 +113,15 @@ class CapabilityLedger:
                 tool_name=normalize_message_text(
                     str(item.get("tool_name", "") or item.get("tool", "") or "")
                 ),
-                command_id=normalize_message_text(str(item.get("command_id", "") or "")),
+                command_id=normalize_message_text(
+                    str(item.get("command_id", "") or "")
+                ),
                 plugin=normalize_message_text(str(item.get("plugin", "") or "")),
                 head=normalize_message_text(str(item.get("head", "") or "")),
                 role=normalize_message_text(str(item.get("role", "") or "")),
-                output_mode=normalize_message_text(str(item.get("output_mode", "") or "")),
+                output_mode=normalize_message_text(
+                    str(item.get("output_mode", "") or "")
+                ),
                 requires_real_tool=bool(item.get("requires_real_tool")),
                 source_of_truth=normalize_message_text(
                     str(item.get("source_of_truth", "") or "")
@@ -126,8 +130,12 @@ class CapabilityLedger:
                 last_ok=item.get("last_ok")
                 if isinstance(item.get("last_ok"), bool)
                 else None,
-                last_task_id=normalize_message_text(str(item.get("last_task_id", "") or "")),
-                last_error=normalize_message_text(str(item.get("last_error", "") or "")),
+                last_task_id=normalize_message_text(
+                    str(item.get("last_task_id", "") or "")
+                ),
+                last_error=normalize_message_text(
+                    str(item.get("last_error", "") or "")
+                ),
             )
             if entry.tool_name:
                 ledger.entries[entry.tool_name] = entry
@@ -152,9 +160,7 @@ class CapabilityLedger:
             existing.requires_real_tool = (
                 entry.requires_real_tool or existing.requires_real_tool
             )
-            existing.source_of_truth = (
-                entry.source_of_truth or existing.source_of_truth
-            )
+            existing.source_of_truth = entry.source_of_truth or existing.source_of_truth
 
     def record_observation(
         self,
@@ -198,13 +204,12 @@ class CapabilityLedger:
         )
         if max_items > 0:
             entries = entries[:max_items]
-        return [
-            entry.to_public_payload()
-            for entry in entries
-        ]
+        return [entry.to_public_payload() for entry in entries]
 
     def to_payload(self) -> dict[str, Any]:
-        return {"entries": [entry.to_public_payload() for entry in self.entries.values()]}
+        return {
+            "entries": [entry.to_public_payload() for entry in self.entries.values()]
+        }
 
 
 @dataclass
@@ -233,7 +238,9 @@ class TaskLedgerEntry:
             "unsupported_reason": self.unsupported_reason,
             "reason": self.reason,
         }
-        return {key: value for key, value in payload.items() if value not in ("", [], None)}
+        return {
+            key: value for key, value in payload.items() if value not in ("", [], None)
+        }
 
 
 @dataclass
@@ -272,9 +279,7 @@ class TaskLedger:
                 continue
             tasks.append(
                 TaskLedgerEntry(
-                    task_id=normalize_message_text(
-                        str(item.get("task_id", "") or "")
-                    )
+                    task_id=normalize_message_text(str(item.get("task_id", "") or ""))
                     or f"task_{len(tasks) + 1}",
                     goal=goal,
                     intent_type=normalize_message_text(
@@ -421,16 +426,16 @@ def _normalize_task_status(status: str) -> str:
 
 
 __all__ = [
-    "CapabilityLedger",
-    "CapabilityLedgerEntry",
-    "TaskLedger",
-    "TaskLedgerEntry",
     "TASK_STATUS_BLOCKED",
     "TASK_STATUS_COMPLETED",
     "TASK_STATUS_FAILED",
     "TASK_STATUS_PENDING",
     "TASK_STATUS_UNSUPPORTED",
     "TERMINAL_TASK_STATUSES",
+    "CapabilityLedger",
+    "CapabilityLedgerEntry",
+    "TaskLedger",
+    "TaskLedgerEntry",
     "capability_ledger_from_payload",
     "task_ledger_from_payload",
 ]

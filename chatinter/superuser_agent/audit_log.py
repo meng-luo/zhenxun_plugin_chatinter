@@ -79,7 +79,9 @@ def query_audit_events(
     contains_text = str(contains or "")
     entries: list[dict[str, Any]] = []
     try:
-        lines = _AUDIT_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = _AUDIT_LOG_PATH.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
     except Exception:
         return []
     for line in reversed(lines[-_MAX_QUERY_LINES:]):
@@ -89,7 +91,9 @@ def query_audit_events(
             continue
         if not isinstance(entry, dict):
             continue
-        if any(filters[key] and str(entry.get(key, "")) != filters[key] for key in filters):
+        if any(
+            filters[key] and str(entry.get(key, "")) != filters[key] for key in filters
+        ):
             continue
         if contains_text and contains_text not in json.dumps(entry, ensure_ascii=False):
             continue

@@ -236,7 +236,9 @@ async def execute_approved_action(
 
         return await process_list(
             query=str(approval.payload.get("query", "") or ""),
-            max_results=_coerce_int(approval.payload.get("max_results"), default=40, lower=1, upper=120),
+            max_results=_coerce_int(
+                approval.payload.get("max_results"), default=40, lower=1, upper=120
+            ),
             actor=actor,
             approval_id=approval.approval_id,
         )
@@ -274,7 +276,9 @@ async def execute_approved_action(
         return await inspect_plugin(
             plugin_name=str(approval.payload.get("plugin_name", "") or ""),
             plugin_root=str(approval.payload.get("plugin_root", "") or "") or None,
-            max_files=_coerce_int(approval.payload.get("max_files"), default=80, lower=1, upper=300),
+            max_files=_coerce_int(
+                approval.payload.get("max_files"), default=80, lower=1, upper=300
+            ),
             actor=actor,
             worktree_id=str(approval.payload.get("worktree_id", "") or ""),
             approval_id=approval.approval_id,
@@ -303,8 +307,16 @@ async def execute_approved_action(
             relative_path=str(approval.payload.get("relative_path", "") or ""),
             content=str(approval.payload.get("content", "") or ""),
             plugin_root=str(approval.payload.get("plugin_root", "") or "") or None,
-            create_dirs=bool(approval.payload.get("create_dirs") if approval.payload.get("create_dirs") is not None else True),
-            overwrite=bool(approval.payload.get("overwrite") if approval.payload.get("overwrite") is not None else True),
+            create_dirs=bool(
+                approval.payload.get("create_dirs")
+                if approval.payload.get("create_dirs") is not None
+                else True
+            ),
+            overwrite=bool(
+                approval.payload.get("overwrite")
+                if approval.payload.get("overwrite") is not None
+                else True
+            ),
             reason=str(approval.payload.get("reason", "") or ""),
             actor=actor,
             worktree_id=str(approval.payload.get("worktree_id", "") or ""),
@@ -378,9 +390,7 @@ async def execute_approved_action(
         try:
             raw_changes = approval.payload.get("changes", [])
             changes = [
-                normalize_change(item)
-                for item in raw_changes
-                if isinstance(item, dict)
+                normalize_change(item) for item in raw_changes if isinstance(item, dict)
             ]
         except Exception as exc:
             return tool_result(
@@ -441,9 +451,7 @@ async def execute_approved_action(
             actor=actor,
             **_plan_payload(approval.payload),
         )
-        engineering_loop_id = str(
-            approval.payload.get("engineering_loop_id", "") or ""
-        )
+        engineering_loop_id = str(approval.payload.get("engineering_loop_id", "") or "")
         if engineering_loop_id:
             try:
                 from ..engineering_loop import bind_eval
@@ -535,7 +543,9 @@ async def execute_approved_action(
             root=str(approval.payload.get("root", "") or "."),
             pattern=str(approval.payload.get("pattern", "") or "**/*"),
             contains=str(approval.payload.get("contains", "") or ""),
-            max_results=_coerce_int(approval.payload.get("max_results"), default=50, lower=1, upper=200),
+            max_results=_coerce_int(
+                approval.payload.get("max_results"), default=50, lower=1, upper=200
+            ),
             actor=actor,
             isolation=dict(approval.payload.get("isolation") or {}),
             approval_id=approval.approval_id,
@@ -567,7 +577,9 @@ async def execute_approved_action(
 
         expected = approval.payload.get("expected_replacements")
         try:
-            expected_replacements = int(expected) if expected not in (None, "") else None
+            expected_replacements = (
+                int(expected) if expected not in (None, "") else None
+            )
         except (TypeError, ValueError):
             expected_replacements = None
         return await replace_in_file(

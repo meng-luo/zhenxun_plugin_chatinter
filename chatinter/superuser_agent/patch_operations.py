@@ -7,8 +7,8 @@ import difflib
 import hashlib
 from pathlib import Path
 import time
-import uuid
 from typing import Any, Literal
+import uuid
 
 from zhenxun.services.llm.types.models import ToolResult
 
@@ -201,9 +201,16 @@ def apply_patch_operation(
 ) -> ToolResult:
     operation = get_patch_operation(operation_id)
     if operation is None:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
-    if operation.user_id != actor["user_id"] or operation.session_key != actor["session_key"]:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
+    if (
+        operation.user_id != actor["user_id"]
+        or operation.session_key != actor["session_key"]
+    ):
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
     if operation.status == "applied":
         return tool_result(
             True,
@@ -211,7 +218,9 @@ def apply_patch_operation(
             operation=operation.public_payload(),
         )
     if operation.status == "rolled_back":
-        return tool_result(False, "patch_operation_already_rolled_back", operation_id=operation_id)
+        return tool_result(
+            False, "patch_operation_already_rolled_back", operation_id=operation_id
+        )
     if operation.status == "failed":
         return tool_result(
             False,
@@ -223,7 +232,10 @@ def apply_patch_operation(
                 phase="apply",
                 error=operation.error or "operation already failed",
             ),
-            instruction="该 patch operation 已失败。为避免旧快照误写，请重读文件后重新 patch_prepare。",
+            instruction=(
+                "该 patch operation 已失败。为避免旧快照误写，"
+                "请重读文件后重新 patch_prepare。"
+            ),
         )
     try:
         lock_error = _workspace_lock_error(operation)
@@ -235,7 +247,9 @@ def apply_patch_operation(
         )
         if conflict:
             raise RuntimeError(conflict)
-        for change, snapshot in zip(operation.changes, operation.snapshots, strict=False):
+        for change, snapshot in zip(
+            operation.changes, operation.snapshots, strict=False
+        ):
             target = Path(change.path)
             if change.create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -243,11 +257,11 @@ def apply_patch_operation(
                 raise FileNotFoundError(str(target.parent))
         for snapshot in operation.snapshots:
             if not _snapshot_matches_current(snapshot):
-                raise RuntimeError(
-                    f"file changed since patch_prepare: {snapshot.path}"
-                )
+                raise RuntimeError(f"file changed since patch_prepare: {snapshot.path}")
         touched: list[FileSnapshot] = []
-        for change, snapshot in zip(operation.changes, operation.snapshots, strict=False):
+        for change, snapshot in zip(
+            operation.changes, operation.snapshots, strict=False
+        ):
             target = Path(change.path)
             target.write_text(snapshot.after_content, encoding="utf-8")
             snapshot.after_mtime_ns = _mtime_ns(target)
@@ -282,10 +296,13 @@ def apply_patch_operation(
             operation=operation.public_payload(),
             eval=eval_run.public_payload() if eval_run is not None else None,
             checkpoints=checkpoints,
-            next_tool="engineering_eval_run" if eval_run is not None else "engineering_eval_plan",
+            next_tool="engineering_eval_run"
+            if eval_run is not None
+            else "engineering_eval_plan",
             instruction=(
                 "patch 已应用并绑定工程 eval。下一步调用 engineering_eval_run "
-                "执行建议测试；如果失败，根据 observation 决定重读、二次 patch 或 rollback。"
+                "执行建议测试；如果失败，根据 observation 决定重读、"
+                "二次 patch 或 rollback。"
             ),
         )
     except Exception as exc:
@@ -323,7 +340,8 @@ def apply_patch_operation(
             retryable=True,
             need_continue=True,
             instruction=(
-                "patch_apply 失败。不要重复应用同一个 stale operation；按 recovery_plan "
+                "patch_apply 失败。不要重复应用同一个 stale operation；"
+                "按 recovery_plan "
                 "重读冲突文件，重新 patch_prepare，必要时先检查 checkpoint。"
             ),
         )
@@ -337,9 +355,16 @@ def rollback_patch_operation(
 ) -> ToolResult:
     operation = get_patch_operation(operation_id)
     if operation is None:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
-    if operation.user_id != actor["user_id"] or operation.session_key != actor["session_key"]:
-        return tool_result(False, "patch_operation_not_found", operation_id=operation_id)
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
+    if (
+        operation.user_id != actor["user_id"]
+        or operation.session_key != actor["session_key"]
+    ):
+        return tool_result(
+            False, "patch_operation_not_found", operation_id=operation_id
+        )
     if operation.status == "rolled_back":
         return tool_result(
             True,
@@ -389,7 +414,9 @@ def rollback_patch_operation(
             "patch_operation_rolled_back",
             operation=operation.public_payload(),
             checkpoints=_checkpoint_payload(operation),
-            instruction="回滚已完成。如需继续工程任务，请重读相关文件并准备新的 patch/eval。",
+            instruction=(
+                "回滚已完成。如需继续工程任务，请重读相关文件" "并准备新的 patch/eval。"
+            ),
         )
     except Exception as exc:
         operation.status = "failed"

@@ -6,8 +6,8 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import time
-import uuid
 from typing import Any
+import uuid
 
 from ..persistence import read_json, state_path, write_json
 from ..runtime_events import emit_runtime_event
@@ -297,7 +297,9 @@ def _save_approvals() -> None:
 
 def _payload_fingerprint(payload: dict[str, Any]) -> str:
     try:
-        text = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+        text = json.dumps(
+            payload or {}, ensure_ascii=False, sort_keys=True, default=str
+        )
     except Exception:
         text = str(payload or {})
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]

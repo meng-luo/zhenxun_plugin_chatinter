@@ -507,7 +507,14 @@ providers:
     max_tools: 120
     schema:
       dialect: openai_strict
-      unsupported_keys: ["$schema", "$id", "examples", "default", "deprecated", "readOnly", "writeOnly"]
+      unsupported_keys:
+        - "$schema"
+        - "$id"
+        - "examples"
+        - "default"
+        - "deprecated"
+        - "readOnly"
+        - "writeOnly"
       strip_additional_properties: false
       strip_strict: false
       nullable_style: nullable
@@ -535,7 +542,14 @@ providers:
     max_tools: 64
     schema:
       dialect: gemini
-      unsupported_keys: ["$schema", "$id", "examples", "default", "deprecated", "readOnly", "writeOnly"]
+      unsupported_keys:
+        - "$schema"
+        - "$id"
+        - "examples"
+        - "default"
+        - "deprecated"
+        - "readOnly"
+        - "writeOnly"
       strip_additional_properties: true
       strip_strict: true
       nullable_style: nullable
@@ -563,7 +577,14 @@ providers:
     max_tools: 96
     schema:
       dialect: generic
-      unsupported_keys: ["$schema", "$id", "examples", "default", "deprecated", "readOnly", "writeOnly"]
+      unsupported_keys:
+        - "$schema"
+        - "$id"
+        - "examples"
+        - "default"
+        - "deprecated"
+        - "readOnly"
+        - "writeOnly"
       strip_additional_properties: false
       strip_strict: false
       nullable_style: nullable
@@ -592,7 +613,14 @@ providers:
     max_tools: 96
     schema:
       dialect: generic
-      unsupported_keys: ["$schema", "$id", "examples", "default", "deprecated", "readOnly", "writeOnly"]
+      unsupported_keys:
+        - "$schema"
+        - "$id"
+        - "examples"
+        - "default"
+        - "deprecated"
+        - "readOnly"
+        - "writeOnly"
       strip_additional_properties: false
       strip_strict: false
       nullable_style: nullable

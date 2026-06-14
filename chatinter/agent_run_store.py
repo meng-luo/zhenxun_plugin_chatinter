@@ -8,7 +8,7 @@ trail and a recovery surface for future resumable runs.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from zhenxun.services.llm import LLMMessage
 from zhenxun.services.llm.types.models import (
@@ -34,13 +34,16 @@ from .persistence import (
     utc_now_iso,
     write_json,
 )
-from .runtime_events import emit_runtime_event, project_runtime_state
+from .runtime_events import (
+    RuntimeEventStatus,
+    emit_runtime_event,
+    project_runtime_state,
+)
 from .task_graph import task_graph_from_payload, task_graph_to_payload
 from .task_ledger import (
     capability_ledger_from_payload,
     task_ledger_from_payload,
 )
-
 
 # In-process cancel signals (P0-1): the cancel tool flips a flag here so the
 # runtime loop can react without re-reading the persisted snapshot every step.
@@ -173,7 +176,10 @@ def list_agent_run_snapshots(
         payload = read_json(path, None)
         if not isinstance(payload, dict):
             continue
-        if normalized_session and str(payload.get("session_key", "")) != normalized_session:
+        if (
+            normalized_session
+            and str(payload.get("session_key", "")) != normalized_session
+        ):
             continue
         rows.append(_compact_run_snapshot(payload))
     rows.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
@@ -205,7 +211,10 @@ def query_agent_run_events(
             continue
         if normalized_trace and str(payload.get("trace_id", "")) != normalized_trace:
             continue
-        if normalized_session and str(payload.get("session_key", "")) != normalized_session:
+        if (
+            normalized_session
+            and str(payload.get("session_key", "")) != normalized_session
+        ):
             continue
         rows.append(payload)
         if len(rows) >= max(1, min(int(limit or 50), 200)):
@@ -231,12 +240,8 @@ def _state_payload(
         "status": str(getattr(state, "status", "") or ""),
         "paused_reason": str(getattr(state, "paused_reason", "") or ""),
         "resume_cursor": to_jsonable(getattr(state, "resume_cursor", {})),
-        "waiting_approval_ids": to_jsonable(
-            getattr(state, "waiting_approval_ids", [])
-        ),
-        "background_task_ids": to_jsonable(
-            getattr(state, "background_task_ids", [])
-        ),
+        "waiting_approval_ids": to_jsonable(getattr(state, "waiting_approval_ids", [])),
+        "background_task_ids": to_jsonable(getattr(state, "background_task_ids", [])),
         "observation_event_ids": to_jsonable(
             getattr(state, "observation_event_ids", [])
         ),
@@ -251,9 +256,7 @@ def _state_payload(
         "tool_obligation_reason": str(
             getattr(state, "tool_obligation_reason", "") or ""
         ),
-        "agent_complexity_mode": str(
-            getattr(state, "agent_complexity_mode", "") or ""
-        ),
+        "agent_complexity_mode": str(getattr(state, "agent_complexity_mode", "") or ""),
         "agent_complexity_reason": str(
             getattr(state, "agent_complexity_reason", "") or ""
         ),
@@ -297,14 +300,10 @@ def _event_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
         "observation_count": len(snapshot.get("observations", [])),
         "pending_task_count": len(snapshot.get("pending_tasks", [])),
         "completed_task_count": len(snapshot.get("completed_tasks", [])),
-        "task_graph_status": (
-            snapshot.get("task_graph", {}) or {}
-        ).get("status", "")
+        "task_graph_status": (snapshot.get("task_graph", {}) or {}).get("status", "")
         if isinstance(snapshot.get("task_graph"), dict)
         else "",
-        "task_ledger_status": _compact_task_ledger_status(
-            snapshot.get("task_ledger")
-        ),
+        "task_ledger_status": _compact_task_ledger_status(snapshot.get("task_ledger")),
         "agent_complexity_mode": snapshot.get("agent_complexity_mode", ""),
         "metadata": snapshot.get("metadata", {}),
     }
@@ -345,18 +344,18 @@ def _emit_agent_run_runtime_event(snapshot: dict[str, Any]) -> None:
     )
 
 
-def _runtime_status_from_snapshot(snapshot: dict[str, Any]) -> str:
+def _runtime_status_from_snapshot(snapshot: dict[str, Any]) -> RuntimeEventStatus:
     status = str(snapshot.get("status", "") or "")
     stage = str(snapshot.get("stage", "") or "")
     if status == "paused":
-        return "waiting"
+        return cast(RuntimeEventStatus, "waiting")
     if status in {"completed", "failed", "cancelled"}:
-        return status
+        return cast(RuntimeEventStatus, status)
     if stage in {"started", "step_started", "model_request"}:
-        return "started"
+        return cast(RuntimeEventStatus, "started")
     if stage in {"guardrail"}:
-        return "blocked"
-    return "progress"
+        return cast(RuntimeEventStatus, "blocked")
+    return cast(RuntimeEventStatus, "progress")
 
 
 def _last_text(value: Any) -> str:
@@ -440,7 +439,9 @@ def _state_from_snapshot(
             artifact_refs=_text_list(snapshot.get("artifact_refs")),
             tool_calls=_tool_calls_from_payload(snapshot.get("tool_calls", [])),
             observations=_observations_from_payload(snapshot.get("observations", [])),
-            pending_tasks=_pending_tasks_from_payload(snapshot.get("pending_tasks", [])),
+            pending_tasks=_pending_tasks_from_payload(
+                snapshot.get("pending_tasks", [])
+            ),
             completed_tasks=_completed_tasks_from_payload(
                 snapshot.get("completed_tasks", [])
             ),
@@ -571,9 +572,7 @@ def _observations_from_payload(value: Any) -> list[AgentObservation]:
                     task_text=str(item.get("task_text", "") or ""),
                     ok=bool(item.get("ok")),
                     need_continue=bool(item.get("need_continue")),
-                    remaining_task_hint=str(
-                        item.get("remaining_task_hint", "") or ""
-                    ),
+                    remaining_task_hint=str(item.get("remaining_task_hint", "") or ""),
                     error=str(item.get("error", "") or ""),
                     artifacts=tuple(
                         dict(artifact)
@@ -705,9 +704,7 @@ def _compact_task_ledger_status(value: Any) -> str:
     if not tasks:
         return "empty"
     statuses = [
-        str(item.get("status", "") or "")
-        for item in tasks
-        if isinstance(item, dict)
+        str(item.get("status", "") or "") for item in tasks if isinstance(item, dict)
     ]
     if statuses and all(status == "completed" for status in statuses):
         return "completed"
@@ -749,12 +746,18 @@ def _resume_integrity_payload(state: Any) -> dict[str, Any]:
     return {
         "can_resume_original_context": True,
         "has_task_graph": task_graph is not None,
-        "task_graph_status": getattr(task_graph, "status", "") if task_graph is not None else "",
-        "task_graph_incomplete_count": len(getattr(task_graph, "incomplete_tasks", []) or [])
+        "task_graph_status": getattr(task_graph, "status", "")
+        if task_graph is not None
+        else "",
+        "task_graph_incomplete_count": len(
+            getattr(task_graph, "incomplete_tasks", []) or []
+        )
         if task_graph is not None
         else 0,
         "has_task_ledger": task_ledger is not None,
-        "task_ledger_incomplete_count": len(getattr(task_ledger, "incomplete_goals", []) or [])
+        "task_ledger_incomplete_count": len(
+            getattr(task_ledger, "incomplete_goals", []) or []
+        )
         if task_ledger is not None
         else 0,
         "waiting_approval_count": len(waiting_approval_ids),

@@ -12,6 +12,7 @@ from typing import Any
 
 from .models.pydantic_models import (
     CommandCapability,
+    CommandRequirement,
     CommandSlotSpec,
     PluginCommandSchema,
 )
@@ -163,11 +164,7 @@ def _collect_relevant_usage_lines(
 ) -> list[str]:
     if not usage:
         return []
-    heads = [
-        text
-        for text in [head, *aliases]
-        if normalize_message_text(text)
-    ]
+    heads = [text for text in [head, *aliases] if normalize_message_text(text)]
     heads = sorted(dict.fromkeys(heads), key=len, reverse=True)
     lines: list[str] = []
     for raw_line in str(usage or "").splitlines():
@@ -306,20 +303,23 @@ def _is_internal_media_param(name: str, requirement: Any) -> bool:
 
 def _is_generic_aggregate_param(name: str) -> bool:
     normalized = _normalize_param_name(name)
-    return normalized in {
-        "params",
-        "args",
-        "arguments",
-        "content",
-        "contents",
-    } or normalized.endswith("_params") or normalized.endswith("params")
+    return (
+        normalized
+        in {
+            "params",
+            "args",
+            "arguments",
+            "content",
+            "contents",
+        }
+        or normalized.endswith("_params")
+        or normalized.endswith("params")
+    )
 
 
 def _payload_policy_from_capability(command: CommandCapability) -> tuple[str, str]:
     requirement = command.requirement
-    if requirement.image_min > 0 and (
-        requirement.text_min > 0 or requirement.params
-    ):
+    if requirement.image_min > 0 and (requirement.text_min > 0 or requirement.params):
         return "text_or_image", "slot_only"
     if requirement.image_min > 0:
         return "image_only", "discard"
@@ -368,8 +368,12 @@ def _normalize_choices(values: list[str] | tuple[str, ...]) -> list[str]:
     return result
 
 
-def _slot_choices_from_requirement(requirement: CommandRequirement) -> dict[str, list[str]]:
-    raw = getattr(requirement, "choices", None) or getattr(requirement, "slot_choices", None)
+def _slot_choices_from_requirement(
+    requirement: CommandRequirement,
+) -> dict[str, list[str]]:
+    raw = getattr(requirement, "choices", None) or getattr(
+        requirement, "slot_choices", None
+    )
     if not isinstance(raw, dict):
         return {}
     result: dict[str, list[str]] = {}
@@ -402,9 +406,14 @@ def _slot_type_from_examples(name: str, values: list[str]) -> str:
         return by_name
     if all(re.fullmatch(r"[-+]?\d+", value) for value in normalized_values):
         return "int"
-    if all(re.fullmatch(r"[-+]?(?:\d+\.\d+|\d+)", value) for value in normalized_values):
+    if all(
+        re.fullmatch(r"[-+]?(?:\d+\.\d+|\d+)", value) for value in normalized_values
+    ):
         return "float"
-    if all(value.startswith("@") or value.isdigit() and len(value) >= 5 for value in normalized_values):
+    if all(
+        value.startswith("@") or (value.isdigit() and len(value) >= 5)
+        for value in normalized_values
+    ):
         return "at"
     return by_name
 
@@ -444,10 +453,7 @@ def _prepare_schema_param_names(
     if len(text_like_params) < text_min:
         return [
             *params,
-            *[
-                f"text{index + 1}"
-                for index in range(len(text_like_params), text_min)
-            ],
+            *[f"text{index + 1}" for index in range(len(text_like_params), text_min)],
         ]
 
     return params
@@ -508,7 +514,11 @@ def _infer_param_names_from_examples(
     text_min: int,
 ) -> list[str]:
     if text_min > 0:
-        return ["text"] if text_min == 1 else [f"text{index + 1}" for index in range(text_min)]
+        return (
+            ["text"]
+            if text_min == 1
+            else [f"text{index + 1}" for index in range(text_min)]
+        )
     rows = _example_argument_rows(command, head=head, usage_lines=usage_lines)
     if not rows:
         return []
@@ -532,9 +542,15 @@ def _infer_param_names_from_examples(
         column_values = [row[index] for row in rows if len(row) > index]
         slot_type = _slot_type_from_examples("", column_values)
         if slot_type in {"int", "float"}:
-            if index == 0 and any(token in metadata_text for token in ("金额", "金币", "余额", "积分", "价格", "总额")):
+            if index == 0 and any(
+                token in metadata_text
+                for token in ("金额", "金币", "余额", "积分", "价格", "总额")
+            ):
                 names.append("amount")
-            elif any(token in metadata_text for token in ("数量", "人数", "个数", "份数", "次数")):
+            elif any(
+                token in metadata_text
+                for token in ("数量", "人数", "个数", "份数", "次数")
+            ):
                 names.append("count" if "count" not in names else f"count{index + 1}")
             else:
                 names.append(f"number{index + 1}")
@@ -596,7 +612,9 @@ def _description_with_choices(description: str, choices: list[str]) -> str:
         return description
     choices_text = "可选值: " + "/".join(normalized_choices[:16])
     base = normalize_message_text(description)
-    return normalize_message_text("；".join(part for part in (base, choices_text) if part))
+    return normalize_message_text(
+        "；".join(part for part in (base, choices_text) if part)
+    )
 
 
 def _command_description(
@@ -970,11 +988,38 @@ def render_command(
         slot.name: _render_slot_value(schema, slot, completed.get(slot.name, ""))
         for slot in schema.slots
     }
+    shortcut_render = _matched_shortcut_render(schema, message_text)
+    if shortcut_render:
+        shortcut_parts = shortcut_render.split()
+        rendered_parts = shortcut_parts[:1] if shortcut_parts else [shortcut_render]
+        rendered_parts.extend(
+            values.get(slot.name, "") for slot in schema.slots if values.get(slot.name)
+        )
+        rendered_parts.extend(shortcut_parts[1:])
+        rendered = " ".join(rendered_parts)
+        return normalize_message_text(rendered), []
     try:
         rendered = schema.render.format_map(values)
     except Exception:
         rendered = schema.head
     return normalize_message_text(rendered), []
+
+
+def _matched_shortcut_render(
+    schema: PluginCommandSchema,
+    message_text: str,
+) -> str:
+    text = normalize_message_text(message_text)
+    if not text:
+        return ""
+    for shortcut in schema.shortcut_renders:
+        if not isinstance(shortcut, dict):
+            continue
+        alias = normalize_message_text(str(shortcut.get("alias", "") or ""))
+        render = normalize_message_text(str(shortcut.get("render", "") or ""))
+        if alias and render and alias in text:
+            return render
+    return ""
 
 
 def _render_slot_value(

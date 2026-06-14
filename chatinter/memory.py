@@ -32,10 +32,10 @@ from .config import (
     MAX_REPLY_LAYERS,
     SESSION_CONTEXT_LIMIT,
     USE_SIGN_IN_IMPRESSION,
-    get_config_value,
 )
 from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
+from .persona import resolve_persona
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
 from .utils.cache import get_user_impression_with_cache
 from .utils.unimsg_utils import (
@@ -227,7 +227,9 @@ class ChatMemory:
         return merged.to_xml_lines()
 
     @staticmethod
-    def _profile_fact_lines(dialogue_context: DialogueContextPack | None) -> tuple[
+    def _profile_fact_lines(
+        dialogue_context: DialogueContextPack | None,
+    ) -> tuple[
         list[str],
         list[str],
         list[str],
@@ -415,6 +417,7 @@ class ChatMemory:
         event: Event | None = None,
         dialogue_context: DialogueContextPack | None = None,
         dialogue_state: "DialogueState | None" = None,
+        scenario: str = "",
     ) -> tuple[str, str, list[Image], list[LLMMessage]]:
         """构建完整的上下文（System + Context + Current + History Messages）
 
@@ -584,6 +587,9 @@ class ChatMemory:
             impression,
             attitude,
             current_message_text=current_message_text,
+            user_id=user_id,
+            group_id=group_id,
+            scenario=scenario,
         )
 
         return system_prompt, context_xml, reply_images, history_messages
@@ -799,9 +805,17 @@ class ChatMemory:
         impression: float,
         attitude: str,
         current_message_text: str = "",
+        user_id: str = "",
+        group_id: str | None = None,
+        scenario: str = "",
     ) -> str:
         """构建系统提示词"""
-        chat_style = str(get_config_value("CHAT_STYLE", "") or "")
+        persona = resolve_persona(
+            user_id=user_id,
+            group_id=group_id,
+            scenario=scenario,
+        ).persona
+        chat_style = persona.style
         if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and self._is_complex_query(
             current_message_text
         ):
@@ -822,8 +836,8 @@ class ChatMemory:
         else:
             impression_rule = ""
 
-        custom_prompt = get_config_value("CUSTOM_PROMPT", "")
-        custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
+        custom_prompt = persona.prompt_fragment()
+        custom_prompt_text = f"\n额外人格设定：{custom_prompt}" if custom_prompt else ""
 
         return base + impression_rule + custom_prompt_text
 

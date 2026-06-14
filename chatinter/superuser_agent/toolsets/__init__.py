@@ -1,10 +1,11 @@
-﻿"""Built-in superuser Agent toolsets."""
+"""Built-in superuser Agent toolsets."""
 
-from . import approval_tools as approval_tools
 from . import agent_run_tools as agent_run_tools
+from . import approval_tools as approval_tools
 from . import artifact_tools as artifact_tools
 from . import audit_tools as audit_tools
 from . import background_tools as background_tools
+from . import delegate_tools as delegate_tools
 from . import engineering_eval_tools as engineering_eval_tools
 from . import engineering_loop_tools as engineering_loop_tools
 from . import eval_harness_tools as eval_harness_tools
@@ -23,11 +24,12 @@ from . import uv_tools as uv_tools
 from . import worktree_tools as worktree_tools
 
 __all__ = [
-    "approval_tools",
     "agent_run_tools",
+    "approval_tools",
     "artifact_tools",
     "audit_tools",
     "background_tools",
+    "delegate_tools",
     "engineering_eval_tools",
     "engineering_loop_tools",
     "eval_harness_tools",

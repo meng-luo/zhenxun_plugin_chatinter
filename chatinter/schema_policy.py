@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
-from .target_policy import TargetPolicy
 from .route_text import normalize_message_text
+from .target_policy import TargetPolicy
 
 _SELF_ONLY_SCOPE = "self_only"
 _AT_SOURCE = "at"
@@ -67,8 +67,7 @@ class CommandTargetPolicy:
     @property
     def allow_reply_image_as_target(self) -> bool:
         return bool(
-            self.allow_reply_image
-            or self.adapter_policy.allow_reply_image_as_target
+            self.allow_reply_image or self.adapter_policy.allow_reply_image_as_target
         )
 
     @property
@@ -77,7 +76,10 @@ class CommandTargetPolicy:
 
     @property
     def target_missing_message(self) -> str:
-        return self.target_missing_message_value or self.adapter_policy.target_missing_message
+        return (
+            self.target_missing_message_value
+            or self.adapter_policy.target_missing_message
+        )
 
 
 def resolve_command_target_policy(
@@ -194,7 +196,7 @@ def schema_is_self_only(schema) -> bool:
 
 
 def _disable_media_target_adapter(adapter: TargetPolicy) -> TargetPolicy:
-    """Keep adapter metadata but prevent media target rules leaking to text-only commands."""
+    """Keep adapter metadata but disable media target rules for text commands."""
 
     return TargetPolicy(
         family=adapter.family,
@@ -236,7 +238,9 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
 
 def _generic_target_missing_message(*, allow_at: bool, allow_image: bool) -> str:
     if allow_at and allow_image:
-        return "这个命令需要明确目标，请重新发送完整命令并@目标成员，或补充图片/回复图片。"
+        return (
+            "这个命令需要明确目标，请重新发送完整命令并@目标成员，或补充图片/回复图片。"
+        )
     if allow_at:
         return "这个命令需要明确目标，请重新发送完整命令并@目标成员或写清昵称。"
     if allow_image:

@@ -8,8 +8,8 @@ from typing import Any
 
 from nonebot.adapters import Event
 
-from .command_schema import normalize_schema_command_head
 from .command_observation import build_command_observation
+from .command_schema import normalize_schema_command_head
 from .feedback_keys import (
     FEEDBACK_REASON_MISSING_PARAMS as _FEEDBACK_REASON_MISSING_PARAMS,
 )
@@ -18,7 +18,6 @@ from .feedback_keys import (
 )
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_route import NativeRouteResult
-from .target_policy import TargetPolicy, get_target_policy
 from .plugin_registry import PluginRegistry
 from .route_text import (
     ROUTE_ACTION_WORDS,
@@ -29,6 +28,7 @@ from .route_text import (
     normalize_message_text,
 )
 from .schema_policy import resolve_command_target_policy
+from .target_policy import TargetPolicy, get_target_policy
 
 
 @dataclass(frozen=True)
@@ -314,7 +314,8 @@ def _view_from_selected_candidate_schema(
     if (
         route_result.command_id
         and command_id
-        and command_id.casefold() != normalize_message_text(route_result.command_id).casefold()
+        and command_id.casefold()
+        != normalize_message_text(route_result.command_id).casefold()
     ):
         return None
     return _view_from_plugin_command_schema(schema)
@@ -647,7 +648,9 @@ def _merge_command_policies_to_adapter(
     allow_at = any(policy.allow_at_as_target for policy in policies)
     allow_image = any(policy.allow_image_as_target for policy in policies)
     allow_reply_image = any(policy.allow_reply_image_as_target for policy in policies)
-    target_required = any(policy.target_requirement == "required" for policy in policies)
+    target_required = any(
+        policy.target_requirement == "required" for policy in policies
+    )
     return TargetPolicy(
         family="general",
         context_hints=tuple(context_hints),
@@ -954,11 +957,7 @@ def _prepare_route_execution_plan(
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     image_max_value = getattr(schema, "image_max", None)
     try:
-        image_max = (
-            int(image_max_value)
-            if image_max_value is not None
-            else None
-        )
+        image_max = int(image_max_value) if image_max_value is not None else None
     except (TypeError, ValueError):
         image_max = None
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
@@ -991,8 +990,7 @@ def _prepare_route_execution_plan(
             if token not in merged_at:
                 merged_at.append(token)
         if (
-            target_requirement == "none"
-            or (image_max is not None and image_max <= 0)
+            target_requirement == "none" or (image_max is not None and image_max <= 0)
         ) and merged_at:
             command = _remove_tokens_from_command(command, merged_at)
             merged_at = []
@@ -1092,8 +1090,8 @@ __all__ = [
     "RouteExecutionPlan",
     "build_invalid_route_observation",
     "build_reply_image_segments_for_reroute",
-    "build_route_observation",
     "build_route_message_with_explicit_context",
+    "build_route_observation",
     "build_target_modules",
     "collect_target_capable_command_heads",
     "contains_self_reference",

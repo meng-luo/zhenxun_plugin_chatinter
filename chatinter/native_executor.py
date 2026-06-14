@@ -6,10 +6,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from zhenxun.services.llm.types.models import ToolResult
-
 from .command_index import CommandCandidate
 from .command_observation import build_command_observation
+from .llm_compat import ToolResult
 from .models.pydantic_models import CommandSlotSpec
 from .native_command_tools import NativeCommandToolBinding
 from .native_route import (
@@ -168,7 +167,9 @@ class NativeCommandExecutionContext:
         )
         if shortcut_command:
             route_message_text = shortcut_command
-            slots = _slots_from_shortcut_command(candidate.schema, shortcut_command, slots)
+            slots = _slots_from_shortcut_command(
+                candidate.schema, shortcut_command, slots
+            )
             task_frame = replace(task_frame, slots=dict(slots))
         selection = NativeCommandSelection(
             action="execute",
@@ -416,7 +417,11 @@ def _shortcut_command_for_task(
     schema = candidate.schema
     shortcuts = getattr(schema, "shortcut_renders", None)
     if not shortcuts:
-        meta = getattr(candidate.tool, "meta", None) if candidate.tool is not None else None
+        meta = (
+            getattr(candidate.tool, "meta", None)
+            if candidate.tool is not None
+            else None
+        )
         shortcuts = meta.get("shortcut_renders") if isinstance(meta, dict) else None
     if not isinstance(shortcuts, list):
         return ""
@@ -491,9 +496,7 @@ def _execution_failure_from_exception(
     exc: Exception,
 ) -> NativeToolExecutionResult:
     task_text = (
-        validated.task_frame.effective_text
-        if validated.task_frame is not None
-        else ""
+        validated.task_frame.effective_text if validated.task_frame is not None else ""
     )
     route_result = validated.route_result
     rendered = (
@@ -533,9 +536,7 @@ def _ensure_execution_observation(
         return execution
     route_result = execution.route_result
     task_text = (
-        validated.task_frame.effective_text
-        if validated.task_frame is not None
-        else ""
+        validated.task_frame.effective_text if validated.task_frame is not None else ""
     )
     rendered = (
         execution.route_command

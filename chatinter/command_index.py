@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import hashlib
 import re
 
 from .capability_graph import build_capability_graph_snapshot
@@ -40,6 +41,8 @@ _RRF_K = 60.0
 _FAMILY_SOFT_CAP = 6
 _PLUGIN_SOFT_CAP = 8
 _EXACT_KEEP_LIMIT = 8
+_INDEX_PREFILTER_MIN_TOOLS = 64
+_INDEX_PREFILTER_LIMIT = 160
 _CJK_COMMAND_BOUNDARY_CHARS = frozenset(" ，,。.!！？?；;：:/|）)]】}《<>")
 _MEDIA_CONTEXT_TERMS = (
     "表情",
@@ -89,6 +92,50 @@ class _ScoredCandidate:
     reasons: tuple[str, ...]
     exact_protected: bool
     features: CommandCandidateFeatures
+
+
+@dataclass
+class _CommandInvertedIndex:
+    fingerprint: str
+    tools: tuple[CommandToolSnapshot, ...]
+    postings: dict[str, dict[int, float]]
+
+    def select(
+        self,
+        query: str,
+        *,
+        limit: int | None,
+    ) -> list[CommandToolSnapshot] | None:
+        terms = _query_index_terms(query)
+        if not terms:
+            return None
+        scores: dict[int, float] = defaultdict(float)
+        for term in terms:
+            for index, weight in self.postings.get(term, {}).items():
+                scores[index] += weight
+        if not scores:
+            return None
+        max_items = _prefilter_limit(limit=limit, total=len(self.tools))
+        if len(scores) >= len(self.tools) * 0.85:
+            return None
+        ranked_indexes = sorted(
+            scores,
+            key=lambda index: (
+                scores[index],
+                self.tools[index].schema_quality,
+                self.tools[index].reliability,
+                -index,
+            ),
+            reverse=True,
+        )[:max_items]
+        if not ranked_indexes:
+            return None
+        return [self.tools[index] for index in ranked_indexes]
+
+
+_INDEX_CACHE: dict[str, _CommandInvertedIndex] = {}
+_INDEX_CACHE_ORDER: list[str] = []
+_INDEX_CACHE_MAX = 8
 
 
 def _empty_features() -> CommandCandidateFeatures:
@@ -177,6 +224,122 @@ def _tokens(text: str) -> set[str]:
     return tokens
 
 
+def _query_index_terms(query: str) -> set[str]:
+    normalized, stripped = _query_variants(query)
+    terms = _tokens(normalized) | _tokens(stripped)
+    for text in (normalized, stripped):
+        lowered = text.casefold()
+        if not lowered:
+            continue
+        for part in re.split(r"\s+", lowered):
+            if part:
+                terms.add(part)
+        terms.update(_cjk_ngrams_for_index(lowered))
+    return {term for term in terms if term}
+
+
+def _cjk_ngrams_for_index(text: str) -> set[str]:
+    chars = "".join(char for char in text if "\u4e00" <= char <= "\u9fff")
+    if len(chars) < 2:
+        return set()
+    result: set[str] = set()
+    max_size = min(len(chars), 4)
+    for size in range(2, max_size + 1):
+        for start in range(0, len(chars) - size + 1):
+            result.add(chars[start : start + size].casefold())
+    return result
+
+
+def _index_terms_for_schema(
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+) -> dict[str, float]:
+    weighted: dict[str, float] = {}
+
+    def add(text: str, weight: float) -> None:
+        normalized = normalize_message_text(text).casefold()
+        if not normalized:
+            return
+        weighted[normalized] = max(weighted.get(normalized, 0.0), weight)
+        for term in _tokens(normalized):
+            weighted[term] = max(weighted.get(term, 0.0), weight)
+        for term in _cjk_ngrams_for_index(normalized):
+            weighted[term] = max(weighted.get(term, 0.0), weight * 0.8)
+
+    add(schema.command_id, 3.0)
+    add(schema.head, 4.0)
+    for alias in schema.aliases:
+        add(alias, 3.6)
+    for phrase in schema.retrieval_phrases:
+        add(phrase, 2.2)
+    add(schema.description, 1.5)
+    add(tool.plugin_name, 1.3)
+    add(tool.plugin_module, 1.0)
+    add(tool.capability_text, 1.4)
+    for text in [
+        *list(tool.task_verbs or []),
+        *list(tool.input_requirements or []),
+        *list(getattr(tool, "use_cases", []) or []),
+        *list(getattr(tool, "intent_types", []) or []),
+    ]:
+        add(text, 1.2)
+    return weighted
+
+
+def _command_index_fingerprint(tools: list[CommandToolSnapshot]) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    for tool in tools:
+        parts = [
+            str(tool.command_id or ""),
+            str(tool.source_signature or ""),
+            str(tool.plugin_module or ""),
+            str(tool.plugin_name or ""),
+            str(tool.head or ""),
+            " ".join(tool.aliases or []),
+            " ".join(tool.retrieval_phrases or []),
+            str(tool.description or ""),
+            str(tool.capability_text or ""),
+        ]
+        for part in parts:
+            digest.update(part.encode("utf-8", "ignore"))
+            digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _get_command_inverted_index(
+    tools: list[CommandToolSnapshot],
+) -> _CommandInvertedIndex:
+    fingerprint = _command_index_fingerprint(tools)
+    cached = _INDEX_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    postings: dict[str, dict[int, float]] = defaultdict(dict)
+    for index, tool in enumerate(tools):
+        schema = _schema_from_tool_snapshot(tool)
+        for term, weight in _index_terms_for_schema(tool, schema).items():
+            if not term:
+                continue
+            postings[term][index] = max(postings[term].get(index, 0.0), weight)
+    built = _CommandInvertedIndex(
+        fingerprint=fingerprint,
+        tools=tuple(tools),
+        postings={term: dict(items) for term, items in postings.items()},
+    )
+    _INDEX_CACHE[fingerprint] = built
+    _INDEX_CACHE_ORDER.append(fingerprint)
+    while len(_INDEX_CACHE_ORDER) > _INDEX_CACHE_MAX:
+        old = _INDEX_CACHE_ORDER.pop(0)
+        _INDEX_CACHE.pop(old, None)
+    return built
+
+
+def _prefilter_limit(*, limit: int | None, total: int) -> int:
+    if total <= 0:
+        return 0
+    requested = total if limit is None or int(limit or 0) <= 0 else int(limit)
+    return min(total, max(requested * 6, _INDEX_PREFILTER_LIMIT))
+
+
 def _schema_text(schema: PluginCommandSchema) -> str:
     slot_text = " ".join(
         " ".join([slot.name, slot.description, *slot.aliases]) for slot in schema.slots
@@ -219,7 +382,8 @@ def _tool_text(tool: CommandToolSnapshot, schema: PluginCommandSchema) -> str:
                 getattr(tool, "entity_scope", ""),
                 "soft_tool" if bool(getattr(tool, "soft_tool", False)) else "",
                 f"reliability {float(getattr(tool, 'reliability', 0.0) or 0.0):.2f}",
-                f"schema_quality {float(getattr(tool, 'schema_quality', 0.0) or 0.0):.2f}",
+                "schema_quality "
+                f"{float(getattr(tool, 'schema_quality', 0.0) or 0.0):.2f}",
                 getattr(tool, "execution_policy", ""),
                 " ".join(tool.retrieval_phrases),
             ]
@@ -601,16 +765,13 @@ def _base_score_tool(
         score += feedback_score
         reasons.append("feedback")
     reliability_score = (
-        feedback_profile.reliability_score
-        + context_profile.reliability_score * 0.7
+        feedback_profile.reliability_score + context_profile.reliability_score * 0.7
     )
     false_trigger_score = (
-        feedback_profile.false_trigger_score
-        + context_profile.false_trigger_score * 0.9
+        feedback_profile.false_trigger_score + context_profile.false_trigger_score * 0.9
     )
     param_failure_score = (
-        feedback_profile.param_failure_score
-        + context_profile.param_failure_score * 0.8
+        feedback_profile.param_failure_score + context_profile.param_failure_score * 0.8
     )
     latency_score = feedback_profile.latency_score
     if reliability_score:
@@ -679,9 +840,7 @@ def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema
         matcher_key=tool.matcher_key,
         retrieval_phrases=tool.retrieval_phrases,
         shortcut_renders=list(
-            tool.meta.get("shortcut_renders", [])
-            if isinstance(tool.meta, dict)
-            else []
+            tool.meta.get("shortcut_renders", []) if isinstance(tool.meta, dict) else []
         ),
     )
     return schema
@@ -940,7 +1099,19 @@ def build_command_candidates(
     if tools is None:
         graph = build_capability_graph_snapshot(knowledge_base)
         tools = build_command_tool_snapshots(graph)
-    ranked = _score_all_tools(tools, query, session_id=session_id)
+    scoring_tools = tools
+    if (
+        len(tools) >= _INDEX_PREFILTER_MIN_TOOLS
+        and not include_unscored
+        and query.strip()
+    ):
+        indexed_tools = _get_command_inverted_index(tools).select(
+            query,
+            limit=limit,
+        )
+        if indexed_tools:
+            scoring_tools = indexed_tools
+    ranked = _score_all_tools(scoring_tools, query, session_id=session_id)
     merged = _merge_ranked_candidates(ranked)
     max_items = len(tools) if limit is None or int(limit or 0) <= 0 else int(limit)
     selected = _diversify_candidates(

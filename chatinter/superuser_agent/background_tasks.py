@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 import time
-from typing import Any
+from typing import Any, cast
 import uuid
 
 from ..artifact_store import get_artifact_store, summarize_artifact_text
 from ..persistence import read_json, state_path, write_json
-from ..runtime_events import emit_runtime_event
+from ..runtime_events import RuntimeEventStatus, emit_runtime_event
 from .audit_log import record_audit_event
 
 _MAX_OUTPUT_CHARS = 8000
@@ -451,7 +451,9 @@ def _ensure_loaded() -> None:
             continue
         if task.status in {"running", "cancelling"}:
             task.status = "interrupted_after_restart"
-            task.error = task.error or "Bot restarted before this background task completed."
+            task.error = (
+                task.error or "Bot restarted before this background task completed."
+            )
             task.updated_at = time.time()
             changed = True
         _TASKS[task.task_id] = task
@@ -491,12 +493,10 @@ def _task_from_payload(task_id: object, payload: object) -> BackgroundTask | Non
             stdout=str(data.get("stdout", "") or ""),
             stderr=str(data.get("stderr", "") or ""),
             output_tail=str(
-                data.get("output_tail", "")
-                or _tail(str(data.get("stdout", "") or ""))
+                data.get("output_tail", "") or _tail(str(data.get("stdout", "") or ""))
             ),
             stderr_tail=str(
-                data.get("stderr_tail", "")
-                or _tail(str(data.get("stderr", "") or ""))
+                data.get("stderr_tail", "") or _tail(str(data.get("stderr", "") or ""))
             ),
             error=str(data.get("error", "") or ""),
             last_stream_event_at=float(data.get("last_stream_event_at") or 0.0),
@@ -509,10 +509,7 @@ def _task_from_payload(task_id: object, payload: object) -> BackgroundTask | Non
 def _save_tasks() -> None:
     write_json(
         _TASKS_PATH,
-        {
-            task_id: task.to_record()
-            for task_id, task in sorted(_TASKS.items())
-        },
+        {task_id: task.to_record() for task_id, task in sorted(_TASKS.items())},
     )
 
 
@@ -558,7 +555,10 @@ def _maybe_emit_stream_event(task: BackgroundTask, *, stdout: bool) -> None:
     now = time.time()
     if task.stream_event_count >= _MAX_STREAM_EVENTS_PER_TASK:
         return
-    if now - float(task.last_stream_event_at or 0.0) < _STREAM_EVENT_MIN_INTERVAL_SECONDS:
+    if (
+        now - float(task.last_stream_event_at or 0.0)
+        < _STREAM_EVENT_MIN_INTERVAL_SECONDS
+    ):
         return
     task.last_stream_event_at = now
     task.stream_event_count += 1
@@ -684,17 +684,17 @@ def _emit_background_runtime_event(event: ObservationEvent) -> None:
     )
 
 
-def _runtime_status_from_background(status: str) -> str:
+def _runtime_status_from_background(status: str) -> RuntimeEventStatus:
     normalized = str(status or "")
     if normalized == "running":
-        return "progress"
+        return cast(RuntimeEventStatus, "progress")
     if normalized == "completed":
-        return "completed"
+        return cast(RuntimeEventStatus, "completed")
     if normalized in {"cancelled", "interrupted_after_restart"}:
-        return "cancelled"
+        return cast(RuntimeEventStatus, "cancelled")
     if normalized in {"failed", "error"}:
-        return "failed"
-    return "info"
+        return cast(RuntimeEventStatus, "failed")
+    return cast(RuntimeEventStatus, "info")
 
 
 def _decode(data: bytes | None) -> str:

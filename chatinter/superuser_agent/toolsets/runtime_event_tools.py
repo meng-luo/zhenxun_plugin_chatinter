@@ -31,15 +31,26 @@ class RuntimeEventListTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "run_id": {"type": ["string", "null"], "description": "可选 run_id。"},
-                    "trace_id": {"type": ["string", "null"], "description": "可选 trace_id。"},
+                    "run_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 run_id。",
+                    },
+                    "trace_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 trace_id。",
+                    },
                     "kind": {
                         "type": ["string", "null"],
-                        "description": "可选事件类型，例如 approval/background_job/tool_observation。",
+                        "description": (
+                            "可选事件类型，例如 "
+                            "approval/background_job/tool_observation。"
+                        ),
                     },
                     "status": {
                         "type": ["string", "null"],
-                        "description": "可选状态，例如 waiting/progress/completed/failed。",
+                        "description": (
+                            "可选状态，例如 " "waiting/progress/completed/failed。"
+                        ),
                     },
                     "source_contains": {
                         "type": ["string", "null"],
@@ -134,9 +145,18 @@ class RuntimeEventReplayTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "run_id": {"type": ["string", "null"], "description": "可选 run_id。"},
-                    "trace_id": {"type": ["string", "null"], "description": "可选 trace_id。"},
-                    "kind": {"type": ["string", "null"], "description": "可选事件类型。"},
+                    "run_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 run_id。",
+                    },
+                    "trace_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 trace_id。",
+                    },
+                    "kind": {
+                        "type": ["string", "null"],
+                        "description": "可选事件类型。",
+                    },
                     "after_event_id": {
                         "type": ["string", "null"],
                         "description": "只返回此事件之后的事件。",
@@ -194,11 +214,19 @@ class RuntimeStateProjectTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "run_id": {"type": ["string", "null"], "description": "可选 run_id。"},
-                    "trace_id": {"type": ["string", "null"], "description": "可选 trace_id。"},
+                    "run_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 run_id。",
+                    },
+                    "trace_id": {
+                        "type": ["string", "null"],
+                        "description": "可选 trace_id。",
+                    },
                     "include_details": {
                         "type": ["boolean", "null"],
-                        "description": "是否返回详细 observations/tool_calls，默认 true。",
+                        "description": (
+                            "是否返回详细 observations/tool_calls，" "默认 true。"
+                        ),
                     },
                     "limit": {
                         "type": ["integer", "null"],

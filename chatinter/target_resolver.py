@@ -13,7 +13,6 @@ from typing import Literal
 from nonebot.adapters import Bot
 
 from .native_route import NativeRouteResult
-from .target_policy import TargetPolicy, get_target_policy
 from .route_execution import (
     extract_at_tokens,
     extract_image_tokens,
@@ -26,6 +25,7 @@ from .target_context import (
     extract_fuzzy_target_hint,
     needs_target_for_route,
 )
+from .target_policy import TargetPolicy, get_target_policy
 
 TargetResolveStatus = Literal[
     "not_needed",
@@ -197,16 +197,18 @@ async def resolve_pre_route_target(
     target_policy: TargetPolicy,
     command_heads: set[str] | None = None,
 ) -> TargetResolveResult:
-    enriched_message, enriched_profiles, prompt = (
-        await enrich_route_message_with_fuzzy_target(
-            group_id=group_id,
-            bot=bot,
-            original_message=original_message,
-            route_message=route_message,
-            mention_profiles=mention_profiles,
-            target_policy=target_policy,
-            command_heads=command_heads,
-        )
+    (
+        enriched_message,
+        enriched_profiles,
+        prompt,
+    ) = await enrich_route_message_with_fuzzy_target(
+        group_id=group_id,
+        bot=bot,
+        original_message=original_message,
+        route_message=route_message,
+        mention_profiles=mention_profiles,
+        target_policy=target_policy,
+        command_heads=command_heads,
     )
     if prompt:
         status: TargetResolveStatus = "ambiguous" if "好几个" in prompt else "missing"

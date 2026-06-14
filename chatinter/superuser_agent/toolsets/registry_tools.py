@@ -29,7 +29,10 @@ class ToolRegistryStatusTool:
                 "properties": {
                     "category": {
                         "type": ["string", "null"],
-                        "description": "可选分类过滤，例如 file/patch/eval/background/artifact。",
+                        "description": (
+                            "可选分类过滤，例如 "
+                            "file/patch/eval/background/artifact。"
+                        ),
                     },
                     "available_only": {
                         "type": ["boolean", "null"],

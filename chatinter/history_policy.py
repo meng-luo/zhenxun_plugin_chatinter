@@ -6,8 +6,8 @@ import json
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
-from zhenxun.services.llm import LLMMessage
 
+from .llm_compat import LLMMessage
 from .models.chat_history import ChatInterChatHistory
 from .person_registry import format_person_history_label, get_person_profile
 from .route_text import normalize_message_text

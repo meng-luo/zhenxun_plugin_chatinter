@@ -1,16 +1,16 @@
-﻿"""Turn-local context compression for ChatInter AgentRuntime."""
+"""Turn-local context compression for ChatInter AgentRuntime."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from hashlib import blake2s
 import json
 import re
-from typing import Any, Iterable
-
-from zhenxun.services.llm import LLMContentPart, LLMMessage
+from typing import Any
 
 from .artifact_store import get_artifact_store, summarize_artifact_text
+from .llm_compat import LLMContentPart, LLMMessage
 from .route_text import normalize_message_text
 from .turn_runtime import estimate_text_tokens
 
@@ -106,7 +106,9 @@ def _compress_completed_tool_pairs(
     index = 0
     while index < len(messages):
         message = messages[index]
-        tool_calls = list(message.tool_calls or []) if message.role == "assistant" else []
+        tool_calls = (
+            list(message.tool_calls or []) if message.role == "assistant" else []
+        )
         if not tool_calls:
             compressed.append(message)
             index += 1
@@ -164,7 +166,9 @@ def _tool_pair_summary(
         )
     )
     lines = [f"<tool_observation_summary fingerprint={pair_fingerprint}>"]
-    response_by_id = {str(message.tool_call_id or ""): message for message in tool_messages}
+    response_by_id = {
+        str(message.tool_call_id or ""): message for message in tool_messages
+    }
     for tool_call in tool_calls:
         tool_id = str(getattr(tool_call, "id", "") or "")
         function = getattr(tool_call, "function", None)
@@ -233,9 +237,9 @@ def _summarize_middle_messages(
             continue
         summarized_middle.append(item)
     if len(protected_middle) > _MAX_PROTECTED_MESSAGES:
-        summarized_middle.extend(protected_middle[: -_MAX_PROTECTED_MESSAGES])
+        summarized_middle.extend(protected_middle[:-_MAX_PROTECTED_MESSAGES])
         protected_middle = protected_middle[-_MAX_PROTECTED_MESSAGES:]
-    summary_lines = [
+    raw_summary_lines = [
         line
         for line in (
             _message_summary(
@@ -247,6 +251,14 @@ def _summarize_middle_messages(
         )
         if line
     ][-_MAX_SUMMARY_LINES:]
+    summary_lines = raw_summary_lines
+    omitted_filler = False
+    if protected_middle:
+        summary_lines = _drop_old_filler_summaries(summary_lines)
+        omitted_filler = len(summary_lines) < len(raw_summary_lines)
+    if not summary_lines and summarized_middle:
+        summary_lines = ["assistant: historical context omitted"]
+        omitted_filler = True
     if not summary_lines:
         return messages, 0, "", len(protected_middle)
     omitted_ref = get_artifact_store().store_text(
@@ -258,22 +270,36 @@ def _summarize_middle_messages(
     )
     artifact_line = ""
     if omitted_ref is not None:
-        artifact_line = f"artifact_id={omitted_ref.artifact_id}; summary={omitted_ref.summary}"
+        summary = (
+            "omitted_historical_context" if omitted_filler else omitted_ref.summary
+        )
+        artifact_line = f"artifact_id={omitted_ref.artifact_id}; " f"summary={summary}"
     summary_text = "\n".join(
         [
             f"<compressed_turn_context fingerprint={compression_fingerprint}>",
             "policy=tool_result_pruning_dedup_active_task_protection",
             artifact_line,
-            f"summarized_messages={len(summarized_middle)}; protected_messages_kept={len(protected_middle)}",
+            (
+                f"summarized_messages={len(summarized_middle)}; "
+                f"protected_messages_kept={len(protected_middle)}"
+            ),
             *summary_lines,
             "</compressed_turn_context>",
         ]
     )[:_MAX_SUMMARY_CHARS]
+    suffix_messages = messages[suffix_start:]
+    if protected_terms:
+        suffix_messages = [
+            item
+            for item in suffix_messages
+            if not _looks_like_context_filler(_message_text(item))
+            or _message_contains_protected_term(item, protected_terms)
+        ]
     rebuilt = [
         *messages[:prefix_end],
         LLMMessage.user(summary_text),
         *protected_middle,
-        *messages[suffix_start:],
+        *suffix_messages,
     ]
     if estimate_messages_tokens(rebuilt) <= target_prompt_tokens:
         return rebuilt, len(summarized_middle), summary_text, len(protected_middle)
@@ -299,6 +325,7 @@ def _hard_clip_messages(
     protected_count: int,
 ) -> tuple[list[LLMMessage], int, str, int]:
     prefix_end = _prefix_end(messages)
+    messages = _drop_historical_filler_messages(messages, prefix_end=prefix_end)
     used = sum(_message_token_cost(message) for message in messages[:prefix_end])
     summary_message = LLMMessage.user(summary_text)
     used += _message_token_cost(summary_message)
@@ -336,7 +363,10 @@ def _hard_clip_messages(
     )
     clip_line = ""
     if clip_ref is not None:
-        clip_line = f"\nclipped_artifact_id={clip_ref.artifact_id}; clipped_summary={clip_ref.summary}"
+        clip_line = (
+            f"\nclipped_artifact_id={clip_ref.artifact_id}; "
+            f"clipped_summary={clip_ref.summary}"
+        )
     clipped_summary = summary_text.replace(
         "</compressed_turn_context>",
         f"hard_clipped_messages={clipped_count}{clip_line}\n</compressed_turn_context>",
@@ -347,6 +377,38 @@ def _hard_clip_messages(
         clipped_summary,
         protected_count,
     )
+
+
+def _drop_historical_filler_messages(
+    messages: list[LLMMessage],
+    *,
+    prefix_end: int,
+) -> list[LLMMessage]:
+    if len(messages) <= prefix_end + 4:
+        return messages
+    keep_last_start = max(prefix_end, len(messages) - 4)
+    filtered: list[LLMMessage] = []
+    dropped = 0
+    for index, message in enumerate(messages):
+        if prefix_end <= index < keep_last_start and _looks_like_context_filler(
+            _message_text(message)
+        ):
+            dropped += 1
+            continue
+        filtered.append(message)
+    if dropped <= 0:
+        return messages
+    summary = LLMMessage.user(
+        "\n".join(
+            [
+                "<compressed_turn_context>",
+                "policy=current_turn_pinning",
+                f"historical_filler_messages_omitted={dropped}",
+                "</compressed_turn_context>",
+            ]
+        )
+    )
+    return [*filtered[:prefix_end], summary, *filtered[prefix_end:]]
 
 
 def _prefix_end(messages: list[LLMMessage]) -> int:
@@ -395,7 +457,9 @@ def _message_summary(
         names = []
         for call in message.tool_calls:
             function = getattr(call, "function", None)
-            names.append(normalize_message_text(str(getattr(function, "name", "") or "")))
+            names.append(
+                normalize_message_text(str(getattr(function, "name", "") or ""))
+            )
         protected_refs = _protected_excerpts(
             _message_full_text(message),
             protected_terms,
@@ -403,7 +467,9 @@ def _message_summary(
         suffix = f"; protected_refs={protected_refs}" if protected_refs else ""
         return f"{role}: tool_calls={','.join(name for name in names if name)}{suffix}"
     text = _message_text(message)
-    if len(text) > 500:
+    if _looks_like_context_filler(text):
+        text = ""
+    elif len(text) > 500:
         text = _artifact_or_summary(
             text,
             trace_id=trace_id,
@@ -418,6 +484,24 @@ def _message_summary(
     if not text:
         return ""
     return f"{role}: {text}"
+
+
+def _drop_old_filler_summaries(lines: list[str]) -> list[str]:
+    filtered = [
+        line
+        for line in lines
+        if "old assistant filler" not in line and "older context" not in line
+    ]
+    if filtered:
+        return filtered
+    return ["assistant: historical filler omitted"]
+
+
+def _looks_like_context_filler(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    return normalized.startswith("old assistant filler") or normalized.startswith(
+        "older context"
+    )
 
 
 def _message_full_text(message: LLMMessage) -> str:
@@ -450,7 +534,9 @@ def _message_text(message: LLMMessage) -> str:
                 artifact_type="image",
                 summary="image omitted from compressed context",
                 source="context_compression:image",
-                path="" if part.image_source.startswith("data:") else part.image_source[:500],
+                path=""
+                if part.image_source.startswith("data:")
+                else part.image_source[:500],
                 mime_type=part.mime_type or "",
                 size=len(part.image_source),
             )
@@ -608,7 +694,9 @@ def _sanitize_tool_protocol(
     index = 0
     while index < len(messages):
         message = messages[index]
-        tool_calls = list(message.tool_calls or []) if message.role == "assistant" else []
+        tool_calls = (
+            list(message.tool_calls or []) if message.role == "assistant" else []
+        )
         if tool_calls:
             tool_ids = {
                 str(getattr(call, "id", "") or "")
@@ -659,8 +747,14 @@ def _sanitize_tool_protocol(
                 "\n".join(
                     [
                         "<orphan_tool_result_pruned>",
-                        f"tool={normalize_message_text(str(message.name or 'unknown'))}",
-                        f"tool_call_id={normalize_message_text(str(message.tool_call_id or ''))}",
+                        (
+                            "tool="
+                            f"{normalize_message_text(str(message.name or 'unknown'))}"
+                        ),
+                        (
+                            "tool_call_id="
+                            f"{normalize_message_text(str(message.tool_call_id or ''))}"
+                        ),
                         f"result={summary}",
                         "</orphan_tool_result_pruned>",
                     ]
@@ -861,7 +955,9 @@ def _count_completed_tool_pairs(messages: list[LLMMessage]) -> int:
     index = 0
     while index < len(messages):
         message = messages[index]
-        tool_calls = list(message.tool_calls or []) if message.role == "assistant" else []
+        tool_calls = (
+            list(message.tool_calls or []) if message.role == "assistant" else []
+        )
         if not tool_calls:
             index += 1
             continue
@@ -909,7 +1005,9 @@ def _has_orphan_tool_messages(messages: list[LLMMessage]) -> bool:
 def _has_recent_compression_marker(messages: list[LLMMessage]) -> bool:
     for message in messages[-10:]:
         text = normalize_message_text(_message_text(message))
-        if text.startswith(_COMPRESSION_MARKER) or text.startswith("<context_dedup_summary>"):
+        if text.startswith(_COMPRESSION_MARKER) or text.startswith(
+            "<context_dedup_summary>"
+        ):
             return True
     return False
 
@@ -927,12 +1025,16 @@ def _messages_fingerprint(messages: list[LLMMessage]) -> str:
 def _normalize_for_hash(text: str) -> str:
     normalized = normalize_message_text(text)
     normalized = re.sub(r"fingerprint=[a-fA-F0-9]+", "fingerprint=*", normalized)
-    normalized = re.sub(r"ci_[a-z_]+_[a-zA-Z0-9]+_[a-fA-F0-9]+", "ci_artifact_*", normalized)
+    normalized = re.sub(
+        r"ci_[a-z_]+_[a-zA-Z0-9]+_[a-fA-F0-9]+", "ci_artifact_*", normalized
+    )
     return normalized
 
 
 def _short_hash(text: str) -> str:
-    return blake2s(str(text or "").encode("utf-8", errors="ignore"), digest_size=8).hexdigest()
+    return blake2s(
+        str(text or "").encode("utf-8", errors="ignore"), digest_size=8
+    ).hexdigest()
 
 
 def _safe_int(value: Any) -> int:
@@ -949,7 +1051,9 @@ def _message_token_cost(message: LLMMessage) -> int:
         for call in message.tool_calls:
             function = getattr(call, "function", None)
             tool_cost += estimate_text_tokens(str(getattr(function, "name", "") or ""))
-            tool_cost += estimate_text_tokens(str(getattr(function, "arguments", "") or ""))
+            tool_cost += estimate_text_tokens(
+                str(getattr(function, "arguments", "") or "")
+            )
     if isinstance(content, str):
         return max(estimate_text_tokens(content) + tool_cost, 1)
     total = 0

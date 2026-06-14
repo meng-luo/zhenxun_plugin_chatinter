@@ -8,10 +8,11 @@ stream is the durable source for audit and recovery.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 import json
 import time
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 import uuid
 
 from .persistence import append_jsonl, read_json, state_path, to_jsonable, write_json
@@ -255,7 +256,9 @@ def list_runtime_events(
     normalized_status = normalize_message_text(status)
     source_filter = normalize_message_text(source_contains).lower()
     after_seen = not bool(after_event_id)
-    rows = sorted(_INDEX.values(), key=lambda item: float(item.get("created_at") or 0.0))
+    rows = sorted(
+        _INDEX.values(), key=lambda item: float(item.get("created_at") or 0.0)
+    )
     result: list[dict[str, Any]] = []
     for payload in rows:
         if payload.get("event_id") == after_event_id:
@@ -273,12 +276,13 @@ def list_runtime_events(
             continue
         if normalized_status and payload.get("status") != normalized_status:
             continue
-        if source_filter and source_filter not in str(payload.get("source", "")).lower():
+        if (
+            source_filter
+            and source_filter not in str(payload.get("source", "")).lower()
+        ):
             continue
         result.append(
-            dict(payload)
-            if include_payload
-            else _without_payload(dict(payload))
+            dict(payload) if include_payload else _without_payload(dict(payload))
         )
     return result[-max(1, min(int(limit or 50), 300)) :]
 
@@ -331,7 +335,9 @@ def replay_runtime_events(
             continue
         if normalized_kind and payload.get("kind") != normalized_kind:
             continue
-        result.append(dict(payload) if include_payload else _without_payload(dict(payload)))
+        result.append(
+            dict(payload) if include_payload else _without_payload(dict(payload))
+        )
     return result[-max(1, min(int(limit or 1000), _MAX_REPLAY_SCAN_EVENTS)) :]
 
 
@@ -425,7 +431,9 @@ def _with_related_session_events(
     return sorted(merged, key=lambda item: float(item.get("created_at") or 0.0))
 
 
-def build_runtime_projection(events: Iterable[dict[str, Any]]) -> RuntimeEventProjection:
+def build_runtime_projection(
+    events: Iterable[dict[str, Any]],
+) -> RuntimeEventProjection:
     projection = RuntimeEventProjection()
     for payload in sorted(
         (dict(item) for item in events if isinstance(item, dict)),
@@ -440,7 +448,9 @@ def rebuild_runtime_event_index(*, max_events: int = _MAX_INDEX_EVENTS) -> int:
 
     global _INDEX
     rows = _read_persisted_event_rows(max_scan=max(max_events, _MAX_INDEX_EVENTS))
-    selected = rows[-max(1, min(int(max_events or _MAX_INDEX_EVENTS), _MAX_REPLAY_SCAN_EVENTS)) :]
+    selected = rows[
+        -max(1, min(int(max_events or _MAX_INDEX_EVENTS), _MAX_REPLAY_SCAN_EVENTS)) :
+    ]
     _INDEX = {
         normalize_message_text(str(item.get("event_id", "") or "")): dict(item)
         for item in selected
@@ -473,7 +483,9 @@ def _read_persisted_event_rows(
             ).splitlines()
         except Exception:
             lines = []
-        for line in lines[-max(1, min(int(max_scan or _MAX_REPLAY_SCAN_EVENTS), 100000)) :]:
+        for line in lines[
+            -max(1, min(int(max_scan or _MAX_REPLAY_SCAN_EVENTS), 100000)) :
+        ]:
             try:
                 payload = json.loads(line)
             except Exception:
@@ -483,7 +495,9 @@ def _read_persisted_event_rows(
     if rows:
         return rows
     _ensure_loaded()
-    return sorted(_INDEX.values(), key=lambda item: float(item.get("created_at") or 0.0))
+    return sorted(
+        _INDEX.values(), key=lambda item: float(item.get("created_at") or 0.0)
+    )
 
 
 def _apply_event_to_projection(
@@ -493,15 +507,19 @@ def _apply_event_to_projection(
     kind = normalize_message_text(str(event.get("kind", "") or "system"))
     status = normalize_message_text(str(event.get("status", "") or "info"))
     event_id = normalize_message_text(str(event.get("event_id", "") or ""))
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    related_ids = (
-        event.get("related_ids") if isinstance(event.get("related_ids"), dict) else {}
+    raw_payload = event.get("payload")
+    payload: dict[str, Any] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    raw_related_ids = event.get("related_ids")
+    related_ids: dict[str, Any] = (
+        dict(raw_related_ids) if isinstance(raw_related_ids, dict) else {}
     )
     projection.event_count += 1
     projection.kinds[kind] = projection.kinds.get(kind, 0) + 1
     projection.status_by_kind[kind] = status
     projection.last_event_id = event_id or projection.last_event_id
-    projection.last_event_at = float(event.get("created_at") or projection.last_event_at or 0.0)
+    projection.last_event_at = float(
+        event.get("created_at") or projection.last_event_at or 0.0
+    )
     projection.run_id = projection.run_id or normalize_message_text(
         str(event.get("run_id", "") or "")
     )
@@ -527,11 +545,17 @@ def _apply_event_to_projection(
     elif kind in {"tool_observation", "observation"}:
         _apply_observation_event(projection, event, payload)
     elif kind == "approval":
-        _apply_approval_event(projection, status=status, payload=payload, related_ids=related_ids)
+        _apply_approval_event(
+            projection, status=status, payload=payload, related_ids=related_ids
+        )
     elif kind == "background_job":
-        _apply_background_event(projection, status=status, payload=payload, related_ids=related_ids)
+        _apply_background_event(
+            projection, status=status, payload=payload, related_ids=related_ids
+        )
     elif kind == "artifact":
-        _apply_artifact_event(projection, payload=payload, artifacts=event.get("artifacts"))
+        _apply_artifact_event(
+            projection, payload=payload, artifacts=event.get("artifacts")
+        )
     elif kind == "task_graph":
         graph = _extract_task_payload(payload, key="graph")
         if graph:
@@ -595,7 +619,8 @@ def _apply_observation_event(
     hint = normalize_message_text(str(payload.get("remaining_task_hint", "") or ""))
     if hint:
         _append_unique(projection.pending_tasks, hint)
-    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    raw_output = payload.get("output")
+    output: dict[str, Any] = dict(raw_output) if isinstance(raw_output, dict) else {}
     _collect_related_refs(projection, output)
     _collect_artifacts(projection, output.get("artifacts"))
 
@@ -769,7 +794,10 @@ def _collect_task_lists(
 
 
 def _extract_task_payload(payload: dict[str, Any], *, key: str) -> dict[str, Any]:
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    raw_metadata = payload.get("metadata")
+    metadata: dict[str, Any] = (
+        dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    )
     candidates = [
         metadata.get(key),
         metadata.get("task_" + key),
@@ -785,8 +813,12 @@ def _extract_task_payload(payload: dict[str, Any], *, key: str) -> dict[str, Any
 
 
 def _compact_projection_event(event: dict[str, Any]) -> dict[str, Any]:
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    raw_payload = event.get("payload")
+    payload: dict[str, Any] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    raw_metadata = payload.get("metadata")
+    metadata: dict[str, Any] = (
+        dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    )
     return {
         "event_id": event.get("event_id", ""),
         "kind": event.get("kind", ""),
@@ -824,8 +856,12 @@ def _event_matches_related_ids(event: dict[str, Any], related: set[str]) -> bool
     if not related:
         return False
     values: list[str] = []
-    related_ids = event.get("related_ids") if isinstance(event.get("related_ids"), dict) else {}
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    raw_related_ids = event.get("related_ids")
+    related_ids: dict[str, Any] = (
+        dict(raw_related_ids) if isinstance(raw_related_ids, dict) else {}
+    )
+    raw_payload = event.get("payload")
+    payload: dict[str, Any] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
     artifacts = event.get("artifacts")
     for source in (related_ids, payload):
         values.extend(_flat_related_values(source))
@@ -899,7 +935,9 @@ def _ensure_loaded() -> None:
 def _trim_index() -> None:
     if len(_INDEX) <= _MAX_INDEX_EVENTS:
         return
-    rows = sorted(_INDEX.items(), key=lambda item: float(item[1].get("created_at") or 0.0))
+    rows = sorted(
+        _INDEX.items(), key=lambda item: float(item[1].get("created_at") or 0.0)
+    )
     for event_id, _payload in rows[: max(len(rows) - _MAX_INDEX_EVENTS, 0)]:
         _INDEX.pop(event_id, None)
 
@@ -935,10 +973,16 @@ def _compact_artifacts(
             {
                 "artifact_id": artifact_id,
                 "type": normalize_message_text(str(item.get("type", "") or "")),
-                "summary": normalize_message_text(str(item.get("summary", "") or ""))[:300],
+                "summary": normalize_message_text(str(item.get("summary", "") or ""))[
+                    :300
+                ],
                 "size": _safe_int(item.get("size")),
                 **(
-                    {"source": normalize_message_text(str(item.get("source", "") or ""))}
+                    {
+                        "source": normalize_message_text(
+                            str(item.get("source", "") or "")
+                        )
+                    }
                     if item.get("source")
                     else {}
                 ),

@@ -402,19 +402,17 @@ _ROUTE_INLINE_NOISE_WORDS = (
 )
 
 _ROUTE_CONTEXT_HINT_WORDS = (
-    ROUTE_ACTION_WORDS
-    + (
-        "给",
-        "对",
-        "向",
-        "让",
-        "替",
-        "去",
-        "发送",
-        "先",
-        "再",
-        "一下",
-    )
+    *ROUTE_ACTION_WORDS,
+    "给",
+    "对",
+    "向",
+    "让",
+    "替",
+    "去",
+    "发送",
+    "先",
+    "再",
+    "一下",
 )
 
 

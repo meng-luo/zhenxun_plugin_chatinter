@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import time
-import uuid
 from typing import Any, Literal
+import uuid
 
 from ..persistence import read_json, state_path, write_json
 from ..route_text import normalize_message_text

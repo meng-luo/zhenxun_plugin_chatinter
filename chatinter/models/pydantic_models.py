@@ -486,6 +486,7 @@ class CommandCandidateSnapshot(BaseModel):
         description="候选可解释特征",
     )
 
+
 class CapabilityGraphSnapshot(BaseModel):
     """一次插件能力图快照"""
 

@@ -72,6 +72,9 @@ class TurnBudgetController:
     def record_classifier(self, label: str, duration: float) -> None:
         self.durations[f"classifier:{label}"] += max(duration, 0.0)
 
+    def record_stage(self, label: str, duration: float) -> None:
+        self.durations[f"stage:{label}"] += max(duration, 0.0)
+
     def allow_hook(self, stage: str) -> bool:
         if self.hook_calls >= self.max_hook_calls:
             self.durations[f"hook_block:{stage}"] += 0.0

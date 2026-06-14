@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 import platform
 import shutil
 import socket
-from pathlib import Path
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
@@ -63,7 +63,9 @@ class ServerStatusTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         payload = {"path": path, "isolation": isolation}
         if decision.decision == "deny":
             return permission_denied_result(
@@ -97,7 +99,9 @@ class ProcessListTool:
                 "properties": {
                     "query": {
                         "type": ["string", "null"],
-                        "description": "可选过滤关键字，例如 python、uvicorn、zhenxun。",
+                        "description": (
+                            "可选过滤关键字，例如 python、uvicorn、" "zhenxun。"
+                        ),
                     },
                     "max_results": {
                         "type": ["integer", "null"],
@@ -183,7 +187,9 @@ class ServerCommandTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not command:
             return tool_result(False, "server_empty_command")
         decision = decide_server(command)
@@ -275,13 +281,19 @@ async def process_list(
         source = "psutil"
         if processes is None:
             source = "system_command"
-            processes = await _processes_from_command(query=query, max_results=max_results)
+            processes = await _processes_from_command(
+                query=query, max_results=max_results
+            )
         record_audit_event(
             event="operation_executed",
             user_id=actor["user_id"],
             session_key=actor["session_key"],
             action="process_list",
-            payload={"query": query, "max_results": max_results, "approval_id": approval_id},
+            payload={
+                "query": query,
+                "max_results": max_results,
+                "approval_id": approval_id,
+            },
             result={"ok": True, "count": len(processes), "source": source},
         )
         return tool_result(
@@ -297,7 +309,11 @@ async def process_list(
         return audited_error_result(
             actor=actor,
             action="process_list",
-            payload={"query": query, "max_results": max_results, "approval_id": approval_id},
+            payload={
+                "query": query,
+                "max_results": max_results,
+                "approval_id": approval_id,
+            },
             status="process_list_error",
             error=str(exc),
         )
@@ -375,8 +391,14 @@ def _processes_from_psutil(
     return processes
 
 
-async def _processes_from_command(*, query: str, max_results: int) -> list[dict[str, Any]]:
-    command = "tasklist /FO CSV /NH" if os.name == "nt" else "ps -eo pid,ppid,pcpu,pmem,comm,args"
+async def _processes_from_command(
+    *, query: str, max_results: int
+) -> list[dict[str, Any]]:
+    command = (
+        "tasklist /FO CSV /NH"
+        if os.name == "nt"
+        else "ps -eo pid,ppid,pcpu,pmem,comm,args"
+    )
     process = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,

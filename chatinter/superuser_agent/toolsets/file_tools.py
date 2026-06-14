@@ -58,7 +58,9 @@ class ReadFileTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         decision = decide_file_read(path)
         payload = {"path": path, "max_chars": max_chars, "isolation": isolation}
         if decision.decision == "deny":
@@ -112,7 +114,9 @@ class ListDirTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         decision = decide_file_read(path)
         payload = {"path": path, "isolation": isolation}
         if decision.decision == "deny":
@@ -179,7 +183,9 @@ class SearchFilesTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", root=root, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", root=root, isolation=isolation
+            )
         decision = decide_file_read(root)
         payload = {
             "root": root,
@@ -253,7 +259,9 @@ class WriteFileTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         decision = decide_file_write(path)
         payload = {
             "path": path,
@@ -326,7 +334,9 @@ class AppendFileTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         decision = decide_file_write(path)
         payload = {
             "path": path,
@@ -413,7 +423,9 @@ class ReplaceInFileTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", path=path, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", path=path, isolation=isolation
+            )
         decision = decide_file_write(path)
         payload = {
             "path": path,

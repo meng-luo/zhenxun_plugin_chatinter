@@ -1,4 +1,4 @@
-﻿"""Artifact inspection tools for superuser Agent turns."""
+"""Artifact inspection tools for superuser Agent turns."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
 
-from ..registry import register_superuser_tool
 from ...artifact_store import get_artifact_store
+from ..registry import register_superuser_tool
 from .common import actor_from_context, tool_result
 
 
@@ -63,7 +63,9 @@ class ArtifactReadTool:
             artifact=ref.to_dict(),
             artifact_content=content,
             offset=offset,
-            next_offset=offset + len(content) if offset + len(content) < ref.size else None,
+            next_offset=offset + len(content)
+            if offset + len(content) < ref.size
+            else None,
             truncated=offset + len(content) < ref.size,
         )
 
@@ -87,11 +89,15 @@ class ArtifactListTool:
                     },
                     "artifact_type": {
                         "type": ["string", "null"],
-                        "description": "可选类型过滤，例如 log/plugin_output/text/image/file。",
+                        "description": (
+                            "可选类型过滤，例如 " "log/plugin_output/text/image/file。"
+                        ),
                     },
                     "source_contains": {
                         "type": ["string", "null"],
-                        "description": "可选 source 关键词过滤，例如 background_task 或 patch。",
+                        "description": (
+                            "可选 source 关键词过滤，例如 " "background_task 或 patch。"
+                        ),
                     },
                 },
                 "required": ["limit", "artifact_type", "source_contains"],
@@ -135,7 +141,11 @@ def _coerce_limit(value: Any) -> int:
         return 20
 
 
-register_superuser_tool(ArtifactReadTool, category="artifact", risk="low", read_only=True)
-register_superuser_tool(ArtifactListTool, category="artifact", risk="low", read_only=True)
+register_superuser_tool(
+    ArtifactReadTool, category="artifact", risk="low", read_only=True
+)
+register_superuser_tool(
+    ArtifactListTool, category="artifact", risk="low", read_only=True
+)
 
 __all__ = ["ArtifactListTool", "ArtifactReadTool"]

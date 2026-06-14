@@ -106,8 +106,12 @@ def _action_like_tool_count(tool_map: dict[str, Any]) -> int:
         snapshot = getattr(candidate, "tool", None)
         if snapshot is None:
             continue
-        output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-        side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+        output_mode = normalize_message_text(
+            str(getattr(snapshot, "output_mode", "") or "")
+        )
+        side_effect = normalize_message_text(
+            str(getattr(snapshot, "side_effect", "") or "")
+        )
         if output_mode in _ACTION_OUTPUT_MODES or side_effect in _ACTION_SIDE_EFFECTS:
             count += 1
     return count

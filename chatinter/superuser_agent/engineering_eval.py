@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import time
-import uuid
 from typing import Any
+import uuid
 
 from zhenxun.services.llm.types.models import ToolResult
 
@@ -86,7 +86,9 @@ def create_engineering_eval(
     _ensure_loaded()
     files = [str(item) for item in files if str(item or "")]
     suggested = suggest_test_commands(files=files, task=task)
-    normalized_tests = _dedupe([str(item) for item in tests if str(item or "")] + suggested)
+    normalized_tests = _dedupe(
+        [str(item) for item in tests if str(item or "")] + suggested
+    )
     eval_run = EngineeringEval(
         eval_id=uuid.uuid4().hex[:12],
         user_id=actor["user_id"],
@@ -129,7 +131,8 @@ def list_engineering_evals(
     rows = [
         item
         for item in _EVALS.values()
-        if item.user_id == str(user_id or "") and item.session_key == str(session_key or "")
+        if item.user_id == str(user_id or "")
+        and item.session_key == str(session_key or "")
     ]
     rows.sort(key=lambda item: item.updated_at, reverse=True)
     return rows[: max(1, min(int(limit or 20), 100))]
@@ -161,7 +164,9 @@ def mark_eval_step(
             )
     elif any(step.status == "failed" for step in eval_run.steps):
         eval_run.status = "failed"
-        eval_run.last_recommended_action = eval_run.last_recommended_action or "inspect_failure_observation"
+        eval_run.last_recommended_action = (
+            eval_run.last_recommended_action or "inspect_failure_observation"
+        )
     elif _all_runnable_steps_passed(eval_run):
         eval_run.status = "passed"
         eval_run.last_recommended_action = "continue_or_summarize"
@@ -178,8 +183,13 @@ def suggest_test_commands(*, files: list[str], task: str = "") -> list[str]:
     tests: list[str] = []
     py_files = [path for path in normalized_files if path.endswith(".py")]
     if py_files:
-        tests.append("py -3 -m compileall -q " + " ".join(_quote(path) for path in py_files[:20]))
-    if any(path.endswith((".html", ".css", ".js", ".ts", ".vue")) for path in normalized_files):
+        tests.append(
+            "py -3 -m compileall -q " + " ".join(_quote(path) for path in py_files[:20])
+        )
+    if any(
+        path.endswith((".html", ".css", ".js", ".ts", ".vue"))
+        for path in normalized_files
+    ):
         tests.append("git diff --check")
     if any("plugins/chatinter" in path for path in normalized_files):
         tests.append("py -3 -m compileall -q zhenxun/plugins/chatinter")
@@ -281,7 +291,9 @@ def build_failure_observation(
 
 
 def tool_result(ok: bool, status: str, **payload: Any) -> ToolResult:
-    return ToolResult(output={"ok": ok, "status": status, **payload}, display_content=status)
+    return ToolResult(
+        output={"ok": ok, "status": status, **payload}, display_content=status
+    )
 
 
 def _default_steps(eval_run: EngineeringEval) -> list[EvalStep]:
@@ -293,7 +305,10 @@ def _default_steps(eval_run: EngineeringEval) -> list[EvalStep]:
         ),
         EvalStep(
             kind="modify_code",
-            description="Apply changes through patch_prepare/patch_apply or transactional file tools.",
+            description=(
+                "Apply changes through patch_prepare/patch_apply or "
+                "transactional file tools."
+            ),
         ),
     ]
     for command in eval_run.tests:
@@ -534,8 +549,8 @@ def _command_signature(command: str) -> str:
 __all__ = [
     "EngineeringEval",
     "EvalStep",
-    "create_engineering_eval",
     "build_failure_observation",
+    "create_engineering_eval",
     "get_engineering_eval",
     "list_engineering_evals",
     "mark_eval_step",

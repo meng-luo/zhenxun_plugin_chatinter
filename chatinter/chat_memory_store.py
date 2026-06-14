@@ -662,16 +662,22 @@ def _append_layered_memory(
         "thread_person_profile_summary",
     }:
         target = buckets.person_facts
-    elif memory_type in {"relationship", "thread_relationship"} or key.startswith("relationship"):
+    elif memory_type in {"relationship", "thread_relationship"} or key.startswith(
+        "relationship"
+    ):
         target = buckets.relationship_facts
     elif memory_type in {"preference", "thread_preference"}:
         target = buckets.preference_facts
-    elif memory_type in {
-        "group_digest",
-        "thread_digest",
-        "thread_fact",
-        "recent_thread_fact",
-    } or scope == "thread":
+    elif (
+        memory_type
+        in {
+            "group_digest",
+            "thread_digest",
+            "thread_fact",
+            "recent_thread_fact",
+        }
+        or scope == "thread"
+    ):
         target = buckets.recent_thread_facts
     else:
         target = buckets.other_facts

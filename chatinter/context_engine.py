@@ -7,10 +7,10 @@ blocks behind the default policy chain.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Protocol
-
-from zhenxun.services.llm import LLMMessage
+import re
+from typing import Any, Protocol
 
 from .context_compression import (
     _MAX_PROMPT_TOKENS,
@@ -27,6 +27,7 @@ from .context_compression import (
     _summarize_middle_messages,
     estimate_messages_tokens,
 )
+from .llm_compat import LLMMessage
 from .route_text import normalize_message_text
 
 _PROTECTED_REF_KEYS = {
@@ -95,6 +96,7 @@ class ContextPolicy(Protocol):
 
     def apply(self, state: ContextEngineState) -> ContextEngineState:
         """Return the updated context state."""
+        ...
 
 
 class ActiveTaskProtectionPolicy:
@@ -109,6 +111,23 @@ class ActiveTaskProtectionPolicy:
                 [*state.protected_terms, *extra_terms]
             )
         state.mark(self.name, f"terms={len(state.protected_terms)}")
+        return state
+
+
+class CurrentTurnPinningPolicy:
+    """Pin latest turn-local task state and tool refs before compression."""
+
+    name = "current_turn_pinning"
+
+    def apply(self, state: ContextEngineState) -> ContextEngineState:
+        terms = list(state.protected_terms)
+        refs = _current_turn_protected_terms(state.messages)
+        for ref in refs:
+            if ref and ref not in terms:
+                terms.append(ref)
+        if refs:
+            state.protected_terms = _normalize_protected_terms(terms)
+        state.mark(self.name, f"terms={len(refs)}")
         return state
 
 
@@ -243,7 +262,9 @@ class ContextEngine:
     """Composable context compression engine."""
 
     def __init__(self, policies: Iterable[ContextPolicy] | None = None) -> None:
-        self.policies: list[ContextPolicy] = list(policies or default_context_policies())
+        self.policies: list[ContextPolicy] = list(
+            policies or default_context_policies()
+        )
 
     def register_policy(
         self,
@@ -308,6 +329,7 @@ class ContextEngine:
 def default_context_policies() -> list[ContextPolicy]:
     return [
         ActiveTaskProtectionPolicy(),
+        CurrentTurnPinningPolicy(),
         AntiThrashingPolicy(),
         ToolResultPruningPolicy(),
         ToolProtocolSanitizerPolicy(),
@@ -382,6 +404,49 @@ def _protected_terms_from_refs(context_refs: dict[str, Any]) -> list[str]:
     return terms[:80]
 
 
+def _current_turn_protected_terms(messages: list[LLMMessage]) -> list[str]:
+    terms: list[str] = []
+    for message in messages[-6:]:
+        text = _message_to_text(message)
+        if not text:
+            continue
+        if "<agent_turn_state>" in text or message.role == "tool":
+            terms.extend(_extract_ref_terms(text))
+            tool_call_id = normalize_message_text(str(message.tool_call_id or ""))
+            if tool_call_id:
+                terms.append(tool_call_id)
+    return list(dict.fromkeys(terms))[:40]
+
+
+def _message_to_text(message: LLMMessage) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(item) for item in content)
+    return str(content or "")
+
+
+def _extract_ref_terms(text: str) -> list[str]:
+    patterns = (
+        r"\b(?:run|trace|task|event|operation|checkpoint|command|tool_call)"
+        r"[-_][A-Za-z0-9_.:-]+\b",
+        r"\bartifact[-_][A-Za-z0-9_.:-]+\b",
+        r"\bcall[-_][A-Za-z0-9_.:-]+\b",
+        r"\b[A-Za-z_]+_id=([A-Za-z0-9_.:-]+)\b",
+        r'"[A-Za-z_]*id"\s*:\s*"([^"]+)"',
+        r'"(?:artifact_id|observation_event_id|remaining_task_hint)"\s*:\s*"([^"]+)"',
+    )
+    terms: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = match.group(1) if match.groups() else match.group(0)
+            value = normalize_message_text(value)
+            if value:
+                terms.append(value)
+    return terms
+
+
 __all__ = [
     "ActiveTaskProtectionPolicy",
     "AntiThrashingPolicy",
@@ -389,6 +454,7 @@ __all__ = [
     "ContextEngine",
     "ContextEngineState",
     "ContextPolicy",
+    "CurrentTurnPinningPolicy",
     "DeduplicateMessagesPolicy",
     "LongTermSummaryPolicy",
     "ToolProtocolSanitizerPolicy",

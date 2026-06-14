@@ -1,4 +1,4 @@
-﻿"""Audit query tools for the superuser private Agent scenario."""
+"""Audit query tools for the superuser private Agent scenario."""
 
 from __future__ import annotations
 
@@ -42,7 +42,9 @@ class AuditLogQueryTool:
                     },
                     "contains": {
                         "type": ["string", "null"],
-                        "description": "可选全文过滤，例如 approval_id、operation_id、task_id。",
+                        "description": (
+                            "可选全文过滤，例如 approval_id、operation_id、" "task_id。"
+                        ),
                     },
                 },
                 "required": [

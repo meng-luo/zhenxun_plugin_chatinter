@@ -82,7 +82,10 @@ class TodoWriteTool:
                                 },
                                 "active_form": {
                                     "type": ["string", "null"],
-                                    "description": "进行中时的动词短语，例如“正在读取入口文件”。",
+                                    "description": (
+                                        "进行中时的动词短语，例如"
+                                        "“正在读取入口文件”。"
+                                    ),
                                 },
                                 "related_tools": {
                                     "type": ["array", "null"],
@@ -107,7 +110,10 @@ class TodoWriteTool:
                     },
                     "replace": {
                         "type": ["boolean", "null"],
-                        "description": "true 覆盖整个列表；false 按 todo_id 合并更新。默认 true。",
+                        "description": (
+                            "true 覆盖整个列表；false 按 todo_id "
+                            "合并更新。默认 true。"
+                        ),
                     },
                     "reason": {
                         "type": ["string", "null"],
@@ -123,13 +129,17 @@ class TodoWriteTool:
         actor = actor_from_context(context)
         raw_todos = kwargs.get("todos")
         if not isinstance(raw_todos, list):
-            return tool_result(False, "todo_invalid_input", error="todos must be a list")
+            return tool_result(
+                False, "todo_invalid_input", error="todos must be a list"
+            )
         try:
             todo_list = write_todos(
                 user_id=actor["user_id"],
                 session_key=actor["session_key"],
                 todos=[item for item in raw_todos if isinstance(item, dict)],
-                replace=True if kwargs.get("replace") is None else bool(kwargs.get("replace")),
+                replace=True
+                if kwargs.get("replace") is None
+                else bool(kwargs.get("replace")),
             )
         except Exception as exc:
             return tool_result(False, "todo_write_failed", error=str(exc))

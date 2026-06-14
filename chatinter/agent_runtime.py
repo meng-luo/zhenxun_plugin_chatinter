@@ -1,4 +1,4 @@
-﻿"""Agent state machine runtime for ChatInter native command tools.
+"""Agent state machine runtime for ChatInter native command tools.
 
 The runtime owns the model/tool loop:
 LLM -> tool_calls -> execute -> observations -> LLM ... -> final text.
@@ -6,8 +6,8 @@ LLM -> tool_calls -> execute -> observations -> LLM ... -> final text.
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -26,8 +26,6 @@ from .agent_run_store import (
     is_agent_run_cancel_signaled,
     persist_agent_run_state,
 )
-from .config import get_fallback_models
-from .provider_failover import request_with_failover
 from .agent_runtime_chain import AgentRuntimeChain
 from .agent_state import (
     AgentRunState,
@@ -35,11 +33,13 @@ from .agent_state import (
 )
 from .artifact_store import compact_tool_result_output, summarize_artifact_text
 from .command_observation import build_command_observation
+from .config import get_fallback_models
 from .context_engine import get_context_engine
 from .feedback import record_command_observation_feedback
 from .provider_capability import (
     ProviderCapabilityAdapter,
 )
+from .provider_failover import request_with_failover
 from .route_text import normalize_message_text
 from .task_frame import TASK_TEXT_FIELD
 from .trajectory_store import record_agent_trajectory
@@ -47,6 +47,7 @@ from .turn_runtime import TurnBudgetController, estimate_text_tokens
 
 _MAIN_STAGE = "main_request"
 _PROGRESS_TASKS: set[asyncio.Task] = set()
+
 
 class AgentRuntime:
     """State-machine ReAct loop around ChatInter command tools."""
@@ -96,7 +97,8 @@ class AgentRuntime:
     _PROGRESS_MIN_INTERVAL = 12.0
 
     def _emit_progress(self) -> None:
-        if self._progress_hook is None:
+        progress_hook = self._progress_hook
+        if progress_hook is None:
             return
         now = time.monotonic()
         elapsed = now - self._run_started_monotonic
@@ -110,14 +112,13 @@ class AgentRuntime:
             last_tool = normalize_message_text(str(observation.tool_name or ""))
             if last_tool:
                 break
-        text = (
-            f"⏳ 执行中 第{self.state.step}/{self.state.max_steps}步"
-            + (f" · 上一步: {last_tool}" if last_tool else "")
+        text = f"⏳ 执行中 第{self.state.step}/{self.state.max_steps}步" + (
+            f" · 上一步: {last_tool}" if last_tool else ""
         )
 
         async def _safe_send() -> None:
             try:
-                await self._progress_hook(text)
+                await progress_hook(text)
             except Exception:
                 pass
 
@@ -146,9 +147,7 @@ class AgentRuntime:
                         "guardrail",
                         reason="token_budget_exhausted",
                     )
-                    await self._force_final_response(
-                        reason="token_budget_exhausted"
-                    )
+                    await self._force_final_response(reason="token_budget_exhausted")
                     return self.state.to_result()
                 self.state.start_step()
                 self._emit_progress()
@@ -163,7 +162,9 @@ class AgentRuntime:
                         reason=request_guardrail.reason,
                     )
                     if request_guardrail.should_stop:
-                        await self._force_final_response(reason=request_guardrail.reason)
+                        await self._force_final_response(
+                            reason=request_guardrail.reason
+                        )
                         return self.state.to_result()
 
                 self._record_prompt_use()
@@ -199,9 +200,7 @@ class AgentRuntime:
                         continue
                 if not tool_calls:
                     final_text = normalize_message_text(str(response.text or ""))
-                    final_decision = await self.chain.complete_if_acceptable(
-                        final_text
-                    )
+                    final_decision = await self.chain.complete_if_acceptable(final_text)
                     if final_decision.action == "retry":
                         self._persist_state("final_acceptance_retry")
                         continue
@@ -316,9 +315,7 @@ class AgentRuntime:
                     and not force_final_reason
                     and self.state.refund_step()
                 ):
-                    self._persist_state(
-                        "step_refunded", reason="read_only_tool_batch"
-                    )
+                    self._persist_state("step_refunded", reason="read_only_tool_batch")
                 if force_final_reason:
                     await self._force_final_response(reason=force_final_reason)
                     return self.state.to_result()
@@ -520,7 +517,10 @@ class AgentRuntime:
         if is_agent_run_cancel_signaled(run_key):
             return True
         snapshot = get_agent_run_snapshot(run_key)
-        return isinstance(snapshot, dict) and str(snapshot.get("status", "")) == "cancelled"
+        return (
+            isinstance(snapshot, dict)
+            and str(snapshot.get("status", "")) == "cancelled"
+        )
 
     _READ_ONLY_TOOL_NAMES = frozenset(
         {
@@ -852,13 +852,19 @@ class AgentRuntime:
         self._trajectory_recorded = True
         try:
             self.state.capture_budget(self.budget_controller)
-            record_agent_trajectory(
+            _, record = record_agent_trajectory(
                 state=self.state,
                 input_message=self.message_text,
                 started_at=started_at,
                 latency_ms=latency_ms,
                 run_context_extra=dict(self.run_context.extra or {}),
             )
+            try:
+                from .skill_learning import schedule_skill_learning
+
+                schedule_skill_learning(record)
+            except Exception:
+                pass
         except Exception:
             return
 

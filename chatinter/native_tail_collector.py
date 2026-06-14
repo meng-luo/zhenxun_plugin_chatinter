@@ -24,19 +24,27 @@ from zhenxun.services import logger
 from zhenxun.services.llm import AI
 
 from .config import build_reasoning_generation_config, get_config_value, get_model_name
+from .event_signals import get_event_signal, set_event_signal
 from .route_text import normalize_message_text
 from .scenario_router import ChatInterScenario, ScenarioRoute
 from .turn_queue import TurnProcessor, get_turn_queue
 
-_COLLECT_DELAY_SECONDS = 1.8
+_COLLECT_DELAY_MIN_SECONDS = 0.8
+_COLLECT_DELAY_BASE_SECONDS = 1.2
+_COLLECT_DELAY_MAX_SECONDS = 3.2
 _NATIVE_OUTPUT_WAIT_SECONDS = 0.8
 _MAX_CACHE_SIZE = 512
 _MAX_CACHE_AGE_SECONDS = 120.0
 _MAX_TAIL_TASKS = 5
+_MESSAGE_RATE_WINDOW_SECONDS = 12.0
+_MESSAGE_RATE_CACHE_SIZE = 512
 _MESSAGE_CACHE: deque[tuple[str, float]] = deque()
 _MESSAGE_KEYS: set[str] = set()
 _CONTINUATION_CACHE: deque[tuple[str, float]] = deque()
 _CONTINUATION_KEYS: set[str] = set()
+_MESSAGE_RATE_CACHE: dict[str, deque[float]] = {}
+_MESSAGE_RATE_LAST_SEEN: deque[tuple[str, float]] = deque()
+_TAIL_FOLLOWUP_TASKS: set[asyncio.Task[None]] = set()
 _CONTINUATION_HINTS = (
     "然后",
     "最后",
@@ -52,9 +60,7 @@ _CONTINUATION_HINTS = (
     "再抽",
 )
 _CONTINUATION_PUNCTUATION = ("，", ",", "。", "；", ";")
-_COMMAND_BOUNDARY_CHARS = frozenset(
-    " \t\r\n，,。.!！?？；;：:/|）)]】}》>、"
-)
+_COMMAND_BOUNDARY_CHARS = frozenset(" \t\r\n，,。.!！?？；;：:/|）)]】}》>、")
 _LEADING_COMMAND_PUNCTUATION_PATTERN = re.compile(r"^[\s,，:：;；.!！?？、]+")
 _LEADING_PLACEHOLDER_PATTERN = re.compile(r"^(?:\s*(?:\[[^\]]*]|\<[^>]*>))+\s*")
 _PARAM_TOKEN_PATTERN = re.compile(r"\s*[?*+]?\[[^\]]+\]")
@@ -145,9 +151,10 @@ def schedule_native_tail_followup(
         return False
     if not _remember_message(key):
         return False
+    collect_delay = _record_and_resolve_collect_delay(event=event, session=session)
     _mark_native_tail_pending(event, raw_message)
     _ensure_sent_observer_registered()
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_native_tail_followup(
             bot=bot,
             event=event,
@@ -157,8 +164,11 @@ def schedule_native_tail_followup(
             route_modules=route_modules,
             cached_plain_text=cached_plain_text,
             processor=processor,
+            collect_delay=collect_delay,
         )
     )
+    _TAIL_FOLLOWUP_TASKS.add(task)
+    task.add_done_callback(_TAIL_FOLLOWUP_TASKS.discard)
     return True
 
 
@@ -172,9 +182,10 @@ async def _run_native_tail_followup(
     route_modules: set[str],
     cached_plain_text: str | None,
     processor: TurnProcessor,
+    collect_delay: float,
 ) -> None:
     try:
-        await asyncio.sleep(_COLLECT_DELAY_SECONDS)
+        await asyncio.sleep(collect_delay)
         if not _native_command_has_completed(event):
             await _wait_native_command_output(event)
         result = await _judge_native_tail(
@@ -212,8 +223,7 @@ async def _run_native_tail_followup(
     )
     if not _remember_continuation(continuation_key):
         logger.debug(
-            "[ChatInter] 原生命令后续任务重复，已跳过："
-            f"{tail_message[:80]}..."
+            "[ChatInter] 原生命令后续任务重复，已跳过：" f"{tail_message[:80]}..."
         )
         _clear_native_tail_pending(event)
         return
@@ -264,8 +274,7 @@ async def _run_native_tail_followup(
         return
     if accepted:
         logger.info(
-            "[ChatInter] 原生命令后续任务已进入队列："
-            f"{tail_message[:80]}..."
+            "[ChatInter] 原生命令后续任务已进入队列：" f"{tail_message[:80]}..."
         )
     _clear_native_tail_pending(event)
 
@@ -307,8 +316,158 @@ async def _judge_native_tail(
             auto_thinking=False,
         )
     except Exception as exc:
-        logger.warning(f"[ChatInter] native-tail judge failed: {exc}")
-        return NativeTailTaskResult(should_continue=False, reason="judge_failed")
+        fallback = _fallback_native_tail_result(
+            raw_message=raw_message,
+            route_modules=route_modules,
+            native_completed=native_completed,
+            reason=f"judge_failed:{type(exc).__name__}",
+        )
+        if fallback.should_continue:
+            logger.debug(
+                "[ChatInter] native-tail judge failed, fallback accepted: "
+                f"{fallback.remaining_tasks[:3]}"
+            )
+        else:
+            logger.debug(f"[ChatInter] native-tail judge failed: {exc}")
+        return fallback
+
+
+def _record_and_resolve_collect_delay(*, event: Event, session: Uninfo) -> float:
+    scope_key = _message_rate_scope_key(event=event, session=session)
+    now = time.monotonic()
+    _cleanup_message_rate_cache(now)
+    bucket = _MESSAGE_RATE_CACHE.setdefault(scope_key, deque())
+    bucket.append(now)
+    while bucket and now - bucket[0] > _MESSAGE_RATE_WINDOW_SECONDS:
+        bucket.popleft()
+    _MESSAGE_RATE_LAST_SEEN.append((scope_key, now))
+    message_count = len(bucket)
+    if message_count <= 1:
+        return _COLLECT_DELAY_BASE_SECONDS
+    if message_count <= 3:
+        delay = _COLLECT_DELAY_BASE_SECONDS + 0.25 * (message_count - 1)
+    else:
+        delay = _COLLECT_DELAY_BASE_SECONDS + 0.5 + 0.15 * min(message_count - 3, 10)
+    return max(
+        _COLLECT_DELAY_MIN_SECONDS,
+        min(_COLLECT_DELAY_MAX_SECONDS, round(delay, 2)),
+    )
+
+
+def _message_rate_scope_key(*, event: Event, session: Uninfo) -> str:
+    session_id = normalize_message_text(str(getattr(session, "id", "") or ""))
+    if session_id:
+        return f"session:{session_id}"
+    for attr in ("group_id", "guild_id", "channel_id", "user_id"):
+        value = normalize_message_text(str(getattr(event, attr, "") or ""))
+        if value:
+            return f"{attr}:{value}"
+    return f"event:{type(event).__module__}.{type(event).__name__}"
+
+
+def _cleanup_message_rate_cache(now: float) -> None:
+    while _MESSAGE_RATE_LAST_SEEN and (
+        len(_MESSAGE_RATE_LAST_SEEN) > _MESSAGE_RATE_CACHE_SIZE
+        or now - _MESSAGE_RATE_LAST_SEEN[0][1] > _MAX_CACHE_AGE_SECONDS
+    ):
+        scope_key, _ = _MESSAGE_RATE_LAST_SEEN.popleft()
+        bucket = _MESSAGE_RATE_CACHE.get(scope_key)
+        if bucket is None:
+            continue
+        while bucket and now - bucket[0] > _MESSAGE_RATE_WINDOW_SECONDS:
+            bucket.popleft()
+        if not bucket:
+            _MESSAGE_RATE_CACHE.pop(scope_key, None)
+
+
+def _fallback_native_tail_result(
+    *,
+    raw_message: str,
+    route_modules: set[str],
+    native_completed: bool,
+    reason: str,
+) -> NativeTailTaskResult:
+    """Deterministic conservative fallback when the LLM judge is unavailable."""
+
+    if not native_completed:
+        return NativeTailTaskResult(
+            should_continue=False,
+            reason=f"{reason}:native_not_observed",
+        )
+    tasks = _extract_fallback_tail_tasks(
+        raw_message=raw_message,
+        route_modules=route_modules,
+    )
+    if not tasks:
+        return NativeTailTaskResult(should_continue=False, reason=reason)
+    return NativeTailTaskResult(
+        should_continue=True,
+        remaining_tasks=tasks,
+        reason=f"{reason}:heuristic_tail",
+    )
+
+
+def _extract_fallback_tail_tasks(
+    *,
+    raw_message: str,
+    route_modules: set[str],
+) -> list[str]:
+    message = normalize_message_text(raw_message)
+    if not message or not route_modules:
+        return []
+    head = _matched_native_head(message)
+    if not head:
+        return []
+    tail = normalize_message_text(message[len(head) :])
+    tail = _LEADING_COMMAND_PUNCTUATION_PATTERN.sub("", tail)
+    if not any(hint in tail for hint in _CONTINUATION_HINTS):
+        return []
+    result: list[str] = []
+    for part in _split_fallback_tail(tail):
+        normalized = _strip_continuation_prefix(part)
+        if not normalized or _looks_like_native_head_argument(normalized):
+            continue
+        if normalized not in result:
+            result.append(normalized)
+        if len(result) >= _MAX_TAIL_TASKS:
+            break
+    return result
+
+
+def _matched_native_head(message: str) -> str:
+    candidates = _message_probe_candidates(message)
+    _ensure_native_route_index()
+    for candidate in candidates:
+        entries = (
+            _NATIVE_ROUTE_PREFIX_MAP.get(candidate[0].casefold()) if candidate else None
+        )
+        if not entries:
+            continue
+        for entry in entries:
+            if _command_matches(candidate, entry.command):
+                return entry.command
+    return ""
+
+
+def _split_fallback_tail(text: str) -> list[str]:
+    tail = normalize_message_text(text)
+    if not tail:
+        return []
+    parts = re.split(r"[，,。；;]+", tail)
+    return [
+        normalize_message_text(part) for part in parts if normalize_message_text(part)
+    ]
+
+
+def _looks_like_native_head_argument(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return True
+    if len(normalized) <= 2 and not any(
+        hint in normalized for hint in _CONTINUATION_HINTS
+    ):
+        return True
+    return False
 
 
 def _message_key(event: Event, raw_message: str) -> str:
@@ -335,22 +494,20 @@ def _continuation_key(
 
 
 def _mark_native_tail_pending(event: Event, raw_message: str) -> None:
-    try:
-        setattr(event, "_chatinter_native_tail_pending", True)
-        setattr(event, "_chatinter_native_tail_source", normalize_message_text(raw_message))
-    except Exception:
-        pass
+    set_event_signal(event, "_chatinter_native_tail_pending", True)
+    set_event_signal(
+        event, "_chatinter_native_tail_source", normalize_message_text(raw_message)
+    )
 
 
 def _clear_native_tail_pending(event: Event) -> None:
-    try:
-        setattr(event, "_chatinter_native_tail_pending", False)
-    except Exception:
-        pass
+    set_event_signal(event, "_chatinter_native_tail_pending", False)
 
 
 def _native_command_has_completed(event: Event) -> bool:
-    return bool(getattr(event, "_chatinter_native_tail_observed_output", False))
+    return bool(
+        get_event_signal(event, "_chatinter_native_tail_observed_output", False)
+    )
 
 
 async def _wait_native_command_output(event: Event) -> None:
@@ -372,12 +529,11 @@ def _ensure_sent_observer_registered() -> None:
 
     @event_postprocessor
     async def _chatinter_native_tail_output_observer(event: Event) -> None:
-        if not bool(getattr(event, "_chatinter_native_tail_pending", False)):
+        if not bool(
+            get_event_signal(event, "_chatinter_native_tail_pending", False)
+        ):
             return
-        try:
-            setattr(event, "_chatinter_native_tail_observed_output", True)
-        except Exception:
-            pass
+        set_event_signal(event, "_chatinter_native_tail_observed_output", True)
 
     _SENT_OBSERVER_REGISTERED = True
 
@@ -406,8 +562,7 @@ def _remember_key(
 ) -> bool:
     now = time.monotonic()
     while cache and (
-        len(cache) > _MAX_CACHE_SIZE
-        or now - cache[0][1] > _MAX_CACHE_AGE_SECONDS
+        len(cache) > _MAX_CACHE_SIZE or now - cache[0][1] > _MAX_CACHE_AGE_SECONDS
     ):
         old_key, _ = cache.popleft()
         keys.discard(old_key)
@@ -531,9 +686,7 @@ def _plugin_command_heads(plugin: Any) -> tuple[str, ...]:
     commands: list[str] = []
     try:
         extra_data = (
-            PluginExtraData(**(metadata.extra or {}))
-            if metadata is not None
-            else None
+            PluginExtraData(**(metadata.extra or {})) if metadata is not None else None
         )
     except Exception:
         extra_data = None
@@ -697,7 +850,9 @@ def _strip_bot_nickname_prefix(text: str) -> str:
 
 def _bot_nickname_variants() -> tuple[str, ...]:
     nicknames: set[str] = set()
-    configured_self = normalize_message_text(getattr(BotConfig, "self_nickname", "") or "")
+    configured_self = normalize_message_text(
+        getattr(BotConfig, "self_nickname", "") or ""
+    )
     if configured_self:
         nicknames.add(configured_self)
     try:

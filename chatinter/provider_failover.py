@@ -127,7 +127,7 @@ async def request_with_failover(
                     used_model=model,
                     attempts=attempts,
                 )
-            except BaseException as exc:  # noqa: BLE001 - classified below
+            except BaseException as exc:
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 kind = classify_llm_error(exc)

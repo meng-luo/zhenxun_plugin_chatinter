@@ -89,6 +89,8 @@ class RouteObservation:
     tool_choice_count: int
     prompt_full_candidates: int
     final_reason: str
+    response_quality: str = ""
+    response_quality_action: str = ""
 
 
 class _RouteObserver:
@@ -111,6 +113,8 @@ class _RouteObserver:
                 "path_counts": {},
                 "outcome_counts": {},
                 "stage_counts": {},
+                "quality_counts": {},
+                "quality_action_counts": {},
                 "top_plugins": {},
                 "avg_candidate_total": 0.0,
                 "avg_tool_candidates": 0.0,
@@ -142,11 +146,19 @@ class _RouteObserver:
                 "chat_completed",
             }
         ][-8:]
+        quality_counts = Counter(
+            row.response_quality for row in rows if row.response_quality
+        )
+        quality_action_counts = Counter(
+            row.response_quality_action for row in rows if row.response_quality_action
+        )
         return {
             "total": len(rows),
             "path_counts": dict(path_counts),
             "outcome_counts": dict(outcome_counts),
             "stage_counts": dict(stage_counts),
+            "quality_counts": dict(quality_counts),
+            "quality_action_counts": dict(quality_action_counts),
             "top_plugins": dict(top_plugins.most_common(8)),
             "avg_candidate_total": round(avg_candidate_total, 2),
             "avg_tool_candidates": round(avg_tool_candidates, 2),
@@ -170,6 +182,8 @@ def record_route_observation(
     route_plugin = str(trace_tags.get("route_plugin", "") or "")
     route_module = str(trace_tags.get("route_module", "") or "")
     route_head = str(trace_tags.get("route_head", "") or "")
+    response_quality = str(trace_tags.get("response_quality", "") or "")
+    response_quality_action = str(trace_tags.get("response_quality_action", "") or "")
     final_reason = ""
     candidate_total = 0
     lexical_candidates = 0
@@ -232,6 +246,8 @@ def record_route_observation(
             tool_choice_count=tool_choice_count,
             prompt_full_candidates=prompt_full_candidates,
             final_reason=final_reason,
+            response_quality=response_quality,
+            response_quality_action=response_quality_action,
         )
     )
 
@@ -252,13 +268,13 @@ def render_route_observer_summary(limit: int = 200) -> str:
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["outcome_counts"].items())),
         "stage: "
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["stage_counts"].items())),
+        "quality: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(payload["quality_counts"].items())),
         (
             f"avg_candidates={payload['avg_candidate_total']}, "
             f"avg_tool_candidates={payload['avg_tool_candidates']}"
         ),
-        (
-            f"avg_prompt_full_schema={payload['avg_prompt_full_candidates']}"
-        ),
+        (f"avg_prompt_full_schema={payload['avg_prompt_full_candidates']}"),
     ]
     top_plugins = payload.get("top_plugins") or {}
     if top_plugins:

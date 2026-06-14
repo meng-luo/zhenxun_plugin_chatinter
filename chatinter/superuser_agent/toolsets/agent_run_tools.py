@@ -273,7 +273,9 @@ class AgentRunResumeTool:
             observation_event_ids=list(state.observation_event_ids[-10:]),
             artifact_refs=list(state.artifact_refs[-10:]),
             task_graph=_compact_task_graph(
-                state.task_graph.to_public_payload() if state.task_graph is not None else {}
+                state.task_graph.to_public_payload()
+                if state.task_graph is not None
+                else {}
             )
             or _compact_task_graph(snapshot.get("task_graph")),
             task_ledger=state.task_ledger.to_public_payload()
@@ -296,7 +298,10 @@ class AgentRunCancelTool:
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="超级用户私聊专用：取消一个 paused/running AgentRun，使其不能再恢复。",
+            description=(
+                "超级用户私聊专用：取消一个 paused/running AgentRun，"
+                "使其不能再恢复。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -317,7 +322,9 @@ class AgentRunCancelTool:
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
         actor = actor_from_context(context)
         run_id = str(kwargs.get("run_id", "") or "").strip()
-        reason = normalize_message_text(str(kwargs.get("reason") or "cancelled_by_user"))
+        reason = normalize_message_text(
+            str(kwargs.get("reason") or "cancelled_by_user")
+        )
         if not run_id:
             return tool_result(False, "agent_run_id_required")
         snapshot = get_agent_run_snapshot(run_id)
@@ -443,12 +450,24 @@ def _resume_max_steps(value: Any, *, fallback: int) -> int:
 
 
 def _resume_context_message(snapshot: dict[str, Any], resume_message: str):
-    cursor = snapshot.get("resume_cursor") if isinstance(snapshot.get("resume_cursor"), dict) else {}
+    cursor = (
+        snapshot.get("resume_cursor")
+        if isinstance(snapshot.get("resume_cursor"), dict)
+        else {}
+    )
     background_ids = snapshot.get("background_task_ids", [])
     approval_ids = snapshot.get("waiting_approval_ids", [])
     task_graph = _compact_task_graph(snapshot.get("task_graph"))
-    task_ledger = snapshot.get("task_ledger") if isinstance(snapshot.get("task_ledger"), dict) else {}
-    resume_integrity = snapshot.get("resume_integrity") if isinstance(snapshot.get("resume_integrity"), dict) else {}
+    task_ledger = (
+        snapshot.get("task_ledger")
+        if isinstance(snapshot.get("task_ledger"), dict)
+        else {}
+    )
+    resume_integrity = (
+        snapshot.get("resume_integrity")
+        if isinstance(snapshot.get("resume_integrity"), dict)
+        else {}
+    )
     return LLMMessage.user(
         "Resume AgentRun from persisted state.\n"
         f"run_id: {snapshot.get('run_id') or snapshot.get('trace_id')}\n"

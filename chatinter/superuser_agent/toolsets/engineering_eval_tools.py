@@ -58,7 +58,9 @@ class EngineeringEvalPlanTool:
                     },
                     "engineering_loop_id": {
                         "type": ["string", "null"],
-                        "description": "可选工程闭环 loop_id；传入后自动绑定 eval gate。",
+                        "description": (
+                            "可选工程闭环 loop_id；传入后自动绑定 " "eval gate。"
+                        ),
                     },
                 },
                 "required": [
@@ -99,7 +101,9 @@ class EngineeringEvalPlanTool:
             True,
             "engineering_eval_planned",
             eval=eval_run.public_payload(),
-            engineering_loop=_loop_payload(str(kwargs.get("engineering_loop_id", "") or "")),
+            engineering_loop=_loop_payload(
+                str(kwargs.get("engineering_loop_id", "") or "")
+            ),
             suggested_tests=eval_run.suggested_tests,
             instruction=(
                 "按 eval steps 执行：先读代码，再修改，再用 engineering_eval_run "
@@ -124,7 +128,10 @@ class EngineeringEvalRunTool:
                     "eval_id": {"type": "string", "description": "eval_id。"},
                     "step_index": {
                         "type": ["integer", "null"],
-                        "description": "要执行的 step 索引，从 0 开始；为空则执行下一个 run_test。",
+                        "description": (
+                            "要执行的 step 索引，从 0 开始；"
+                            "为空则执行下一个 run_test。"
+                        ),
                     },
                     "command": {
                         "type": ["string", "null"],
@@ -198,9 +205,15 @@ class EngineeringEvalStatusTool:
         eval_id = str(kwargs.get("eval_id", "") or "").strip()
         if eval_id:
             eval_run = get_engineering_eval(eval_id)
-            if eval_run is None or eval_run.user_id != actor["user_id"] or eval_run.session_key != actor["session_key"]:
+            if (
+                eval_run is None
+                or eval_run.user_id != actor["user_id"]
+                or eval_run.session_key != actor["session_key"]
+            ):
                 return tool_result(False, "engineering_eval_not_found", eval_id=eval_id)
-            return tool_result(True, "engineering_eval_status", eval=eval_run.public_payload())
+            return tool_result(
+                True, "engineering_eval_status", eval=eval_run.public_payload()
+            )
         rows = list_engineering_evals(
             user_id=actor["user_id"],
             session_key=actor["session_key"],
@@ -220,7 +233,8 @@ def _plan_payload(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {
         "task": str(kwargs.get("task", "") or ""),
         "files": files,
-        "tests": tests or suggest_test_commands(files=files, task=str(kwargs.get("task", "") or "")),
+        "tests": tests
+        or suggest_test_commands(files=files, task=str(kwargs.get("task", "") or "")),
         "rollback_operation_id": str(kwargs.get("rollback_operation_id", "") or ""),
     }
 
@@ -239,7 +253,11 @@ async def run_engineering_eval_step(
     engineering_loop_id: str = "",
 ) -> ToolResult:
     eval_run = get_engineering_eval(eval_id)
-    if eval_run is None or eval_run.user_id != actor["user_id"] or eval_run.session_key != actor["session_key"]:
+    if (
+        eval_run is None
+        or eval_run.user_id != actor["user_id"]
+        or eval_run.session_key != actor["session_key"]
+    ):
         return tool_result(False, "engineering_eval_not_found", eval_id=eval_id)
     resolved_index = _resolve_step_index(eval_run, step_index)
     if resolved_index < 0:
@@ -262,7 +280,9 @@ async def run_engineering_eval_step(
         else resolve_cwd(cwd or step.cwd, actor=actor, worktree_id=worktree_id)
     )
     if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-        return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+        return tool_result(
+            False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+        )
     command = str(command or step.command or "").strip()
     if not command:
         return tool_result(
@@ -376,7 +396,10 @@ def _eval_instruction(*, ok: bool, observation: dict[str, Any]) -> str:
     if ok:
         return "测试通过。继续下一个 eval step；全部通过后再总结。"
     if not observation:
-        return "测试失败。读取 command_result，判断是否需要重读代码、二次 patch 或 rollback。"
+        return (
+            "测试失败。读取 command_result，判断是否需要重读代码、"
+            "二次 patch 或 rollback。"
+        )
     actions: list[str] = []
     if observation.get("needs_reread"):
         actions.append("先重读相关代码")

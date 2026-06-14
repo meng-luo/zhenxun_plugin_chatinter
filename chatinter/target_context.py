@@ -11,7 +11,6 @@ from nonebot.adapters import Bot
 from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 
-from .target_policy import TargetPolicy
 from .route_execution import (
     contains_self_reference,
     contains_third_person_reference,
@@ -25,6 +24,7 @@ from .route_text import (
     parse_command_with_head,
     strip_invoke_prefix,
 )
+from .target_policy import TargetPolicy
 
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@([^\]\s]+)\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[\u7684\uff0c,\u3002.!！？?]))"
@@ -104,8 +104,7 @@ _TARGET_HINT_LEADING_NOISE_PATTERN = re.compile(
     r")+"
 )
 _TARGET_HINT_TRAILING_NOISE_PATTERN = re.compile(
-    r"(?:的)?(?:表情包?|梗图|头像|图片|照片|图|"
-    r"一下|一把|一个|一张|个|张)+$"
+    r"(?:的)?(?:表情包?|梗图|头像|图片|照片|图|" r"一下|一把|一个|一张|个|张)+$"
 )
 _TARGET_HINT_ACTION_BOUNDARY_PATTERN = re.compile(
     r"(?:\u505a\u6210|\u53d8\u6210|\u5236\u6210|\u505a\u4e3a|\u4f5c\u4e3a|\u751f\u6210|\u5236\u4f5c|\u505a|\u6574|\u5f04|\u6765|\u53d1|\u53d8|\u8f6c).*$"
@@ -121,6 +120,7 @@ _GROUP_ACTIVE_RANK_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 _NICKNAME_RESOLUTION_MEMORY_TTL = 12 * 3600.0
 _NICKNAME_RESOLUTION_MEMORY_MAX = 2048
 _NICKNAME_RESOLUTION_MEMORY: dict[str, tuple[float, str]] = {}
+
 
 def _extract_pending_entities(message_text: str) -> tuple[str, ...]:
     normalized = normalize_message_text(message_text)
@@ -219,7 +219,9 @@ def _clean_fuzzy_target_hint(candidate: str) -> str:
         previous = text
         text = normalize_message_text(strip_invoke_prefix(text))
         text = normalize_message_text(_TARGET_HINT_LEADING_NOISE_PATTERN.sub("", text))
-        text = normalize_message_text(_TARGET_HINT_ACTION_BOUNDARY_PATTERN.sub("", text))
+        text = normalize_message_text(
+            _TARGET_HINT_ACTION_BOUNDARY_PATTERN.sub("", text)
+        )
         text = normalize_message_text(_TARGET_HINT_TRAILING_NOISE_PATTERN.sub("", text))
         text = text.strip(" 的：:,，。.!！？?")
     if not text:
@@ -698,9 +700,9 @@ def _resolve_fuzzy_trigger_strength(
         return ""
     if extract_at_tokens(normalized_route):
         return ""
-    if _is_technical_request_like(
-        normalized_original
-    ) and not has_adapter_context_hint(normalized_original, policy):
+    if _is_technical_request_like(normalized_original) and not has_adapter_context_hint(
+        normalized_original, policy
+    ):
         return ""
     if _contains_non_self_target_phrase(normalized_original):
         return "strong"
@@ -901,9 +903,7 @@ async def _build_mention_profiles(
         return mention_profiles
 
     remaining_user_ids = {
-        user_id
-        for user_id in mentioned_user_ids
-        if user_id not in mention_profiles
+        user_id for user_id in mentioned_user_ids if user_id not in mention_profiles
     }
     try:
         from zhenxun.models.group_member_info import GroupInfoUser
@@ -937,9 +937,7 @@ async def _build_mention_profiles(
         }
 
     remaining_user_ids = {
-        user_id
-        for user_id in mentioned_user_ids
-        if user_id not in mention_profiles
+        user_id for user_id in mentioned_user_ids if user_id not in mention_profiles
     }
     if remaining_user_ids and bot is not None:
         for user_id in remaining_user_ids:

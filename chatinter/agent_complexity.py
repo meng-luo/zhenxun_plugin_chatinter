@@ -8,12 +8,14 @@ runtime should enable the durable planner/verifier layer, not which tool to use.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
 import re
+from typing import Any, Literal
 
 from .route_text import normalize_message_text
 
-AgentComplexityMode = Literal["chat", "single_tool_fast", "complex_pev"]
+AgentComplexityMode = Literal[
+    "chat", "single_tool_fast", "multi_tool_fast", "complex_pev"
+]
 
 _MULTI_STEP_HINTS = (
     "然后",
@@ -110,6 +112,7 @@ def route_agent_complexity(
     tool_map: dict[str, Any],
     enable_agent_tools: bool,
     resumed_run: bool = False,
+    local_task_count: int = 0,
 ) -> AgentComplexityDecision:
     if not enable_agent_tools:
         return AgentComplexityDecision(
@@ -130,6 +133,18 @@ def route_agent_complexity(
     text = normalize_message_text(message_text)
     if not text:
         return AgentComplexityDecision(mode="chat", reason="empty_message")
+
+    if local_task_count >= 2 and not any(
+        hint in text.casefold() for hint in _HIGH_RISK_HINTS
+    ):
+        return AgentComplexityDecision(
+            mode="multi_tool_fast",
+            reason=f"local_task_ledger={local_task_count}",
+            score=1.8,
+            expected_tool_budget=max(int(local_task_count) + 1, 3),
+            enable_planner=False,
+            enable_verifier=False,
+        )
 
     score = 0.0
     reasons: list[str] = []
@@ -228,7 +243,9 @@ def resolve_agent_run_budget(
         scenario = "private_chat"
     steps_by_mode = AGENT_STEP_BUDGETS.get(scenario) or {}
     normalized_mode = str(mode or "chat")
-    max_steps = int(steps_by_mode.get(normalized_mode) or steps_by_mode.get("chat") or 5)
+    max_steps = int(
+        steps_by_mode.get(normalized_mode) or steps_by_mode.get("chat") or 5
+    )
     max_total_tokens = int(AGENT_TOKEN_BUDGETS.get(scenario) or 0)
     max_step_refunds = max(int(max_steps * AGENT_STEP_REFUND_RATIO), 0)
     return AgentRunBudget(

@@ -28,14 +28,17 @@ class UvCommandTool:
             name=self.name,
             description=(
                 "超级用户私聊专用：执行 uv 项目/依赖管理命令，例如 sync、lock、"
-                "pip install、run ruff。只传 uv 后面的参数；执行前经过 uv.allow/ask/deny。"
+                "pip install、run ruff。只传 uv 后面的参数；"
+                "执行前经过 uv.allow/ask/deny。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "args": {
                         "type": "string",
-                        "description": "uv 后面的完整参数，例如 'sync'、'pip install pillow'。",
+                        "description": (
+                            "uv 后面的完整参数，例如 'sync'、" "'pip install pillow'。"
+                        ),
                     },
                     "cwd": {
                         "type": ["string", "null"],
@@ -67,7 +70,9 @@ class UvCommandTool:
             worktree_id=worktree_id_from_context(context),
         )
         if isolation.get("invalid_worktree") or isolation.get("escaped_worktree"):
-            return tool_result(False, "worktree_resolution_failed", cwd=cwd, isolation=isolation)
+            return tool_result(
+                False, "worktree_resolution_failed", cwd=cwd, isolation=isolation
+            )
         if not args:
             return tool_result(False, "uv_empty_args")
         command = _uv_command_from_args(args)

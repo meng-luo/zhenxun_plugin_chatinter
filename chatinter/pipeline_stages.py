@@ -81,6 +81,7 @@ from .plugin_registry import (
     PluginSelectionContext,
     get_user_plugin_knowledge,
 )
+from .response_quality_judge import schedule_shadow_quality_judge
 from .route_execution import (
     build_invalid_route_observation,
     build_reply_image_segments_for_reroute,
@@ -101,6 +102,7 @@ from .route_text import (
     normalize_message_text,
     should_force_knowledge_refresh,
 )
+from .skill_store import mark_skills_used, render_skill_hints, search_skills_semantic
 from .target_context import (
     append_mention_context_xml,
     build_mention_name_map,
@@ -113,6 +115,7 @@ from .target_resolver import resolve_execution_target, resolve_pre_route_target
 from .thread_resolver import ThreadContext, resolve_thread_context
 from .thread_store import record_thread_message
 from .trace import StageTrace
+from .trajectory_eval import schedule_response_quality_eval
 from .turn_frame import PipelineStage, TurnFrame
 from .turn_metrics import (
     build_turn_metrics_snapshot,
@@ -132,15 +135,15 @@ _GROUP_PLUGIN_SELECTOR_RULES = """
 候选工具是真实 NoneBot 插件命令；调用后会返回结构化 Observation，
 下一轮你可以基于 Observation 继续调用其他工具或给出最终回复。
 
-当前请求会优先暴露命令级候选工具：命令少的插件会暴露全部命令，命令
-很多的插件只暴露与当前对话较相关的少量命令。候选不足时，可以调用
-retrieve_plugin_commands 检索更多能力；它只负责发现和注入 schema，
-不代表任务已经完成。
+当前请求会按候选规模选择暴露策略：候选少时直接暴露命令 schema；
+候选多时先暴露轻量 capability card 让你选择能力，运行时会在下一步
+补入选中命令的完整 schema。候选不足时，可以调用 retrieve_plugin_commands
+检索更多能力；它只负责发现和注入 schema，不代表任务已经完成。
 
 如果你决定执行插件能力，请调用对应命令工具获取真实结果；如果只是闲聊、
 玩梗、讨论命令概念、候选工具不匹配或信息不足，可以直接自然回复。
-每个命令工具都有完整 schema；选择工具和填写参数时以工具 description
-与参数 schema 为准，不要填写 schema 外参数。
+如果命令工具当前是空参数/compact schema，调用它只是选择该能力，下一步
+再根据完整 schema 填参数执行；不要臆造 schema 外参数。
 
 多任务可以通过连续多个工具调用完成。task_text 只是当前工具调用负责内容
 的简短标注；无法明确标注时可以传 null，不需要依赖本地拆句。
@@ -173,7 +176,8 @@ Observation 作为完成依据。
   逐项推进并用 observation 标记完成。
 - 插件开发：plugin_dev_inspect / plugin_dev_scaffold / plugin_dev_write_file。
 - 工程隔离：worktree_create / worktree_status / worktree_list / worktree_remove。
-- 文件操作：read_file / list_dir / search_files / write_file / append_file / replace_in_file。
+- 文件操作：read_file / list_dir / search_files / write_file / append_file /
+  replace_in_file。
 - 工程闭环协议：engineering_loop_start -> engineering_lsp_read -> semantic_patch_plan
   -> patch_prepare -> patch_apply -> engineering_eval_run -> engineering_eval_gate
   -> engineering_loop_complete。复杂代码任务优先走这条固定协议；不要跳过
@@ -181,7 +185,8 @@ Observation 作为完成依据。
 - 工程失败恢复协议：engineering_eval_run 失败后先用 engineering_failure_diagnose
   固化诊断，再根据 allowed_next_tools 选择重读代码、二次 semantic_patch/patch、
   或 patch_rollback；不要原样重复失败测试，也不要绕过诊断直接二次 patch。
-- 工程修改：patch_prepare 先生成 diff，patch_apply 应用，patch_rollback 回滚，patch_show 查看历史。
+- 工程修改：patch_prepare 先生成 diff，patch_apply 应用，patch_rollback 回滚，
+  patch_show 查看历史。
 - 大输出读取：artifact_list / artifact_read 读取被压缩的长日志、diff、工具结果。
 - 运行时事件：runtime_event_list / runtime_event_read 查看统一事件流，
   包括 AgentRun、工具进度、Observation、Artifact、Approval、Background Job、TaskGraph。
@@ -192,8 +197,10 @@ Observation 作为完成依据。
 - 长任务：background_task_start，之后用 background_observation_wait /
   background_observation_list / background_task_status 查看 ObservationEvent，
   必要时 background_task_cancel。
-- 工程验收：engineering_eval_plan 建立“读代码 -> 改代码 -> 跑测试 -> 可回滚”的 eval，engineering_eval_run 记录测试结果。
-- 审计和确认：list_pending_approvals / approve_pending_action / reject_pending_action / revoke_pending_approval / audit_log_query。
+- 工程验收：engineering_eval_plan 建立“读代码 -> 改代码 -> 跑测试 -> 可回滚”
+  的 eval，engineering_eval_run 记录测试结果。
+- 审计和确认：list_pending_approvals / approve_pending_action /
+  reject_pending_action / revoke_pending_approval / audit_log_query。
 - 只有无法归类的普通命令才用 shell_command。
 
 安全规则：
@@ -209,8 +216,9 @@ final 前会检查 TaskGraph 未完成项；如果被提示 task_graph_incomplet
 Todo 是过程控制，不替代真实工具结果；Todo completed 需要对应 observation 支持。
 涉及代码修改时，优先使用工程闭环协议；轻微单文件修改至少使用
 patch_prepare -> patch_apply，便于用户预览和回滚。
-当主工作区可能有用户改动，或任务涉及代码写入、多文件修改、插件开发、长时间验证时，先用
-worktree_create 创建隔离工作区；创建后 read/write/search、shell/git、patch、eval、plugin_dev
+当主工作区可能有用户改动，或任务涉及代码写入、多文件修改、插件开发、
+长时间验证时，先用 worktree_create 创建隔离工作区；创建后
+read/write/search、shell/git、patch、eval、plugin_dev
 默认落到该 worktree。不要把隔离 worktree 的改动说成已经合入主工作区；总结时用
 worktree_status 给出分支、路径和 diff 摘要。
 如果用户明确要求直接改主工作区，可以不创建 worktree，但必须说明风险并遵守 approval。
@@ -437,7 +445,9 @@ _VISIBLE_OUTPUT_REQUIRED_MODES = {"image", "file"}
 _VISIBLE_OUTPUT_REQUIRED_SIDE_EFFECTS = {"query", "send", "mutate"}
 
 
-def _candidate_tool_snapshot(validated: NativeValidatedRoute) -> CommandToolSnapshot | None:
+def _candidate_tool_snapshot(
+    validated: NativeValidatedRoute,
+) -> CommandToolSnapshot | None:
     candidate = getattr(validated, "candidate", None)
     snapshot = getattr(candidate, "tool", None) if candidate is not None else None
     return snapshot if isinstance(snapshot, CommandToolSnapshot) else None
@@ -452,8 +462,12 @@ def _route_requires_visible_output(validated: NativeValidatedRoute) -> bool:
     role = normalize_message_text(str(getattr(snapshot, "command_role", "") or ""))
     if role in {"helper", "usage", "catalog"}:
         return False
-    output_mode = normalize_message_text(str(getattr(snapshot, "output_mode", "") or ""))
-    side_effect = normalize_message_text(str(getattr(snapshot, "side_effect", "") or ""))
+    output_mode = normalize_message_text(
+        str(getattr(snapshot, "output_mode", "") or "")
+    )
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    )
     if output_mode == "plugin_output":
         return True
     return (
@@ -505,6 +519,32 @@ def _append_route_notice(context_xml: str, notice: str) -> str:
     if section in str(context_xml or ""):
         return context_xml
     return f"{context_xml}\n{section}".strip()
+
+
+def _append_context_section(context_xml: str, section: str) -> str:
+    text = str(section or "").strip()
+    if not text:
+        return context_xml
+    if text in str(context_xml or ""):
+        return context_xml
+    return f"{context_xml}\n{text}".strip()
+
+
+async def _inject_skill_hints(frame: TurnFrame) -> None:
+    if frame.scenario != "superuser_agent" or not frame.allow_agent_tools:
+        return
+    try:
+        matches = await search_skills_semantic(
+            frame.route_message or frame.current_message, limit=3
+        )
+        hint_xml = render_skill_hints(matches)
+        if not hint_xml:
+            return
+        frame.context_xml = _append_context_section(frame.context_xml, hint_xml)
+        frame.update_tags(skill_hints=len(matches))
+        mark_skills_used(matches)
+    except Exception as exc:
+        logger.debug(f"[ChatInter] skill hint injection skipped: {exc}")
 
 
 async def _execute_native_tool_route(
@@ -828,9 +868,7 @@ async def stage_memory(
         frame.previous_dialogue_state = profile.previous_state
     dialogue_state = frame.dialogue_state
     memory_message = (
-        frame.raw_message
-        if frame.turn_messages
-        else frame.uni_msg or frame.raw_message
+        frame.raw_message if frame.turn_messages else frame.uni_msg or frame.raw_message
     )
     memory_dialogue_state = ChatRuntime.memory_dialogue_state(frame)
     (
@@ -848,6 +886,7 @@ async def stage_memory(
         event,
         frame.dialogue_context_pack,
         memory_dialogue_state,
+        frame.scenario,
     )
     frame.chat_memory_layered = getattr(
         frame.dialogue_context_pack,
@@ -879,6 +918,7 @@ async def stage_dialogue_state(*, frame: TurnFrame) -> None:
             group_atmosphere=profile.dialogue_state.group_atmosphere,
         )
     frame.stage(PipelineStage.DIALOGUE_STATE)
+
 
 async def _prepare_current_message_context(
     *,
@@ -1163,6 +1203,7 @@ async def stage_capability_hint(
         middleware_state=middleware_state,
         middleware=middleware,
     )
+    await _inject_skill_hints(frame)
     frame.stage(PipelineStage.CAPABILITY_HINT)
 
 
@@ -1232,9 +1273,7 @@ def _build_turn_queue_context(frame: TurnFrame) -> str:
         )
         if lines:
             sections.append(
-                "<pending_human_updates>\n"
-                f"{lines}\n"
-                "</pending_human_updates>"
+                "<pending_human_updates>\n" f"{lines}\n" "</pending_human_updates>"
             )
     return "\n".join(sections)
 
@@ -1426,16 +1465,39 @@ async def stage_agent_run(
         reply_text = main_result.output.final_text
         if not normalize_message_text(reply_text):
             reply_text = "我暂时没想好怎么回答你。"
+        quality_enabled = ChatRuntime.isolation_for_frame(frame).allow_quality_judge
         quality = ChatRuntime.judge_final_reply(
             frame=frame,
             final_text=reply_text,
         )
+        frame.response_quality_result = quality
+        if quality.reason:
+            frame.update_tags(
+                response_quality=quality.reason,
+                response_quality_action=quality.action,
+            )
         if not quality.ok:
-            frame.update_tags(response_quality=quality.reason)
             if quality.revised_text:
                 reply_text = quality.revised_text
             elif quality.instruction:
                 envelope.add(ChannelName.ANALYSIS, quality.instruction)
+        if quality_enabled:
+            schedule_shadow_quality_judge(
+                final_text=reply_text,
+                original_message=frame.current_message,
+                scenario=frame.scenario,
+                session_key=frame.session_key,
+                trace_id=str(frame.trace.tags.get("message_id", "")),
+                quality_result=quality,
+            )
+            schedule_response_quality_eval(
+                quality_result=quality,
+                final_text=reply_text,
+                original_message=frame.current_message,
+                scenario=frame.scenario,
+                session_key=frame.session_key,
+                trace_id=str(frame.trace.tags.get("message_id", "")),
+            )
         envelope.add(ChannelName.FINAL, reply_text)
     frame.final_envelope = envelope
 

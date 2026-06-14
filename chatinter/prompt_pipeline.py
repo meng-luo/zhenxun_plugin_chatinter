@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import Uninfo
@@ -25,7 +25,6 @@ from .pipeline_stages import (
     stage_thread_context,
 )
 from .turn_frame import TurnFrame
-
 
 PostGateCallback = Callable[..., Awaitable[None]]
 

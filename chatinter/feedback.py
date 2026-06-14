@@ -14,8 +14,6 @@ import time
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, cast
 
-from zhenxun.services import logger
-
 from .feedback_keys import (
     FEEDBACK_REASON_DIRECT_TARGET_REQUIRED,
     FEEDBACK_REASON_FUZZY_CLARIFY,
@@ -25,6 +23,7 @@ from .feedback_keys import (
     FEEDBACK_REASON_SELF_ONLY_BLOCKED,
     FEEDBACK_REASON_TARGET_REQUIRED,
 )
+from .log_compat import logger
 from .persistence import read_json, state_path, utc_now_iso, write_json
 from .route_text import normalize_message_text
 
@@ -345,16 +344,10 @@ class FeedbackStore:
     _module_feedback_ts: ClassVar[dict[str, float]] = {}
     _reason_feedback: ClassVar[dict[str, dict[str, float]]] = {}
     _command_reliability: ClassVar[dict[str, _ReliabilityStats]] = {}
-    _session_command_reliability: ClassVar[
-        dict[str, dict[str, _ReliabilityStats]]
-    ] = {}
+    _session_command_reliability: ClassVar[dict[str, dict[str, _ReliabilityStats]]] = {}
     _module_reliability: ClassVar[dict[str, _ReliabilityStats]] = {}
-    _context_command_reliability: ClassVar[
-        dict[str, dict[str, _ReliabilityStats]]
-    ] = {}
-    _command_success_examples: ClassVar[
-        dict[str, list[_CommandSuccessExample]]
-    ] = {}
+    _context_command_reliability: ClassVar[dict[str, dict[str, _ReliabilityStats]]] = {}
+    _command_success_examples: ClassVar[dict[str, list[_CommandSuccessExample]]] = {}
     _longterm_loaded: ClassVar[bool] = False
     _longterm_dirty: ClassVar[bool] = False
     _last_longterm_save: ClassVar[float] = 0.0
@@ -994,7 +987,9 @@ class FeedbackStore:
         success, failure, false_trigger, correction = _reliability_delta(observation)
         param_failure = _param_failure_delta(observation)
         latency_ms = _observation_latency_ms(observation)
-        if not any((success, failure, false_trigger, correction, param_failure, latency_ms)):
+        if not any(
+            (success, failure, false_trigger, correction, param_failure, latency_ms)
+        ):
             return
 
         if command_id:
@@ -1163,10 +1158,7 @@ class FeedbackStore:
         now = time.monotonic()
         cls._prune(now)
         examples = cls._command_success_examples.get(normalized_command_id, [])
-        return [
-            item.to_dict()
-            for item in examples[: max(1, min(int(limit or 8), 24))]
-        ]
+        return [item.to_dict() for item in examples[: max(1, min(int(limit or 8), 24))]]
 
     @classmethod
     def _ensure_longterm_loaded(cls) -> None:
@@ -1262,9 +1254,7 @@ class FeedbackStore:
             "commands": _dump_stats_bucket(cls._command_reliability),
             "modules": _dump_stats_bucket(cls._module_reliability),
             "contexts": _dump_nested_stats_bucket(cls._context_command_reliability),
-            "success_examples": _dump_success_examples(
-                cls._command_success_examples
-            ),
+            "success_examples": _dump_success_examples(cls._command_success_examples),
             "scores": _dump_float_bucket(cls._command_feedback),
             "score_ts": _dump_float_bucket(cls._command_feedback_ts),
             "module_scores": _dump_float_bucket(cls._module_feedback),
@@ -1472,7 +1462,7 @@ def record_command_observation_feedback(
     output: dict[str, Any],
     action: str = "execute",
     session_id: str | None = None,
-    latency_ms: int | float = 0,
+    latency_ms: float = 0,
     selected_rank: int = 0,
     selected_score: float = 0.0,
     selected_reason: str = "",
@@ -1506,9 +1496,9 @@ def record_command_observation_feedback(
             ),
             route_stage=normalize_message_text(str(output.get("status", "") or "")),
             session_id=normalize_message_text(session_id or ""),
-            message_preview=normalize_message_text(str(output.get("task_text", "") or ""))[
-                :120
-            ],
+            message_preview=normalize_message_text(
+                str(output.get("task_text", "") or "")
+            )[:120],
             token_usage={},
             candidate_total=0,
             tool_candidates=0,
@@ -1604,9 +1594,13 @@ def _normalize_observation_for_feedback(observation: Any) -> Any:
     if not normalize_message_text(getattr(observation, "command_id", "")):
         setattr_if_possible(observation, "command_id", output.get("command_id", ""))
     if not normalize_message_text(getattr(observation, "plugin_module", "")):
-        setattr_if_possible(observation, "plugin_module", output.get("plugin_module", ""))
+        setattr_if_possible(
+            observation, "plugin_module", output.get("plugin_module", "")
+        )
     if not normalize_message_text(getattr(observation, "plugin_name", "")):
-        setattr_if_possible(observation, "plugin_name", output.get("matched_plugin", ""))
+        setattr_if_possible(
+            observation, "plugin_name", output.get("matched_plugin", "")
+        )
     if not normalize_message_text(getattr(observation, "command", "")):
         setattr_if_possible(observation, "command", output.get("rendered_command", ""))
     return observation
@@ -1701,7 +1695,9 @@ def _trim_stats_map(values: dict[str, _ReliabilityStats], capacity: int) -> None
         values.pop(key, None)
 
 
-def _dump_stats_bucket(values: dict[str, _ReliabilityStats]) -> dict[str, dict[str, Any]]:
+def _dump_stats_bucket(
+    values: dict[str, _ReliabilityStats],
+) -> dict[str, dict[str, Any]]:
     return {
         key: stats.to_dict()
         for key, stats in values.items()
@@ -1957,14 +1953,11 @@ def _profile_from_stats(
         (param_failure_rate * 26.0 + param_failure * 1.8) * sample_weight,
     )
     latency_score = _latency_reliability_score(avg_latency_ms, sample_weight)
-    low_reliability = (
-        total >= 3.0
-        and (
-            success_rate < 0.38
-            or false_trigger_rate >= 0.28
-            or false_trigger >= 2.0
-            or param_failure_rate >= 0.42
-        )
+    low_reliability = total >= 3.0 and (
+        success_rate < 0.38
+        or false_trigger_rate >= 0.28
+        or false_trigger >= 2.0
+        or param_failure_rate >= 0.42
     )
     high_reliability = (
         total >= 3.0
@@ -2296,9 +2289,9 @@ def _update_trajectory_bucket(
     current["tool_call_total"] = int(current.get("tool_call_total", 0) or 0) + int(
         evaluation.get("tool_call_count", 0) or 0
     )
-    current["latency_ms_total"] = int(
-        current.get("latency_ms_total", 0) or 0
-    ) + max(_trajectory_nested_int(record, "latency", "total_ms"), 0)
+    current["latency_ms_total"] = int(current.get("latency_ms_total", 0) or 0) + max(
+        _trajectory_nested_int(record, "latency", "total_ms"), 0
+    )
     current["prompt_tokens_total"] = int(
         current.get("prompt_tokens_total", 0) or 0
     ) + max(_trajectory_nested_int(record, "token", "prompt_estimated"), 0)
@@ -2309,7 +2302,9 @@ def _update_trajectory_bucket(
     total = int(current.get("total", 0) or 0)
     hit_total = int(current.get("hit_total", 0) or 0)
     multi_total = int(current.get("multi_task_total", 0) or 0)
-    current["hit_rate"] = _trajectory_rate(int(current.get("hit_count", 0) or 0), hit_total)
+    current["hit_rate"] = _trajectory_rate(
+        int(current.get("hit_count", 0) or 0), hit_total
+    )
     current["false_trigger_rate"] = _trajectory_rate(
         int(current.get("false_trigger_count", 0) or 0),
         total,
@@ -2318,18 +2313,30 @@ def _update_trajectory_bucket(
         int(current.get("multi_task_covered_count", 0) or 0),
         multi_total,
     )
-    current["avg_tool_calls"] = round(
-        float(current.get("tool_call_total", 0) or 0) / float(total),
-        3,
-    ) if total else 0.0
-    current["avg_latency_ms"] = round(
-        float(current.get("latency_ms_total", 0) or 0) / float(total),
-        2,
-    ) if total else None
-    current["avg_prompt_tokens"] = round(
-        float(current.get("prompt_tokens_total", 0) or 0) / float(total),
-        2,
-    ) if total else None
+    current["avg_tool_calls"] = (
+        round(
+            float(current.get("tool_call_total", 0) or 0) / float(total),
+            3,
+        )
+        if total
+        else 0.0
+    )
+    current["avg_latency_ms"] = (
+        round(
+            float(current.get("latency_ms_total", 0) or 0) / float(total),
+            2,
+        )
+        if total
+        else None
+    )
+    current["avg_prompt_tokens"] = (
+        round(
+            float(current.get("prompt_tokens_total", 0) or 0) / float(total),
+            2,
+        )
+        if total
+        else None
+    )
     return current
 
 

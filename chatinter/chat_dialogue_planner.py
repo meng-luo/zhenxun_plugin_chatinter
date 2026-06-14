@@ -18,6 +18,7 @@ def contains_any(text: str, needles: tuple[str, ...]) -> bool:
     normalized = normalize_message_text(text)
     return any(item and item in normalized for item in needles)
 
+
 ChatDialogueKind = Literal[
     "casual_chat",
     "factual_qa",
@@ -415,8 +416,7 @@ def build_dialogue_state(
         if previous_state is not None
         else "",
         reason=(
-            f"{getattr(plan, 'reason', 'no_plan')}:{emotion}:{purpose}:"
-            f"{continuity}"
+            f"{getattr(plan, 'reason', 'no_plan')}:{emotion}:{purpose}:" f"{continuity}"
         ),
     )
 
@@ -614,8 +614,10 @@ def _dialogue_continuity(
         return "new_topic" if topic else "unknown"
     if topic and topic == previous_state.topic_hint:
         return "same_topic"
-    if topic and previous_state.topic_hint and (
-        topic in previous_state.topic_hint or previous_state.topic_hint in topic
+    if (
+        topic
+        and previous_state.topic_hint
+        and (topic in previous_state.topic_hint or previous_state.topic_hint in topic)
     ):
         return "followup"
     return "new_topic"

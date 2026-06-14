@@ -291,7 +291,9 @@ class PluginRegistry:
             candidate = cls._normalize_command(head_tokens[0]) if head_tokens else ""
             if not candidate:
                 text_tokens = text.split(maxsplit=1)
-                candidate = cls._normalize_command(text_tokens[0]) if text_tokens else ""
+                candidate = (
+                    cls._normalize_command(text_tokens[0]) if text_tokens else ""
+                )
             if not candidate:
                 continue
             if candidate.casefold() == primary:
@@ -668,9 +670,7 @@ class PluginRegistry:
                         "alias": alias,
                         "render": render,
                         "args": [
-                            str(arg).strip()
-                            for arg in args
-                            if str(arg or "").strip()
+                            str(arg).strip() for arg in args if str(arg or "").strip()
                         ]
                         if isinstance(args, list | tuple)
                         else [],
@@ -1066,7 +1066,9 @@ class PluginRegistry:
                 text = str(example.get("exec") or example.get("example") or "").strip()
                 example_description = str(example.get("description") or "").strip()
                 if example_description:
-                    description = cls._merge_text_fields(description, example_description)
+                    description = cls._merge_text_fields(
+                        description, example_description
+                    )
             else:
                 text = str(example).strip()
             if text:
@@ -1082,7 +1084,9 @@ class PluginRegistry:
             ],
             params=[str(param).strip() for param in params if str(param or "").strip()],
             slot_choices=item.get("slot_choices", schema.get("slot_choices")),
-            shortcut_renders=item.get("shortcut_renders", schema.get("shortcut_renders")),
+            shortcut_renders=item.get(
+                "shortcut_renders", schema.get("shortcut_renders")
+            ),
             examples=normalized_examples,
             text_min=cls._safe_int(item.get("text_min"))
             if item.get("text_min") is not None
@@ -1216,7 +1220,9 @@ class PluginRegistry:
         text = str(line or "").strip()
         text = text.strip("` \t")
         text = re.sub(r"^[\-\*\d\.\)、)\s]+", "", text).strip()
-        text = re.sub(r"^(?:命令|用法|示例|格式|usage|example)\s*[:：]\s*", "", text, flags=re.I)
+        text = re.sub(
+            r"^(?:命令|用法|示例|格式|usage|example)\s*[:：]\s*", "", text, flags=re.I
+        )
         return text.strip()
 
     @staticmethod
@@ -1267,7 +1273,9 @@ class PluginRegistry:
                 ),
                 "",
             )
-            if not matched_head and cls._command_placeholder_pattern.search(command_part):
+            if not matched_head and cls._command_placeholder_pattern.search(
+                command_part
+            ):
                 before_placeholder = cls._command_placeholder_pattern.split(
                     command_part, maxsplit=1
                 )[0]
@@ -1276,7 +1284,9 @@ class PluginRegistry:
                     matched_head = cls._normalize_command(head_parts[0])
             if not matched_head:
                 continue
-            if len(matched_head) > 32 or any(mark in matched_head for mark in "，。！？；"):
+            if len(matched_head) > 32 or any(
+                mark in matched_head for mark in "，。！？；"
+            ):
                 continue
             params = cls._extract_command_params_from_text(command_part)
             result.append(
@@ -2032,8 +2042,7 @@ class PluginRegistry:
 
         except Exception as e:
             logger.error(
-                "预加载知识库缓存失败："
-                f"{e}\n{traceback.format_exc(limit=8)}"
+                "预加载知识库缓存失败：" f"{e}\n{traceback.format_exc(limit=8)}"
             )
 
 

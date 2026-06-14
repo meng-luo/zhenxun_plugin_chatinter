@@ -37,9 +37,9 @@ def record_agent_trajectory(
     state: AgentRunState,
     input_message: str,
     started_at: float,
-    latency_ms: int | float,
+    latency_ms: float,
     run_context_extra: dict[str, Any] | None = None,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     """Append one completed/paused/failed AgentRun trajectory to durable JSONL."""
 
     record = build_agent_trajectory_record(
@@ -54,7 +54,7 @@ def record_agent_trajectory(
     write_json(state_path("trajectories", "latest.json"), record)
     _record_feedback_projection(record)
     _record_eval_projection(record)
-    return path
+    return path, record
 
 
 def build_agent_trajectory_record(
@@ -62,7 +62,7 @@ def build_agent_trajectory_record(
     state: AgentRunState,
     input_message: str,
     started_at: float,
-    latency_ms: int | float,
+    latency_ms: float,
     run_context_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     extra = dict(run_context_extra or {})
@@ -83,7 +83,9 @@ def build_agent_trajectory_record(
         "schema_version": SCHEMA_VERSION,
         "trace_id": state.trace_id,
         "run_id": state.run_id,
-        "eval_case_id": normalize_message_text(str(extra.get("eval_case_id", "") or "")),
+        "eval_case_id": normalize_message_text(
+            str(extra.get("eval_case_id", "") or "")
+        ),
         "eval_layer": normalize_message_text(str(extra.get("eval_layer", "") or "")),
         "eval_expectation": normalize_message_text(
             str(extra.get("eval_expectation", "") or "")
@@ -91,7 +93,11 @@ def build_agent_trajectory_record(
         "session_key": state.session_key or "",
         "created_at": utc_now_iso(),
         "started_at": _iso_from_timestamp(started_at),
-        "scenario": _scenario_from_extra(extra, state=state, selected_tools=selected_tools),
+        "scenario": _scenario_from_extra(
+            extra,
+            state=state,
+            selected_tools=selected_tools,
+        ),
         "agent_mode": normalize_message_text(str(extra.get("agent_mode", ""))),
         "agent_complexity_mode": state.agent_complexity_mode,
         "agent_complexity_reason": state.agent_complexity_reason,
@@ -162,9 +168,11 @@ def load_trajectory_records(
             continue
         if not isinstance(payload, dict):
             continue
-        if scenario_filter and normalize_message_text(
-            str(payload.get("scenario", ""))
-        ) != scenario_filter:
+        if (
+            scenario_filter
+            and normalize_message_text(str(payload.get("scenario", "")))
+            != scenario_filter
+        ):
             continue
         records.append(payload)
     return records[-max_items:]
@@ -184,7 +192,9 @@ def _evaluate_record_fields(
     status: str,
 ) -> dict[str, Any]:
     actionable_observations = [
-        item for item in observations if item.get("tool_name") and not item.get("synthetic")
+        item
+        for item in observations
+        if item.get("tool_name") and not item.get("synthetic")
     ]
     ok_observations = [item for item in actionable_observations if item.get("ok")]
     obligation = normalize_message_text(tool_obligation)
@@ -330,7 +340,10 @@ def _scenario_from_extra(
         value = normalize_message_text(str(extra.get(key, "") or ""))
         if value:
             return value
-    if bool(extra.get("enable_agent_tools")) or extra.get("agent_mode") == "superuser_agent":
+    if (
+        bool(extra.get("enable_agent_tools"))
+        or extra.get("agent_mode") == "superuser_agent"
+    ):
         return "superuser_agent"
     registry = extra.get("capability_registry")
     has_plugin_tools = False
@@ -340,7 +353,10 @@ def _scenario_from_extra(
                 record = registry.tool_record_for(tool_name)
             except Exception:
                 record = None
-            if normalize_message_text(str(getattr(record, "kind", ""))) == "plugin_command":
+            if (
+                normalize_message_text(str(getattr(record, "kind", "")))
+                == "plugin_command"
+            ):
                 has_plugin_tools = True
                 break
     if has_plugin_tools:
@@ -413,7 +429,11 @@ def _artifact_summary(
 
 
 def _is_synthetic_observation(observation: AgentObservation) -> bool:
-    if observation.command_id or observation.rendered_command or observation.matched_plugin:
+    if (
+        observation.command_id
+        or observation.rendered_command
+        or observation.matched_plugin
+    ):
         return False
     status = normalize_message_text(str(observation.output.get("status", "")))
     return observation.tool_name.startswith("runtime_") or status.startswith(
@@ -461,7 +481,9 @@ def _compact_value(value: Any, *, limit: int = _MAX_ARGUMENT_TEXT) -> Any:
             for key, item in list(payload.items())[:24]
         }
     if isinstance(payload, list):
-        return [_compact_value(item, limit=max(160, limit // 2)) for item in payload[:24]]
+        return [
+            _compact_value(item, limit=max(160, limit // 2)) for item in payload[:24]
+        ]
     return payload
 
 
@@ -474,9 +496,7 @@ def _clip(value: Any, *, limit: int = _MAX_TEXT) -> str:
 
 def _drop_empty(payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: value
-        for key, value in payload.items()
-        if value not in ("", [], {}, None)
+        key: value for key, value in payload.items() if value not in ("", [], {}, None)
     }
 
 

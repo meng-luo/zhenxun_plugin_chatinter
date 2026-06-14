@@ -38,7 +38,10 @@ _CONFIG_KEY = "MCP_SERVERS"
 _DEFAULT_CONNECT_TIMEOUT = 12.0
 _DEFAULT_TOOL_TIMEOUT = 60.0
 _DEFAULT_FAILURE_ISOLATION_SECONDS = 60.0
+_DEFAULT_MCP_CONCURRENCY = 3
+_MAX_MCP_CONCURRENCY = 4
 _MAX_RESULT_CHARS = 60000
+_MCP_REFRESH_TASKS: set[asyncio.Task[None]] = set()
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class MCPServerConfig:
     include_tools: frozenset[str] = field(default_factory=frozenset)
     exclude_tools: frozenset[str] = field(default_factory=frozenset)
     max_tools: int = 80
+    max_concurrency: int = _DEFAULT_MCP_CONCURRENCY
     failure_isolation_seconds: float = _DEFAULT_FAILURE_ISOLATION_SECONDS
 
     @property
@@ -82,6 +86,7 @@ class MCPServerConfig:
             "include_tools": sorted(self.include_tools),
             "exclude_tools": sorted(self.exclude_tools),
             "max_tools": self.max_tools,
+            "max_concurrency": self.max_concurrency,
         }
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -106,7 +111,9 @@ class MCPServerStatus:
             "tool_count": self.tool_count,
             "error": self.error,
             "failure_count": self.failure_count,
-            "isolated_until": round(self.isolated_until, 3) if self.isolated_until else 0,
+            "isolated_until": round(self.isolated_until, 3)
+            if self.isolated_until
+            else 0,
             "config_signature": self.config_signature[:12],
         }
 
@@ -143,6 +150,7 @@ class MCPToolExecutable:
         self.name = self.raw_name
         self.description = _tool_description(raw_tool)
         self.input_schema = normalize_mcp_input_schema(_tool_input_schema(raw_tool))
+        self.importance_score = _tool_importance_score(raw_tool, server.config)
 
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -170,7 +178,9 @@ class MCPServerConnection:
         self._exit_stack: AsyncExitStack | None = None
         self._session: Any | None = None
         self._tools: list[Any] = []
-        self._rpc_lock = asyncio.Lock()
+        self._rpc_semaphore = asyncio.Semaphore(
+            _bounded_mcp_concurrency(config.max_concurrency)
+        )
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._sdk: dict[str, Any] | None = None
@@ -180,7 +190,9 @@ class MCPServerConnection:
         return len(self._tools)
 
     def should_skip_for_failure_isolation(self) -> bool:
-        return bool(self.status.isolated_until and time.time() < self.status.isolated_until)
+        return bool(
+            self.status.isolated_until and time.time() < self.status.isolated_until
+        )
 
     async def ensure_connected(self, *, force: bool = False) -> None:
         if not self.config.enabled:
@@ -205,7 +217,9 @@ class MCPServerConnection:
             try:
                 await asyncio.wait_for(
                     self._connect_with_sdk(self._sdk),
-                    timeout=max(float(self.config.timeout or _DEFAULT_CONNECT_TIMEOUT), 1.0),
+                    timeout=max(
+                        float(self.config.timeout or _DEFAULT_CONNECT_TIMEOUT), 1.0
+                    ),
                 )
                 await self.refresh_tools(force=True)
                 self.status.status = "connected"
@@ -221,10 +235,19 @@ class MCPServerConnection:
             return
         async with self._refresh_lock:
             try:
-                async with self._rpc_lock:
+                async with self._rpc_semaphore:
                     result = await self._session.list_tools()
                 tools = list(getattr(result, "tools", []) or [])
                 self._tools = _filter_tools(tools, self.config)
+                if len(self._tools) != len(tools):
+                    logger.debug(
+                        (
+                            f"[ChatInter MCP] {self.config.name} 工具筛选: "
+                            f"raw={len(tools)} selected={len(self._tools)} "
+                            f"max={self.config.max_tools}"
+                        ),
+                        "mcp_runtime",
+                    )
                 self.status.tool_count = len(self._tools)
                 self.status.status = "connected"
                 self.status.error = ""
@@ -256,18 +279,23 @@ class MCPServerConnection:
             )
 
         async def _call_once() -> Any:
-            async with self._rpc_lock:
+            async with self._rpc_semaphore:
+                session = self._session
+                if session is None:
+                    raise RuntimeError("MCP session is unavailable")
                 read_timeout = timedelta(
-                    seconds=max(float(self.config.tool_timeout or _DEFAULT_TOOL_TIMEOUT), 1.0)
+                    seconds=max(
+                        float(self.config.tool_timeout or _DEFAULT_TOOL_TIMEOUT), 1.0
+                    )
                 )
                 try:
-                    return await self._session.call_tool(
+                    return await session.call_tool(
                         name=tool_name,
                         arguments=arguments or {},
                         read_timeout_seconds=read_timeout,
                     )
                 except TypeError:
-                    return await self._session.call_tool(
+                    return await session.call_tool(
                         name=tool_name,
                         arguments=arguments or {},
                     )
@@ -276,8 +304,12 @@ class MCPServerConnection:
             result = await _call_once()
         except Exception as exc:
             if _looks_like_closed_resource(exc):
+                reconnect_tip = (
+                    f"[ChatInter MCP] {self.config.name}.{tool_name} "
+                    "连接已关闭，尝试重连"
+                )
                 logger.warning(
-                    f"[ChatInter MCP] {self.config.name}.{tool_name} 连接已关闭，尝试重连",
+                    reconnect_tip,
                     "mcp_runtime",
                 )
                 await self.ensure_connected(force=True)
@@ -317,7 +349,7 @@ class MCPServerConnection:
     async def _connect_with_sdk(self, sdk: dict[str, Any]) -> None:
         stack = AsyncExitStack()
         self._exit_stack = stack
-        session_kwargs = {
+        session_kwargs: dict[str, Any] = {
             "read_timeout_seconds": timedelta(
                 seconds=max(float(self.config.session_read_timeout or 60.0), 1.0)
             ),
@@ -386,18 +418,27 @@ class MCPServerConnection:
             self._session = await stack.enter_async_context(
                 sdk["ClientSession"](*streams, **session_kwargs)
             )
-        init_result = await self._session.initialize()
+        session = self._session
+        if session is None:
+            raise RuntimeError("MCP session initialize failed")
+        init_result = await session.initialize()
         self.status.status = "initialized"
         setattr(self, "initialize_result", init_result)
 
     def _message_handler(self):
         async def _handler(message: Any) -> None:
             if _is_tools_changed_notification(message):
-                logger.info(
-                    f"[ChatInter MCP] {self.config.name} 收到 tools/list_changed，后台刷新",
+                refresh_tip = (
+                    f"[ChatInter MCP] {self.config.name} "
+                    "收到 tools/list_changed，后台刷新"
+                )
+                logger.debug(
+                    refresh_tip,
                     "mcp_runtime",
                 )
-                asyncio.create_task(self.refresh_tools(force=True))
+                task = asyncio.create_task(self.refresh_tools(force=True))
+                _MCP_REFRESH_TASKS.add(task)
+                task.add_done_callback(_MCP_REFRESH_TASKS.discard)
 
         return _handler
 
@@ -470,7 +511,9 @@ class MCPRuntimeManager:
                 result.statuses.append(server.status)
             return result
 
-    async def reload(self, *, server_names: list[str] | None = None) -> MCPDiscoveryResult:
+    async def reload(
+        self, *, server_names: list[str] | None = None
+    ) -> MCPDiscoveryResult:
         async with self._lock:
             selected = {
                 normalize_message_text(name)
@@ -596,7 +639,11 @@ def normalize_mcp_input_schema(schema: Any) -> dict[str, Any]:
             out_key = "$defs" if key == "definitions" else key
             if key in {"examples", "default", "deprecated", "readOnly", "writeOnly"}:
                 continue
-            if key == "$ref" and isinstance(value, str) and value.startswith("#/definitions/"):
+            if (
+                key == "$ref"
+                and isinstance(value, str)
+                and value.startswith("#/definitions/")
+            ):
                 repaired[out_key] = "#/$defs/" + value[len("#/definitions/") :]
             else:
                 repaired[out_key] = visit(value)
@@ -633,7 +680,9 @@ def normalize_mcp_input_schema(schema: Any) -> dict[str, Any]:
                 repaired["properties"] = props
             required = repaired.get("required")
             if isinstance(required, list):
-                valid = [item for item in required if isinstance(item, str) and item in props]
+                valid = [
+                    item for item in required if isinstance(item, str) and item in props
+                ]
                 if valid:
                     repaired["required"] = valid
                 else:
@@ -652,7 +701,8 @@ def normalize_mcp_input_schema(schema: Any) -> dict[str, Any]:
 
 
 def _server_config_from_raw(name: Any, raw: dict[str, Any]) -> MCPServerConfig:
-    tools = raw.get("tools") if isinstance(raw.get("tools"), dict) else {}
+    raw_tools = raw.get("tools")
+    tools: dict[str, Any] = raw_tools if isinstance(raw_tools, dict) else {}
     return MCPServerConfig(
         name=normalize_message_text(str(name or "")) or "mcp_server",
         enabled=_bool(raw.get("enabled", raw.get("active", True)), True),
@@ -663,7 +713,9 @@ def _server_config_from_raw(name: Any, raw: dict[str, Any]) -> MCPServerConfig:
         else {},
         cwd=str(raw.get("cwd", "") or "").strip(),
         url=str(raw.get("url", "") or "").strip(),
-        transport=normalize_message_text(str(raw.get("transport", raw.get("type", "")) or "")),
+        transport=normalize_message_text(
+            str(raw.get("transport", raw.get("type", "")) or "")
+        ),
         headers={str(k): str(v) for k, v in (raw.get("headers") or {}).items()}
         if isinstance(raw.get("headers"), dict)
         else {},
@@ -674,6 +726,9 @@ def _server_config_from_raw(name: Any, raw: dict[str, Any]) -> MCPServerConfig:
         include_tools=frozenset(str(item) for item in _list(tools.get("include"))),
         exclude_tools=frozenset(str(item) for item in _list(tools.get("exclude"))),
         max_tools=_int(raw.get("max_tools"), 80),
+        max_concurrency=_bounded_mcp_concurrency(
+            raw.get("max_concurrency", raw.get("concurrency"))
+        ),
         failure_isolation_seconds=_float(
             raw.get("failure_isolation_seconds"),
             _DEFAULT_FAILURE_ISOLATION_SECONDS,
@@ -714,8 +769,8 @@ def _load_mcp_sdk() -> dict[str, Any]:
 
 
 def _filter_tools(tools: list[Any], config: MCPServerConfig) -> list[Any]:
-    selected: list[Any] = []
-    for tool in tools:
+    candidates: list[tuple[float, int, Any]] = []
+    for index, tool in enumerate(tools):
         name = _tool_name(tool)
         if not name:
             continue
@@ -723,10 +778,88 @@ def _filter_tools(tools: list[Any], config: MCPServerConfig) -> list[Any]:
             continue
         if config.exclude_tools and name in config.exclude_tools:
             continue
-        selected.append(tool)
-        if len(selected) >= max(int(config.max_tools or 1), 1):
-            break
-    return selected
+        candidates.append((_tool_importance_score(tool, config), index, tool))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    max_tools = max(int(config.max_tools or 1), 1)
+    return [tool for _, _, tool in candidates[:max_tools]]
+
+
+def _tool_importance_score(tool: Any, config: MCPServerConfig) -> float:
+    name = _tool_name(tool)
+    description = _tool_description(tool)
+    schema = normalize_mcp_input_schema(_tool_input_schema(tool))
+    annotations = _tool_annotations(tool)
+
+    score = 0.0
+    if config.include_tools and name in config.include_tools:
+        score += 1000.0
+    score += 8.0 if description else -5.0
+    if len(description) >= 24:
+        score += 4.0
+    if len(description) > 600:
+        score -= 3.0
+
+    properties = schema.get("properties")
+    required = schema.get("required")
+    property_count = len(properties) if isinstance(properties, dict) else 0
+    required_count = len(required) if isinstance(required, list) else 0
+    score += min(property_count, 12) * 1.5
+    score += min(required_count, 4) * 0.75
+    if property_count == 0:
+        score -= 2.0
+    if required_count > 8:
+        score -= float(required_count - 8)
+
+    if _annotation_bool(annotations, "readOnlyHint"):
+        score += 5.0
+    if _annotation_bool(annotations, "idempotentHint"):
+        score += 2.0
+    if _annotation_bool(annotations, "destructiveHint"):
+        score -= 8.0
+    if _annotation_bool(annotations, "openWorldHint"):
+        score -= 1.0
+
+    normalized_name = normalize_message_text(name)
+    if any(
+        token in normalized_name for token in ("search", "query", "list", "get", "read")
+    ):
+        score += 3.0
+    if any(
+        token in normalized_name
+        for token in ("delete", "remove", "drop", "write", "exec", "shell", "token")
+    ):
+        score -= 4.0
+    return score
+
+
+def _tool_annotations(tool: Any) -> dict[str, Any]:
+    annotations: Any = getattr(tool, "annotations", None)
+    if isinstance(annotations, dict):
+        return annotations
+    model_dump = getattr(annotations, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="json")
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    dict_method = getattr(annotations, "dict", None)
+    if callable(dict_method):
+        try:
+            payload = dict_method()
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _annotation_bool(annotations: dict[str, Any], key: str) -> bool:
+    value = annotations.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 def _serialize_mcp_result(result: Any) -> Any:
@@ -807,7 +940,16 @@ def _tool_input_schema(tool: Any) -> Any:
 
 def _looks_like_closed_resource(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".casefold()
-    return any(token in text for token in ("closedresource", "brokenresource", "closed resource", "connection reset", "session is closed"))
+    return any(
+        token in text
+        for token in (
+            "closedresource",
+            "brokenresource",
+            "closed resource",
+            "connection reset",
+            "session is closed",
+        )
+    )
 
 
 def _is_tools_changed_notification(message: Any) -> bool:
@@ -863,6 +1005,14 @@ def _int(value: Any, default: int) -> int:
         return default
 
 
+def _bounded_mcp_concurrency(value: Any = None) -> int:
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError):
+        concurrency = _DEFAULT_MCP_CONCURRENCY
+    return min(max(concurrency, 1), _MAX_MCP_CONCURRENCY)
+
+
 def _list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -900,7 +1050,8 @@ def _insert_mcp_servers_key(text: str) -> str:
 
 
 def _mcp_config_block() -> str:
-    return """  # MCP_SERVERS: 超级用户私聊 Agent 可用的 MCP server 配置。仅 superuser_agent 场景暴露，不进入群聊/普通私聊。
+    return """  # MCP_SERVERS: 超级用户私聊 Agent 可用的 MCP server 配置。
+  # 仅 superuser_agent 场景暴露，不进入群聊/普通私聊。
   # 示例:
   # MCP_SERVERS:
   #   filesystem:
@@ -911,6 +1062,7 @@ def _mcp_config_block() -> str:
   #       include: []
   #       exclude: []
   #     max_tools: 80
+  #     max_concurrency: 3
   #     timeout: 12
   #     tool_timeout: 60
   MCP_SERVERS: {}
