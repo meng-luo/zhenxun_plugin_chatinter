@@ -27,8 +27,8 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from .execution_observer import render_execution_observer_summary
 from .event_signals import get_event_signal
+from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
 from .memory import _chat_memory
@@ -45,7 +45,7 @@ from .turn_queue import get_turn_queue
 from .utils.unimsg_utils import uni_to_text_with_tags
 
 driver = get_driver()
-_DYNAMIC_MATCHER_RESCAN_DELAYS = (2, 8, 20)
+_DYNAMIC_MATCHER_RESCAN_DELAYS = (8,)
 _dynamic_rescan_task: asyncio.Task | None = None
 
 
@@ -158,10 +158,15 @@ __plugin_meta__ = PluginMetadata(
                 command="chatinter统计",
                 description="查看最近 ChatInter 路由统计（超级用户）",
             ),
+            Command(
+                command="重建插件索引",
+                description="重建 ChatInter 插件知识库索引（超级用户）",
+            ),
         ],
         superuser_help="""
 - `重置会话`
 - `chatinter统计`
+- `重建插件索引`
         """.strip(),
     ).to_dict(),
 )
@@ -417,6 +422,14 @@ _stats_matcher = on_alconna(
     rule=to_me(),
 )
 
+_rebuild_plugin_index_matcher = on_alconna(
+    Alconna("重建插件索引"),
+    permission=SUPERUSER,
+    block=True,
+    priority=1,
+    rule=to_me(),
+)
+
 
 @_reset_matcher.handle()
 async def _handle_reset_by_alconna(
@@ -448,6 +461,21 @@ async def _handle_stats_by_alconna():
     ).send()
 
 
+@_rebuild_plugin_index_matcher.handle()
+async def _handle_rebuild_plugin_index():
+    try:
+        knowledge_base = await PluginRegistry.get_plugin_knowledge_base(
+            force_refresh=True
+        )
+    except Exception as exc:
+        logger.error(f"ChatInter 插件索引重建失败：{exc}")
+        await MessageUtils.build_message(f"插件索引重建失败：{exc}").send()
+        return
+    await MessageUtils.build_message(
+        f"插件索引已重建，共 {len(knowledge_base.plugins)} 个插件。"
+    ).send()
+
+
 @driver.on_startup
 async def _on_startup():
     """插件启动初始化"""
@@ -472,7 +500,12 @@ async def _on_shutdown():
 
 
 async def _rescan_dynamic_matchers_after_startup():
-    """等其它插件 startup 动态 matcher 创建完成后，分批重建知识库。"""
+    """等其它插件 startup 动态 matcher 创建完成后，重建一次知识库。
+
+    大部分插件（包括 nonebot_plugin_memes）在导入期已注册完 matcher；保留
+    一次延迟补扫主要覆盖 parser-lite 这类 startup 阶段动态注册 matcher 的插件。
+    插件开启/关闭状态变化由 PluginInfoMemoryCache refresh 版本驱动缓存失效。
+    """
     for delay_seconds in _DYNAMIC_MATCHER_RESCAN_DELAYS:
         await asyncio.sleep(delay_seconds)
         await PluginRegistry.preload_cache(force_refresh=True)

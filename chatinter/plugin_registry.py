@@ -8,6 +8,7 @@ ChatInter - 插件信息注册表
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import importlib
 import inspect
 import re
@@ -17,9 +18,13 @@ from typing import Any, ClassVar, Literal, cast
 import nonebot
 
 from zhenxun.configs.utils import PluginExtraData
-from zhenxun.services.cache.runtime_cache import PluginInfoMemoryCache
+from zhenxun.services.cache.runtime_cache import (
+    GroupMemoryCache,
+    PluginInfoMemoryCache,
+    _parse_block_modules,
+)
 from zhenxun.services.log import logger
-from zhenxun.utils.enum import PluginType
+from zhenxun.utils.enum import BlockType, PluginType
 
 from .capability_graph import build_capability_graph_snapshot
 from .metadata_builder import AutoMetadataBuilder
@@ -64,14 +69,21 @@ class PluginRegistry:
 
     # 缓存相关
     _cache: ClassVar[dict[str, tuple[PluginKnowledgeBase, datetime]]] = {}
+    _cache_plugin_info_refresh: ClassVar[dict[str, float]] = {}
     _cache_ttl: ClassVar[int] = 300  # 缓存有效期（秒）
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _command_tool_cache: ClassVar[dict[str, tuple[list[CommandToolSnapshot], int]]] = {}
+    _command_tool_cache_order: ClassVar[list[str]] = []
+    _command_tool_cache_max: ClassVar[int] = 16
+    _knowledge_revision: ClassVar[int] = 0
 
     @classmethod
     def invalidate_knowledge_cache(cls) -> None:
         """插件安装/卸载/更新后调用,强制下一次访问重建知识库与命令 schema
         (P0-4 schema 重建触发;常规时效仍由 _cache_ttl 兜底)。"""
         cls._cache.clear()
+        cls._cache_plugin_info_refresh.clear()
+        cls._clear_command_tool_cache(bump_revision=True)
 
     _max_matcher_commands: ClassVar[int] = 800
     _max_discovered_commands: ClassVar[int] = 2000
@@ -154,7 +166,15 @@ class PluginRegistry:
         async with cls._lock:
             if not force_refresh and cache_key in cls._cache:
                 cached_data, cached_time = cls._cache[cache_key]
-                if (datetime.now() - cached_time).total_seconds() < cls._cache_ttl:
+                plugin_refresh_ts = cls._plugin_info_refresh_ts()
+                cache_fresh = (
+                    datetime.now() - cached_time
+                ).total_seconds() < cls._cache_ttl
+                plugin_cache_same = (
+                    cls._cache_plugin_info_refresh.get(cache_key, 0.0)
+                    == plugin_refresh_ts
+                )
+                if cache_fresh and plugin_cache_same:
                     logger.debug("使用缓存的插件知识库")
                     return cached_data
 
@@ -164,8 +184,10 @@ class PluginRegistry:
         # 更新缓存
         async with cls._lock:
             cls._cache[cache_key] = (knowledge_base, datetime.now())
+            cls._cache_plugin_info_refresh[cache_key] = cls._plugin_info_refresh_ts()
             # 清理过期缓存
             cls._cleanup_cache()
+            cls._clear_command_tool_cache(bump_revision=True)
 
         return knowledge_base
 
@@ -1356,6 +1378,10 @@ class PluginRegistry:
         fallback_name: str | None = None,
         admin_level: int | None = None,
         limit_superuser: bool | None = None,
+        status: bool = True,
+        block_type: BlockType | str | None = None,
+        load_status: bool = True,
+        block_keys: list[str] | None = None,
     ) -> PluginInfo | None:
         command_meta = cls._extract_command_meta(extra_data)
         discovered_meta = await cls._discover_command_meta_from_plugin(
@@ -1431,6 +1457,10 @@ class PluginRegistry:
             usage=resolved_usage,
             admin_level=resolved_admin_level,
             limit_superuser=resolved_limit_superuser,
+            status=bool(status),
+            block_type=cls._normalize_block_type(block_type),
+            load_status=bool(load_status),
+            block_keys=cls._merge_unique_strings([module_name], block_keys or []),
         )
 
     @classmethod
@@ -1493,32 +1523,43 @@ class PluginRegistry:
             if bool(db_plugin.limit_superuser):
                 continue
 
-            module_candidates = [
-                str(db_plugin.module or "").strip(),
-                str(db_plugin.module_path or "").strip(),
-            ]
-            module_name = next((item for item in module_candidates if item), "")
+            module_path = str(db_plugin.module_path or "").strip()
+            module_short_name = str(db_plugin.module or "").strip()
+            module_name = module_path or module_short_name
             if not module_name:
                 continue
             if cls._is_infrastructure_module(module_name, str(db_plugin.name or "")):
                 continue
 
-            runtime_plugin = plugins_by_module.get(module_name)
+            runtime_plugin = plugins_by_module.get(
+                module_path
+            ) or plugins_by_module.get(module_short_name)
+            if not cls._is_db_plugin_loadable(db_plugin):
+                plugins_by_module.pop(module_path, None)
+                plugins_by_module.pop(module_short_name, None)
+                continue
+
             if runtime_plugin is not None:
-                plugins_by_module[module_name] = runtime_plugin.model_copy(
+                plugins_by_module.pop(module_path, None)
+                plugins_by_module.pop(module_short_name, None)
+                plugins_by_module[runtime_plugin.module] = runtime_plugin.model_copy(
                     update={
                         "name": str(db_plugin.name or runtime_plugin.name).strip()
                         or runtime_plugin.name,
                         "admin_level": db_plugin.admin_level,
                         "limit_superuser": bool(db_plugin.limit_superuser),
+                        "status": bool(db_plugin.status),
+                        "block_type": cls._normalize_block_type(db_plugin.block_type),
+                        "load_status": bool(db_plugin.load_status),
+                        "block_keys": cls._merge_unique_strings(
+                            runtime_plugin.block_keys,
+                            [runtime_plugin.module, module_path, module_short_name],
+                        ),
                     }
                 )
                 continue
 
-            if not db_plugin.load_status:
-                continue
-
-            nb_plugin = nonebot.get_plugin_by_module_name(str(db_plugin.module_path))
+            nb_plugin = nonebot.get_plugin_by_module_name(module_path)
             if not nb_plugin or not nb_plugin.metadata:
                 continue
             extra_data = cls._parse_extra_data(nb_plugin.metadata.extra)
@@ -1532,6 +1573,10 @@ class PluginRegistry:
                 fallback_name=str(db_plugin.name or "").strip() or None,
                 admin_level=db_plugin.admin_level,
                 limit_superuser=bool(db_plugin.limit_superuser),
+                status=bool(db_plugin.status),
+                block_type=db_plugin.block_type,
+                load_status=bool(db_plugin.load_status),
+                block_keys=[module_path, module_short_name],
             )
             if plugin_info is not None:
                 plugins_by_module[module_name] = plugin_info
@@ -1820,11 +1865,14 @@ class PluginRegistry:
         ]
         for key in expired_keys:
             del cls._cache[key]
+            cls._cache_plugin_info_refresh.pop(key, None)
 
     @classmethod
     def clear_cache(cls):
         """清空所有缓存"""
         cls._cache.clear()
+        cls._cache_plugin_info_refresh.clear()
+        cls._clear_command_tool_cache(bump_revision=True)
         logger.info("插件知识库缓存已清空")
 
     @classmethod
@@ -1875,6 +1923,77 @@ class PluginRegistry:
         return True
 
     @classmethod
+    def _normalize_block_type(cls, block_type: BlockType | str | None) -> str | None:
+        if block_type is None:
+            return None
+        value = getattr(block_type, "value", block_type)
+        text = str(value or "").strip().upper()
+        return text or None
+
+    @classmethod
+    def _is_db_plugin_loadable(cls, db_plugin: object) -> bool:
+        if not bool(getattr(db_plugin, "load_status", True)):
+            return False
+        block_type = cls._normalize_block_type(getattr(db_plugin, "block_type", None))
+        if (
+            not bool(getattr(db_plugin, "status", True))
+            and block_type == BlockType.ALL.value
+        ):
+            return False
+        return True
+
+    @classmethod
+    def _is_plugin_status_allowed(
+        cls,
+        plugin: PluginInfo,
+        selection_context: PluginSelectionContext | None,
+    ) -> bool:
+        if not plugin.load_status:
+            return False
+        block_type = cls._normalize_block_type(plugin.block_type)
+        if plugin.status:
+            return True
+        if block_type == BlockType.ALL.value:
+            return bool(selection_context and selection_context.is_superuser)
+        if selection_context is None:
+            return True
+        if selection_context.is_superuser:
+            return True
+        if block_type == BlockType.GROUP.value and selection_context.group_id:
+            return False
+        if block_type == BlockType.PRIVATE.value and selection_context.is_private:
+            return False
+        return True
+
+    @classmethod
+    def _is_group_plugin_allowed(
+        cls,
+        plugin: PluginInfo,
+        selection_context: PluginSelectionContext | None,
+    ) -> bool:
+        if selection_context is None:
+            return True
+        if selection_context.is_superuser:
+            return True
+        group_id = str(selection_context.group_id or "").strip()
+        if not group_id:
+            return True
+        group = GroupMemoryCache.get_if_ready(group_id)
+        if group is None:
+            return True
+        block_raw = getattr(group, "block_plugin", "") or ""
+        block_set = getattr(group, "block_plugin_set", None)
+        if block_set is None or (not block_set and block_raw):
+            block_set = _parse_block_modules(block_raw)
+        super_block_raw = getattr(group, "superuser_block_plugin", "") or ""
+        super_block_set = getattr(group, "superuser_block_plugin_set", None)
+        if super_block_set is None or (not super_block_set and super_block_raw):
+            super_block_set = _parse_block_modules(super_block_raw)
+        keys = set(plugin.block_keys or [])
+        keys.add(plugin.module)
+        return not (keys & set(block_set)) and not (keys & set(super_block_set))
+
+    @classmethod
     def _is_plugin_authorized(
         cls,
         plugin: PluginInfo,
@@ -1891,6 +2010,8 @@ class PluginRegistry:
 
     @classmethod
     def _is_allowed_plugin_info(cls, plugin: PluginInfo) -> bool:
+        if not plugin.load_status:
+            return False
         if not plugin.commands:
             return False
         if cls._is_infrastructure_module(plugin.module, plugin.name):
@@ -1913,6 +2034,10 @@ class PluginRegistry:
         selected: list[PluginInfo] = []
         for plugin in knowledge_base.plugins:
             if not cls._is_allowed_plugin_info(plugin):
+                continue
+            if not cls._is_plugin_status_allowed(plugin, selection_context):
+                continue
+            if not cls._is_group_plugin_allowed(plugin, selection_context):
                 continue
             if not cls._is_plugin_enabled(plugin, selection_context):
                 continue
@@ -1942,6 +2067,8 @@ class PluginRegistry:
             selected: list[PluginInfo] = []
             for plugin in knowledge_base.plugins:
                 if cls._is_allowed_plugin_info(plugin):
+                    if not cls._is_plugin_status_allowed(plugin, None):
+                        continue
                     selected.append(plugin)
             source = PluginKnowledgeBase(
                 plugins=selected,
@@ -1972,12 +2099,10 @@ class PluginRegistry:
         selection_context: PluginSelectionContext | None = None,
         limit: int | None = None,
     ) -> list[CommandToolSnapshot]:
-        graph = cls.build_capability_graph(
+        snapshots = cls._get_cached_command_tool_snapshots(
             knowledge_base,
             selection_context=selection_context,
-            limit=None,
         )
-        snapshots = build_command_tool_snapshots(graph, limit=None)
         if selection_context is not None:
             snapshots = [
                 snapshot
@@ -1987,6 +2112,88 @@ class PluginRegistry:
         if limit is not None:
             return snapshots[: max(int(limit), 0)]
         return snapshots
+
+    @classmethod
+    def _get_cached_command_tool_snapshots(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None,
+    ) -> list[CommandToolSnapshot]:
+        cache_key = cls._command_tool_cache_key(
+            knowledge_base,
+            selection_context=selection_context,
+        )
+        cached = cls._command_tool_cache.get(cache_key)
+        if cached is not None:
+            return list(cached[0])
+
+        graph = cls.build_capability_graph(
+            knowledge_base,
+            selection_context=selection_context,
+            limit=None,
+        )
+        snapshots = build_command_tool_snapshots(graph, limit=None)
+        cls._command_tool_cache[cache_key] = (list(snapshots), len(snapshots))
+        cls._command_tool_cache_order.append(cache_key)
+        while len(cls._command_tool_cache_order) > cls._command_tool_cache_max:
+            old_key = cls._command_tool_cache_order.pop(0)
+            cls._command_tool_cache.pop(old_key, None)
+        return list(snapshots)
+
+    @classmethod
+    def _command_tool_cache_key(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+        *,
+        selection_context: PluginSelectionContext | None,
+    ) -> str:
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(cls._knowledge_revision).encode("ascii", "ignore"))
+        digest.update(b"\x00")
+        digest.update(str(len(knowledge_base.plugins)).encode("ascii", "ignore"))
+        digest.update(b"\x00")
+        for plugin in knowledge_base.plugins:
+            digest.update(str(plugin.module or "").encode("utf-8", "ignore"))
+            digest.update(b"\x1f")
+            digest.update(str(plugin.name or "").encode("utf-8", "ignore"))
+            digest.update(b"\x1f")
+            digest.update(str(plugin.admin_level or 0).encode("ascii", "ignore"))
+            digest.update(b"\x1f")
+            digest.update(str(bool(plugin.limit_superuser)).encode("ascii", "ignore"))
+            digest.update(b"\x1f")
+            digest.update(str(len(plugin.command_meta)).encode("ascii", "ignore"))
+            digest.update(b"\x1f")
+            for command in plugin.commands:
+                digest.update(str(command or "").encode("utf-8", "ignore"))
+                digest.update(b"\x1d")
+            digest.update(b"\x1e")
+
+        if selection_context is None:
+            digest.update(b"context:none")
+        else:
+            # Only plugin-level filters belong in this key. Per-message capability
+            # checks (image/reply/at/private) are still applied after the cache hit.
+            parts = (
+                str(selection_context.session_id or ""),
+                str(selection_context.group_id or ""),
+                "1" if selection_context.is_superuser else "0",
+            )
+            for part in parts:
+                digest.update(part.encode("utf-8", "ignore"))
+                digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @classmethod
+    def _clear_command_tool_cache(cls, *, bump_revision: bool = False) -> None:
+        cls._command_tool_cache.clear()
+        cls._command_tool_cache_order.clear()
+        if bump_revision:
+            cls._knowledge_revision += 1
+
+    @staticmethod
+    def _plugin_info_refresh_ts() -> float:
+        return float(getattr(PluginInfoMemoryCache, "_last_refresh", 0.0) or 0.0)
 
     @classmethod
     async def set_plugin_enabled(
@@ -2009,6 +2216,7 @@ class PluginRegistry:
                 gid = str(group_id).strip()
                 if gid:
                     cls._group_plugin_overrides.setdefault(gid, {})[key] = enabled
+            cls._clear_command_tool_cache(bump_revision=True)
 
     @classmethod
     async def reset_dynamic_overrides(
@@ -2022,6 +2230,7 @@ class PluginRegistry:
                 cls._session_plugin_overrides.pop(str(session_id).strip(), None)
             if group_id:
                 cls._group_plugin_overrides.pop(str(group_id).strip(), None)
+            cls._clear_command_tool_cache(bump_revision=True)
 
     @classmethod
     async def preload_cache(cls, *, force_refresh: bool = False):

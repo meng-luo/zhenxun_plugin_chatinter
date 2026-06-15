@@ -64,7 +64,7 @@ from .main_request import MainRequestResult, run_chatinter_main_request
 from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
 from .middleware import TurnMiddlewareState
-from .models.pydantic_models import CommandToolSnapshot
+from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
 from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
 from .native_route import (
     NativeRouteDecision,
@@ -1187,7 +1187,11 @@ async def stage_capability_hint(
     middleware,
     cached_plain_text: str | None = None,
 ) -> None:
-    frame.knowledge_base = await get_user_plugin_knowledge()
+    frame.knowledge_base = (
+        await get_user_plugin_knowledge()
+        if frame.allow_plugin_tools
+        else _empty_plugin_knowledge_base()
+    )
     frame.stage(PipelineStage.KNOWLEDGE)
     await _prepare_current_message_context(
         frame=frame,
@@ -1195,16 +1199,112 @@ async def stage_capability_hint(
         middleware=middleware,
         cached_plain_text=cached_plain_text,
     )
-    await _prepare_capability_route_context(frame=frame, bot=bot, event=event)
-    await _select_capability_route(
-        frame=frame,
-        bot=bot,
-        event=event,
-        middleware_state=middleware_state,
-        middleware=middleware,
-    )
+    if frame.allow_plugin_tools:
+        await _prepare_capability_route_context(frame=frame, bot=bot, event=event)
+        await _select_capability_route(
+            frame=frame,
+            bot=bot,
+            event=event,
+            middleware_state=middleware_state,
+            middleware=middleware,
+        )
+    else:
+        await _prepare_lightweight_chat_route(
+            frame=frame,
+            bot=bot,
+            event=event,
+            middleware_state=middleware_state,
+            middleware=middleware,
+        )
     await _inject_skill_hints(frame)
     frame.stage(PipelineStage.CAPABILITY_HINT)
+
+
+def _empty_plugin_knowledge_base() -> PluginKnowledgeBase:
+    return PluginKnowledgeBase(plugins=[], user_role="普通用户")
+
+
+async def _prepare_lightweight_chat_route(
+    *,
+    frame: TurnFrame,
+    bot: Bot,
+    event: Event,
+    middleware_state: TurnMiddlewareState,
+    middleware,
+) -> None:
+    event_context = frame.event_context
+    reply_sender_id = (
+        event_context.reply.sender_id
+        if event_context is not None and event_context.reply is not None
+        else extract_reply_sender_id(event)
+    )
+    reply_image_count = len(frame.reply_images_data or [])
+    frame.reply_sender_id = reply_sender_id
+    frame.reply_image_count = reply_image_count
+    frame.has_reply = bool(reply_sender_id) or reply_image_count > 0
+    frame.reply_image_segments_for_reroute = build_reply_image_segments_for_reroute(
+        frame.reply_images_data
+    )
+    frame.route_message = frame.current_message
+    frame.sync_to_middleware(
+        middleware_state,
+        phase=PipelineStage.ROUTE_SELECTION.value,
+        route_message=frame.route_message,
+    )
+    frame.stage(PipelineStage.ROUTE_SELECTION)
+    await middleware.dispatch("before_route", middleware_state)
+    route_message = middleware_state.route_message or frame.route_message
+    frame.route_message = route_message
+    frame.selection_context = PluginSelectionContext(
+        query=route_message,
+        session_id=frame.session_key,
+        user_id=frame.user_id,
+        group_id=frame.group_id,
+        is_superuser=frame.is_superuser,
+        event_type=event_type_name(event),
+        adapter=event_adapter_name(bot),
+        is_private=event_is_private(event),
+        has_image=bool(extract_image_tokens(route_message)),
+        has_at=bool(extract_at_tokens(route_message)),
+        has_reply=frame.has_reply,
+        thread_id=frame.thread_context.thread_id if frame.thread_context else "",
+        intervention_action=frame.intervention_decision.action
+        if frame.intervention_decision
+        else "",
+    )
+    frame.command_tools = []
+    frame.chat_tool_exposure_state = "none"
+    intent_profile = classify_message_intent(
+        route_message,
+        frame.knowledge_base or _empty_plugin_knowledge_base(),
+    )
+    frame.intent_profile = intent_profile
+    frame.update_tags(
+        intent_kind=intent_profile.kind,
+        intent_reason=intent_profile.reason,
+    )
+    middleware_state.intent = intent_profile
+    middleware_state.route_message = route_message
+    middleware_state.metadata = {
+        "phase": "after_intent",
+        "intent_kind": intent_profile.kind,
+        "intent_reason": intent_profile.reason,
+    }
+    await middleware.dispatch("after_intent", middleware_state)
+    frame.apply_prompt_state(middleware_state)
+    route_message = middleware_state.route_message or route_message
+    frame.route_message = route_message
+    frame.stage(PipelineStage.INTENT)
+    route_report = NativeRouteReport(helper_mode=is_usage_question(frame.route_message))
+    frame.set_native_route(
+        native_decision=NativeRouteDecision(
+            action="chat",
+            confidence=0.0,
+            reason="chat_only_no_plugin_tools",
+        ),
+        route_result=None,
+        route_report=route_report,
+    )
 
 
 def _build_system_prompt(frame: TurnFrame) -> str:

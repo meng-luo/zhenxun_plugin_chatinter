@@ -85,6 +85,13 @@ class PluginInfo(BaseModel):
     usage: str | None = Field(default=None, description="用法说明")
     admin_level: int | None = Field(default=None, description="插件权限等级要求")
     limit_superuser: bool = Field(default=False, description="是否限制超级管理员")
+    status: bool = Field(default=True, description="插件全局启用状态")
+    block_type: str | None = Field(default=None, description="插件全局禁用场景")
+    load_status: bool = Field(default=True, description="插件加载状态")
+    block_keys: list[str] = Field(
+        default_factory=list,
+        description="用于对齐本体群内插件关闭字段的模块键",
+    )
 
 
 class PluginKnowledgeBase(BaseModel):

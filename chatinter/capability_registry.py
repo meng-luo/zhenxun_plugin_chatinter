@@ -8,6 +8,7 @@ command tool from injected full schemas.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 from typing import Any, cast
 
 from .capability_card import (
@@ -158,6 +159,19 @@ class ToolCapabilityRecord:
         }
 
 
+@dataclass(frozen=True)
+class _ImmutableCommandToolIndex:
+    fingerprint: str
+    tools: tuple[CommandToolSnapshot, ...]
+    records: dict[str, CapabilityRecord]
+    tools_by_plugin: dict[str, tuple[CommandToolSnapshot, ...]]
+
+
+_COMMAND_TOOL_INDEX_CACHE: dict[str, _ImmutableCommandToolIndex] = {}
+_COMMAND_TOOL_INDEX_CACHE_ORDER: list[str] = []
+_COMMAND_TOOL_INDEX_CACHE_MAX = 16
+
+
 class CapabilityRegistry:
     """Registry of all safe capabilities and executable tools for one turn."""
 
@@ -168,13 +182,13 @@ class CapabilityRegistry:
         tools: list[CommandToolSnapshot],
         session_id: str | None,
     ) -> None:
+        index = _get_command_tool_index(tools)
         self.knowledge_base = knowledge_base
-        self.tools = list(tools)
+        self.tools = list(index.tools)
         self.session_id = session_id
-        self.records = {
-            normalize_message_text(tool.command_id): _record_from_tool(tool)
-            for tool in self.tools
-            if normalize_message_text(tool.command_id)
+        self.records = dict(index.records)
+        self._tools_by_plugin = {
+            key: list(items) for key, items in index.tools_by_plugin.items()
         }
         self.tool_records: dict[str, ToolCapabilityRecord] = {}
         self.generation = 0
@@ -201,13 +215,7 @@ class CapabilityRegistry:
     def command_tools_by_plugin(self) -> dict[str, list[CommandToolSnapshot]]:
         """Return command snapshots grouped by their plugin identity."""
 
-        grouped: dict[str, list[CommandToolSnapshot]] = {}
-        for tool in self.tools:
-            key = normalize_message_text(tool.plugin_module or tool.plugin_name)
-            if not key:
-                key = "unknown"
-            grouped.setdefault(key, []).append(tool)
-        return grouped
+        return {key: list(items) for key, items in self._tools_by_plugin.items()}
 
     def recall(
         self,
@@ -736,6 +744,48 @@ def _ensure_command_tools(
         return [tool for tool in tools if isinstance(tool, CommandToolSnapshot)]
     graph = build_capability_graph_snapshot(knowledge_base)
     return list(build_command_tool_snapshots(graph))
+
+
+def _get_command_tool_index(
+    tools: list[CommandToolSnapshot],
+) -> _ImmutableCommandToolIndex:
+    fingerprint = _command_tool_index_fingerprint(tools)
+    cached = _COMMAND_TOOL_INDEX_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+
+    records = {
+        normalize_message_text(tool.command_id): _record_from_tool(tool)
+        for tool in tools
+        if normalize_message_text(tool.command_id)
+    }
+    grouped: dict[str, list[CommandToolSnapshot]] = {}
+    for tool in tools:
+        key = normalize_message_text(tool.plugin_module or tool.plugin_name)
+        if not key:
+            key = "unknown"
+        grouped.setdefault(key, []).append(tool)
+
+    index = _ImmutableCommandToolIndex(
+        fingerprint=fingerprint,
+        tools=tuple(tools),
+        records=records,
+        tools_by_plugin={key: tuple(items) for key, items in grouped.items()},
+    )
+    _COMMAND_TOOL_INDEX_CACHE[fingerprint] = index
+    _COMMAND_TOOL_INDEX_CACHE_ORDER.append(fingerprint)
+    while len(_COMMAND_TOOL_INDEX_CACHE_ORDER) > _COMMAND_TOOL_INDEX_CACHE_MAX:
+        old = _COMMAND_TOOL_INDEX_CACHE_ORDER.pop(0)
+        _COMMAND_TOOL_INDEX_CACHE.pop(old, None)
+    return index
+
+
+def _command_tool_index_fingerprint(tools: list[CommandToolSnapshot]) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    for tool in tools:
+        digest.update(tool.model_dump_json().encode("utf-8", "ignore"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 def _record_from_tool(tool: CommandToolSnapshot) -> CapabilityRecord:
