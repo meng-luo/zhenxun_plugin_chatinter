@@ -322,6 +322,18 @@ async def execute_approved_action(
             worktree_id=str(approval.payload.get("worktree_id", "") or ""),
             approval_id=approval.approval_id,
         )
+    if approval.action == "plugin_dev_publish":
+        from .plugin_dev_tools import publish_plugin
+
+        return await publish_plugin(
+            plugin_name=str(approval.payload.get("plugin_name", "") or ""),
+            plugin_root=str(approval.payload.get("plugin_root", "") or "") or None,
+            overwrite=bool(approval.payload.get("overwrite") or False),
+            reason=str(approval.payload.get("reason", "") or ""),
+            actor=actor,
+            worktree_id=str(approval.payload.get("worktree_id", "") or ""),
+            approval_id=approval.approval_id,
+        )
     if approval.action == "worktree_create":
         from ..workspace_isolation import create_worktree_session
 
@@ -606,9 +618,15 @@ def _coerce_int(value: Any, *, default: int, lower: int, upper: int) -> int:
         return default
 
 
-register_superuser_tool(ApprovePendingActionTool)
-register_superuser_tool(RejectPendingActionTool)
-register_superuser_tool(RevokePendingApprovalTool)
+register_superuser_tool(
+    ApprovePendingActionTool, risk="low", destructive=False, side_effect="control"
+)
+register_superuser_tool(
+    RejectPendingActionTool, risk="low", destructive=False, side_effect="control"
+)
+register_superuser_tool(
+    RevokePendingApprovalTool, risk="low", destructive=False, side_effect="control"
+)
 register_superuser_tool(ListPendingApprovalsTool)
 
 __all__ = [

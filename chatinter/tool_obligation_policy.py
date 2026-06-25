@@ -30,7 +30,7 @@ def _tool_gate_spend_context(
 
 
 async def resolve_tool_obligation(**kwargs: Any) -> Any:
-    from .main_request import _resolve_tool_obligation
+    from .main_request_support import _resolve_tool_obligation
 
     return await _resolve_tool_obligation(**kwargs)
 

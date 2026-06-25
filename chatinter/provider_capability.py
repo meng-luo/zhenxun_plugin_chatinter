@@ -45,6 +45,7 @@ from .provider_protocol import (
 from .route_text import normalize_message_text
 
 ProviderFamily = Literal["openai", "gemini", "anthropic", "custom"]
+ToolSchemaMode = Literal["full", "compact", "light"]
 
 _AUTO_FULL_SCHEMA_TOOL_CAP = 8
 _MAX_TOOL_DESCRIPTION_CHARS = 1800
@@ -110,7 +111,7 @@ class ProviderToolSchemaPlan:
 
     use_compact_schema: bool
     full_schema_names: frozenset[str]
-    schema_modes: dict[str, Literal["full", "compact"]]
+    schema_modes: dict[str, ToolSchemaMode]
     reason: str
 
     def to_metadata(self) -> dict[str, Any]:
@@ -141,7 +142,7 @@ class ProviderAdjustedTool:
         *,
         executable: ToolExecutable,
         adapter: "ProviderCapabilityAdapter",
-        schema_mode: Literal["full", "compact"] = "full",
+        schema_mode: ToolSchemaMode = "full",
     ) -> None:
         self.executable = executable
         self.adapter = adapter
@@ -153,6 +154,8 @@ class ProviderAdjustedTool:
 
     async def get_definition(self) -> ToolDefinition:
         definition = await self.executable.get_definition()
+        if self.chatinter_schema_mode == "light":
+            definition = _light_tool_definition(definition)
         return self.adapter.sanitize_tool_definition(definition)
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
@@ -301,7 +304,7 @@ class ProviderCapabilityAdapter:
         tools: dict[str, ToolExecutable] | None,
         *,
         required_tool_names: Iterable[str] = (),
-        schema_modes: dict[str, Literal["full", "compact"]] | None = None,
+        schema_modes: dict[str, ToolSchemaMode] | None = None,
     ) -> dict[str, ToolExecutable] | None:
         if not tools or not self.profile.supports_tools:
             return None
@@ -365,14 +368,15 @@ class ProviderCapabilityAdapter:
         tools: dict[str, ToolExecutable] | None,
         tool_choice: str | dict[str, Any] | None,
         required_tool_names: Iterable[str] = (),
-        schema_modes: dict[str, Literal["full", "compact"]] | None = None,
+        schema_modes: dict[str, ToolSchemaMode] | None = None,
         generation_config: Any | None = None,
     ) -> ProviderPreparedRequest:
         """Build the provider-safe request shape consumed by AI.generate_internal."""
 
         request_tools: dict[str, ToolExecutable] | None
         if tools and all(
-            str(getattr(tool, "chatinter_schema_mode", "") or "") in {"full", "compact"}
+            str(getattr(tool, "chatinter_schema_mode", "") or "")
+            in {"full", "compact", "light"}
             for tool in tools.values()
         ):
             request_tools = self.limit_tool_map(
@@ -483,7 +487,7 @@ class ProviderCapabilityAdapter:
             full_schema_names=full_names,
             force=two_stage,
         )
-        schema_modes: dict[str, Literal["full", "compact"]] = {}
+        schema_modes: dict[str, ToolSchemaMode] = {}
         for name, tool in tools.items():
             if _is_command_tool(tool) and use_compact and name not in full_names:
                 schema_modes[name] = "compact"
@@ -795,6 +799,21 @@ def is_compact_request_tool(tool: ToolExecutable | None) -> bool:
     return str(getattr(tool, "chatinter_schema_mode", "") or "") == "compact"
 
 
+def is_light_request_tool(tool: ToolExecutable | None) -> bool:
+    return str(getattr(tool, "chatinter_schema_mode", "") or "") == "light"
+
+
+def _light_tool_definition(definition: ToolDefinition) -> ToolDefinition:
+    parameters = {"type": "object", "properties": {}, "required": []}
+    if hasattr(definition, "model_copy"):
+        return definition.model_copy(update={"parameters": parameters})
+    return ToolDefinition(
+        name=str(getattr(definition, "name", "") or ""),
+        description=str(getattr(definition, "description", "") or ""),
+        parameters=parameters,
+    )
+
+
 def sanitize_json_schema(
     schema: dict[str, Any],
     *,
@@ -1002,5 +1021,6 @@ __all__ = [
     "ProviderPreparedRequest",
     "ProviderToolSchemaPlan",
     "is_compact_request_tool",
+    "is_light_request_tool",
     "sanitize_json_schema",
 ]

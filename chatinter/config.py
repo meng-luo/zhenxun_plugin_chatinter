@@ -29,6 +29,7 @@ USE_SIGN_IN_IMPRESSION = True
 AGENT_STEP_BUDGETS: dict[str, dict[str, int]] = {
     "superuser_agent": {
         "chat": 8,
+        "readonly_fast": 4,
         "single_tool_fast": 12,
         "multi_tool_fast": 16,
         "complex_pev": 40,
@@ -79,6 +80,7 @@ DEFAULTS = {
     "QUALITY_SHADOW_SAMPLE_RATE": 0.0,
     "REASONING_EFFORT": "MEDIUM",
     "FALLBACK_MODELS": "",
+    "SUPERUSER_PERMISSION_MODE": "default",
 }
 
 

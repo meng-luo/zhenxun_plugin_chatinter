@@ -165,6 +165,8 @@ register_superuser_tool(
     category="mcp",
     risk="medium",
     read_only=False,
+    destructive=False,
+    side_effect="execute",
     approval_mode="policy",
     description="重载 MCP server 连接和工具列表。",
     tags=("mcp", "reload", "provider", "runtime"),

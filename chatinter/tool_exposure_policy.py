@@ -6,7 +6,7 @@ from typing import Any
 
 
 def apply_tool_exposure_policy(**kwargs: Any) -> None:
-    from .main_request import _apply_tool_exposure_policy
+    from .main_request_support import _apply_tool_exposure_policy
 
     _apply_tool_exposure_policy(**kwargs)
 

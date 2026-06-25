@@ -171,6 +171,8 @@ async def run_shell_command(
         )
 
 
-register_superuser_tool(ShellCommandTool)
+register_superuser_tool(
+    ShellCommandTool, risk="high", destructive=True, side_effect="execute"
+)
 
 __all__ = ["ShellCommandTool", "run_shell_command"]

@@ -780,10 +780,18 @@ def _coerce_limit(value: Any) -> int:
         return 20
 
 
-register_superuser_tool(PatchPrepareTool)
-register_superuser_tool(PatchApplyTool)
-register_superuser_tool(PatchRollbackTool)
-register_superuser_tool(PatchShowTool)
+register_superuser_tool(
+    PatchPrepareTool, risk="low", destructive=False, side_effect="mutate"
+)
+register_superuser_tool(
+    PatchApplyTool, risk="high", destructive=True, side_effect="mutate"
+)
+register_superuser_tool(
+    PatchRollbackTool, risk="high", destructive=True, side_effect="destructive"
+)
+register_superuser_tool(
+    PatchShowTool, risk="low", destructive=False, side_effect="query", read_only=True
+)
 
 __all__ = [
     "PatchApplyTool",

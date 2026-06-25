@@ -28,19 +28,33 @@ def worktree_id_from_context(context: Any | None) -> str:
 
 def tool_result(ok: bool, status: str, **payload: Any) -> ToolResult:
     output = {"ok": ok, "status": status, **payload}
-    return ToolResult(output=output, display_content=status)
+    return ToolResult(output=output, display_content=_display_content(status, payload))
+
+
+def _display_content(status: str, payload: dict[str, Any]) -> str:
+    for key in ("summary", "stdout", "stderr", "error", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return compact_text(value.strip(), max_chars=1200)
+    return status
 
 
 def actor_from_context(context: Any | None) -> dict[str, str]:
     session_id = str(getattr(context, "session_id", "") or "")
     extra = getattr(context, "extra", None)
     user_id = ""
+    run_id = ""
+    trace_id = ""
     if isinstance(extra, dict):
         user_id = str(extra.get("actor_user_id", "") or "")
+        run_id = str(extra.get("run_id", "") or "")
+        trace_id = str(extra.get("trace_id", "") or "")
     user_id = user_id or session_id or "unknown"
     return {
         "user_id": user_id,
         "session_key": session_id or user_id,
+        "run_id": run_id,
+        "trace_id": trace_id,
     }
 
 
@@ -75,11 +89,16 @@ def approval_required_result(
     payload: dict[str, Any],
     permission: PermissionResult,
 ) -> ToolResult:
+    runtime_payload = dict(payload)
+    if actor.get("run_id"):
+        runtime_payload.setdefault("run_id", actor["run_id"])
+    if actor.get("trace_id"):
+        runtime_payload.setdefault("trace_id", actor["trace_id"])
     approval = create_pending_approval(
         user_id=actor["user_id"],
         session_key=actor["session_key"],
         action=action,
-        payload=payload,
+        payload=runtime_payload,
         reason=permission.reason,
         matched_pattern=permission.matched_pattern,
     )
@@ -88,7 +107,7 @@ def approval_required_result(
         user_id=actor["user_id"],
         session_key=actor["session_key"],
         action=action,
-        payload={"approval_id": approval.approval_id, **payload},
+        payload={"approval_id": approval.approval_id, **runtime_payload},
         result={"permission": permission.__dict__},
     )
     return tool_result(
@@ -98,8 +117,8 @@ def approval_required_result(
         approval=approval.to_public_payload(),
         permission=permission.__dict__,
         instruction=(
-            "请向超级用户说明此操作需要确认。用户确认后，调用 "
-            "approve_pending_action 并传入 approval_id 执行。"
+            "请向超级用户说明此操作需要确认。用户可直接回复“确认”或“取消”；"
+            "运行时会消费待确认操作并继续任务。"
         ),
     )
 

@@ -554,6 +554,8 @@ register_superuser_tool(
     category="engineering_loop",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     tags=("engineering", "protocol", "loop"),
 )
 register_superuser_tool(
@@ -575,6 +577,8 @@ register_superuser_tool(
     category="engineering_loop",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     tags=("engineering", "semantic_patch", "plan"),
 )
 register_superuser_tool(
@@ -582,6 +586,8 @@ register_superuser_tool(
     category="engineering_loop",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     tags=("engineering", "protocol", "bind"),
 )
 register_superuser_tool(
@@ -596,6 +602,8 @@ register_superuser_tool(
     category="engineering_loop",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     tags=("engineering", "eval", "diagnosis", "recovery"),
 )
 register_superuser_tool(
@@ -603,6 +611,8 @@ register_superuser_tool(
     category="engineering_loop",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     tags=("engineering", "protocol", "complete"),
 )
 

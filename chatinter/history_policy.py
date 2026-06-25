@@ -6,6 +6,8 @@ import json
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.models.chat_history import ChatHistory
+from zhenxun.services.db_context import with_db_timeout
+from zhenxun.services.message_load import is_db_unhealthy
 
 from .llm_compat import LLMMessage
 from .models.chat_history import ChatInterChatHistory
@@ -289,12 +291,22 @@ async def _build_chatroom_lines(
     limit = max(int(chatroom_limit or 0), 0)
     if limit <= 0 or not group_id:
         return []
+    if is_db_unhealthy():
+        return []
 
-    rows = (
-        await ChatHistory.filter(group_id=group_id)
-        .order_by("-create_time", "-id")
-        .limit(limit + 3)
-    )
+    try:
+        rows = await with_db_timeout(
+            ChatHistory.filter(group_id=group_id)
+            .order_by("-create_time", "-id")
+            .limit(limit + 3),
+            timeout=2.5,
+            operation="ChatInter.chatroom_history",
+            source="chatinter",
+        )
+    except TimeoutError:
+        return []
+    except Exception:
+        return []
     current_normalized = _normalize_for_compare(current_message_text)
     selected = []
     for row in reversed(rows):

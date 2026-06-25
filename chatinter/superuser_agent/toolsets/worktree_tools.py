@@ -257,6 +257,8 @@ register_superuser_tool(
     risk="medium",
     approval_mode="policy",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     todo_relevant=True,
     tags=("worktree", "isolation", "engineering"),
 )
@@ -283,6 +285,8 @@ register_superuser_tool(
     risk="high",
     approval_mode="policy",
     read_only=False,
+    destructive=True,
+    side_effect="destructive",
     tags=("worktree", "isolation", "cleanup", "approval_sensitive"),
 )
 

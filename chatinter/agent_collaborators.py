@@ -467,8 +467,9 @@ class RuntimeObservationCoordinator:
                     "type": "approval",
                     "approval_ids": approval_ids,
                     "resume_instruction": (
-                        "After the user approves, call approve_pending_action "
-                        "then agent_run_resume."
+                        "Runtime will consume the user's confirm/reject message "
+                        "directly; do not call approve_pending_action unless the "
+                        "user explicitly asks to manage approvals by tool."
                     ),
                 },
             )
@@ -760,7 +761,7 @@ def _approval_pause_reply(
         parts.append(f"操作：{action}。")
     if reason:
         parts.append(f"原因：{reason}。")
-    parts.append("确认后我可以继续执行。")
+    parts.append("回复“确认”继续执行，或回复“取消”放弃。")
     return "".join(parts)
 
 

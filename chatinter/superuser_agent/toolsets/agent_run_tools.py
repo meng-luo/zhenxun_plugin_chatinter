@@ -18,13 +18,13 @@ from ...agent_run_store import (
     update_agent_run_status,
 )
 from ...agent_runtime import AgentRuntime
+from ...agent_state import AgentObservation
 from ...capability_registry import CapabilityRegistry
 from ...config import (
     build_reasoning_generation_config,
     get_config_value,
     get_model_name,
 )
-from ...models.pydantic_models import PluginKnowledgeBase
 from ...provider_capability import ProviderCapabilityAdapter
 from ...route_text import normalize_message_text
 from ..audit_log import record_audit_event
@@ -177,15 +177,12 @@ class AgentRunResumeTool:
 
         model_name = get_model_name()
         provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
-        capability_registry = CapabilityRegistry.from_knowledge_base(
-            PluginKnowledgeBase(plugins=[], user_role="超级管理员"),
-            session_id=actor["session_key"],
-            tools=[],
+        capability_registry = CapabilityRegistry.empty(session_id=actor["session_key"])
+        capability_registry.register_available_superuser_tools(
+            message_text=str(kwargs.get("resume_message") or ""),
+            include_deferred=True,
         )
-        capability_registry.register_available_superuser_tools()
-        mcp_status = await capability_registry.register_available_mcp_tools(
-            provider_adapter=provider_adapter,
-        )
+        mcp_status = None
         tools = capability_registry.executable_tool_map()
         state = load_agent_run_state(run_id, tool_map=tools)
         if state is None:
@@ -197,6 +194,18 @@ class AgentRunResumeTool:
             fallback=max(6, int(state.max_steps or 8) - int(state.step or 0)),
         )
         state.resume(reason="agent_run_resume")
+        pre_resume_observation = _coerce_pre_resume_observation(
+            kwargs.get("pre_resume_observation"),
+            step=state.step,
+        )
+        if pre_resume_observation is not None:
+            state.append_synthetic_observation(
+                pre_resume_observation,
+                timeline_kind="pre_resume_tool_observation",
+                content=pre_resume_observation.error
+                or str(pre_resume_observation.output.get("status", "") or ""),
+                metadata={"source": "runtime_approval"},
+            )
         resume_message = normalize_message_text(str(kwargs.get("resume_message") or ""))
         resume_context = _resume_context_message(snapshot, resume_message)
         complexity_decision = route_agent_complexity(
@@ -234,6 +243,8 @@ class AgentRunResumeTool:
                 "actor_user_id": actor["user_id"],
                 "agent_mode": "superuser_agent",
                 "enable_agent_tools": True,
+                "trace_id": state.trace_id,
+                "run_id": state.run_id,
                 "resumed_run_id": state.run_id,
                 "agent_complexity": complexity_decision.to_metadata(),
                 "capability_registry": capability_registry,
@@ -486,8 +497,46 @@ def _resume_context_message(snapshot: dict[str, Any], resume_message: str):
     )
 
 
+def _coerce_pre_resume_observation(
+    value: Any,
+    *,
+    step: int,
+) -> AgentObservation | None:
+    if not isinstance(value, dict):
+        return None
+    output = value.get("output")
+    output = dict(output) if isinstance(output, dict) else {}
+    tool_name = normalize_message_text(str(value.get("tool_name", "") or ""))
+    if not tool_name and not output:
+        return None
+    artifacts = output.get("artifacts")
+    return AgentObservation(
+        tool_call_id=normalize_message_text(str(value.get("tool_call_id", "") or ""))
+        or "runtime_approval",
+        tool_name=tool_name or "runtime_approval",
+        task_text=normalize_message_text(str(value.get("task_text", "") or "")),
+        ok=bool(output.get("ok")),
+        need_continue=bool(output.get("need_continue")),
+        remaining_task_hint=normalize_message_text(
+            str(output.get("remaining_task_hint", "") or "")
+        ),
+        error=normalize_message_text(str(output.get("error", "") or "")),
+        artifacts=tuple(
+            dict(item) for item in artifacts or [] if isinstance(item, dict)
+        )
+        if isinstance(artifacts, list | tuple)
+        else (),
+        step=max(int(step or 0), 0),
+        output=output,
+    )
+
+
 register_superuser_tool(AgentRunStatusTool)
-register_superuser_tool(AgentRunResumeTool)
-register_superuser_tool(AgentRunCancelTool)
+register_superuser_tool(
+    AgentRunResumeTool, risk="low", destructive=False, side_effect="mutate"
+)
+register_superuser_tool(
+    AgentRunCancelTool, risk="low", destructive=True, side_effect="mutate"
+)
 
 __all__ = ["AgentRunCancelTool", "AgentRunResumeTool", "AgentRunStatusTool"]

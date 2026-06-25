@@ -136,6 +136,8 @@ def git_command_from_args(args: str) -> str:
     return f"git {args}"
 
 
-register_superuser_tool(GitCommandTool)
+register_superuser_tool(
+    GitCommandTool, risk="medium", destructive=True, side_effect="execute"
+)
 
 __all__ = ["GitCommandTool", "git_command_from_args", "run_git_command"]

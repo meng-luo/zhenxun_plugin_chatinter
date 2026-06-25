@@ -161,6 +161,8 @@ register_superuser_tool(
     category="todo",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="mutate",
     todo_relevant=True,
 )
 

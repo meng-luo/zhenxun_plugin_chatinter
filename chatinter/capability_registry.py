@@ -146,6 +146,20 @@ class ToolCapabilityRecord:
             "intent_types": list(self.card.intent_types),
             "permission_tags": list(self.card.permission_tags),
         }
+        if self.kind == "superuser_tool" and self.raw_card is not None:
+            payload.update(
+                {
+                    "read_only": bool(getattr(self.raw_card, "read_only", False)),
+                    "destructive": bool(
+                        getattr(self.raw_card, "destructive", False)
+                    ),
+                    "side_effect": normalize_message_text(
+                        str(getattr(self.raw_card, "side_effect", "") or "")
+                    ),
+                    "always_load": bool(getattr(self.raw_card, "always_load", False)),
+                    "defer_load": bool(getattr(self.raw_card, "defer_load", False)),
+                }
+            )
         if self.command_record is not None:
             payload["plugin_module"] = self.command_record.plugin_module
             payload["plugin_name"] = self.command_record.plugin_name
@@ -178,7 +192,7 @@ class CapabilityRegistry:
     def __init__(
         self,
         *,
-        knowledge_base: PluginKnowledgeBase,
+        knowledge_base: PluginKnowledgeBase | None,
         tools: list[CommandToolSnapshot],
         session_id: str | None,
     ) -> None:
@@ -192,6 +206,12 @@ class CapabilityRegistry:
         }
         self.tool_records: dict[str, ToolCapabilityRecord] = {}
         self.generation = 0
+
+    @classmethod
+    def empty(cls, *, session_id: str | None) -> "CapabilityRegistry":
+        """Build a runtime-tool-only registry without plugin command knowledge."""
+
+        return cls(knowledge_base=None, tools=[], session_id=session_id)
 
     @classmethod
     def from_knowledge_base(
@@ -226,6 +246,8 @@ class CapabilityRegistry:
     ) -> list[CommandCandidate]:
         """Return recall candidates only; never treat ranking as final choice."""
 
+        if self.knowledge_base is None:
+            return []
         candidates = retrieve_command_candidates(
             self.knowledge_base,
             query,
@@ -414,7 +436,13 @@ class CapabilityRegistry:
                 raw_card=raw_card,
             )
 
-    def register_available_superuser_tools(self) -> None:
+    def register_available_superuser_tools(
+        self,
+        *,
+        message_text: str = "",
+        limit: int | None = None,
+        include_deferred: bool = False,
+    ) -> None:
         """Load and register currently available superuser tools.
 
         Callers should not import the superuser registry directly for runtime
@@ -424,7 +452,11 @@ class CapabilityRegistry:
 
         from .superuser_agent.registry import build_superuser_agent_tool_bundle
 
-        bundle = build_superuser_agent_tool_bundle()
+        bundle = build_superuser_agent_tool_bundle(
+            message_text=message_text,
+            limit=limit,
+            include_deferred=include_deferred,
+        )
         self.register_superuser_tools(bundle.tools, cards=bundle.cards)
 
     def register_external_tools(
@@ -898,7 +930,9 @@ def _capability_card_from_superuser_tool(
     source_of_truth = _normalize_source_of_truth(
         getattr(raw_card, "source_of_truth", "local_state")
     )
-    side_effect = "query" if read_only else "mutate"
+    side_effect = _normalize_side_effect(
+        getattr(raw_card, "side_effect", "query" if read_only else "mutate")
+    )
     execution_policy = "normal"
     if approval_mode == "deny":
         execution_policy = "confirmation_required"
@@ -1048,6 +1082,15 @@ def _capability_card_from_external_tool(
         tool_name=tool_name,
         metadata={"provider_protocol": provider_adapter.mcp_metadata()},
     )
+
+
+def _normalize_side_effect(value: Any) -> str:
+    side_effect = normalize_message_text(str(value or "")).lower()
+    if side_effect in {"query", "send", "mutate"}:
+        return side_effect
+    if side_effect in {"execute", "control", "destructive"}:
+        return "mutate"
+    return "query"
 
 
 def _capability_id(*, kind: str, tool_name: str, card: CapabilityCard) -> str:

@@ -315,8 +315,12 @@ def _python_executable() -> str:
     return "python"
 
 
-register_superuser_tool(PythonExecTool)
-register_superuser_tool(PythonModuleTool)
+register_superuser_tool(
+    PythonExecTool, risk="high", destructive=True, side_effect="execute"
+)
+register_superuser_tool(
+    PythonModuleTool, risk="medium", destructive=False, side_effect="execute"
+)
 
 __all__ = [
     "PythonExecTool",

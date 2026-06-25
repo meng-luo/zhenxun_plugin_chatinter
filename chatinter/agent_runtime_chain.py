@@ -65,6 +65,9 @@ class AgentRuntimeChain:
         self._persist_state = persist_state
         self._force_required_tool_choice_once = False
         self._post_batch_guardrails: list[RuntimeGuardrailDecision] = []
+        agent_mode = normalize_message_text(
+            str(getattr(run_context, "extra", {}).get("agent_mode", "") or "")
+        )
 
         self.guardrails = RuntimeGuardrails(
             session_id=state.session_key,
@@ -75,6 +78,8 @@ class AgentRuntimeChain:
                 45.0,
                 float(getattr(state, "max_steps", 5)) * 15.0,
             ),
+            track_repeated_failures=agent_mode
+            not in {"superuser_agent", "superuser_subagent"},
         )
         from .agent_planner import AgentPlanner
         from .agent_verifier import AgentVerifier

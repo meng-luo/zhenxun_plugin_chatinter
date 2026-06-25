@@ -10,13 +10,13 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.services import logger
 
 from .config import get_config_value, get_model_name
-from .event_signals import get_event_signal, set_event_signal
 from .event_runtime import (
     get_nickname,
     is_already_handled,
     mark_as_handled,
     resolve_superuser,
 )
+from .event_signals import get_event_signal, set_event_signal
 from .prompt_pipeline import PromptPipeline
 from .scenario_router import ScenarioRoute, resolve_chatinter_scenario
 from .turn_frame import TurnFrame
@@ -63,6 +63,19 @@ async def handle_fallback(
     if not scenario_route.should_handle:
         logger.debug(f"ChatInter scenario skip: {scenario_route.reason}")
         return
+
+    if scenario_route.allow_agent_tools:
+        from .superuser_agent.runtime_approval import try_handle_runtime_approval
+
+        if await try_handle_runtime_approval(
+            bot=bot,
+            event=event,
+            session=session,
+            raw_message=raw_message,
+        ):
+            if not queued:
+                mark_as_handled(event)
+            return
 
     frame = TurnFrame.create(
         raw_message=raw_message,

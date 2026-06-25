@@ -137,6 +137,8 @@ def _uv_command_from_args(args: str) -> str:
     return f"uv {args}"
 
 
-register_superuser_tool(UvCommandTool)
+register_superuser_tool(
+    UvCommandTool, risk="medium", destructive=False, side_effect="execute"
+)
 
 __all__ = ["UvCommandTool", "run_uv_command"]

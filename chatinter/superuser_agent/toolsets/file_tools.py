@@ -704,9 +704,15 @@ def _safe_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
 register_superuser_tool(ReadFileTool)
 register_superuser_tool(ListDirTool)
 register_superuser_tool(SearchFilesTool)
-register_superuser_tool(WriteFileTool)
-register_superuser_tool(AppendFileTool)
-register_superuser_tool(ReplaceInFileTool)
+register_superuser_tool(
+    WriteFileTool, risk="high", destructive=True, side_effect="mutate"
+)
+register_superuser_tool(
+    AppendFileTool, risk="high", destructive=True, side_effect="mutate"
+)
+register_superuser_tool(
+    ReplaceInFileTool, risk="high", destructive=True, side_effect="mutate"
+)
 
 __all__ = [
     "AppendFileTool",

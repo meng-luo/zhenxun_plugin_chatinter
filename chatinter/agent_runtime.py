@@ -6,8 +6,6 @@ LLM -> tool_calls -> execute -> observations -> LLM ... -> final text.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from typing import Any
 
@@ -20,6 +18,11 @@ from zhenxun.services.llm.types.models import (
 )
 from zhenxun.services.llm.types.protocols import ToolExecutable
 
+from .agent_final_contract import (
+    final_contract_text,
+    observation_contract_reply,
+)
+from .agent_progress import AgentProgressReporter
 from .agent_run_store import (
     clear_agent_run_cancel_signal,
     get_agent_run_snapshot,
@@ -31,22 +34,40 @@ from .agent_state import (
     AgentRunState,
     AgentRuntimeResult,
 )
-from .artifact_store import compact_tool_result_output, summarize_artifact_text
+from .agent_tool_execution import (
+    exception_tool_result,
+    execute_tool_call,
+)
+from .artifact_store import (
+    compact_tool_result_output,
+    summarize_artifact_text,
+)
 from .command_observation import build_command_observation
 from .config import get_fallback_models
 from .context_engine import get_context_engine
 from .feedback import record_command_observation_feedback
 from .provider_capability import (
     ProviderCapabilityAdapter,
+    ToolSchemaMode,
+    is_light_request_tool,
 )
 from .provider_failover import request_with_failover
 from .route_text import normalize_message_text
+from .superuser_agent.permission_policy import (
+    reset_current_permission_session,
+    set_current_permission_session,
+)
+from .superuser_agent.tool_guardrail import (
+    SUPERUSER_AGENT_MODES,
+    SuperuserToolGuardrail,
+    _parse_tool_arguments,
+)
 from .task_frame import TASK_TEXT_FIELD
 from .trajectory_store import record_agent_trajectory
 from .turn_runtime import TurnBudgetController, estimate_text_tokens
 
 _MAIN_STAGE = "main_request"
-_PROGRESS_TASKS: set[asyncio.Task] = set()
+_SUPERUSER_TWO_STAGE_SCHEMA_THRESHOLD = 10
 
 
 class AgentRuntime:
@@ -87,49 +108,13 @@ class AgentRuntime:
             persist_state=self._persist_state,
         )
         self._trajectory_recorded = False
-        self._progress_hook = progress_hook
-        self._run_started_monotonic = 0.0
-        self._last_progress_sent = 0.0
-
-    # 进度回显(P0-2 最小落地):长任务期间向用户播报步数与当前工具,
-    # 首次播报延迟 + 播报间隔节流,避免刷屏。
-    _PROGRESS_FIRST_DELAY = 10.0
-    _PROGRESS_MIN_INTERVAL = 12.0
-
-    def _emit_progress(self) -> None:
-        progress_hook = self._progress_hook
-        if progress_hook is None:
-            return
-        now = time.monotonic()
-        elapsed = now - self._run_started_monotonic
-        if elapsed < self._PROGRESS_FIRST_DELAY:
-            return
-        if now - self._last_progress_sent < self._PROGRESS_MIN_INTERVAL:
-            return
-        self._last_progress_sent = now
-        last_tool = ""
-        for observation in reversed(self.state.observations):
-            last_tool = normalize_message_text(str(observation.tool_name or ""))
-            if last_tool:
-                break
-        text = f"⏳ 执行中 第{self.state.step}/{self.state.max_steps}步" + (
-            f" · 上一步: {last_tool}" if last_tool else ""
-        )
-
-        async def _safe_send() -> None:
-            try:
-                await progress_hook(text)
-            except Exception:
-                pass
-
-        task = asyncio.ensure_future(_safe_send())
-        _PROGRESS_TASKS.add(task)
-        task.add_done_callback(_PROGRESS_TASKS.discard)
+        self._progress = AgentProgressReporter(progress_hook)
+        self._superuser_tool_guardrail = SuperuserToolGuardrail()
 
     async def run(self) -> AgentRuntimeResult:
         started_at = time.time()
         started_perf = time.perf_counter()
-        self._run_started_monotonic = time.monotonic()
+        self._progress.start()
         if self.state.status != "running":
             self.state.status = "running"
             self.state.paused_reason = ""
@@ -150,7 +135,11 @@ class AgentRuntime:
                     await self._force_final_response(reason="token_budget_exhausted")
                     return self.state.to_result()
                 self.state.start_step()
-                self._emit_progress()
+                self._progress.emit(
+                    step=self.state.step,
+                    max_steps=self.state.max_steps,
+                    observations=self.state.observations,
+                )
                 self._sync_dynamic_tools()
                 self._persist_state("step_started")
                 self._compress_context_if_needed()
@@ -172,6 +161,10 @@ class AgentRuntime:
                 self._persist_state("model_request")
                 tool_choice = self.chain.tool_choice_for_request()
                 tools_for_request = self.chain.tools_for_request(tool_choice)
+                tools_for_request = self._maybe_light_superuser_schema_tools(
+                    tools_for_request,
+                    tool_choice=tool_choice,
+                )
                 response = await self._request_model(
                     tools=tools_for_request,
                     tool_choice=tool_choice,
@@ -188,6 +181,16 @@ class AgentRuntime:
                         as_message=True,
                         record_timeline=True,
                     )
+                if self._uses_light_superuser_schema(tools_for_request, tool_calls):
+                    tool_calls = await self._resolve_light_superuser_tool_calls(
+                        tool_calls
+                    )
+                    if self.state.status == "completed":
+                        self._persist_state("completed", reason=self.state.stop_reason)
+                        return self.state.to_result()
+                    if not tool_calls:
+                        self._persist_state("light_schema_resolution_empty")
+                        continue
                 if self._uses_compact_command_schema(tools_for_request, tool_calls):
                     tool_calls = await self._resolve_compact_command_tool_calls(
                         tool_calls
@@ -200,6 +203,11 @@ class AgentRuntime:
                         continue
                 if not tool_calls:
                     final_text = normalize_message_text(str(response.text or ""))
+                    final_text = final_contract_text(
+                        self.state,
+                        self.run_context,
+                        final_text,
+                    )
                     final_decision = await self.chain.complete_if_acceptable(final_text)
                     if final_decision.action == "retry":
                         self._persist_state("final_acceptance_retry")
@@ -250,18 +258,25 @@ class AgentRuntime:
                         if pre_guardrail.should_stop:
                             force_final_reason = pre_guardrail.reason
                     else:
+                        permission_token = set_current_permission_session(
+                            self.state.session_key
+                        )
                         try:
                             (
                                 resolved_call,
                                 tool_result,
-                            ) = await self.invoker.execute_tool_call(
-                                tool_call,
-                                self.state.tool_map,
-                                self.run_context,
-                            )
+                            ) = await self._execute_tool_call(tool_call)
                         except Exception as exc:
                             resolved_call = tool_call
-                            tool_result = self._exception_tool_result(tool_call, exc)
+                            tool_result = exception_tool_result(
+                                tool_call,
+                                exc,
+                                tool_map=self.state.tool_map,
+                                message_text=self.message_text,
+                                trace_id=self.state.trace_id,
+                            )
+                        finally:
+                            reset_current_permission_session(permission_token)
                         tool_result = self._normalize_command_tool_result(
                             resolved_call,
                             tool_result,
@@ -269,6 +284,12 @@ class AgentRuntime:
                     tool_result = self._compact_tool_result_for_context(
                         resolved_call,
                         tool_result,
+                    )
+                    superuser_tool_guardrail = (
+                        self._superuser_tool_guardrail_after_result(
+                            resolved_call,
+                            tool_result,
+                        )
                     )
                     if batch_all_read_only and (
                         pre_guardrail is not None
@@ -299,6 +320,18 @@ class AgentRuntime:
                         "tool_observation",
                         tool_name=str(resolved_call.function.name or ""),
                     )
+                    if superuser_tool_guardrail is not None:
+                        self.state.append_guardrail_observation(
+                            superuser_tool_guardrail,
+                            as_message=True,
+                        )
+                        self._persist_state(
+                            "guardrail",
+                            reason=str(
+                                superuser_tool_guardrail.get("guardrail_reason", "")
+                            ),
+                            tool_name=str(resolved_call.function.name or ""),
+                        )
                     post_observation = await self.chain.after_tool_observation(
                         tool_call=resolved_call,
                         tool_result=tool_result,
@@ -318,6 +351,9 @@ class AgentRuntime:
                     self._persist_state("step_refunded", reason="read_only_tool_batch")
                 if force_final_reason:
                     await self._force_final_response(reason=force_final_reason)
+                    return self.state.to_result()
+                if self._complete_readonly_fast_from_observation():
+                    self._persist_state("completed", reason=self.state.stop_reason)
                     return self.state.to_result()
                 if self.chain.should_finish_after_observation():
                     self.state.complete_final(
@@ -402,12 +438,26 @@ class AgentRuntime:
         self._persist_state("force_final_requested", reason=reason)
         response = await self._request_model(tools=None, tool_choice=None)
         final_text = normalize_message_text(str(response.text or ""))
+        final_text = final_contract_text(self.state, self.run_context, final_text)
         final_decision = await self.chain.complete_if_acceptable(
             final_text,
             allow_retry=False,
             fallback_reason=reason,
         )
         self._persist_state("completed", reason=final_decision.reason or reason)
+
+    async def _execute_tool_call(
+        self,
+        tool_call: LLMToolCall,
+    ) -> tuple[LLMToolCall, ToolResult]:
+        return await execute_tool_call(
+            self.invoker,
+            tool_call,
+            self.state.tool_map,
+            self.run_context,
+            message_text=self.message_text,
+            trace_id=self.state.trace_id,
+        )
 
     def _allow_tool_batch(self, call_count: int) -> bool:
         if self.budget_controller is None:
@@ -442,6 +492,20 @@ class AgentRuntime:
             budget_controller=self.budget_controller,
         )
 
+    def _complete_readonly_fast_from_observation(self) -> bool:
+        if self.state.agent_complexity_mode != "readonly_fast":
+            return False
+        if not self.state.observations or self.state.pending_tasks:
+            return False
+        if any(observation.need_continue for observation in self.state.observations):
+            return False
+        latest = self.state.observations[-1]
+        self.state.complete_final(
+            observation_contract_reply(latest),
+            reason="readonly_fast_observation_final",
+        )
+        return True
+
     def _sync_dynamic_tools(self) -> None:
         extra = getattr(self.run_context, "extra", None)
         if not isinstance(extra, dict):
@@ -465,6 +529,127 @@ class AgentRuntime:
             base_tool_map=self.state.tool_map,
             tool_calls=tool_calls,
         )
+
+    def _maybe_light_superuser_schema_tools(
+        self,
+        tools: dict[str, ToolExecutable] | None,
+        *,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, ToolExecutable] | None:
+        if not self._should_use_light_superuser_schema(tools, tool_choice=tool_choice):
+            return tools
+        schema_modes: dict[str, ToolSchemaMode] = {
+            name: "light" for name in tools or {}
+        }
+        self.state.append_timeline(
+            role="system",
+            kind="light_schema_request",
+            metadata={
+                "step": self.state.step,
+                "tool_count": len(tools or {}),
+                "agent_complexity_mode": self.state.agent_complexity_mode,
+            },
+        )
+        return self.provider_adapter.prepare_tool_map_for_request(
+            tools,
+            required_tool_names=self.state.required_tool_names,
+            schema_modes=schema_modes,
+        )
+
+    def _should_use_light_superuser_schema(
+        self,
+        tools: dict[str, ToolExecutable] | None,
+        *,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> bool:
+        if self._agent_mode() not in SUPERUSER_AGENT_MODES:
+            return False
+        tool_count = len(tools or {})
+        if tool_count <= 1:
+            return False
+        if self.state.tool_obligation == "required" or tool_choice == "required":
+            return False
+        if self.state.agent_complexity_mode in {"readonly_fast", "single_tool_fast"}:
+            return False
+        return (
+            tool_count > _SUPERUSER_TWO_STAGE_SCHEMA_THRESHOLD
+            or self.state.agent_complexity_mode == "complex_pev"
+        )
+
+    def _uses_light_superuser_schema(
+        self,
+        tools: dict[str, ToolExecutable] | None,
+        tool_calls: list[LLMToolCall],
+    ) -> bool:
+        if self._agent_mode() not in SUPERUSER_AGENT_MODES:
+            return False
+        if not tools or not tool_calls:
+            return False
+        return any(
+            is_light_request_tool(
+                tools.get(normalize_message_text(str(call.function.name or "")))
+            )
+            for call in tool_calls
+        )
+
+    async def _resolve_light_superuser_tool_calls(
+        self,
+        tool_calls: list[LLMToolCall],
+    ) -> list[LLMToolCall]:
+        selected = self._selected_superuser_tools(tool_calls)
+        if not selected:
+            return []
+        self.state.messages.append(
+            LLMMessage.user(
+                "You selected lightweight tool card(s). Now call only the selected "
+                "tool(s) again with the full parameter schema and concrete "
+                "arguments from the current user task. If none fit, answer briefly."
+            )
+        )
+        self.state.append_timeline(
+            role="system",
+            kind="light_schema_upgrade",
+            metadata={
+                "step": self.state.step,
+                "selected_tools": list(selected.keys()),
+            },
+        )
+        response = await self._request_model(
+            tools=selected,
+            tool_choice="auto",
+        )
+        selected_names = set(selected)
+        resolved = [
+            call
+            for call in self.provider_adapter.tool_calls_for_execution(
+                list(response.tool_calls or [])
+            )
+            if normalize_message_text(str(call.function.name or "")) in selected_names
+        ]
+        if resolved:
+            return resolved
+        final_text = normalize_message_text(str(response.text or ""))
+        if final_text:
+            final_text = final_contract_text(self.state, self.run_context, final_text)
+            completion_decision = await self.chain.complete_if_acceptable(
+                final_text,
+                fallback_reason="light_schema_direct_response",
+            )
+            if completion_decision.action == "retry":
+                return []
+        return []
+
+    def _selected_superuser_tools(
+        self,
+        tool_calls: list[LLMToolCall],
+    ) -> dict[str, ToolExecutable]:
+        selected: dict[str, ToolExecutable] = {}
+        for tool_call in tool_calls:
+            name = normalize_message_text(str(tool_call.function.name or ""))
+            tool = self.state.tool_map.get(name)
+            if tool is not None and getattr(tool, "binding", None) is None:
+                selected[name] = tool
+        return self.provider_adapter.sort_tool_map(selected)
 
     async def _resolve_compact_command_tool_calls(
         self,
@@ -501,6 +686,7 @@ class AgentRuntime:
             return resolved
         final_text = normalize_message_text(str(response.text or ""))
         if final_text:
+            final_text = final_contract_text(self.state, self.run_context, final_text)
             completion_decision = await self.chain.complete_if_acceptable(
                 final_text,
                 fallback_reason="compact_schema_direct_response",
@@ -508,6 +694,14 @@ class AgentRuntime:
             if completion_decision.action == "retry":
                 return []
         return []
+
+    def _agent_mode(self) -> str:
+        extra = getattr(self.run_context, "extra", None)
+        return (
+            normalize_message_text(str(extra.get("agent_mode", "") or ""))
+            if isinstance(extra, dict)
+            else ""
+        )
 
     def _persist_state(self, stage: str, **metadata: Any) -> None:
         persist_agent_run_state(self.state, stage=stage, metadata=metadata)
@@ -541,6 +735,31 @@ class AgentRuntime:
         except Exception:
             return False
         return bool(card is not None and getattr(card, "read_only", False))
+
+    def _superuser_tool_guardrail_after_result(
+        self,
+        tool_call: LLMToolCall,
+        tool_result: ToolResult,
+    ) -> dict[str, Any] | None:
+        extra = getattr(self.run_context, "extra", None)
+        agent_mode = (
+            str(extra.get("agent_mode", "") or "") if isinstance(extra, dict) else ""
+        )
+        guardrail = getattr(self, "_superuser_tool_guardrail", None)
+        if guardrail is None:
+            guardrail = SuperuserToolGuardrail()
+            self._superuser_tool_guardrail = guardrail
+        payload = guardrail.after_result(
+            agent_mode=agent_mode,
+            tool_call=tool_call,
+            tool_result=tool_result,
+        )
+        if payload is not None and payload.get("action") == "block_tool":
+            tool_name = normalize_message_text(str(tool_call.function.name or ""))
+            if tool_name:
+                self.chain.guardrails.block_tool(tool_name)
+                self._sync_dynamic_tools()
+        return payload
 
     def _compress_context_if_needed(self) -> None:
         result = get_context_engine().compress(
@@ -652,12 +871,27 @@ class AgentRuntime:
             trace_id=self.state.trace_id,
             source=f"tool_result:{tool_call.function.name}",
         )
-        return ToolResult(
-            output=output,
-            display_content=summarize_artifact_text(
-                str(tool_result.display_content or output.get("status", ""))
-            ),
+        display_content = self._compact_tool_display_content(
+            tool_call,
+            tool_result,
         )
+        return ToolResult(output=output, display_content=display_content)
+
+    def _compact_tool_display_content(
+        self,
+        tool_call: LLMToolCall,
+        tool_result: ToolResult,
+    ) -> str:
+        content = str(tool_result.display_content or "")
+        if not content:
+            output = tool_result.output if isinstance(tool_result.output, dict) else {}
+            content = str(output.get("status", "") or "")
+        compacted = compact_tool_result_output(
+            {"display_content": content},
+            trace_id=self.state.trace_id,
+            source=f"display_content:{tool_call.function.name}",
+        )
+        return summarize_artifact_text(str(compacted.get("display_content", "")))
 
     def _tool_result_for_model(
         self,
@@ -733,54 +967,6 @@ class AgentRuntime:
                 plugin_module=getattr(candidate, "plugin_module", ""),
             ),
             display_content=tool_result.display_content,
-        )
-
-    def _exception_tool_result(
-        self,
-        tool_call: LLMToolCall,
-        exc: Exception,
-    ) -> ToolResult:
-        executable = self.state.tool_map.get(str(tool_call.function.name or ""))
-        binding = getattr(executable, "binding", None)
-        candidate = getattr(binding, "candidate", None)
-        arguments = _parse_tool_arguments(str(tool_call.function.arguments or ""))
-        task_text = ""
-        if isinstance(arguments, dict):
-            task_text = normalize_message_text(
-                str(arguments.get(TASK_TEXT_FIELD) or "")
-            )
-        if candidate is None:
-            output = {
-                "ok": False,
-                "command_id": "",
-                "rendered_command": "",
-                "matched_plugin": "",
-                "task_text": task_text,
-                "error": f"工具执行异常：{type(exc).__name__}: {exc}",
-                "messages_sent": [],
-                "artifacts": [],
-                "need_continue": True,
-                "remaining_task_hint": task_text,
-                "retryable": False,
-                "status": "tool_execution_exception",
-            }
-        else:
-            output = build_command_observation(
-                ok=False,
-                command_id=getattr(binding, "command_id", ""),
-                rendered_command=getattr(candidate.schema, "head", ""),
-                matched_plugin=getattr(candidate, "plugin_name", ""),
-                task_text=task_text,
-                ambient_message=self.message_text,
-                trace_id=self.state.trace_id,
-                error=f"工具执行异常：{type(exc).__name__}: {exc}",
-                retryable=False,
-                plugin_module=getattr(candidate, "plugin_module", ""),
-            )
-            output["status"] = "tool_execution_exception"
-        return ToolResult(
-            output=output,
-            display_content=normalize_message_text(str(output.get("error", ""))),
         )
 
     def _record_tool_feedback(
@@ -869,19 +1055,9 @@ class AgentRuntime:
             return
 
 
-def _parse_tool_arguments(arguments: str) -> dict[str, Any] | str:
-    text = str(arguments or "").strip()
-    if not text:
-        return {}
-    try:
-        value = json.loads(text)
-    except Exception:
-        return text
-    return value if isinstance(value, dict) else {"value": value}
-
-
 def _estimate_prompt_tokens(messages: list[Any]) -> int:
     total = 0
     for message in messages:
         total += estimate_text_tokens(getattr(message, "content", ""))
     return total
+

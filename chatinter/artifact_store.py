@@ -25,6 +25,7 @@ _INLINE_TEXT_LIMIT = 240
 _SUMMARY_TEXT_LIMIT = 180
 _MODEL_STRING_LIMIT = 700
 _MODEL_LONG_FIELD_LIMIT = 360
+_MODEL_COMPLEX_VALUE_LIMIT = _MODEL_STRING_LIMIT * 2
 _MODEL_LIST_ITEMS = 12
 _MODEL_DICT_DEPTH = 5
 _ARTIFACT_DIR = Path("data") / "chatinter_artifacts"
@@ -42,6 +43,23 @@ _LONG_TEXT_KEYS = {
     "output",
     "traceback",
     "artifact_content",
+    "body",
+    "command_output",
+    "combined_output",
+    "display_content",
+    "response_text",
+    "result_text",
+}
+_COMPLEX_VALUE_KEYS = {
+    "body",
+    "data",
+    "details",
+    "json",
+    "metadata",
+    "payload",
+    "raw",
+    "response",
+    "result",
 }
 _REFERENCE_KEYS = {
     "artifact_id",
@@ -408,6 +426,14 @@ def _compact_value(
                 key=key,
                 artifacts=artifacts,
             )
+        if _should_store_complex_dict(value, key=key):
+            return _store_complex_value(
+                value,
+                trace_id=trace_id,
+                source=source,
+                key=key,
+                artifacts=artifacts,
+            )
         return {
             str(item_key): _compact_value(
                 item_value,
@@ -536,6 +562,17 @@ def _compact_list(
             "summary": ref.summary,
         }
     return compacted
+
+
+def _should_store_complex_dict(value: dict[Any, Any], *, key: str) -> bool:
+    lowered = key.lower()
+    if lowered not in _COMPLEX_VALUE_KEYS and len(value) <= _MODEL_LIST_ITEMS:
+        return False
+    try:
+        raw_text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        raw_text = str(value)
+    return len(value) > _MODEL_LIST_ITEMS or len(raw_text) > _MODEL_COMPLEX_VALUE_LIMIT
 
 
 def _store_complex_value(

@@ -472,8 +472,12 @@ def _loop_payload(engineering_loop_id: str) -> dict[str, Any] | None:
         return None
 
 
-register_superuser_tool(EngineeringEvalPlanTool)
-register_superuser_tool(EngineeringEvalRunTool)
+register_superuser_tool(
+    EngineeringEvalPlanTool, risk="low", destructive=False, side_effect="execute"
+)
+register_superuser_tool(
+    EngineeringEvalRunTool, risk="medium", destructive=False, side_effect="execute"
+)
 register_superuser_tool(EngineeringEvalStatusTool)
 
 __all__ = [

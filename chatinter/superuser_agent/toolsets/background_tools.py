@@ -518,10 +518,20 @@ def _task_payload(
     return payload
 
 
-register_superuser_tool(BackgroundTaskStartTool)
+register_superuser_tool(
+    BackgroundTaskStartTool, risk="high", destructive=True, side_effect="execute"
+)
 register_superuser_tool(BackgroundTaskStatusTool)
-register_superuser_tool(BackgroundTaskCancelTool)
-register_superuser_tool(BackgroundObservationWaitTool)
+register_superuser_tool(
+    BackgroundTaskCancelTool, risk="high", destructive=True, side_effect="execute"
+)
+register_superuser_tool(
+    BackgroundObservationWaitTool,
+    risk="low",
+    destructive=False,
+    side_effect="query",
+    read_only=True,
+)
 register_superuser_tool(BackgroundObservationListTool)
 
 __all__ = [

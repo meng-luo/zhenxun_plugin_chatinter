@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import re
+import shutil
 from typing import Any
 
 from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
@@ -283,6 +285,72 @@ class PluginDevWriteFileTool:
         )
 
 
+class PluginDevPublishTool:
+    name = "plugin_dev_publish"
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "超级用户私聊专用：验证隔离 worktree 中的插件后，同步到主插件目录。"
+                "不处理插件商店/marketplace；发布后需要重载或重启真寻。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plugin_name": {
+                        "type": "string",
+                        "description": "插件目录名，例如 my_plugin。",
+                    },
+                    "plugin_root": {
+                        "type": ["string", "null"],
+                        "description": "主插件根目录，默认 zhenxun/plugins。",
+                    },
+                    "overwrite": {
+                        "type": ["boolean", "null"],
+                        "description": "目标插件已存在时是否覆盖，默认 false。",
+                    },
+                    "reason": {
+                        "type": ["string", "null"],
+                        "description": "为什么要发布该插件。",
+                    },
+                },
+                "required": ["plugin_name", "plugin_root", "overwrite", "reason"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        actor = actor_from_context(context)
+        payload = {
+            "plugin_name": str(kwargs.get("plugin_name", "") or "").strip(),
+            "plugin_root": str(kwargs.get("plugin_root", "") or "").strip() or None,
+            "overwrite": bool(kwargs.get("overwrite") or False),
+            "reason": str(kwargs.get("reason", "") or ""),
+            "worktree_id": worktree_id_from_context(context),
+        }
+        decision = decide_plugin_dev("plugin_dev_publish " + payload["plugin_name"])
+        if decision.decision == "deny":
+            return permission_denied_result(
+                actor=actor,
+                action=self.name,
+                payload=payload,
+                permission=decision,
+            )
+        if decision.decision == "ask":
+            return approval_required_result(
+                actor=actor,
+                action=self.name,
+                payload=payload,
+                permission=decision,
+            )
+        return await publish_plugin(
+            actor=actor,
+            worktree_id=str(payload.pop("worktree_id", "") or ""),
+            **payload,
+        )
+
+
 async def inspect_plugin(
     *,
     plugin_name: str,
@@ -422,6 +490,7 @@ async def scaffold_plugin(
         )
         if not isinstance(result.output, dict) or not result.output.get("ok"):
             return result
+        validation = _validate_plugin_tree(plugin_dir)
         record_audit_event(
             event="operation_executed",
             user_id=actor["user_id"],
@@ -434,17 +503,36 @@ async def scaffold_plugin(
             },
             result={"ok": True, "path": str(init_path)},
         )
+        if not validation["ok"]:
+            return tool_result(
+                False,
+                "plugin_validation_failed",
+                plugin_name=plugin_name,
+                path=str(init_path),
+                approval_id=approval_id,
+                patch_operation=result.output.get("operation")
+                if isinstance(result.output, dict)
+                else None,
+                validation=validation,
+                instruction=(
+                    "插件文件已写入，但语法验证未通过。"
+                    "修复 validation.errors 后再发布/启用。"
+                ),
+            )
         return tool_result(
             True,
             "plugin_scaffolded",
             plugin_name=plugin_name,
             path=str(init_path),
             approval_id=approval_id,
+            validation=validation,
             patch_operation=result.output.get("operation")
             if isinstance(result.output, dict)
             else None,
             files=[str(init_path)],
             next_steps=[
+                "如果当前在隔离 worktree 中，插件不会被主程序直接加载；"
+                "需要 publish/同步到主插件目录并重启/重载后才会生效。",
                 "根据需求补充业务逻辑和参数 schema。",
                 "需要依赖时使用 uv_command 处理依赖。",
                 "需要验证时使用 python_module 或 uv_command 运行定向检查。",
@@ -503,6 +591,7 @@ async def write_plugin_file(
         )
         if not isinstance(result.output, dict) or not result.output.get("ok"):
             return result
+        validation = _validate_plugin_tree(plugin_dir)
         record_audit_event(
             event="operation_executed",
             user_id=actor["user_id"],
@@ -516,6 +605,24 @@ async def write_plugin_file(
             },
             result={"ok": True, "bytes_written": len(content.encode("utf-8"))},
         )
+        if not validation["ok"]:
+            return tool_result(
+                False,
+                "plugin_validation_failed",
+                plugin_name=plugin_name,
+                path=str(target),
+                relative_path=relative_path,
+                approval_id=approval_id,
+                patch_operation=result.output.get("operation")
+                if isinstance(result.output, dict)
+                else None,
+                bytes_written=len(content.encode("utf-8")),
+                validation=validation,
+                instruction=(
+                    "文件已写入，但插件语法验证未通过。"
+                    "继续修改前先处理 validation.errors。"
+                ),
+            )
         return tool_result(
             True,
             "plugin_file_written",
@@ -523,6 +630,7 @@ async def write_plugin_file(
             path=str(target),
             relative_path=relative_path,
             approval_id=approval_id,
+            validation=validation,
             patch_operation=result.output.get("operation")
             if isinstance(result.output, dict)
             else None,
@@ -539,6 +647,97 @@ async def write_plugin_file(
                 "approval_id": approval_id,
             },
             status="plugin_write_error",
+            error=str(exc),
+        )
+
+
+async def publish_plugin(
+    *,
+    plugin_name: str,
+    plugin_root: str | None,
+    overwrite: bool,
+    reason: str,
+    actor: dict[str, str],
+    worktree_id: str = "",
+    approval_id: str | None = None,
+) -> ToolResult:
+    try:
+        _validate_plugin_name(plugin_name)
+        source_dir = _plugin_dir(
+            plugin_name, plugin_root, actor=actor, worktree_id=worktree_id
+        )
+        target_dir = _plugin_dir(plugin_name, plugin_root, actor=None)
+        if source_dir == target_dir:
+            return tool_result(
+                False,
+                "plugin_publish_requires_worktree",
+                plugin_name=plugin_name,
+                instruction=(
+                    "请先使用 worktree_create 创建隔离工作区，再生成并发布插件。"
+                ),
+            )
+        if not source_dir.exists() or not source_dir.is_dir():
+            return tool_result(False, "plugin_source_not_found", path=str(source_dir))
+        if target_dir.exists() and not overwrite:
+            return tool_result(
+                False,
+                "plugin_target_exists",
+                path=str(target_dir),
+                instruction="如确认覆盖主插件目录，请重新调用并设置 overwrite=true。",
+            )
+        validation = _validate_plugin_tree(source_dir)
+        if not validation["ok"]:
+            return tool_result(
+                False,
+                "plugin_validation_failed",
+                plugin_name=plugin_name,
+                path=str(source_dir),
+                validation=validation,
+                instruction="验证未通过，禁止发布。请先修复 validation.errors。",
+            )
+        if any(path.is_symlink() for path in source_dir.rglob("*")):
+            return tool_result(False, "plugin_publish_symlink_blocked")
+        _replace_plugin_dir(source_dir, target_dir)
+        record_audit_event(
+            event="operation_executed",
+            user_id=actor["user_id"],
+            session_key=actor["session_key"],
+            action="plugin_dev_publish",
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "reason": reason,
+                "approval_id": approval_id,
+            },
+            result={"ok": True, "target": str(target_dir)},
+        )
+        return tool_result(
+            True,
+            "plugin_published",
+            plugin_name=plugin_name,
+            source_path=str(source_dir),
+            target_path=str(target_dir),
+            approval_id=approval_id,
+            validation=validation,
+            copied_files=_plugin_files(target_dir),
+            needs_reload=True,
+            instruction="插件已同步到主插件目录；需要重载插件或重启真寻后才会加载。",
+            next_steps=[
+                "重载插件或重启真寻。",
+                "重载后用真寻帮助或插件命令做一次功能验证。",
+            ],
+        )
+    except Exception as exc:
+        return audited_error_result(
+            actor=actor,
+            action="plugin_dev_publish",
+            payload={
+                "plugin_name": plugin_name,
+                "plugin_root": plugin_root,
+                "reason": reason,
+                "approval_id": approval_id,
+            },
+            status="plugin_publish_error",
             error=str(exc),
         )
 
@@ -599,6 +798,88 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def _validate_plugin_tree(plugin_dir: Path) -> dict[str, Any]:
+    """Syntax-check generated plugin files before the Agent calls them done."""
+
+    if not plugin_dir.exists():
+        return {"ok": False, "errors": [f"path not found: {plugin_dir}"], "files": []}
+    files = [
+        path
+        for path in sorted(plugin_dir.rglob("*.py"), key=lambda item: item.as_posix())
+        if "__pycache__" not in path.parts
+    ]
+    checked: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for path in files[:120]:
+        checked.append(str(path))
+        try:
+            ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            errors.append(
+                {
+                    "path": str(path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "ok": not errors,
+        "checked": len(checked),
+        "files": checked,
+        "errors": errors,
+        "truncated": len(files) > len(checked),
+    }
+
+
+def _replace_plugin_dir(source_dir: Path, target_dir: Path) -> None:
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = target_dir.with_name(f".{target_dir.name}.publish_tmp")
+    backup_dir = target_dir.with_name(f".{target_dir.name}.publish_backup")
+    _remove_path(tmp_dir)
+    _remove_path(backup_dir)
+    shutil.copytree(source_dir, tmp_dir, ignore=_copy_ignore)
+    backed_up = False
+    try:
+        if target_dir.exists():
+            target_dir.rename(backup_dir)
+            backed_up = True
+        tmp_dir.rename(target_dir)
+        _remove_path(backup_dir)
+    except Exception:
+        if backed_up:
+            _remove_path(target_dir)
+            backup_dir.rename(target_dir)
+        raise
+    finally:
+        _remove_path(tmp_dir)
+
+
+def _copy_ignore(_path: str, names: list[str]) -> set[str]:
+    return {
+        name
+        for name in names
+        if name == "__pycache__"
+        or name.endswith(".pyc")
+        or name in {".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    }
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _plugin_files(plugin_dir: Path, *, limit: int = 120) -> list[str]:
+    return [
+        path.relative_to(plugin_dir).as_posix()
+        for path in sorted(plugin_dir.rglob("*"), key=lambda item: item.as_posix())
+        if path.is_file() and "__pycache__" not in path.parts
+    ][:limit]
+
+
 def _render_plugin_init(
     *,
     display_name: str,
@@ -648,15 +929,30 @@ def _coerce_int(value: Any, *, default: int, lower: int, upper: int) -> int:
         return default
 
 
-register_superuser_tool(PluginDevInspectTool)
-register_superuser_tool(PluginDevScaffoldTool)
-register_superuser_tool(PluginDevWriteFileTool)
+register_superuser_tool(
+    PluginDevInspectTool,
+    risk="low",
+    destructive=False,
+    side_effect="query",
+    read_only=True,
+)
+register_superuser_tool(
+    PluginDevScaffoldTool, risk="high", destructive=True, side_effect="mutate"
+)
+register_superuser_tool(
+    PluginDevWriteFileTool, risk="high", destructive=True, side_effect="mutate"
+)
+register_superuser_tool(
+    PluginDevPublishTool, risk="high", destructive=True, side_effect="mutate"
+)
 
 __all__ = [
     "PluginDevInspectTool",
+    "PluginDevPublishTool",
     "PluginDevScaffoldTool",
     "PluginDevWriteFileTool",
     "inspect_plugin",
+    "publish_plugin",
     "scaffold_plugin",
     "write_plugin_file",
 ]

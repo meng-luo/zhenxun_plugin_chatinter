@@ -485,7 +485,9 @@ class AgentRunState:
         self.messages.append(
             LLMMessage.user(
                 "工具调用已经结束或达到上限。请不要再调用工具，"
-                "根据已经完成的工具结果直接给用户一个简短最终回复。"
+                "根据已有 Observation 直接给用户一个简短最终回复："
+                "明确已完成/失败/需要确认；如有 artifact_id 必须列出；"
+                "不要声称完成 Observation 未证明的事项。"
             )
         )
         self.append_timeline(

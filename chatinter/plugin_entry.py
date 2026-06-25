@@ -17,7 +17,7 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot.typing import T_State
-from nonebot_plugin_alconna import Alconna, on_alconna
+from nonebot_plugin_alconna import Alconna, Args, Match, on_alconna
 from nonebot_plugin_alconna.uniseg import UniMsg
 from nonebot_plugin_uninfo import Uninfo
 
@@ -27,6 +27,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
+from .event_runtime import mark_as_handled
 from .event_signals import get_event_signal
 from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
@@ -40,6 +41,24 @@ from .native_tail_collector import (
 from .plugin_registry import PluginRegistry
 from .reflection_observer import render_reflection_observer_summary
 from .scenario_router import resolve_chatinter_scenario
+from .superuser_agent.permission_policy import (
+    clear_session_permission_mode,
+    get_session_permission_mode,
+    set_session_permission_mode,
+)
+from .superuser_agent.runtime_approval import (
+    has_runtime_approval_intent,
+    try_handle_runtime_approval,
+)
+from .superuser_agent.runtime_control import (
+    has_runtime_control_intent,
+    try_handle_runtime_control,
+)
+from .superuser_agent.tool_preset import (
+    get_session_tool_preset,
+    set_session_tool_preset,
+    tool_preset_label,
+)
 from .turn_metrics import render_route_observer_summary
 from .turn_queue import get_turn_queue
 from .utils.unimsg_utils import uni_to_text_with_tags
@@ -148,6 +167,18 @@ __plugin_meta__ = PluginMetadata(
                 default_value="",
                 type=str,
             ),
+            RegisterConfig(
+                module="chatinter",
+                key="SUPERUSER_PERMISSION_MODE",
+                value="default",
+                help=(
+                    "超级用户 Agent 权限模式：default=按权限策略，"
+                    "ask_all=全部确认，auto_readonly=只读自动通过/其他确认，"
+                    "bypass=跳过确认"
+                ),
+                default_value="default",
+                type=str,
+            ),
         ],
         commands=[
             Command(
@@ -162,11 +193,24 @@ __plugin_meta__ = PluginMetadata(
                 command="重建插件索引",
                 description="重建 ChatInter 插件知识库索引（超级用户）",
             ),
+            Command(
+                command="Agent权限模式 [default|ask_all|auto_readonly|bypass|clear]",
+                description="设置当前会话的超级用户 Agent 权限模式（内存生效）",
+            ),
+            Command(
+                command=(
+                    "Agent工具模式 "
+                    "[default|read_only|code_edit|plugin_dev|server_ops|clear]"
+                ),
+                description="设置当前会话的超级用户 Agent 工具预设（内存生效）",
+            ),
         ],
         superuser_help="""
 - `重置会话`
 - `chatinter统计`
 - `重建插件索引`
+- `Agent权限模式 [default|ask_all|auto_readonly|bypass|clear]`
+- `Agent工具模式 [default|read_only|code_edit|plugin_dev|server_ops|clear]`
         """.strip(),
     ).to_dict(),
 )
@@ -297,6 +341,22 @@ async def _handle_fallback(
     if raw_message is None:
         return
 
+    if await _try_runtime_approval_before_queue(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return
+
+    if await _try_runtime_control_before_queue(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return
+
     route_modules = _event_route_modules(state)
     if route_modules:
         logger.debug("event already has route modules, skip ChatInter fallback")
@@ -346,6 +406,20 @@ async def _handle_turn_followup(
     raw_message = _extract_raw_message(event, msg, state_plain_text)
     if raw_message is None:
         return
+    if await _try_runtime_approval_before_queue(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return
+    if await _try_runtime_control_before_queue(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return
     scenario = _resolve_entry_scenario(
         bot=bot,
         event=event,
@@ -367,6 +441,46 @@ async def _handle_turn_followup(
     )
     if accepted:
         logger.debug(f"[ChatInter] 收到连续 turn 补充：{raw_message[:50]}...")
+
+
+async def _try_runtime_control_before_queue(
+    *,
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    raw_message: str,
+) -> bool:
+    if not has_runtime_control_intent(raw_message):
+        return False
+    if not await try_handle_runtime_control(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return False
+    mark_as_handled(event)
+    return True
+
+
+async def _try_runtime_approval_before_queue(
+    *,
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    raw_message: str,
+) -> bool:
+    if not has_runtime_approval_intent(raw_message):
+        return False
+    if not await try_handle_runtime_approval(
+        bot=bot,
+        event=event,
+        session=session,
+        raw_message=raw_message,
+    ):
+        return False
+    mark_as_handled(event)
+    return True
 
 
 @_native_tail_collector_matcher.handle()
@@ -430,6 +544,42 @@ _rebuild_plugin_index_matcher = on_alconna(
     rule=to_me(),
 )
 
+_permission_mode_matcher = on_alconna(
+    Alconna(
+        "Agent权限模式",
+        Args["mode?", ["default", "ask_all", "auto_readonly", "bypass", "clear"]],
+    ),
+    permission=SUPERUSER,
+    block=True,
+    priority=1,
+    rule=to_me(),
+)
+
+_tool_preset_matcher = on_alconna(
+    Alconna(
+        "Agent工具模式",
+        Args[
+            "preset?",
+            [
+                "default",
+                "read_only",
+                "code_edit",
+                "plugin_dev",
+                "server_ops",
+                "clear",
+                "只读模式",
+                "改代码模式",
+                "插件开发模式",
+                "服务器排查模式",
+            ],
+        ],
+    ),
+    permission=SUPERUSER,
+    block=True,
+    priority=1,
+    rule=to_me(),
+)
+
 
 @_reset_matcher.handle()
 async def _handle_reset_by_alconna(
@@ -473,6 +623,55 @@ async def _handle_rebuild_plugin_index():
         return
     await MessageUtils.build_message(
         f"插件索引已重建，共 {len(knowledge_base.plugins)} 个插件。"
+    ).send()
+
+
+@_permission_mode_matcher.handle()
+async def _handle_permission_mode(session: Uninfo, mode: Match[str]):
+    user_id = str(session.user.id if session.user else "")
+    session_key = str(session.group.id) if session.group else user_id
+    if not session_key:
+        await MessageUtils.build_message("无法识别当前会话。").send()
+        return
+    current = get_session_permission_mode(session_key)
+    if not mode.available:
+        await MessageUtils.build_message(
+            "当前会话权限模式："
+            f"{current or '未设置，使用全局 SUPERUSER_PERMISSION_MODE'}"
+        ).send()
+        return
+    value = str(mode.result or "").strip().lower()
+    if value == "clear":
+        clear_session_permission_mode(session_key)
+        await MessageUtils.build_message(
+            "已清除当前会话权限模式，恢复全局配置。"
+        ).send()
+        return
+    applied = set_session_permission_mode(session_key, value)
+    await MessageUtils.build_message(f"当前会话权限模式已设为：{applied}").send()
+
+
+@_tool_preset_matcher.handle()
+async def _handle_tool_preset(session: Uninfo, preset: Match[str]):
+    user_id = str(session.user.id if session.user else "")
+    session_key = str(session.group.id) if session.group else user_id
+    if not session_key:
+        await MessageUtils.build_message("无法识别当前会话。").send()
+        return
+    current = get_session_tool_preset(session_key)
+    if not preset.available:
+        await MessageUtils.build_message(
+            "当前会话工具模式：" f"{tool_preset_label(current)}"
+        ).send()
+        return
+    value = str(preset.result or "").strip()
+    if value == "clear":
+        value = "default"
+    applied = set_session_tool_preset(session_key, value)
+    await MessageUtils.build_message(
+        "当前会话工具模式已设为："
+        f"{tool_preset_label(applied)}"
+        + ("；权限模式已联动调整。" if applied != "default" else "。")
     ).send()
 
 

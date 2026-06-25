@@ -20,7 +20,6 @@ from ...config import (
     get_config_value,
     get_model_name,
 )
-from ...models.pydantic_models import PluginKnowledgeBase
 from ...provider_capability import ProviderCapabilityAdapter
 from ...route_text import normalize_message_text
 from ..audit_log import record_audit_event
@@ -192,12 +191,13 @@ async def _run_delegate_task(
     try:
         model_name = get_model_name()
         provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
-        capability_registry = CapabilityRegistry.from_knowledge_base(
-            PluginKnowledgeBase(plugins=[], user_role="超级管理员"),
+        capability_registry = CapabilityRegistry.empty(
             session_id=f"{actor['session_key']}:delegate:{index}",
-            tools=[],
         )
-        capability_registry.register_available_superuser_tools()
+        capability_registry.register_available_superuser_tools(
+            message_text=task.task,
+            include_deferred=True,
+        )
         _filter_delegate_registry(
             capability_registry,
             allowed_tools=allowed_tools,
@@ -436,6 +436,8 @@ register_superuser_tool(
     risk="medium",
     approval_mode="policy",
     read_only=False,
+    destructive=False,
+    side_effect="execute",
     description="将独立子任务交给隔离子 AgentRuntime 并行处理。",
     tags=("delegate", "subagent", "parallel"),
     source_of_truth="local_state",

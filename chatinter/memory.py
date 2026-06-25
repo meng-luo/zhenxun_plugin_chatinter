@@ -24,7 +24,9 @@ from nonebot_plugin_alconna.uniseg.tools import reply_fetch
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
+from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.llm import LLMMessage
+from zhenxun.services.message_load import is_db_unhealthy
 
 from .chat_memory_store import ChatMemoryStore, LayeredMemoryRecall
 from .config import (
@@ -355,11 +357,21 @@ class ChatMemory:
             return self._user_nickname_cache.get(user_id)
 
         if group_id:
+            if is_db_unhealthy():
+                return None
             from zhenxun.models.group_member_info import GroupInfoUser
 
-            member = await GroupInfoUser.filter(
-                group_id=group_id, user_id=user_id
-            ).first()
+            try:
+                member = await with_db_timeout(
+                    GroupInfoUser.filter(group_id=group_id, user_id=user_id).first(),
+                    timeout=2.0,
+                    operation="ChatInter.fetch_user_nickname",
+                    source="chatinter",
+                )
+            except TimeoutError:
+                return None
+            except Exception:
+                return None
             if member:
                 nick = str(getattr(member, "nickname", "") or member.user_name or "")
                 if nick:

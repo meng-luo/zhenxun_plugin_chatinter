@@ -59,13 +59,14 @@ def validate_final_reply(
         observation
         for observation in observations
         if bool(getattr(observation, "ok", False))
-        and normalize_message_text(str(getattr(observation, "command_id", "") or ""))
+        and _is_real_completion_observation(observation)
     ]
     action_tools = _action_like_tool_count(tool_map)
     claims_action_completion = _looks_like_action_completion(normalized)
     requires_observation = (
         normalize_message_text(tool_obligation) == "required"
         or bool(pending_tasks)
+        or bool(observations and claims_action_completion)
         or bool(action_tools and observations)
         or bool(action_tools and claims_action_completion)
     )
@@ -115,6 +116,15 @@ def _action_like_tool_count(tool_map: dict[str, Any]) -> int:
         if output_mode in _ACTION_OUTPUT_MODES or side_effect in _ACTION_SIDE_EFFECTS:
             count += 1
     return count
+
+
+def _is_real_completion_observation(observation: Any) -> bool:
+    tool_name = normalize_message_text(str(getattr(observation, "tool_name", "") or ""))
+    if tool_name == "retrieve_plugin_commands":
+        return False
+    if normalize_message_text(str(getattr(observation, "command_id", "") or "")):
+        return True
+    return bool(tool_name)
 
 
 def _looks_like_action_completion(text: str) -> bool:

@@ -462,6 +462,8 @@ class ChatMemoryStore:
                     source_dialog_id=source_dialog_id,
                     source_message=source_message,
                 )
+                if row is None:
+                    continue
                 await _upsert_vector_if_needed(
                     row=row,
                     memory_type=candidate.memory_type,
@@ -515,6 +517,8 @@ class ChatMemoryStore:
                 source_dialog_id=None,
                 source_message=digest.source_message,
             )
+            if row is None:
+                return 0
             await _upsert_vector_if_needed(
                 row=row,
                 memory_type=candidate.memory_type,

@@ -244,6 +244,8 @@ register_superuser_tool(
     category="eval",
     risk="low",
     read_only=False,
+    destructive=False,
+    side_effect="execute",
     produces_artifacts=True,
     tags=("eval", "trajectory", "regression"),
 )

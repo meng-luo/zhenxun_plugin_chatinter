@@ -89,9 +89,11 @@ class RuntimeGuardrails:
         *,
         session_id: str | None,
         max_elapsed_seconds: float,
+        track_repeated_failures: bool = True,
     ) -> None:
         self.session_id = normalize_message_text(session_id or "")
         self.max_elapsed_seconds = max(float(max_elapsed_seconds or 0), 15.0)
+        self.track_repeated_failures = bool(track_repeated_failures)
         self.started_at = time.monotonic()
         self.blocked_tool_names: set[str] = set()
         self.catalog_no_result_streak = 0
@@ -209,7 +211,7 @@ class RuntimeGuardrails:
                 payload={"duplicate_count": duplicate_count},
             )
         failed_count = self.failed_call_counts.get(signature, 0)
-        if failed_count <= 0:
+        if failed_count <= 0 or not self.track_repeated_failures:
             return None
 
         command_id = _command_id_from_executable(executable) or tool_name
@@ -291,7 +293,7 @@ class RuntimeGuardrails:
             error = normalize_message_text(str(output.get("error", "")))
             if _looks_like_validation_failure(error):
                 self.validation_failed_signatures.add(signature)
-            if count >= _REPEAT_FAILURE_BLOCK_LIMIT:
+            if self.track_repeated_failures and count >= _REPEAT_FAILURE_BLOCK_LIMIT:
                 severity: GuardrailSeverity = (
                     "heavy" if count >= _REPEAT_FAILURE_STOP_LIMIT else "medium"
                 )

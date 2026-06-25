@@ -419,7 +419,9 @@ async def _processes_from_command(
 
 register_superuser_tool(ServerStatusTool)
 register_superuser_tool(ProcessListTool)
-register_superuser_tool(ServerCommandTool)
+register_superuser_tool(
+    ServerCommandTool, risk="high", destructive=True, side_effect="execute"
+)
 
 __all__ = [
     "ProcessListTool",

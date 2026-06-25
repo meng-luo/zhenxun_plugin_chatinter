@@ -14,7 +14,7 @@ from typing import Any, Literal
 from .route_text import normalize_message_text
 
 AgentComplexityMode = Literal[
-    "chat", "single_tool_fast", "multi_tool_fast", "complex_pev"
+    "chat", "readonly_fast", "single_tool_fast", "multi_tool_fast", "complex_pev"
 ]
 
 _MULTI_STEP_HINTS = (
@@ -80,6 +80,84 @@ _HIGH_RISK_HINTS = (
     "checkout",
 )
 _CONNECTOR_PATTERN = re.compile(r"(?:然后|最后|顺便|接着|以及|同时|并且|再帮|再看)")
+_READONLY_FAST_HINTS = (
+    "查状态",
+    "看状态",
+    "查看状态",
+    "读日志",
+    "看日志",
+    "查看日志",
+    "读文件",
+    "看文件",
+    "查看文件",
+    "列目录",
+    "看目录",
+)
+_READONLY_FAST_COMMANDS = (
+    "git status",
+    "git diff",
+    "git log",
+    "docker ps",
+    "docker info",
+    "df",
+    "free",
+    "uptime",
+    "whoami",
+    "hostname",
+)
+_READONLY_FAST_BLOCKERS = (
+    "写",
+    "改",
+    "删",
+    "删除",
+    "创建",
+    "生成",
+    "安装",
+    "启动",
+    "停止",
+    "重启",
+    "提交",
+    "回滚",
+    "修复",
+    "实现",
+    "开发",
+    "制作",
+    "发布",
+    "部署",
+    "为什么",
+    "原因",
+    "分析",
+    "定位",
+    "解决",
+    "怎么办",
+    "怎么改",
+    "优化",
+    "审计",
+    "测试",
+    "验收",
+)
+_PLUGIN_SCAFFOLD_HINTS = ("生成插件", "创建插件", "制作插件", "写插件")
+_COMPLEX_PLUGIN_HINTS = (
+    "复杂",
+    "完整",
+    "多文件",
+    "数据库",
+    "权限",
+    "测试",
+    "验收",
+    "发布",
+    "同步",
+    "修复",
+    "改造",
+    "重构",
+    "性能",
+    "压测",
+    "迁移",
+    "后台",
+    "定时",
+    "webui",
+    "api",
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +212,16 @@ def route_agent_complexity(
     if not text:
         return AgentComplexityDecision(mode="chat", reason="empty_message")
 
+    if _looks_like_readonly_fast_request(text):
+        return AgentComplexityDecision(
+            mode="readonly_fast",
+            reason="readonly_fast_request",
+            score=0.5,
+            expected_tool_budget=1,
+            enable_planner=False,
+            enable_verifier=False,
+        )
+
     if local_task_count >= 2 and not any(
         hint in text.casefold() for hint in _HIGH_RISK_HINTS
     ):
@@ -142,6 +230,16 @@ def route_agent_complexity(
             reason=f"local_task_ledger={local_task_count}",
             score=1.8,
             expected_tool_budget=max(int(local_task_count) + 1, 3),
+            enable_planner=False,
+            enable_verifier=False,
+        )
+
+    if _looks_like_simple_plugin_scaffold(text):
+        return AgentComplexityDecision(
+            mode="single_tool_fast",
+            reason="simple_plugin_scaffold_request",
+            score=1.0,
+            expected_tool_budget=1,
             enable_planner=False,
             enable_verifier=False,
         )
@@ -198,6 +296,28 @@ def route_agent_complexity(
         enable_planner=False,
         enable_verifier=False,
     )
+
+
+def _looks_like_readonly_fast_request(text: str) -> bool:
+    lowered = text.casefold()
+    if _CONNECTOR_PATTERN.search(text):
+        return False
+    if any(hint in lowered for hint in _HIGH_RISK_HINTS):
+        return False
+    if any(hint in lowered for hint in _READONLY_FAST_BLOCKERS):
+        return False
+    if any(command in lowered for command in _READONLY_FAST_COMMANDS):
+        return True
+    return any(hint in lowered for hint in _READONLY_FAST_HINTS)
+
+
+def _looks_like_simple_plugin_scaffold(text: str) -> bool:
+    lowered = text.casefold()
+    if _CONNECTOR_PATTERN.search(text):
+        return False
+    if not any(hint in lowered for hint in _PLUGIN_SCAFFOLD_HINTS):
+        return False
+    return not any(hint in lowered for hint in _COMPLEX_PLUGIN_HINTS)
 
 
 @dataclass(frozen=True)

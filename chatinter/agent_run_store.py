@@ -7,6 +7,7 @@ trail and a recovery surface for future resumable runs.
 
 from __future__ import annotations
 
+from collections import deque
 import json
 from typing import Any, cast
 
@@ -49,6 +50,9 @@ from .task_ledger import (
 # runtime loop can react without re-reading the persisted snapshot every step.
 _CANCEL_SIGNALS: set[str] = set()
 _CANCEL_SIGNALS_MAX = 512
+_ACTIVITY_RING_MAX_RUNS = 128
+_ACTIVITY_RING_MAX_ITEMS = 40
+_ACTIVITY_RING: dict[str, deque[dict[str, Any]]] = {}
 
 
 def signal_agent_run_cancel(run_id: str) -> None:
@@ -70,6 +74,14 @@ def clear_agent_run_cancel_signal(run_id: str) -> None:
     _CANCEL_SIGNALS.discard(safe)
 
 
+def list_agent_run_activities(run_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    safe = _safe_trace_id(str(run_id or ""))
+    if not safe:
+        return []
+    rows = list(_ACTIVITY_RING.get(safe, ()))
+    return rows[-max(1, min(int(limit or 10), _ACTIVITY_RING_MAX_ITEMS)) :]
+
+
 def persist_agent_run_state(
     state: Any,
     *,
@@ -78,6 +90,7 @@ def persist_agent_run_state(
 ) -> None:
     try:
         payload = _state_payload(state, stage=stage, metadata=metadata or {})
+        _remember_activity(payload)
         write_json(_run_snapshot_path(str(state.trace_id)), payload)
         run_id = str(getattr(state, "run_id", "") or "")
         if run_id and run_id != str(getattr(state, "trace_id", "") or ""):
@@ -362,6 +375,79 @@ def _last_text(value: Any) -> str:
     if isinstance(value, list | tuple) and value:
         return str(value[-1] or "")
     return ""
+
+
+def _remember_activity(snapshot: dict[str, Any]) -> None:
+    stage = str(snapshot.get("stage", "") or "")
+    activity = _activity_from_snapshot(snapshot, stage=stage)
+    if not activity:
+        return
+    keys = {
+        _safe_trace_id(str(snapshot.get("run_id", "") or "")),
+        _safe_trace_id(str(snapshot.get("trace_id", "") or "")),
+    }
+    for key in {item for item in keys if item}:
+        ring = _ACTIVITY_RING.setdefault(
+            key,
+            deque(maxlen=_ACTIVITY_RING_MAX_ITEMS),
+        )
+        ring.append(activity)
+    while len(_ACTIVITY_RING) > _ACTIVITY_RING_MAX_RUNS:
+        _ACTIVITY_RING.pop(next(iter(_ACTIVITY_RING)))
+
+
+def _activity_from_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    stage: str,
+) -> dict[str, Any]:
+    if stage == "tool_calls":
+        tool_call = _last_dict(snapshot.get("tool_calls"))
+        tool_name = _tool_call_name(tool_call)
+        if tool_name:
+            return _activity_payload(snapshot, stage=stage, tool_name=tool_name)
+    if stage == "tool_observation":
+        observation = _last_dict(snapshot.get("observations"))
+        tool_name = str(observation.get("tool_name", "") or "")
+        if tool_name:
+            return _activity_payload(
+                snapshot,
+                stage=stage,
+                tool_name=tool_name,
+                ok=bool(observation.get("ok")),
+            )
+    if stage == "paused" and snapshot.get("waiting_approval_ids"):
+        return _activity_payload(snapshot, stage=stage, tool_name="approval_required")
+    return {}
+
+
+def _activity_payload(
+    snapshot: dict[str, Any],
+    *,
+    stage: str,
+    tool_name: str,
+    ok: bool | None = None,
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "tool_name": str(tool_name or ""),
+        "ok": ok,
+        "step": int(snapshot.get("step", 0) or 0),
+        "updated_at": str(snapshot.get("updated_at", "") or ""),
+    }
+
+
+def _last_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, list | tuple) and value and isinstance(value[-1], dict):
+        return dict(value[-1])
+    return {}
+
+
+def _tool_call_name(item: dict[str, Any]) -> str:
+    function = item.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name", "") or "")
+    return str(item.get("tool_name", "") or "")
 
 
 def _run_snapshot_path(trace_id: str):
@@ -784,6 +870,7 @@ def _task_ledger_payload(state: Any) -> dict[str, Any] | None:
 
 __all__ = [
     "get_agent_run_snapshot",
+    "list_agent_run_activities",
     "list_agent_run_snapshots",
     "load_agent_run_state",
     "persist_agent_run_state",

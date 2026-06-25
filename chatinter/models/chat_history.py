@@ -3,7 +3,24 @@ import json
 from tortoise import fields
 from tortoise.expressions import F
 
-from zhenxun.services.db_context import Model
+from zhenxun.services.db_context import Model, with_db_timeout
+from zhenxun.services.message_load import is_db_unhealthy
+
+_CHATINTER_DB_TIMEOUT = 2.5
+
+
+async def _db_or_default(coro, *, operation: str, default):
+    try:
+        return await with_db_timeout(
+            coro,
+            timeout=_CHATINTER_DB_TIMEOUT,
+            operation=operation,
+            source="chatinter",
+        )
+    except TimeoutError:
+        return default
+    except Exception:
+        return default
 
 
 class ChatInterChatHistory(Model):
@@ -60,10 +77,14 @@ class ChatInterChatHistory(Model):
         返回:
             list[ChatInterChatHistory]: 按时间正序排列的对话列表
         """
-        dialogs = (
-            await cls.filter(session_id=session_id, reset=False)
+        if is_db_unhealthy():
+            return []
+        dialogs = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False)
             .order_by("-create_time", "-id")
-            .limit(limit)
+            .limit(limit),
+            operation="ChatInterChatHistory.get_recent_dialogs",
+            default=[],
         )
         # 反转为正序（从旧到新）
         return list(reversed(dialogs))
@@ -82,10 +103,14 @@ class ChatInterChatHistory(Model):
         返回:
             list[ChatInterChatHistory]: 按时间正序排列的对话列表
         """
-        dialogs = (
-            await cls.filter(session_id=session_id, reset=False)
+        if is_db_unhealthy():
+            return []
+        dialogs = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False)
             .order_by("create_time", "id")
-            .limit(limit)
+            .limit(limit),
+            operation="ChatInterChatHistory.get_conversation_history",
+            default=[],
         )
         return list(dialogs)
 
@@ -101,22 +126,34 @@ class ChatInterChatHistory(Model):
         ai_response: str = "",
         group_id: str | None = None,
         bot_id: str | None = None,
-    ) -> "ChatInterChatHistory":
+    ) -> "ChatInterChatHistory | None":
         """添加一次完整 ChatInter message timeline。"""
-        dialog = await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            user_message=user_message,
-            ai_response=ai_response,
-            timeline=json.dumps(list(timeline), ensure_ascii=False, default=str),
-            bot_id=bot_id,
+        if is_db_unhealthy():
+            return None
+        dialog = await _db_or_default(
+            cls.create(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                user_message=user_message,
+                ai_response=ai_response,
+                timeline=json.dumps(list(timeline), ensure_ascii=False, default=str),
+                bot_id=bot_id,
+            ),
+            operation="ChatInterChatHistory.add_timeline",
+            default=None,
         )
+        if dialog is None:
+            return None
         try:
             from ..session_search import upsert_session_search_dialog
 
-            await upsert_session_search_dialog(dialog)
+            await _db_or_default(
+                upsert_session_search_dialog(dialog),
+                operation="ChatInterChatHistory.upsert_session_search_dialog",
+                default=None,
+            )
         except Exception:
             pass
         return dialog
@@ -158,15 +195,28 @@ class ChatInterChatHistory(Model):
             session_id: 会话标识
             max_limit: 最大保留数量
         """
-        total = await cls.filter(session_id=session_id, reset=False).count()
+        if is_db_unhealthy():
+            return
+        total = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False).count(),
+            operation="ChatInterChatHistory.prune_old_dialogs.count",
+            default=0,
+        )
         if total > max_limit:
             to_delete_count = total - max_limit
-            to_delete = (
-                await cls.filter(session_id=session_id, reset=False)
+            to_delete = await _db_or_default(
+                cls.filter(session_id=session_id, reset=False)
                 .order_by("create_time", "id")
-                .limit(to_delete_count)
+                .limit(to_delete_count),
+                operation="ChatInterChatHistory.prune_old_dialogs.list",
+                default=[],
             )
-            await cls.filter(id__in=[dlg.id for dlg in to_delete]).delete()
+            if to_delete:
+                await _db_or_default(
+                    cls.filter(id__in=[dlg.id for dlg in to_delete]).delete(),
+                    operation="ChatInterChatHistory.prune_old_dialogs.delete",
+                    default=0,
+                )
 
     @classmethod
     async def reset_session(cls, session_id: str) -> int:
@@ -179,8 +229,12 @@ class ChatInterChatHistory(Model):
         返回:
             int: 被重置的对话数量
         """
-        updated = await cls.filter(session_id=session_id, reset=False).update(
-            reset=True
+        if is_db_unhealthy():
+            return 0
+        updated = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False).update(reset=True),
+            operation="ChatInterChatHistory.reset_session",
+            default=0,
         )
         return updated or 0
 
@@ -192,7 +246,13 @@ class ChatInterChatHistory(Model):
         参数:
             session_id: 会话标识
         """
-        await cls.filter(session_id=session_id).delete()
+        if is_db_unhealthy():
+            return
+        await _db_or_default(
+            cls.filter(session_id=session_id).delete(),
+            operation="ChatInterChatHistory.clear_session",
+            default=0,
+        )
 
 
 class ChatInterMemory(Model):
@@ -250,14 +310,22 @@ class ChatInterMemory(Model):
         participants: str = "",
         source_dialog_id: int | None = None,
         source_message: str | None = None,
-    ) -> "ChatInterMemory":
-        existing = await cls.filter(
-            session_id=session_id,
-            user_id=user_id,
-            memory_type=memory_type,
-            key=key,
-            expired=False,
-        ).first()
+    ) -> "ChatInterMemory | None":
+        if is_db_unhealthy():
+            return None
+        existing = await _db_or_default(
+            cls.filter(
+                session_id=session_id,
+                user_id=user_id,
+                memory_type=memory_type,
+                key=key,
+                expired=False,
+            ).first(),
+            operation="ChatInterMemory.upsert_memory.find",
+            default=None,
+        )
+        if is_db_unhealthy():
+            return None
         if existing is not None:
             if float(existing.confidence or 0.0) <= float(confidence or 0.0):
                 existing.value = value
@@ -269,31 +337,47 @@ class ChatInterMemory(Model):
                 existing.participants = participants
                 existing.source_dialog_id = source_dialog_id
                 existing.source_message = source_message
-                await existing.save()
+                await _db_or_default(
+                    existing.save(),
+                    operation="ChatInterMemory.upsert_memory.save",
+                    default=None,
+                )
+                if is_db_unhealthy():
+                    return None
             return existing
-        return await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            memory_type=memory_type,
-            key=key,
-            value=value,
-            confidence=float(confidence or 0.0),
-            scope=scope,
-            thread_id=thread_id,
-            topic_key=topic_key,
-            participants=participants,
-            source_dialog_id=source_dialog_id,
-            source_message=source_message,
+        return await _db_or_default(
+            cls.create(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                memory_type=memory_type,
+                key=key,
+                value=value,
+                confidence=float(confidence or 0.0),
+                scope=scope,
+                thread_id=thread_id,
+                topic_key=topic_key,
+                participants=participants,
+                source_dialog_id=source_dialog_id,
+                source_message=source_message,
+            ),
+            operation="ChatInterMemory.upsert_memory.create",
+            default=None,
         )
 
     @classmethod
     async def mark_recalled(cls, memory_ids: list[int]) -> None:
         if not memory_ids:
             return
+        if is_db_unhealthy():
+            return
         try:
-            await cls.filter(id__in=memory_ids).update(
-                recall_count=F("recall_count") + 1
+            await _db_or_default(
+                cls.filter(id__in=memory_ids).update(
+                    recall_count=F("recall_count") + 1
+                ),
+                operation="ChatInterMemory.mark_recalled",
+                default=0,
             )
         except Exception:
             return
@@ -312,6 +396,8 @@ class ChatInterMemory(Model):
         participants: tuple[str, ...] = (),
         addressee_user_id: str | None = None,
     ) -> list["ChatInterMemory"]:
+        if is_db_unhealthy():
+            return []
         query_text = str(query or "")
         query_tokens = {
             token
@@ -320,10 +406,12 @@ class ChatInterMemory(Model):
         }
         participant_set = {str(item) for item in participants if str(item)}
         structured_limit = max(int(limit or 0) * 8, int(limit or 0), 1)
-        rows = (
-            await cls.filter(expired=False)
+        rows = await _db_or_default(
+            cls.filter(expired=False)
             .order_by("-confidence", "-update_time", "-id")
-            .limit(structured_limit)
+            .limit(structured_limit),
+            operation="ChatInterMemory.recall_memories",
+            default=[],
         )
         scoped: list[ChatInterMemory] = []
         for row in rows:
