@@ -1,21 +1,10 @@
-"""Backend-agnostic event signal channel (补强1 / 执行可靠性).
+"""Backend-agnostic event signal channel.
 
-ChatInter passes a handful of control flags across NoneBot hooks by attaching
-private attributes to the live ``Event`` object (``_ai_triggered``,
-``_chatinter_native_tail_pending`` ...). On OneBot v11 the event model is a
-Pydantic model with ``model_config.extra="allow"``, so ``setattr`` persists and
-the original mechanism works. But it is the only no-fallback single point in the
-plugin-invocation path: on an adapter whose event model forbids extra fields
-(``extra="forbid"``) ``setattr`` silently no-ops and every cross-hook signal is
-lost — observation collection, tail-task routing and AI-route gating all break.
+ChatInter passes control flags across NoneBot hooks through event attributes
+and an ``id(event)``-keyed side registry. The side registry supports adapters
+whose event models reject extra attributes.
 
-This module makes the channel backend-agnostic without changing existing
-behaviour:
-
-* ``set_event_signal`` writes BOTH to the event attribute (fast path, keeps the
-  existing external readers such as ``auth_checker._collect_ai_route_modules``
-  working unchanged on OB11) AND to an ``id(event)``-keyed side registry that is
-  auto-cleaned by ``weakref.finalize`` when the event is garbage-collected.
+* ``set_event_signal`` writes to the event attribute and side registry.
 * ``get_event_signal`` reads the attribute first, then falls back to the side
   registry — so even if ``setattr`` was a no-op the value is still recoverable.
 
@@ -28,11 +17,10 @@ from __future__ import annotations
 from typing import Any
 import weakref
 
-# id(event) -> {signal_key: value}
 _SIGNAL_STORE: dict[int, dict[str, Any]] = {}
 _FINALIZERS: dict[int, weakref.finalize] = {}
-# Hard cap so a pathological adapter that recycles ids without GC cannot grow
-# this unbounded; finalize normally keeps it tiny.
+
+
 _MAX_TRACKED = 4096
 
 
@@ -45,7 +33,7 @@ def _ensure_tracked(event: Any, event_id: int) -> dict[str, Any]:
     bucket = _SIGNAL_STORE.get(event_id)
     if bucket is None:
         if len(_SIGNAL_STORE) >= _MAX_TRACKED:
-            # Drop the oldest-inserted bucket; dict preserves insertion order.
+
             oldest = next(iter(_SIGNAL_STORE), None)
             if oldest is not None:
                 _cleanup(oldest)
@@ -54,7 +42,7 @@ def _ensure_tracked(event: Any, event_id: int) -> dict[str, Any]:
         try:
             _FINALIZERS[event_id] = weakref.finalize(event, _cleanup, event_id)
         except TypeError:
-            # Object does not support weak references; rely on the size cap.
+
             pass
     return bucket
 
@@ -64,8 +52,8 @@ def set_event_signal(event: Any, key: str, value: Any) -> None:
     try:
         setattr(event, key, value)
     except Exception:
-        # extra="forbid" adapters: attribute write is rejected; side registry
-        # below still carries the value.
+
+
         pass
     try:
         _ensure_tracked(event, id(event))[key] = value

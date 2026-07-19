@@ -2,22 +2,14 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-import re
 
-_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,8}", re.IGNORECASE)
-_DEFAULT_PROMPT_BUDGET = 9000
+from .token_compat import estimate_text_tokens
+
+_DEFAULT_PROMPT_BUDGET = 16000
 _DEFAULT_TOOL_CALL_LIMIT = 12
 _DEFAULT_TOOL_BATCH_LIMIT = 6
 _DEFAULT_HOOK_LIMIT = 18
 _DEFAULT_CLASSIFIER_LIMIT = 8
-
-
-def estimate_text_tokens(text: str) -> int:
-    source = str(text or "")
-    if not source:
-        return 0
-    token_hits = len(_TOKEN_PATTERN.findall(source))
-    return max(1, int(token_hits * 0.9))
 
 
 @dataclass
@@ -27,6 +19,7 @@ class TurnBudgetSnapshot:
     tool_calls: int
     tool_batches: int
     prompt_tokens: int
+    completion_tokens: int
     durations_ms: dict[str, float]
 
 
@@ -43,6 +36,7 @@ class TurnBudgetController:
     tool_calls: int = 0
     tool_batches: int = 0
     prompt_tokens: int = 0
+    completion_tokens: int = 0
     durations: defaultdict[str, float] = field(
         default_factory=lambda: defaultdict(float)
     )
@@ -108,6 +102,15 @@ class TurnBudgetController:
     ) -> None:
         self.prompt_tokens += max(int(estimated_tokens), 0)
 
+    def record_model_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        self.prompt_tokens += max(int(prompt_tokens), 0)
+        self.completion_tokens += max(int(completion_tokens), 0)
+
     def prompt_budget_remaining(self) -> int:
         return max(self.prompt_budget_tokens - self.prompt_tokens, 0)
 
@@ -118,6 +121,7 @@ class TurnBudgetController:
             tool_calls=self.tool_calls,
             tool_batches=self.tool_batches,
             prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
             durations_ms={
                 key: round(value * 1000, 2)
                 for key, value in sorted(self.durations.items())

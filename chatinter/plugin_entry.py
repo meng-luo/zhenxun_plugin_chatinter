@@ -17,48 +17,33 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot.typing import T_State
-from nonebot_plugin_alconna import Alconna, Args, Match, on_alconna
+from nonebot_plugin_alconna import Alconna, on_alconna
 from nonebot_plugin_alconna.uniseg import UniMsg
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.configs.utils import Command, PluginExtraData, RegisterConfig
+from zhenxun.configs.utils import Command, PluginExtraData
 from zhenxun.models.chat_history import ChatHistory as _ChatHistory  # noqa: F401
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from .event_runtime import mark_as_handled
+from .config import CHATINTER_REGISTER_CONFIGS
+from .event_runtime import (
+    event_is_private,
+    is_already_handled,
+    mark_as_handled,
+    resolve_superuser,
+)
 from .event_signals import get_event_signal
 from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
 from .lifecycle import ensure_lifecycle_hooks_registered
 from .memory import _chat_memory
 from .models import chat_history as _chatinter_models  # noqa: F401
-from .native_tail_collector import (
-    resolve_native_tail_route_modules,
-    schedule_native_tail_followup,
-)
 from .plugin_registry import PluginRegistry
 from .reflection_observer import render_reflection_observer_summary
-from .scenario_router import resolve_chatinter_scenario
-from .superuser_agent.permission_policy import (
-    clear_session_permission_mode,
-    get_session_permission_mode,
-    set_session_permission_mode,
-)
-from .superuser_agent.runtime_approval import (
-    has_runtime_approval_intent,
-    try_handle_runtime_approval,
-)
-from .superuser_agent.runtime_control import (
-    has_runtime_control_intent,
-    try_handle_runtime_control,
-)
-from .superuser_agent.tool_preset import (
-    get_session_tool_preset,
-    set_session_tool_preset,
-    tool_preset_label,
-)
+from .scenario_router import ChatInterScenario, resolve_chatinter_scenario
+from .session_identity import conversation_session_key, legacy_session_key
 from .turn_metrics import render_route_observer_summary
 from .turn_queue import get_turn_queue
 from .utils.unimsg_utils import uni_to_text_with_tags
@@ -81,105 +66,7 @@ __plugin_meta__ = PluginMetadata(
         menu_type="其他",
         ignore_prompt=True,
         ignore_statistics=True,
-        configs=[
-            RegisterConfig(
-                module="chatinter",
-                key="ENABLE_FALLBACK",
-                value=True,
-                help="是否启用 ChatInter 兜底对话能力",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="INTENT_TIMEOUT",
-                value=20,
-                help=(
-                    "ChatInter 推理超时时间（秒），"
-                    "<=0 时复用 AI.CLIENT_SETTINGS.timeout"
-                ),
-                default_value=20,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="NATIVE_REROUTE_TIMEOUT",
-                value=10,
-                help="等待插件重路由执行并观测发送输出的超时时间（秒）",
-                default_value=10,
-                type=int,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CHAT_STYLE",
-                value="",
-                help="ChatInter 对话风格补充设定，留空使用默认风格",
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="CUSTOM_PROMPT",
-                value="",
-                help="ChatInter 自定义系统提示词补充，会追加到系统提示词末尾",
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="PERSONA_FILE",
-                value="",
-                help=(
-                    "ChatInter Persona JSON 文件路径，留空使用 "
-                    "data/chatinter_agent/personas.json。"
-                    "未配置文件时自动兼容 CHAT_STYLE/CUSTOM_PROMPT。"
-                ),
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="QUALITY_SHADOW_SAMPLE_RATE",
-                value=0.0,
-                help=(
-                    "ChatInter 回复质量轻模型事后抽检比例，0 表示关闭。"
-                    "抽检异步执行，不阻塞主回复。"
-                ),
-                default_value=0.0,
-                type=float,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="REASONING_EFFORT",
-                value="MEDIUM",
-                help=("强制推理强度，可选 MEDIUM 或 HIGH。留空表示不强制设置。"),
-                default_value="MEDIUM",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="FALLBACK_MODELS",
-                value="",
-                help=(
-                    "主模型请求失败时的降级模型链，逗号分隔，按顺序尝试。"
-                    "留空表示不降级。"
-                ),
-                default_value="",
-                type=str,
-            ),
-            RegisterConfig(
-                module="chatinter",
-                key="SUPERUSER_PERMISSION_MODE",
-                value="default",
-                help=(
-                    "超级用户 Agent 权限模式：default=按权限策略，"
-                    "ask_all=全部确认，auto_readonly=只读自动通过/其他确认，"
-                    "bypass=跳过确认"
-                ),
-                default_value="default",
-                type=str,
-            ),
-        ],
+        configs=list(CHATINTER_REGISTER_CONFIGS),
         commands=[
             Command(
                 command="重置会话",
@@ -194,23 +81,113 @@ __plugin_meta__ = PluginMetadata(
                 description="重建 ChatInter 插件知识库索引（超级用户）",
             ),
             Command(
-                command="Agent权限模式 [default|ask_all|auto_readonly|bypass|clear]",
-                description="设置当前会话的超级用户 Agent 权限模式（内存生效）",
+                command="/开启agent",
+                description="开启 Superuser Agent（超级用户私聊）",
             ),
             Command(
-                command=(
-                    "Agent工具模式 "
-                    "[default|read_only|code_edit|plugin_dev|server_ops|clear]"
-                ),
-                description="设置当前会话的超级用户 Agent 工具预设（内存生效）",
+                command="/退出agent",
+                description="退出 Superuser Agent，保留当前会话（超级用户私聊）",
+            ),
+            Command(
+                command="/agent帮助",
+                description="查看 Superuser Agent 命令（超级用户私聊）",
+            ),
+            Command(
+                command="/状态",
+                description="查看当前 Agent 状态（超级用户私聊）",
+            ),
+            Command(
+                command="/中断",
+                description="中断当前任务或待审批操作（超级用户私聊）",
+            ),
+            Command(
+                command="/清除上下文",
+                description="清除当前会话上下文（超级用户私聊）",
+            ),
+            Command(
+                command="/压缩上下文",
+                description="压缩当前会话上下文（超级用户私聊）",
+            ),
+            Command(
+                command="/请求批准模式",
+                description="切换为请求批准权限模式（超级用户私聊）",
+            ),
+            Command(
+                command="/只读模式",
+                description="切换为只读权限模式（超级用户私聊）",
+            ),
+            Command(
+                command="/完全访问模式",
+                description="切换为完全访问权限模式（超级用户私聊）",
+            ),
+            Command(
+                command="/新增会话",
+                params=["[名称]"],
+                description="新增并切换 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/当前会话",
+                description="查看当前 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/列出会话",
+                description="列出可用 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/切换会话",
+                params=["[ID/名称]"],
+                description="选择或切换 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/重命名会话",
+                params=["ID/名称", "新名称"],
+                description="重命名 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/归档会话",
+                params=["[ID/名称]"],
+                description="归档 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/列出归档会话",
+                description="列出已归档 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/恢复会话",
+                params=["ID/名称"],
+                description="恢复已归档 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/删除会话",
+                params=["ID/名称"],
+                description="删除 Agent 会话（超级用户私聊）",
+            ),
+            Command(
+                command="/允许",
+                description="允许执行一次待审批操作（超级用户私聊）",
+            ),
+            Command(
+                command="/本对话允许",
+                description="允许当前对话后续相同权限范围（超级用户私聊）",
+            ),
+            Command(
+                command="/拒绝",
+                params=["[理由]"],
+                description="拒绝待审批操作（超级用户私聊）",
             ),
         ],
         superuser_help="""
 - `重置会话`
 - `chatinter统计`
 - `重建插件索引`
-- `Agent权限模式 [default|ask_all|auto_readonly|bypass|clear]`
-- `Agent工具模式 [default|read_only|code_edit|plugin_dev|server_ops|clear]`
+- Agent：`/开启agent` `/退出agent` `/agent帮助` `/状态` `/中断`
+- 上下文：`/清除上下文` `/压缩上下文`
+- 权限：`/请求批准模式` `/只读模式` `/完全访问模式`
+- 会话：`/新增会话 [名称]` `/当前会话` `/列出会话`
+  `/切换会话 [ID/名称]` `/重命名会话 ID/名称 新名称`
+  `/归档会话 [ID/名称]` `/列出归档会话`
+  `/恢复会话 ID/名称` `/删除会话 ID/名称`
+- 审批：`/允许` `/本对话允许` `/拒绝 [理由]` `/中断`
         """.strip(),
     ).to_dict(),
 )
@@ -221,22 +198,14 @@ _fallback_matcher = on_message(
     block=True,
     rule=to_me(),
 )
-setattr(_fallback_matcher, "_zx_dispatch_lane", "fallback_ai")
 
 _turn_followup_matcher = on_message(
     priority=998,
     block=False,
 )
-setattr(_turn_followup_matcher, "_zx_dispatch_lane", "passive_light")
-
-_native_tail_collector_matcher = on_message(
-    priority=4,
-    block=False,
-)
-setattr(_native_tail_collector_matcher, "_zx_dispatch_lane", "passive_light")
 
 
-def _is_private_text_only_message(
+def _is_supported_private_message(
     event: Event,
     event_message: object,
 ) -> bool:
@@ -244,18 +213,19 @@ def _is_private_text_only_message(
         return True
     if not isinstance(event_message, Message):
         return False
-    has_text = False
+    has_content = False
     for seg in event_message:
         seg_type = str(getattr(seg, "type", "") or "")
         if seg_type == "text":
             text = str(getattr(seg, "data", {}).get("text", "")).strip()
             if text:
-                has_text = True
+                has_content = True
             continue
-        if seg_type == "reply":
+        if seg_type in {"reply", "image"}:
+            has_content = True
             continue
         return False
-    return has_text
+    return has_content
 
 
 def _state_plain_text(state: T_State) -> str | None:
@@ -297,8 +267,8 @@ def _extract_raw_message(
         event_message = event.get_message()
     except Exception:
         event_message = None
-    if not _is_private_text_only_message(event, event_message):
-        logger.debug("ChatInter 私聊仅文本策略：忽略非文本消息")
+    if not _is_supported_private_message(event, event_message):
+        logger.debug("ChatInter 私聊媒体策略：忽略不支持的消息段")
         return None
 
     try:
@@ -341,6 +311,10 @@ async def _handle_fallback(
     if raw_message is None:
         return
 
+    if is_already_handled(event):
+        logger.debug("event already handled, skip ChatInter fallback")
+        return
+
     if await _try_runtime_approval_before_queue(
         bot=bot,
         event=event,
@@ -361,6 +335,7 @@ async def _handle_fallback(
     if route_modules:
         logger.debug("event already has route modules, skip ChatInter fallback")
         return
+
     scenario = _resolve_entry_scenario(
         bot=bot,
         event=event,
@@ -370,6 +345,17 @@ async def _handle_fallback(
     )
     if not scenario.should_handle:
         logger.debug(f"ChatInter scenario skip: {scenario.reason}")
+        return
+    if scenario.scenario is ChatInterScenario.SUPERUSER_AGENT:
+        from .agents.superuser_entry import handle_superuser_agent_turn
+
+        mark_as_handled(event)
+        await handle_superuser_agent_turn(
+            raw_message=raw_message,
+            session_key=str(session.group.id)
+            if session.group
+            else str(session.user.id),
+        )
         return
     accepted = await get_turn_queue().submit(
         bot=bot,
@@ -406,20 +392,6 @@ async def _handle_turn_followup(
     raw_message = _extract_raw_message(event, msg, state_plain_text)
     if raw_message is None:
         return
-    if await _try_runtime_approval_before_queue(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-    ):
-        return
-    if await _try_runtime_control_before_queue(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-    ):
-        return
     scenario = _resolve_entry_scenario(
         bot=bot,
         event=event,
@@ -438,6 +410,7 @@ async def _handle_turn_followup(
         route_modules=None,
         cached_plain_text=state_plain_text,
         processor=handle_fallback,
+        priority_override=0,
     )
     if accepted:
         logger.debug(f"[ChatInter] 收到连续 turn 补充：{raw_message[:50]}...")
@@ -450,7 +423,16 @@ async def _try_runtime_control_before_queue(
     session: Uninfo,
     raw_message: str,
 ) -> bool:
-    if not has_runtime_control_intent(raw_message):
+    user_id = str(session.user.id if session.user else "")
+    if not event_is_private(event) or not resolve_superuser(bot, user_id):
+        return False
+    from .superuser_agent.runtime_control import (
+        has_runtime_control_intent,
+        try_handle_runtime_control,
+    )
+
+    session_key = str(session.group.id) if session.group else user_id
+    if not has_runtime_control_intent(raw_message, session_key=session_key):
         return False
     if not await try_handle_runtime_control(
         bot=bot,
@@ -470,6 +452,14 @@ async def _try_runtime_approval_before_queue(
     session: Uninfo,
     raw_message: str,
 ) -> bool:
+    user_id = str(session.user.id if session.user else "")
+    if not event_is_private(event) or not resolve_superuser(bot, user_id):
+        return False
+    from .superuser_agent.runtime_approval import (
+        has_runtime_approval_intent,
+        try_handle_runtime_approval,
+    )
+
     if not has_runtime_approval_intent(raw_message):
         return False
     if not await try_handle_runtime_approval(
@@ -481,43 +471,6 @@ async def _try_runtime_approval_before_queue(
         return False
     mark_as_handled(event)
     return True
-
-
-@_native_tail_collector_matcher.handle()
-async def _handle_native_tail_collector(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
-    msg: UniMsg,
-    state: T_State,
-):
-    """Collect native-command messages that contain independent follow-up tasks."""
-
-    if get_event_signal(event, "_ai_triggered", False):
-        return
-    route_modules = _event_route_modules(state)
-    state_plain_text = _state_plain_text(state)
-    raw_message = _extract_raw_message(event, msg, state_plain_text)
-    if raw_message is None:
-        return
-    if not route_modules:
-        route_modules = resolve_native_tail_route_modules(raw_message)
-    if not route_modules:
-        return
-    scheduled = schedule_native_tail_followup(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-        message=msg,
-        route_modules=route_modules,
-        cached_plain_text=state_plain_text,
-        processor=handle_fallback,
-    )
-    if scheduled:
-        logger.debug(
-            "[ChatInter] 原生命令后续任务旁路收集已挂起：" f"{raw_message[:80]}..."
-        )
 
 
 _reset_matcher = on_alconna(
@@ -544,42 +497,6 @@ _rebuild_plugin_index_matcher = on_alconna(
     rule=to_me(),
 )
 
-_permission_mode_matcher = on_alconna(
-    Alconna(
-        "Agent权限模式",
-        Args["mode?", ["default", "ask_all", "auto_readonly", "bypass", "clear"]],
-    ),
-    permission=SUPERUSER,
-    block=True,
-    priority=1,
-    rule=to_me(),
-)
-
-_tool_preset_matcher = on_alconna(
-    Alconna(
-        "Agent工具模式",
-        Args[
-            "preset?",
-            [
-                "default",
-                "read_only",
-                "code_edit",
-                "plugin_dev",
-                "server_ops",
-                "clear",
-                "只读模式",
-                "改代码模式",
-                "插件开发模式",
-                "服务器排查模式",
-            ],
-        ],
-    ),
-    permission=SUPERUSER,
-    block=True,
-    priority=1,
-    rule=to_me(),
-)
-
 
 @_reset_matcher.handle()
 async def _handle_reset_by_alconna(
@@ -589,7 +506,12 @@ async def _handle_reset_by_alconna(
     user_id = session.user.id if session.user else ""
     group_id = session.group.id if session.group else None
 
-    reset_count = await _chat_memory.reset_session_history(user_id, group_id)
+    reset_count = await _chat_memory.reset_session_history(
+        user_id,
+        group_id,
+        session_id=conversation_session_key(session),
+        legacy_session_id=legacy_session_key(session),
+    )
 
     chat_type = "群聊" if group_id else "私聊"
     logger.info(
@@ -626,55 +548,6 @@ async def _handle_rebuild_plugin_index():
     ).send()
 
 
-@_permission_mode_matcher.handle()
-async def _handle_permission_mode(session: Uninfo, mode: Match[str]):
-    user_id = str(session.user.id if session.user else "")
-    session_key = str(session.group.id) if session.group else user_id
-    if not session_key:
-        await MessageUtils.build_message("无法识别当前会话。").send()
-        return
-    current = get_session_permission_mode(session_key)
-    if not mode.available:
-        await MessageUtils.build_message(
-            "当前会话权限模式："
-            f"{current or '未设置，使用全局 SUPERUSER_PERMISSION_MODE'}"
-        ).send()
-        return
-    value = str(mode.result or "").strip().lower()
-    if value == "clear":
-        clear_session_permission_mode(session_key)
-        await MessageUtils.build_message(
-            "已清除当前会话权限模式，恢复全局配置。"
-        ).send()
-        return
-    applied = set_session_permission_mode(session_key, value)
-    await MessageUtils.build_message(f"当前会话权限模式已设为：{applied}").send()
-
-
-@_tool_preset_matcher.handle()
-async def _handle_tool_preset(session: Uninfo, preset: Match[str]):
-    user_id = str(session.user.id if session.user else "")
-    session_key = str(session.group.id) if session.group else user_id
-    if not session_key:
-        await MessageUtils.build_message("无法识别当前会话。").send()
-        return
-    current = get_session_tool_preset(session_key)
-    if not preset.available:
-        await MessageUtils.build_message(
-            "当前会话工具模式：" f"{tool_preset_label(current)}"
-        ).send()
-        return
-    value = str(preset.result or "").strip()
-    if value == "clear":
-        value = "default"
-    applied = set_session_tool_preset(session_key, value)
-    await MessageUtils.build_message(
-        "当前会话工具模式已设为："
-        f"{tool_preset_label(applied)}"
-        + ("；权限模式已联动调整。" if applied != "default" else "。")
-    ).send()
-
-
 @driver.on_startup
 async def _on_startup():
     """插件启动初始化"""
@@ -694,7 +567,9 @@ async def _on_shutdown():
     """Release long-lived ChatInter runtime resources."""
 
     from .mcp_runtime import get_mcp_runtime_manager
+    from .memory_extractor import drain_memory_extraction_tasks
 
+    await drain_memory_extraction_tasks()
     await get_mcp_runtime_manager().shutdown()
 
 

@@ -35,12 +35,23 @@ def read_json(path: Path, default: Any) -> Any:
             return default
 
 
-def write_json(path: Path, payload: Any) -> None:
+def write_json(path: Path, payload: Any, *, compact: bool = False) -> None:
     with _LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
+        jsonable = to_jsonable(payload)
+        content = (
+            json.dumps(
+                jsonable,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            if compact
+            else json.dumps(jsonable, ensure_ascii=False, indent=2, default=str)
+        )
         tmp.write_text(
-            json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2, default=str),
+            content,
             encoding="utf-8",
         )
         tmp.replace(path)
@@ -52,6 +63,17 @@ def append_jsonl(path: Path, payload: Any) -> None:
         with path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(to_jsonable(payload), ensure_ascii=False, default=str))
             fp.write("\n")
+
+
+def write_jsonl(path: Path, rows: Sequence[Any]) -> None:
+    with _LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fp:
+            for row in rows:
+                fp.write(json.dumps(to_jsonable(row), ensure_ascii=False, default=str))
+                fp.write("\n")
+        tmp.replace(path)
 
 
 def to_jsonable(value: Any) -> Any:
@@ -88,4 +110,5 @@ __all__ = [
     "to_jsonable",
     "utc_now_iso",
     "write_json",
+    "write_jsonl",
 ]

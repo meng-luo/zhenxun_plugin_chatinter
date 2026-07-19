@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+import shlex
 from typing import Any
 
 from .command_index import CommandCandidate
@@ -19,7 +20,12 @@ from .native_route import (
     NativeSlotValue,
     candidate_selection_to_native_route,
 )
-from .route_text import collect_placeholders, normalize_message_text
+from .route_text import (
+    collect_placeholders,
+    normalize_message_text,
+    parse_command_with_head,
+    sanitize_template_tail,
+)
 
 _PAYLOAD_EXPLANATION_MARKERS = (
     "作为",
@@ -137,6 +143,11 @@ class NativeCommandExecutionContext:
             target_hint,
         )
         slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
+        slots = _fill_missing_text_slots_from_task(
+            candidate.schema,
+            slots,
+            task_text=task_text,
+        )
         slots = _fill_missing_slots_from_payload_hint(
             candidate.schema.slots,
             slots,
@@ -265,14 +276,57 @@ def _fill_missing_slots_from_payload_hint(
         if slot.name in filled:
             continue
         slot_type = str(slot.type or "text")
-        value = target_hint if slot_type == "at" else payload_hint
         if slot_type == "text":
-            value = _safe_text_payload_hint(value, task_text=task_text)
+            continue
+        value = target_hint if slot_type == "at" else payload_hint
         if not value:
             continue
         coerced = _coerce_slot_value(slot, value)
         if coerced is not None:
             filled[slot.name] = coerced
+    return filled
+
+
+def _fill_missing_text_slots_from_task(
+    schema: Any,
+    slots: dict[str, str],
+    *,
+    task_text: str,
+) -> dict[str, str]:
+    if normalize_message_text(getattr(schema, "payload_policy", "")) != "text":
+        return slots
+    required = [
+        slot
+        for slot in list(getattr(schema, "slots", []) or [])
+        if bool(getattr(slot, "required", False))
+        and str(getattr(slot, "type", "") or "") == "text"
+    ]
+    if not required or any(slot.name in slots for slot in required):
+        return slots
+    parsed = parse_command_with_head(
+        task_text,
+        normalize_message_text(getattr(schema, "head", "")),
+        allow_sticky=True,
+    )
+    if parsed is None:
+        return slots
+    tail = sanitize_template_tail(parsed.payload_text)
+    if not tail:
+        return slots
+    try:
+        values = shlex.split(tail)
+    except ValueError:
+        values = tail.split()
+    if len(required) == 1:
+        values = [" ".join(values)]
+    if len(values) != len(required):
+        return slots
+    filled = dict(slots)
+    for slot, value in zip(required, values, strict=True):
+        coerced = _coerce_slot_value(slot, value)
+        if coerced is None:
+            return slots
+        filled[slot.name] = coerced
     return filled
 
 
@@ -283,8 +337,7 @@ def _safe_text_payload_hint(payload_hint: str, *, task_text: str = "") -> str:
     lowered = text.casefold()
     if any(marker in text for marker in _PAYLOAD_EXPLANATION_MARKERS):
         return ""
-    # A hint longer than the task itself is usually an explanation from the
-    # model, not user-provided text content for the command.
+
     if task_text and len(text) > max(len(normalize_message_text(task_text)) + 8, 48):
         return ""
     if lowered in {"null", "none", "undefined", "n/a"}:
@@ -401,9 +454,6 @@ def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
         if normalize_message_text(str(choice or ""))
     ]
     if choices and normalized not in choices:
-        # Constrained parser slots must not receive natural-language aliases.
-        # Returning the raw text would render commands the plugin parser rejects;
-        # the shortcut renderer can still recover from user-facing shortcut text.
         return None
     return normalized
 

@@ -74,6 +74,8 @@ class TaskExecutionQueue:
         observations: list[TaskObservation] = []
         tool_results: list[Any] = []
         for route in sorted(route_result.routes, key=lambda item: item.order):
+            if route.status != "selected":
+                continue
             observation, tool_result = await self._execute_route(route)
             observations.append(observation)
             if tool_result is not None:
@@ -95,8 +97,6 @@ class TaskExecutionQueue:
         self,
         route: TaskRouteResult,
     ) -> tuple[TaskObservation, Any | None]:
-        if route.status != "selected":
-            return _skipped_observation(route), None
         tool = self.tools_by_command.get(route.command_id)
         if tool is None:
             return _missing_tool_observation(route), None
@@ -152,30 +152,6 @@ def _tools_by_command(candidates: list[Any]) -> dict[str, NativeCommandTool]:
         if command_id:
             result[command_id] = tool
     return result
-
-
-def _skipped_observation(route: TaskRouteResult) -> TaskObservation:
-    reason = (
-        route.clarification_question
-        if route.status == "clarify"
-        else route.reason or "unsupported"
-    )
-    return TaskObservation(
-        task_id=route.task_id,
-        command_id=route.command_id,
-        ok=False,
-        error=normalize_message_text(reason),
-        output=build_command_observation(
-            ok=False,
-            command_id=route.command_id,
-            rendered_command="",
-            matched_plugin="",
-            task_text=route.text,
-            error=reason,
-            retryable=route.status == "clarify",
-        ),
-    )
-
 
 def _missing_tool_observation(route: TaskRouteResult) -> TaskObservation:
     error = "selected command binding is missing"

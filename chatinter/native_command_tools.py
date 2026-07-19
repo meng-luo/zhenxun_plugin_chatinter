@@ -367,8 +367,8 @@ def _build_parameters(
             continue
         seen.add(name)
         properties[name] = _slot_to_property(slot, schema=schema, snapshot=snapshot)
-        # OpenAI strict function schemas require every object property to appear
-        # in `required`. Optional command slots therefore accept null explicitly.
+
+
         required.append(name)
     return {
         "type": "object",

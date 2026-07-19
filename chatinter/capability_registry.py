@@ -13,11 +13,6 @@ from typing import Any, cast
 
 from .capability_card import (
     CapabilityCard,
-    CapabilityEntityScope,
-    CapabilityExecutionPolicy,
-    CapabilityOutputMode,
-    CapabilityRiskLevel,
-    CapabilitySideEffect,
     CapabilitySourceOfTruth,
     build_capability_card,
 )
@@ -99,9 +94,8 @@ class CapabilityRecord:
 class ToolCapabilityRecord:
     """One executable runtime tool attached to a capability card.
 
-    This is the unified turn-local source of truth for tools exposed to the
-    LLM.  Plugin commands, catalog tools and superuser tools all pass through
-    the same metadata surface before becoming executable tools.
+    This is the turn-local source of truth for plugin and runtime tools exposed
+    to the LLM.
     """
 
     capability_id: str
@@ -146,20 +140,6 @@ class ToolCapabilityRecord:
             "intent_types": list(self.card.intent_types),
             "permission_tags": list(self.card.permission_tags),
         }
-        if self.kind == "superuser_tool" and self.raw_card is not None:
-            payload.update(
-                {
-                    "read_only": bool(getattr(self.raw_card, "read_only", False)),
-                    "destructive": bool(
-                        getattr(self.raw_card, "destructive", False)
-                    ),
-                    "side_effect": normalize_message_text(
-                        str(getattr(self.raw_card, "side_effect", "") or "")
-                    ),
-                    "always_load": bool(getattr(self.raw_card, "always_load", False)),
-                    "defer_load": bool(getattr(self.raw_card, "defer_load", False)),
-                }
-            )
         if self.command_record is not None:
             payload["plugin_module"] = self.command_record.plugin_module
             payload["plugin_name"] = self.command_record.plugin_name
@@ -407,57 +387,6 @@ class CapabilityRegistry:
             kind="runtime_tool",
             card=card,
         )
-
-    def register_superuser_tools(
-        self,
-        tools: dict[str, ToolExecutable],
-        *,
-        cards: tuple[Any, ...] | list[Any] = (),
-    ) -> None:
-        cards_by_name = {
-            normalize_message_text(str(getattr(card, "name", "") or "")): card
-            for card in cards
-        }
-        for name, executable in tools.items():
-            tool_name = normalize_message_text(str(name or ""))
-            if not tool_name:
-                continue
-            raw_card = cards_by_name.get(tool_name)
-            card = _capability_card_from_superuser_tool(
-                tool_name=tool_name,
-                executable=executable,
-                raw_card=raw_card,
-            )
-            self.register_executable_tool(
-                tool_name=tool_name,
-                executable=executable,
-                kind="superuser_tool",
-                card=card,
-                raw_card=raw_card,
-            )
-
-    def register_available_superuser_tools(
-        self,
-        *,
-        message_text: str = "",
-        limit: int | None = None,
-        include_deferred: bool = False,
-    ) -> None:
-        """Load and register currently available superuser tools.
-
-        Callers should not import the superuser registry directly for runtime
-        exposure; this keeps availability, risk and metadata under this unified
-        registry.
-        """
-
-        from .superuser_agent.registry import build_superuser_agent_tool_bundle
-
-        bundle = build_superuser_agent_tool_bundle(
-            message_text=message_text,
-            limit=limit,
-            include_deferred=include_deferred,
-        )
-        self.register_superuser_tools(bundle.tools, cards=bundle.cards)
 
     def register_external_tools(
         self,
@@ -902,101 +831,6 @@ def _feedback_payload(
     }
 
 
-def _capability_card_from_superuser_tool(
-    *,
-    tool_name: str,
-    executable: ToolExecutable,
-    raw_card: Any | None,
-) -> CapabilityCard:
-    category = normalize_message_text(str(getattr(raw_card, "category", "") or "agent"))
-    if not category:
-        category = "agent"
-    risk = _normalize_risk(getattr(raw_card, "risk", "medium"))
-    read_only = bool(getattr(raw_card, "read_only", False))
-    description = normalize_message_text(
-        str(
-            getattr(raw_card, "description", "")
-            or getattr(executable, "description", "")
-            or ""
-        )
-    )
-    approval_mode = normalize_message_text(
-        str(getattr(raw_card, "approval_mode", "") or "policy")
-    )
-    output_mode = _normalize_output_mode(
-        getattr(raw_card, "output_mode", "plugin_output")
-    )
-    entity_scope = _normalize_entity_scope(getattr(raw_card, "entity_scope", "global"))
-    source_of_truth = _normalize_source_of_truth(
-        getattr(raw_card, "source_of_truth", "local_state")
-    )
-    side_effect = _normalize_side_effect(
-        getattr(raw_card, "side_effect", "query" if read_only else "mutate")
-    )
-    execution_policy = "normal"
-    if approval_mode == "deny":
-        execution_policy = "confirmation_required"
-    elif approval_mode == "ask" or risk == "high" or not read_only:
-        execution_policy = (
-            "confirmation_required" if risk == "high" else "strong_intent"
-        )
-    tags = tuple(
-        normalize_message_text(str(tag or ""))
-        for tag in tuple(getattr(raw_card, "tags", ()) or ())
-        if normalize_message_text(str(tag or ""))
-    )
-    permission_tags = tuple(
-        dict.fromkeys(
-            (
-                "superuser",
-                f"approval:{approval_mode or 'policy'}",
-                f"category:{category}",
-            )
-        )
-    )
-    use_cases = tuple(
-        item
-        for item in (
-            description or f"超级用户工具 {tool_name}",
-            f"类别: {category}",
-            f"风险: {risk}",
-        )
-        if item
-    )
-    return CapabilityCard(
-        command_id=tool_name,
-        plugin_module="chatinter.superuser_agent",
-        plugin_name=f"superuser:{category}",
-        family=f"superuser:{category}",
-        description=description,
-        use_cases=use_cases,
-        anti_use_cases=("普通群聊和普通私聊不可调用", "非超级用户私聊不可调用"),
-        task_verbs=(category,),
-        input_requirements=("superuser_private_chat",),
-        output_mode=cast(CapabilityOutputMode, output_mode),
-        side_effect=cast(CapabilitySideEffect, side_effect),
-        risk_level=cast(CapabilityRiskLevel, risk),
-        risk=cast(CapabilityRiskLevel, risk),
-        source_of_truth=cast(CapabilitySourceOfTruth, source_of_truth),
-        requires_real_tool=bool(getattr(raw_card, "requires_real_tool", True)),
-        entity_scope=cast(CapabilityEntityScope, entity_scope),
-        reliability=_clamp01(getattr(raw_card, "reliability", 0.7)),
-        schema_quality=_clamp01(getattr(raw_card, "schema_quality", 0.65)),
-        soft_tool=bool(getattr(raw_card, "soft_tool", False)),
-        intent_types=(category, "agent"),
-        requires_real_result=True,
-        generative=False,
-        execution_policy=cast(CapabilityExecutionPolicy, execution_policy),
-        risk_tags=tuple(dict.fromkeys((risk, *tags))),
-        permission_tags=permission_tags,
-        search_text=normalize_message_text(
-            " ".join([tool_name, category, description, " ".join(tags)])
-        ),
-        capability_kind="superuser_tool",
-        tool_name=tool_name,
-    )
-
-
 class ProviderExternalTool:
     """Provider-normalized wrapper for MCP/external ToolExecutable objects."""
 
@@ -1100,7 +934,7 @@ def _capability_id(*, kind: str, tool_name: str, card: CapabilityCard) -> str:
 
 
 def _capability_kind(kind: str) -> str:
-    if kind in {"plugin_command", "catalog", "superuser_tool", "runtime_tool"}:
+    if kind in {"plugin_command", "catalog", "runtime_tool"}:
         return kind
     return "runtime_tool"
 
@@ -1108,9 +942,8 @@ def _capability_kind(kind: str) -> str:
 def _kind_rank(kind: str) -> int:
     return {
         "catalog": 0,
-        "superuser_tool": 1,
-        "plugin_command": 2,
-        "runtime_tool": 3,
+        "plugin_command": 1,
+        "runtime_tool": 2,
     }.get(kind, 9)
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
 import re
 import time
 
@@ -11,6 +10,12 @@ from nonebot.adapters import Bot
 from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 
+from .member_similarity import (
+    MemberAliasEntry,
+    build_member_alias_entries,
+    score_member_alias,
+)
+from .person_registry import resolve_alias_candidates
 from .route_execution import (
     contains_self_reference,
     contains_third_person_reference,
@@ -189,24 +194,21 @@ def _extract_user_id_from_at_token(token: str) -> str | None:
 
 
 def _build_alias_keys(*names: str) -> tuple[str, ...]:
-    keys: set[str] = set()
-    for raw_name in names:
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        alias = _normalize_alias_key(name)
-        if len(alias) >= 2:
-            keys.add(alias)
-            for size in (2, 3):
-                if len(alias) >= size:
-                    keys.add(alias[-size:])
-        for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", name):
-            normalized_chunk = _normalize_alias_key(chunk)
-            if len(normalized_chunk) >= 2:
-                keys.add(normalized_chunk)
-                for size in (2, 3):
-                    if len(normalized_chunk) >= size:
-                        keys.add(normalized_chunk[-size:])
+    return _alias_entries_to_keys(_build_alias_entries(*names))
+
+
+def _build_alias_entries(*names: str) -> tuple[MemberAliasEntry, ...]:
+    return build_member_alias_entries(*names)
+
+
+def _alias_entries_to_keys(
+    entries: tuple[MemberAliasEntry, ...],
+) -> tuple[str, ...]:
+    keys = {
+        entry.value
+        for entry in entries
+        if entry.kind != "suffix" and len(entry.value) >= 2
+    }
     return tuple(sorted(keys, key=len, reverse=True))
 
 
@@ -319,7 +321,8 @@ async def _get_group_member_profiles_for_fuzzy(
         uid = str(member.uid).strip() if member.uid is not None else ""
         platform = str(member.platform or "").strip() or "qq"
         alias_key = _normalize_alias_key(display_name)
-        alias_keys = _build_alias_keys(display_name, nickname, user_name)
+        alias_entries = _build_alias_entries(display_name, nickname, user_name)
+        alias_keys = _alias_entries_to_keys(alias_entries)
         profiles.append(
             {
                 "user_id": user_id,
@@ -330,6 +333,7 @@ async def _get_group_member_profiles_for_fuzzy(
                 "platform": platform,
                 "alias_key": alias_key,
                 "alias_keys": alias_keys,
+                "alias_entries": alias_entries,
             }
         )
 
@@ -341,9 +345,9 @@ async def _get_group_member_profiles_for_fuzzy(
             continue
         profiles.append(profile)
 
-    # Unit tests and freshly joined groups may not have GroupInfoUser persisted
-    # yet.  Fall back to recent chat history so nickname-target commands can
-    # still resolve known speakers without plugin-specific shortcuts.
+
+
+
     for profile in await _get_recent_chat_member_profiles(group_id):
         user_id = str(profile.get("user_id") or "").strip()
         if not user_id or any(
@@ -391,6 +395,12 @@ async def _get_recent_chat_member_profiles(
         if not user_id or user_id in seen or not display_name:
             continue
         seen.add(user_id)
+        alias_entries = _build_alias_entries(
+            display_name,
+            nickname,
+            group_card,
+            *aliases,
+        )
         profiles.append(
             {
                 "user_id": user_id,
@@ -400,12 +410,8 @@ async def _get_recent_chat_member_profiles(
                 "uid": "",
                 "platform": "qq",
                 "alias_key": _normalize_alias_key(display_name),
-                "alias_keys": _build_alias_keys(
-                    display_name,
-                    nickname,
-                    group_card,
-                    *aliases,
-                ),
+                "alias_keys": _alias_entries_to_keys(alias_entries),
+                "alias_entries": alias_entries,
             }
         )
     return profiles
@@ -437,7 +443,8 @@ async def _get_adapter_group_member_profiles(
         remark = str(row.get("remark") or "").strip()
         user_name = card or nickname or remark
         display_name = user_name or user_id
-        alias_keys = _build_alias_keys(display_name, card, nickname, remark)
+        alias_entries = _build_alias_entries(display_name, card, nickname, remark)
+        alias_keys = _alias_entries_to_keys(alias_entries)
         profiles.append(
             {
                 "user_id": user_id,
@@ -448,6 +455,7 @@ async def _get_adapter_group_member_profiles(
                 "platform": "qq",
                 "alias_key": _normalize_alias_key(display_name),
                 "alias_keys": alias_keys,
+                "alias_entries": alias_entries,
             }
         )
     return profiles
@@ -575,48 +583,32 @@ def _pick_fuzzy_target_profile(
     if len(hint) < 2:
         return None, [], 0.0
 
-    strength = (trigger_strength or "weak").lower()
-    if strength == "strong":
-        ratio_threshold = 0.72
-        match_threshold = 0.72
-        ambiguous_top_threshold = 0.86
-        ambiguous_gap_threshold = 0.08
-    else:
-        ratio_threshold = 0.80
-        match_threshold = 0.86
-        ambiguous_top_threshold = 0.92
-        ambiguous_gap_threshold = 0.12
+    (
+        _ratio_threshold,
+        match_threshold,
+        ambiguous_top_threshold,
+        ambiguous_gap_threshold,
+    ) = _fuzzy_match_thresholds(trigger_strength)
 
-    ranked: list[tuple[float, dict[str, str | tuple[str, ...]]]] = []
+    ranked: list[tuple[float, bool, float, dict[str, str | tuple[str, ...]]]] = []
     active_scores = active_scores or {}
     for profile in profiles:
         user_id = str(profile.get("user_id") or "").strip()
-        alias_keys = profile.get("alias_keys") or ()
-        if not isinstance(alias_keys, tuple):
-            continue
         best_score = 0.0
-        for alias in alias_keys:
-            alias_text = str(alias or "").strip()
-            if len(alias_text) < 2:
-                continue
-            if hint == alias_text:
-                best_score = max(best_score, 1.0)
-                continue
-            if (hint in alias_text or alias_text in hint) and min(
-                len(hint), len(alias_text)
-            ) >= 4:
-                overlap = min(len(hint), len(alias_text)) / max(
-                    len(hint), len(alias_text)
-                )
-                best_score = max(best_score, 0.85 + overlap * 0.12)
-                continue
-            ratio = SequenceMatcher(None, hint, alias_text).ratio()
-            if ratio >= ratio_threshold:
-                best_score = max(best_score, ratio)
-        if user_id and user_id in active_scores:
-            best_score += active_scores[user_id]
+        has_exact_full_alias = False
+        for alias_entry in _profile_alias_entries(profile):
+            best_score = max(best_score, score_member_alias(hint, alias_entry))
+            if alias_entry.kind != "suffix" and hint == alias_entry.value:
+                has_exact_full_alias = True
         if best_score >= match_threshold:
-            ranked.append((best_score, profile))
+            ranked.append(
+                (
+                    best_score,
+                    has_exact_full_alias,
+                    active_scores.get(user_id, 0.0),
+                    profile,
+                )
+            )
 
     if not ranked:
         return None, [], 0.0
@@ -624,21 +616,26 @@ def _pick_fuzzy_target_profile(
     ranked.sort(
         key=lambda item: (
             item[0],
-            len(str(item[1].get("display_name") or "")),
+            item[1],
+            item[2],
+            len(str(item[3].get("display_name") or "")),
         ),
         reverse=True,
     )
-    top_score, top_profile = ranked[0]
+    top_score, top_exact, _, top_profile = ranked[0]
     if len(ranked) == 1:
         return top_profile, [], top_score
 
     second_score = ranked[1][0]
+    second_exact = ranked[1][1]
+    if top_exact and not second_exact:
+        return top_profile, [], top_score
     if (
         top_score < ambiguous_top_threshold
         or (top_score - second_score) < ambiguous_gap_threshold
     ):
         candidates: list[dict[str, str | tuple[str, ...]]] = []
-        for _, profile in ranked[:5]:
+        for _, _, _, profile in ranked[:5]:
             display_name = str(profile.get("display_name") or "").strip()
             user_id = str(profile.get("user_id") or "").strip()
             if display_name and user_id:
@@ -648,21 +645,126 @@ def _pick_fuzzy_target_profile(
     return top_profile, [], top_score
 
 
-def _build_member_ambiguity_message(
-    candidates: list[dict[str, str | tuple[str, ...]]],
-) -> str:
-    if not candidates:
-        return "我不太确定你说的是谁。请重新发送完整命令，并直接@目标成员。"
-    display_options: list[str] = []
-    for profile in candidates[:4]:
-        display_name = str(profile.get("display_name") or "").strip()
-        user_id = str(profile.get("user_id") or "").strip()
-        if display_name and user_id:
-            display_options.append(f"{display_name}(@{user_id})")
-    if not display_options:
-        return "我不太确定你说的是谁。请重新发送完整命令，并直接@目标成员。"
-    options = "、".join(display_options)
-    return f"我匹配到好几个可能对象：{options}。请重新发送完整命令并@目标成员。"
+def _profile_alias_entries(
+    profile: dict[str, str | tuple[str, ...]],
+) -> tuple[MemberAliasEntry, ...]:
+    alias_entries = profile.get("alias_entries") or ()
+    if isinstance(alias_entries, tuple):
+        entries = tuple(
+            entry for entry in alias_entries if isinstance(entry, MemberAliasEntry)
+        )
+        if entries:
+            return entries
+
+    alias_keys = profile.get("alias_keys") or ()
+    if not isinstance(alias_keys, tuple):
+        return ()
+    return tuple(
+        MemberAliasEntry(str(alias), "full", str(alias))
+        for alias in alias_keys
+        if len(str(alias or "").strip()) >= 2
+    )
+
+
+def _fuzzy_match_thresholds(trigger_strength: str) -> tuple[float, float, float, float]:
+    if (trigger_strength or "weak").lower() == "strong":
+        return 0.72, 0.72, 0.86, 0.08
+    return 0.80, 0.86, 0.92, 0.12
+
+
+async def _pick_registered_alias_profile(
+    *,
+    group_id: str,
+    target_hint: str,
+    active_scores: dict[str, float],
+    trigger_strength: str,
+) -> tuple[
+    dict[str, str | tuple[str, ...]] | None,
+    list[dict[str, str | tuple[str, ...]]],
+    float,
+]:
+    try:
+        candidates = await resolve_alias_candidates(
+            group_id=group_id,
+            text=target_hint,
+            limit=5,
+        )
+    except Exception as exc:
+        logger.debug(f"ChatInter person_registry 昵称解析失败: {exc}")
+        return None, [], 0.0
+
+    _, match_threshold, ambiguous_top_threshold, ambiguous_gap_threshold = (
+        _fuzzy_match_thresholds(trigger_strength)
+    )
+    ranked: list[tuple[float, bool, float, dict[str, str | tuple[str, ...]]]] = []
+    for candidate in candidates:
+        profile = candidate.profile
+        user_id = str(profile.user_id or "").strip()
+        if not user_id:
+            continue
+        score = float(candidate.score or 0.0)
+        if score < match_threshold:
+            continue
+        matched_alias = _normalize_alias_key(str(candidate.matched_alias or ""))
+        ranked.append(
+            (
+                score,
+                bool(
+                    matched_alias
+                    and matched_alias == _normalize_alias_key(target_hint)
+                ),
+                active_scores.get(user_id, 0.0),
+                _person_profile_to_target_profile(profile),
+            )
+        )
+
+    if not ranked:
+        return None, [], 0.0
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2],
+            len(str(item[3].get("display_name") or "")),
+        ),
+        reverse=True,
+    )
+    top_score, top_exact, _, top_profile = ranked[0]
+    if len(ranked) == 1:
+        return top_profile, [], top_score
+    second_score = ranked[1][0]
+    second_exact = ranked[1][1]
+    if top_exact and not second_exact:
+        return top_profile, [], top_score
+    if (
+        top_score < ambiguous_top_threshold
+        or (top_score - second_score) < ambiguous_gap_threshold
+    ):
+        return None, [profile for _, _, _, profile in ranked[:5]], top_score
+    return top_profile, [], top_score
+
+
+def _person_profile_to_target_profile(
+    profile: object,
+) -> dict[str, str | tuple[str, ...]]:
+    display_name = str(getattr(profile, "display_name", "") or "").strip()
+    nickname = str(getattr(profile, "nickname", "") or "").strip()
+    group_card = str(getattr(profile, "group_card", "") or "").strip()
+    aliases = tuple(
+        str(item) for item in (getattr(profile, "aliases", ()) or ()) if str(item)
+    )
+    alias_entries = _build_alias_entries(display_name, nickname, group_card, *aliases)
+    return {
+        "user_id": str(getattr(profile, "user_id", "") or "").strip(),
+        "display_name": display_name,
+        "nickname": nickname,
+        "user_name": group_card or nickname,
+        "uid": "",
+        "platform": "qq",
+        "alias_key": _normalize_alias_key(display_name),
+        "alias_keys": _alias_entries_to_keys(alias_entries),
+        "alias_entries": alias_entries,
+    }
 
 
 def _is_self_only_action_message(message_text: str) -> bool:
@@ -715,9 +817,9 @@ def _resolve_fuzzy_trigger_strength(
     ):
         return "strong"
     if command_heads and has_adapter_context_hint(normalized_original, policy):
-        # Command-aware media/action requests often omit explicit "帮/给" words,
-        # e.g. "做个番茄的敲表情".  Treat a clean nickname hint plus a known
-        # target-capable command head as enough signal to try nickname lookup.
+
+
+
         if _extract_fuzzy_target_hint(normalized_route, command_heads):
             return "weak"
     if command_heads:
@@ -789,12 +891,9 @@ async def _enrich_route_message_with_fuzzy_target(
     if not target_hint:
         return route_message, mention_profiles, None
 
-    profiles = await _get_group_member_profiles_for_fuzzy(group_id, bot=bot)
-    if not profiles:
-        return route_message, mention_profiles, None
-
     remembered_user_id = _lookup_remembered_target(group_id, target_hint)
     if remembered_user_id:
+        profiles = await _get_group_member_profiles_for_fuzzy(group_id, bot=bot)
         remembered_profile = next(
             (
                 profile
@@ -826,6 +925,48 @@ async def _enrich_route_message_with_fuzzy_target(
             return enriched_message, mention_profiles, None
 
     active_scores = await _get_group_recent_active_scores(group_id)
+    matched, ambiguous_candidates, top_score = await _pick_registered_alias_profile(
+        group_id=group_id,
+        target_hint=target_hint,
+        active_scores=active_scores,
+        trigger_strength=trigger_strength,
+    )
+    if ambiguous_candidates:
+        logger.debug(
+            "ChatInter person_registry 昵称解析歧义: "
+            f"hint='{target_hint}', candidates="
+            + ", ".join(
+                f"{profile.get('display_name')}(@{profile.get('user_id')})"
+                for profile in ambiguous_candidates[:4]
+            )
+        )
+        return route_message, mention_profiles, None
+    if matched is not None:
+        user_id = str(matched.get("user_id") or "").strip()
+        if user_id:
+            enriched_message = normalize_message_text(f"{route_message} [@{user_id}]")
+            mention_profiles = dict(mention_profiles)
+            mention_profiles[user_id] = {
+                "display_name": str(matched.get("display_name") or "").strip(),
+                "nickname": str(matched.get("nickname") or "").strip(),
+                "user_name": str(matched.get("user_name") or "").strip(),
+                "uid": str(matched.get("uid") or "").strip(),
+                "platform": str(matched.get("platform") or "qq").strip() or "qq",
+                "alias_key": str(matched.get("alias_key") or "").strip(),
+            }
+            logger.debug(
+                "ChatInter person_registry 昵称解析命中: "
+                f"hint='{target_hint}' -> "
+                f"{mention_profiles[user_id].get('display_name')}(@{user_id})"
+            )
+            if top_score >= 0.90:
+                _remember_target_resolution(group_id, target_hint, user_id)
+            return enriched_message, mention_profiles, None
+
+    profiles = await _get_group_member_profiles_for_fuzzy(group_id, bot=bot)
+    if not profiles:
+        return route_message, mention_profiles, None
+
     matched, ambiguous_candidates, top_score = _pick_fuzzy_target_profile(
         target_hint,
         profiles,
@@ -833,23 +974,24 @@ async def _enrich_route_message_with_fuzzy_target(
         trigger_strength=trigger_strength,
     )
     if ambiguous_candidates:
-        return (
-            route_message,
-            mention_profiles,
-            _build_member_ambiguity_message(ambiguous_candidates),
+        logger.debug(
+            "ChatInter 昵称模糊映射歧义: "
+            f"hint='{target_hint}', candidates="
+            + ", ".join(
+                f"{profile.get('display_name')}(@{profile.get('user_id')})"
+                for profile in ambiguous_candidates[:4]
+            )
         )
+        return route_message, mention_profiles, None
     if matched is None:
-        policy = target_policy or TargetPolicy()
         if _needs_target_for_route(
             original_message,
             route_message,
-            target_policy=policy,
+            target_policy=target_policy or TargetPolicy(),
         ):
-            return (
-                route_message,
-                mention_profiles,
-                policy.target_missing_message
-                or "要帮别人做的话，请重新发送完整命令，并补充目标成员。",
+            logger.debug(
+                "ChatInter 昵称模糊映射未命中: "
+                f"hint='{target_hint}', group_id='{group_id}'"
             )
         return route_message, mention_profiles, None
 

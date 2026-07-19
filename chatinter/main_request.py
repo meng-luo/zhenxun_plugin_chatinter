@@ -1,8 +1,8 @@
-﻿"""Thin dispatcher for ChatInter scenario agents.
+"""Compatibility shim for legacy ChatInter main-request callers.
 
-The heavy command-routing and AgentRuntime plumbing lives behind the scenario
-agents.  This module keeps the historical public function and result types so
-callers do not need to know which agent handled the turn.
+New runtime code should call PluginCommandAgent, ChatReplyAgent or
+SuperuserAgent directly.  This module keeps the historical public function and
+result types for older tests/imports.
 """
 
 from __future__ import annotations
@@ -11,9 +11,13 @@ import time
 from typing import Any
 
 from zhenxun.services import logger
-from zhenxun.services.llm import LLMMessage
 
-from .agents.core import AgentRequest
+from .agents.core import (
+    AgentRequest,
+    PluginCommandRequest,
+    PrivateChatRequest,
+)
+from .llm_compat import LLMMessage
 from .main_request_models import (
     CandidateObligationEvaluation,
     MainRequestOutput,
@@ -23,20 +27,17 @@ from .main_request_models import (
     MainRequestTimelineItem,
     ToolObligationDecision,
 )
-from .main_request_support import (
-    _apply_tool_exposure_policy,
-    _candidates_for_task_routes,
-    _fallback_result,
-    _finalize_result,
-    _resolve_tool_obligation,
-    _result_from_task_execution_queue,
-    _try_local_direct_command,
-    _user_timeline_item,
-)
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_executor import ExecuteNativeRoute
 from .native_route import NativeRouteReport
 from .route_text import is_usage_question, normalize_message_text
+from .runtime_result import (
+    _convert_runtime_timeline,
+    _fallback_result,
+    _finalize_result,
+    _result_from_agent_runtime,
+    _user_timeline_item,
+)
 from .turn_runtime import TurnBudgetController
 
 _MAIN_STAGE = "main_request"
@@ -55,8 +56,8 @@ async def run_chatinter_main_request(
     route_completed_hook: MainRequestRouteHook | None = None,
     reply_hook: MainRequestReplyHook | None = None,
     enable_plugin_tools: bool = True,
-    initial_command_exposure: bool = False,
     enable_agent_tools: bool = False,
+    router_context: dict[str, object] | None = None,
     progress_hook: Any | None = None,
     _skip_agent_wrapper: bool = False,
 ) -> MainRequestResult:
@@ -83,8 +84,8 @@ async def run_chatinter_main_request(
             route_executor=route_executor,
             report=report,
             enable_plugin_tools=enable_plugin_tools,
-            initial_command_exposure=initial_command_exposure,
             enable_agent_tools=enable_agent_tools,
+            router_context=router_context,
             progress_hook=progress_hook,
             _skip_agent_wrapper=_skip_agent_wrapper,
         )
@@ -112,22 +113,11 @@ async def run_chatinter_main_request(
 
 async def _dispatch_agent(
     request: AgentRequest,
-    *,
-    enable_plugin_tools: bool,
-    enable_agent_tools: bool,
 ):
-    if enable_agent_tools:
-        from .agents.superuser_agent import SuperuserAgent
-
-        return await SuperuserAgent().run(request)
-    if enable_plugin_tools:
+    if isinstance(request, PluginCommandRequest):
         from .agents.plugin_command_agent import PluginCommandAgent
 
-        return await PluginCommandAgent(
-            candidates_for_task_routes=_candidates_for_task_routes,
-            result_from_task_execution_queue=_result_from_task_execution_queue,
-            try_local_direct_command=_try_local_direct_command,
-        ).run(request)
+        return await PluginCommandAgent().run(request)
     from .agents.private_chat_agent import PrivateChatAgent
 
     return await PrivateChatAgent().run(request)
@@ -145,38 +135,55 @@ async def _run_main_request(
     route_executor: ExecuteNativeRoute,
     report: NativeRouteReport,
     enable_plugin_tools: bool,
-    initial_command_exposure: bool,
     enable_agent_tools: bool,
+    router_context: dict[str, object] | None = None,
     progress_hook: Any | None = None,
     _skip_agent_wrapper: bool = False,
 ) -> MainRequestResult:
     """Compatibility dispatcher for older tests/imports."""
 
-    request = AgentRequest(
-        message_text=message_text,
-        knowledge_base=knowledge_base,
-        session_key=session_key,
-        budget_controller=budget_controller,
-        has_reply=has_reply,
-        command_tools=command_tools,
-        messages=messages,
-        route_executor=route_executor,
-        kwargs={
-            "enable_plugin_tools": enable_plugin_tools,
-            "initial_command_exposure": initial_command_exposure,
-            "enable_agent_tools": enable_agent_tools,
-            "progress_hook": progress_hook,
-            "_skip_agent_wrapper": _skip_agent_wrapper,
-        },
-        report=report,
-    )
-    return (
-        await _dispatch_agent(
-            request,
-            enable_plugin_tools=enable_plugin_tools,
-            enable_agent_tools=enable_agent_tools,
+    del _skip_agent_wrapper
+    if enable_agent_tools:
+        from .agents.superuser_agent import SuperuserAgent, SuperuserRequest
+
+        agent_result = await SuperuserAgent().run(
+            SuperuserRequest(
+                message_text=message_text,
+                session_key=session_key,
+                progress_hook=progress_hook,
+            )
         )
-    ).to_main_result()
+        timeline = _convert_runtime_timeline(agent_result.timeline)
+        report.tool_choice_count += sum(
+            1 for item in agent_result.timeline if item.kind == "tool_call"
+        )
+        return _result_from_agent_runtime(
+            report=report,
+            executions=[],
+            agent_result=agent_result,
+            timeline=timeline,
+        )
+    if enable_plugin_tools:
+        request: AgentRequest = PluginCommandRequest(
+            message_text=message_text,
+            knowledge_base=knowledge_base,
+            session_key=session_key,
+            budget_controller=budget_controller,
+            has_reply=has_reply,
+            command_tools=command_tools,
+            route_executor=route_executor,
+            router_context=router_context,
+            report=report,
+        )
+    else:
+        request = PrivateChatRequest(
+            message_text=message_text,
+            session_key=session_key,
+            budget_controller=budget_controller,
+            messages=messages,
+            report=report,
+        )
+    return (await _dispatch_agent(request)).to_main_result()
 
 
 __all__ = [
@@ -185,7 +192,5 @@ __all__ = [
     "MainRequestResult",
     "MainRequestTimelineItem",
     "ToolObligationDecision",
-    "_apply_tool_exposure_policy",
-    "_resolve_tool_obligation",
     "run_chatinter_main_request",
 ]

@@ -4,6 +4,13 @@ import re
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
+_INTERNAL_REPLY_BLOCK_PATTERN = re.compile(
+    r"<(response_guidance|persona|event_context|context_layers|"
+    r"current_message_layers|chatroom_history|long_term_memory)\b[^>]*>"
+    r".*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
 _PLACEHOLDER_PATTERN = re.compile(
     r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
@@ -345,8 +352,8 @@ KNOWLEDGE_REFRESH_WORDS = (
     "开关",
 )
 
-# 不在全局把自然语言短语改写成具体插件命令，避免插件未安装时污染
-# speech-act / 候选召回。具体命令的自然别名由已安装插件的 schema 派生。
+
+
 ACTION_REWRITES: tuple[tuple[str, str], ...] = ()
 
 _TEMPLATE_TAIL_NOISE_WORDS = (
@@ -429,6 +436,19 @@ class RouteCommandMatch:
 
 def normalize_message_text(text: str) -> str:
     return _WHITESPACE_PATTERN.sub(" ", (text or "").strip())
+
+
+def normalize_reply_text(text: str) -> str:
+    """Clean model-visible reply text without flattening useful paragraphs."""
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _INTERNAL_REPLY_BLOCK_PATTERN.sub("", normalized)
+    paragraphs: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", normalized):
+        cleaned = "\n".join(line.rstrip() for line in paragraph.splitlines()).strip()
+        if cleaned and (not paragraphs or cleaned != paragraphs[-1]):
+            paragraphs.append(cleaned)
+    return _EXCESSIVE_LINE_BREAKS_PATTERN.sub("\n\n", "\n\n".join(paragraphs))
 
 
 def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -575,8 +595,8 @@ def _find_short_noise_head_boundary(text: str, command: str) -> int | None:
     if not compact_command or len(compact_command) > 4:
         return None
 
-    # 对于 1-2 字符的命令，编辑距离 ≤1 的模糊匹配没有意义
-    # （任意两个单字符之间编辑距离都是 1），必须要求精确前缀匹配
+
+
     if len(compact_command) <= 2:
         return None
 
@@ -633,9 +653,11 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
     return edits <= 1
 
 
-def strip_invoke_prefix(text: str) -> str:
+def invoke_prefix_variants(text: str) -> tuple[str, ...]:
     stripped = normalize_message_text(text)
+    variants: list[str] = []
     while stripped:
+        variants.append(stripped)
         matched = next(
             (
                 prefix
@@ -645,9 +667,15 @@ def strip_invoke_prefix(text: str) -> str:
             None,
         )
         if matched is None:
-            return stripped
+            break
         stripped = normalize_message_text(stripped[len(matched) :])
-    return stripped
+    variants.append(stripped)
+    return tuple(dict.fromkeys(variants))
+
+
+def strip_invoke_prefix(text: str) -> str:
+    variants = invoke_prefix_variants(text)
+    return variants[-1] if variants else ""
 
 
 def _strip_route_leading_noise(text: str) -> str:
@@ -1123,6 +1151,7 @@ __all__ = [
     "match_command_head_or_sticky",
     "normalize_action_phrases",
     "normalize_message_text",
+    "normalize_reply_text",
     "parse_command_with_head",
     "rewrite_command_with_head",
     "sanitize_template_tail",

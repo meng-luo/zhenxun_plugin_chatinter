@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any
 
+from .member_similarity import MemberAliasEntry, score_member_alias
 from .route_text import normalize_message_text
 
 _PROFILE_CACHE_TTL = 300.0
@@ -320,26 +321,6 @@ def format_person_history_label(
     if profile.conflict_state:
         parts.append(f"conflict={_xml_escape(profile.conflict_state)}")
     return "[" + "; ".join(parts) + "]"
-
-
-def format_profile_lines(profile: PersonProfile, *, prefix: str = "") -> list[str]:
-    if not profile.user_id:
-        return []
-    label = f"{prefix}user" if prefix else "user"
-    lines = [f"{label}_id={_xml_escape(profile.user_id)}"]
-    if profile.display_name:
-        lines.append(f"{label}_name={_xml_escape(profile.display_name)}")
-    if profile.aliases:
-        lines.append(f"{label}_aliases={_xml_escape('、'.join(profile.aliases[:6]))}")
-    if profile.conflict_state:
-        lines.append(f"{label}_conflict_state={_xml_escape(profile.conflict_state)}")
-    if profile.known_facts:
-        lines.append(f"{label}_facts={_xml_escape('；'.join(profile.known_facts[:4]))}")
-    if profile.relationship:
-        lines.append(f"{label}_relationship={_xml_escape(profile.relationship)}")
-    if profile.confidence:
-        lines.append(f"{label}_confidence={profile.confidence:.2f}")
-    return lines
 
 
 def format_person_fact_layers(
@@ -761,15 +742,16 @@ def _score_alias_match(alias_key: str, profile: PersonProfile) -> tuple[float, s
             )
 
     best_score = 0.0
+    best_weight = 0.0
     best_alias = ""
     for candidate, (weight, alias) in candidates.items():
-        score = 0.0
-        if alias_key == candidate:
-            score = weight + 0.25
-        elif len(alias_key) >= 3 and (alias_key in candidate or candidate in alias_key):
-            score = weight + 0.08
-        if score > best_score:
+        score = score_member_alias(
+            alias_key,
+            MemberAliasEntry(candidate, "full", alias or candidate),
+        )
+        if score > best_score or (score == best_score and weight > best_weight):
             best_score = score
+            best_weight = weight
             best_alias = alias or candidate
     if profile.conflict_state:
         best_score -= 0.18
@@ -908,7 +890,6 @@ __all__ = [
     "RelevantPerson",
     "format_person_fact_layers",
     "format_person_history_label",
-    "format_profile_lines",
     "get_person_profile",
     "normalize_alias_key",
     "resolve_alias_candidates",

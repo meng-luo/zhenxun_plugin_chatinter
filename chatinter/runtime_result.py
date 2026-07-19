@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from inspect import isawaitable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from zhenxun.services.llm.types.models import ToolResult
-
-from .agent_state import AgentRuntimeResult, AgentRuntimeTimelineItem
+from .llm_compat import ToolResult
 from .main_request_models import (
     MainRequestOutput,
     MainRequestReplyHook,
@@ -18,7 +16,10 @@ from .main_request_models import (
 )
 from .native_executor import NativeCommandExecutionContext, NativeToolExecutionResult
 from .native_route import NativeRouteDecision, NativeRouteReport, NativeRouteResult
-from .route_text import normalize_message_text
+from .route_text import normalize_message_text, normalize_reply_text
+
+if TYPE_CHECKING:
+    from .superuser_agent.state import AgentRuntimeResult, AgentRuntimeTimelineItem
 from .task_coverage import TaskCoverageReport
 
 _MAIN_STAGE = "main_request"
@@ -74,7 +75,7 @@ def _result_from_agent_runtime(
         for result in agent_result.tool_results
         if not _is_catalog_tool_result(result)
     ]
-    final_text = normalize_message_text(agent_result.final_text)
+    final_text = normalize_reply_text(agent_result.final_text)
     should_send = bool(final_text)
     memory_text = _timeline_memory_text(timeline, fallback=final_text)
     handled_by_tools = bool(executions or command_tool_results)
@@ -148,9 +149,7 @@ def _result_from_task_execution_queue(
             metadata=task_coverage_report.to_payload(),
         ),
     )
-    reply = normalize_message_text(final_text) or _fallback_final_reply(executions)
-    if not reply:
-        reply = "没有可执行的明确任务。"
+    reply = normalize_reply_text(final_text)
     return MainRequestResult(
         decision=NativeRouteDecision(
             action="execute",
@@ -165,7 +164,7 @@ def _result_from_task_execution_queue(
         output=MainRequestOutput(
             final_text=reply,
             memory_text=_timeline_memory_text(timeline, fallback=reply),
-            should_send=bool(reply),
+            should_send=False,
             outcome="tool_completed"
             if task_coverage_report.all_completed
             else "tool_failed",
@@ -201,7 +200,7 @@ async def _finalize_result(
     if not output.should_send:
         return result
 
-    final_text = normalize_message_text(output.final_text)
+    final_text = normalize_reply_text(output.final_text)
     if not final_text:
         final_text = (
             _fallback_final_reply(list(result.executions)) or "我暂时没想好怎么回答你。"
@@ -211,7 +210,7 @@ async def _finalize_result(
         final_text = (
             await maybe_reply if isawaitable(maybe_reply) else str(maybe_reply or "")
         )
-    final_text = normalize_message_text(final_text)
+    final_text = normalize_reply_text(final_text)
     if not final_text:
         final_text = "我暂时没想好怎么回答你。"
     final_timeline = _with_final_timeline(
@@ -363,7 +362,6 @@ def _with_final_timeline(
             role="assistant",
             kind="final_output",
             content=final_text,
-            metadata={"sent_by_chatinter": should_send},
         ),
     )
 

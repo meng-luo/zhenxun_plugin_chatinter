@@ -1,4 +1,4 @@
-"""Externalized provider and MCP protocol profiles for ChatInter.
+"""Provider and MCP protocol profiles for ChatInter.
 
 This module is the policy/source-of-truth layer for provider differences.  The
 runtime asks for one profile and applies it; it should not branch on provider
@@ -7,16 +7,10 @@ quirks such as schema dialect, tool_choice shape or MCP naming rules.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 import json
-from pathlib import Path
 import re
 from typing import Any, Literal
-
-try:
-    from ruamel.yaml import YAML
-except Exception:  # pragma: no cover - yaml dependency is available in zhenxun
-    YAML = None  # type: ignore[assignment]
 
 from .route_text import normalize_message_text
 
@@ -30,9 +24,6 @@ ToolResultMessageFormat = Literal[
     "generic",
 ]
 SchemaExposureMode = Literal["full", "compact", "auto"]
-
-_CONFIG_PATH = Path("data") / "configs" / "chatinter_provider_protocols.yaml"
-
 
 @dataclass(frozen=True)
 class ProviderSchemaPolicy:
@@ -135,15 +126,6 @@ class ProviderProtocolProfile:
         }
 
 
-def ensure_provider_protocol_config() -> Path:
-    if _CONFIG_PATH.exists():
-        return _CONFIG_PATH
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    text = _default_yaml_text()
-    _CONFIG_PATH.write_text(text, encoding="utf-8")
-    return _CONFIG_PATH
-
-
 def load_provider_protocol_profile(
     model_name: str | None,
     *,
@@ -152,17 +134,12 @@ def load_provider_protocol_profile(
 ) -> ProviderProtocolProfile:
     name = normalize_message_text(str(model_name or "")) or "unknown"
     family = infer_provider_family(name)
-    profile = _default_profile(
+    return _default_profile(
         model_name=name,
         family=family,
         supports_tools=supports_tools,
         supports_image_input=supports_image_input,
     )
-    config = _load_config()
-    profile = _apply_config_profile(profile, config.get("providers", {}).get(family))
-    for override in _matching_model_overrides(name, config.get("models", [])):
-        profile = _apply_config_profile(profile, override)
-    return profile
 
 
 def infer_provider_family(model_name: str) -> ProviderFamily:
@@ -289,6 +266,8 @@ def _default_profile(
             strip_strict=True,
             compose_oneof_as_anyof=True,
             compose_allof_as_anyof=True,
+            max_tool_description_chars=1600,
+            max_param_description_chars=520,
         )
         tool_choice = ProviderToolChoicePolicy(
             supports_tools=supports_tools,
@@ -301,6 +280,7 @@ def _default_profile(
             full_schema_tool_cap=6,
             auto_command_tool_cap=24,
             required_command_tool_cap=18,
+            compact_upgrade_prompt="Return a functionCall if a real command fits.",
         )
         result_format = "gemini_function_response"
         max_tools = 64
@@ -321,7 +301,11 @@ def _default_profile(
         result_format = "anthropic_tool_result"
         max_tools = 96
     else:
-        schema = ProviderSchemaPolicy(dialect="generic")
+        schema = ProviderSchemaPolicy(
+            dialect="generic",
+            max_tool_description_chars=1600,
+            max_param_description_chars=600,
+        )
         tool_choice = ProviderToolChoicePolicy(
             supports_tools=supports_tools,
             supports_required=False,
@@ -340,7 +324,9 @@ def _default_profile(
         enabled=True,
         max_name_length=128 if family == "anthropic" else 64,
         result_message_format=result_format,
-        max_result_chars=8000 if family == "gemini" else 12000,
+        max_result_chars=(
+            8000 if family == "gemini" else 10000 if family == "custom" else 12000
+        ),
         supports_streaming_observations=family == "anthropic",
     )
     return ProviderProtocolProfile(
@@ -355,125 +341,6 @@ def _default_profile(
         mcp=mcp,
         source="defaults",
     )
-
-
-def _apply_config_profile(
-    profile: ProviderProtocolProfile,
-    raw: Any,
-) -> ProviderProtocolProfile:
-    if not isinstance(raw, dict):
-        return profile
-    source = normalize_message_text(str(raw.get("source", "") or "config")) or "config"
-    schema = _merge_dataclass(profile.schema, raw.get("schema"))
-    tool_choice = _merge_dataclass(profile.tool_choice, raw.get("tool_choice"))
-    exposure = _merge_dataclass(profile.schema_exposure, raw.get("schema_exposure"))
-    mcp = _merge_dataclass(profile.mcp, raw.get("mcp"))
-    result_format = str(
-        raw.get("tool_result_message_format")
-        or raw.get("tool_result_format")
-        or profile.tool_result_message_format
-    )
-    return replace(
-        profile,
-        max_tools=_coerce_int(raw.get("max_tools"), profile.max_tools),
-        supports_image_input=_coerce_bool(
-            raw.get("supports_image_input"),
-            profile.supports_image_input,
-        ),
-        schema=schema,
-        tool_choice=tool_choice,
-        schema_exposure=exposure,
-        tool_result_message_format=_normalize_result_format(result_format),
-        mcp=mcp,
-        source=source,
-    )
-
-
-def _merge_dataclass(value: Any, raw: Any) -> Any:
-    if not isinstance(raw, dict):
-        return value
-    allowed = set(asdict(value))
-    updates = {
-        key: _coerce_field(getattr(value, key), raw[key])
-        for key in raw
-        if key in allowed
-    }
-    return replace(value, **updates)
-
-
-def _coerce_field(default: Any, value: Any) -> Any:
-    if isinstance(default, bool):
-        return _coerce_bool(value, default)
-    if isinstance(default, int):
-        return _coerce_int(value, default)
-    if isinstance(default, tuple):
-        if isinstance(value, list | tuple):
-            return tuple(str(item) for item in value)
-        return default
-    return value if value is not None else default
-
-
-def _matching_model_overrides(model_name: str, rows: Any) -> list[dict[str, Any]]:
-    if not isinstance(rows, list | tuple):
-        return []
-    lowered = model_name.casefold()
-    result: list[dict[str, Any]] = []
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        pattern = normalize_message_text(str(item.get("match", "") or ""))
-        if not pattern:
-            continue
-        try:
-            matched = bool(re.search(pattern, lowered, flags=re.IGNORECASE))
-        except re.error:
-            matched = pattern.casefold() in lowered
-        if matched:
-            result.append(item)
-    return result
-
-
-def _load_config() -> dict[str, Any]:
-    path = ensure_provider_protocol_config()
-    if YAML is None:
-        return {}
-    try:
-        yaml = YAML(typ="safe", pure=True)
-        with path.open("r", encoding="utf-8") as fp:
-            data = yaml.load(fp) or {}
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _normalize_result_format(value: str) -> ToolResultMessageFormat:
-    text = normalize_message_text(value)
-    if text in {
-        "openai_tool",
-        "gemini_function_response",
-        "anthropic_tool_result",
-        "generic",
-    }:
-        return text  # type: ignore[return-value]
-    return "generic"
-
-
-def _coerce_bool(value: Any, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value or "").strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _coerce_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _is_small_model(model_name: str) -> bool:
@@ -499,158 +366,6 @@ def _compact_tool_result_value(value: Any, *, max_chars: int) -> Any:
     }
 
 
-def _default_yaml_text() -> str:
-    return """# ChatInter provider/MCP protocol profiles.
-# Runtime should consume these profiles instead of branching on provider quirks.
-providers:
-  openai:
-    max_tools: 120
-    schema:
-      dialect: openai_strict
-      unsupported_keys:
-        - "$schema"
-        - "$id"
-        - "examples"
-        - "default"
-        - "deprecated"
-        - "readOnly"
-        - "writeOnly"
-      strip_additional_properties: false
-      strip_strict: false
-      nullable_style: nullable
-      compose_oneof_as_anyof: false
-      compose_allof_as_anyof: false
-      max_tool_description_chars: 1800
-      max_param_description_chars: 700
-    tool_choice:
-      supports_required: true
-      supports_named: true
-      supports_parallel: true
-    schema_exposure:
-      prefers_compact: false
-      full_schema_tool_cap: 10
-      auto_command_tool_cap: 32
-      required_command_tool_cap: 24
-    tool_result_message_format: openai_tool
-    mcp:
-      namespace_separator: "__"
-      max_name_length: 64
-      name_pattern: "[^0-9A-Za-z_-]+"
-      result_message_format: openai_tool
-      max_result_chars: 12000
-  gemini:
-    max_tools: 64
-    schema:
-      dialect: gemini
-      unsupported_keys:
-        - "$schema"
-        - "$id"
-        - "examples"
-        - "default"
-        - "deprecated"
-        - "readOnly"
-        - "writeOnly"
-      strip_additional_properties: true
-      strip_strict: true
-      nullable_style: nullable
-      compose_oneof_as_anyof: true
-      compose_allof_as_anyof: true
-      max_tool_description_chars: 1600
-      max_param_description_chars: 520
-    tool_choice:
-      supports_required: true
-      supports_named: true
-      supports_parallel: false
-    schema_exposure:
-      prefers_compact: true
-      full_schema_tool_cap: 6
-      auto_command_tool_cap: 24
-      required_command_tool_cap: 18
-    tool_result_message_format: gemini_function_response
-    mcp:
-      namespace_separator: "__"
-      max_name_length: 64
-      name_pattern: "[^0-9A-Za-z_-]+"
-      result_message_format: gemini_function_response
-      max_result_chars: 8000
-  anthropic:
-    max_tools: 96
-    schema:
-      dialect: generic
-      unsupported_keys:
-        - "$schema"
-        - "$id"
-        - "examples"
-        - "default"
-        - "deprecated"
-        - "readOnly"
-        - "writeOnly"
-      strip_additional_properties: false
-      strip_strict: false
-      nullable_style: nullable
-      compose_oneof_as_anyof: false
-      compose_allof_as_anyof: false
-      max_tool_description_chars: 1800
-      max_param_description_chars: 700
-    tool_choice:
-      supports_required: true
-      supports_named: false
-      supports_parallel: true
-    schema_exposure:
-      prefers_compact: false
-      full_schema_tool_cap: 8
-      auto_command_tool_cap: 32
-      required_command_tool_cap: 24
-    tool_result_message_format: anthropic_tool_result
-    mcp:
-      namespace_separator: "__"
-      max_name_length: 128
-      name_pattern: "[^0-9A-Za-z_-]+"
-      result_message_format: anthropic_tool_result
-      max_result_chars: 12000
-      supports_streaming_observations: true
-  custom:
-    max_tools: 96
-    schema:
-      dialect: generic
-      unsupported_keys:
-        - "$schema"
-        - "$id"
-        - "examples"
-        - "default"
-        - "deprecated"
-        - "readOnly"
-        - "writeOnly"
-      strip_additional_properties: false
-      strip_strict: false
-      nullable_style: nullable
-      compose_oneof_as_anyof: false
-      compose_allof_as_anyof: false
-      max_tool_description_chars: 1600
-      max_param_description_chars: 600
-    tool_choice:
-      supports_required: false
-      supports_named: false
-      supports_parallel: false
-    schema_exposure:
-      prefers_compact: true
-      full_schema_tool_cap: 8
-      auto_command_tool_cap: 24
-      required_command_tool_cap: 20
-    tool_result_message_format: generic
-    mcp:
-      namespace_separator: "__"
-      max_name_length: 64
-      name_pattern: "[^0-9A-Za-z_-]+"
-      result_message_format: generic
-      max_result_chars: 10000
-models:
-  - match: "(mini|flash|lite)"
-    source: compact_model_override
-    schema_exposure:
-      prefers_compact: true
-"""
-
 
 __all__ = [
     "MCPToolProtocolProfile",
@@ -664,7 +379,6 @@ __all__ = [
     "ToolResultMessageFormat",
     "adapt_tool_choice_for_policy",
     "adapt_tool_result_payload_for_protocol",
-    "ensure_provider_protocol_config",
     "infer_provider_family",
     "load_provider_protocol_profile",
     "sanitize_external_tool_name_for_protocol",

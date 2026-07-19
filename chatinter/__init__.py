@@ -15,3 +15,4 @@ except Exception:
     __plugin_meta__ = None
 else:
     from .plugin_entry import *  # noqa: F403
+    from .plugin_entry import __plugin_meta__ as __plugin_meta__

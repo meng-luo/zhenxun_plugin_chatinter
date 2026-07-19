@@ -398,7 +398,7 @@ class CommandToolSnapshot(BaseModel):
     )
     meta: dict[str, Any] = Field(
         default_factory=dict,
-        description="????????????/??????",
+        description="插件能力的附加元数据",
     )
     intent_types: list[str] = Field(
         default_factory=list,

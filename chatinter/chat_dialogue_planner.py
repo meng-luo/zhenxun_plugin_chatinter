@@ -146,11 +146,12 @@ _MEMORY_UPDATE_HINTS = (
     "我不喜欢",
     "别叫",
 )
+_CASUAL_HINTS = ("随便聊", "聊两句", "陪我聊", "闲聊", "吐槽")
 _HAPPY_HINTS = ("开心", "高兴", "好耶", "舒服", "爽", "赢", "喜欢")
 _SAD_HINTS = ("难过", "伤心", "委屈", "想哭", "失落", "不开心")
 _ANGRY_HINTS = ("生气", "气死", "烦死", "恼火", "讨厌", "离谱")
 _CONFUSED_HINTS = ("不懂", "看不懂", "迷惑", "懵", "不会", "什么意思")
-_PLAYFUL_HINTS = ("哈哈", "笑死", "草", "乐", "整活", "好玩")
+_PLAYFUL_HINTS = ("哈哈", "笑死", "草", "乐", "整活", "好玩", "吐槽")
 _FOLLOWUP_HINTS = ("怎么选", "怎么办", "你觉得", "要不要", "该不该")
 
 
@@ -293,6 +294,13 @@ def plan_chat_dialogue(
             style="concise",
             reason="memory_hint",
         )
+    if contains_any(normalized, _CASUAL_HINTS):
+        return ChatDialoguePlan(
+            kind="casual_chat",
+            confidence=0.8,
+            style="concise",
+            reason="casual_hint",
+        )
     if (
         has_images
         or has_reply
@@ -426,6 +434,7 @@ def load_dialogue_state(
     session_key: str,
     user_id: str,
     group_id: str | None,
+    legacy_session_key: str = "",
 ) -> DialogueState | None:
     payload = read_json(_DIALOGUE_STATE_PATH, {})
     if not isinstance(payload, dict):
@@ -436,6 +445,18 @@ def load_dialogue_state(
         group_id=group_id,
     )
     record = payload.get(key)
+    if not isinstance(record, dict) and legacy_session_key:
+        legacy_key = _dialogue_state_key(
+            session_key=legacy_session_key,
+            user_id=user_id,
+            group_id=group_id,
+        )
+        legacy_record = payload.get(legacy_key)
+        if isinstance(legacy_record, dict):
+            record = legacy_record
+            payload[key] = legacy_record
+            payload.pop(legacy_key, None)
+            write_json(_DIALOGUE_STATE_PATH, payload)
     if not isinstance(record, dict):
         return None
     if (

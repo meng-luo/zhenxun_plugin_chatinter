@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .addressee_resolver import AddresseeResult, format_addressee_xml
 from .event_context import ChatInterEventContext
-from .person_registry import PersonProfile, RelevantPerson, format_profile_lines
+from .person_registry import PersonProfile, RelevantPerson
 from .thread_resolver import ThreadContext, format_thread_xml
 
 
@@ -65,10 +65,6 @@ def build_group_dialogue_context(
     lines.extend(_event_lines(event_context))
     if speaker_profile is not None:
         lines.extend(_turn_identity_lines(event_context, speaker_profile))
-    if speaker_profile is not None:
-        lines.append("<speaker_profile>")
-        lines.extend(format_profile_lines(speaker_profile, prefix="speaker"))
-        lines.append("</speaker_profile>")
     if relevant_people:
         lines.extend(_relevant_people_lines(relevant_people))
     if addressee is not None:

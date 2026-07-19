@@ -30,21 +30,8 @@ _RANDOM_ROLE_TERMS = ("随机", "抽", "roll", "掷", "选择", "塔罗")
 _TEMPLATE_ROLE_TERMS = ("生成", "制作", "做", "表情", "模板", "绘制", "画图", "图片")
 _QUERY_ROLE_TERMS = ("查询", "查看", "搜索", "识别", "解析", "翻译", "统计", "排行")
 _SELF_SCOPE_TERMS = ("我的", "自己", "本人", "个人", "我")
-_TARGET_TERMS = (
-    "@",
-    "at",
-    "qq",
-    "user",
-    "member",
-    "target",
-    "nickname",
-    "用户",
-    "成员",
-    "群友",
-    "目标",
-    "对象",
-    "昵称",
-)
+_ASCII_TARGET_TERMS = {"at", "user", "member", "target", "nickname"}
+_CJK_TARGET_TERMS = ("用户", "成员", "群友", "目标", "对象", "昵称")
 
 
 def _slot(
@@ -219,8 +206,8 @@ def _requires_from_capability(command: CommandCapability) -> dict[str, bool]:
     requirement = command.requirement
     allow_at = _capability_accepts_at_target(command)
     return {
-        # `requires` is a hard execution gate. Optional slots (for example
-        # `我的信息 ?[at]` or `随机小猪 [数量]`) must not become required text.
+
+
         "text": bool(requirement.text_min > 0),
         "image": bool(requirement.image_min > 0),
         "reply": bool(requirement.requires_reply),
@@ -232,6 +219,18 @@ def _requires_from_capability(command: CommandCapability) -> dict[str, bool]:
 
 def _normalize_param_name(name: str) -> str:
     return normalize_message_text(name).lower()
+
+
+def _contains_target_term(text: str) -> bool:
+    normalized = _normalize_param_name(text)
+    if not normalized:
+        return False
+    if "@" in normalized or any(term in normalized for term in _CJK_TARGET_TERMS):
+        return True
+    return any(
+        token in _ASCII_TARGET_TERMS
+        for token in re.findall(r"[a-z]+", normalized)
+    )
 
 
 def _capability_accepts_image_input(command: CommandCapability) -> bool:
@@ -319,13 +318,16 @@ def _is_generic_aggregate_param(name: str) -> bool:
 
 def _payload_policy_from_capability(command: CommandCapability) -> tuple[str, str]:
     requirement = command.requirement
-    if requirement.image_min > 0 and (requirement.text_min > 0 or requirement.params):
+    accepts_text = requirement.text_min > 0 or (
+        bool(requirement.params) and requirement.text_max != 0
+    )
+    if requirement.image_min > 0 and accepts_text:
         return "text_or_image", "slot_only"
     if requirement.image_min > 0:
         return "image_only", "discard"
     if requirement.text_min > 0:
         return "text", "slot_only"
-    if requirement.params:
+    if accepts_text:
         return "slots", "slot_only"
     return "none", "keep"
 
@@ -354,7 +356,7 @@ def _slot_type_from_name(name: str) -> str:
         return "float"
     if any(token in normalized for token in ("image", "图片", "图", "照片")):
         return "image"
-    if any(token in normalized for token in _TARGET_TERMS):
+    if _contains_target_term(normalized):
         return "at"
     return "text"
 
@@ -437,6 +439,19 @@ def _prepare_schema_param_names(
         for param in raw_params
         if not _is_internal_media_param(param, requirement)
     ]
+    try:
+        text_max = int(getattr(requirement, "text_max", -1))
+    except (TypeError, ValueError):
+        text_max = -1
+    if text_max == 0:
+        params = [
+            param
+            for param in params
+            if not (
+                _slot_type_from_name(param) == "text"
+                and _is_generic_aggregate_param(param)
+            )
+        ]
     if text_min <= 0:
         return params
 
@@ -623,13 +638,14 @@ def _command_description(
     *,
     usage_lines: list[str] | None = None,
     plugin_description: str = "",
+    include_global_context: bool = True,
 ) -> str:
     parts: list[str] = []
     command_description = normalize_message_text(command.description)
     if command_description:
         parts.append(command_description)
     plugin_desc = normalize_message_text(plugin_description)
-    if plugin_desc and plugin_desc != "暂无描述":
+    if include_global_context and plugin_desc and plugin_desc != "暂无描述":
         parts.append(plugin_desc)
     examples = [
         normalize_message_text(example)
@@ -652,7 +668,7 @@ def _command_description(
         requirement_parts.append("需要明确目标")
     if requirement_parts:
         parts.append("；".join(requirement_parts))
-    if usage_lines:
+    if include_global_context and usage_lines:
         parts.append("用法: " + " / ".join(usage_lines[:3]))
     if not parts:
         parts.append(f"执行“{head}”命令")
@@ -719,6 +735,7 @@ def schema_from_capability(
     *,
     usage: str | None = None,
     plugin_description: str = "",
+    include_global_context: bool = True,
 ) -> PluginCommandSchema | None:
     raw_command = normalize_message_text(command.command)
     head = normalize_schema_command_head(raw_command) or raw_command
@@ -828,6 +845,7 @@ def schema_from_capability(
         head,
         usage_lines=usage_lines,
         plugin_description=plugin_description,
+        include_global_context=include_global_context,
     )
     metadata_text = normalize_message_text(
         " ".join(
@@ -901,13 +919,104 @@ def schema_from_capability(
                 command.description,
                 *command.examples,
                 *usage_lines,
-                plugin_description,
+                plugin_description if include_global_context else "",
             ]
             if normalize_message_text(phrase)
         ],
     )
     schema.shortcut_renders = list(command.shortcut_renders or [])
     return schema
+
+
+def _shortcut_schema_views(
+    module: str,
+    schema: PluginCommandSchema,
+) -> list[PluginCommandSchema]:
+    views: list[PluginCommandSchema] = []
+    for shortcut in schema.shortcut_renders:
+        if not isinstance(shortcut, dict):
+            continue
+        view = _shortcut_schema_view(module, schema, shortcut)
+        if view is not None:
+            views.append(view)
+    return views
+
+
+def _shortcut_schema_view(
+    module: str,
+    schema: PluginCommandSchema,
+    shortcut: dict[str, Any],
+) -> PluginCommandSchema | None:
+    alias = normalize_message_text(str(shortcut.get("alias", "") or ""))
+    if not alias or alias == schema.head:
+        return None
+    optional_params = _optional_shortcut_params(shortcut)
+    return schema.model_copy(
+        update={
+            "command_id": _command_id(module, alias),
+            "head": alias,
+            "aliases": [],
+            "slots": _slots_with_optional_shortcut_params(
+                schema.slots,
+                optional_params,
+            ),
+            "render": alias,
+            "shortcut_renders": [],
+            "retrieval_phrases": list(
+                dict.fromkeys([alias, schema.head, *schema.retrieval_phrases])
+            ),
+        },
+        deep=True,
+    )
+
+
+def _optional_shortcut_params(shortcut: dict[str, Any]) -> set[str]:
+    return {
+        normalize_message_text(str(param or "")).casefold()
+        for param in shortcut.get("optional_params", []) or []
+        if normalize_message_text(str(param or ""))
+    }
+
+
+def _slots_with_optional_shortcut_params(
+    slots: list[CommandSlotSpec],
+    optional_params: set[str],
+) -> list[CommandSlotSpec]:
+    if not optional_params:
+        return list(slots)
+    return [
+        slot.model_copy(update={"required": False})
+        if _slot_matches_optional_shortcut_param(slot, optional_params)
+        else slot
+        for slot in slots
+    ]
+
+
+def _slot_matches_optional_shortcut_param(
+    slot: CommandSlotSpec,
+    optional_params: set[str],
+) -> bool:
+    name = normalize_message_text(slot.name).casefold()
+    return name in optional_params or (
+        slot.type in {"text", "int", "float"}
+        and name == "text"
+        and len(optional_params) == 1
+    )
+
+
+def _schema_with_optional_shortcut_params(
+    schema: PluginCommandSchema,
+    optional_params: set[str],
+) -> PluginCommandSchema:
+    if not optional_params:
+        return schema
+    slots = _slots_with_optional_shortcut_params(schema.slots, optional_params)
+    requires = dict(schema.requires or {})
+    if not any(
+        slot.required and slot.type in {"text", "int", "float"} for slot in slots
+    ):
+        requires["text"] = False
+    return schema.model_copy(update={"slots": slots, "requires": requires}, deep=True)
 
 
 def build_command_schemas(
@@ -920,17 +1029,39 @@ def build_command_schemas(
     module_key = normalize_message_text(module)
     schemas: list[PluginCommandSchema] = []
     seen: set[str] = set()
+    include_global_context = len(commands) <= 1
     for command in commands:
         schema = schema_from_capability(
             module_key,
             command,
             usage=usage,
             plugin_description=plugin_description,
+            include_global_context=include_global_context,
         )
         if schema is None or schema.command_id in seen:
             continue
         seen.add(schema.command_id)
         schemas.append(schema)
+    for schema in list(schemas):
+        for shortcut in schema.shortcut_renders:
+            if not isinstance(shortcut, dict):
+                continue
+            shortcut_schema = _shortcut_schema_view(module_key, schema, shortcut)
+            if shortcut_schema is None:
+                continue
+            if shortcut_schema.command_id in seen:
+                optional_params = _optional_shortcut_params(shortcut)
+                if optional_params:
+                    for index, existing in enumerate(schemas):
+                        if existing.command_id == shortcut_schema.command_id:
+                            schemas[index] = _schema_with_optional_shortcut_params(
+                                existing,
+                                optional_params,
+                            )
+                            break
+                continue
+            seen.add(shortcut_schema.command_id)
+            schemas.append(shortcut_schema)
     return schemas
 
 

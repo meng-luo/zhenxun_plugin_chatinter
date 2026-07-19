@@ -11,7 +11,6 @@ from zhenxun.services.cache.cache_containers import CacheDict
 
 from .impression_provider import get_impression_provider
 
-# 好感度缓存（使用框架 CacheDict，6 小时过期）
 _impression_cache: CacheDict[tuple[float, str, float]] = CacheDict(
     "chatinter_impression",
     expire=6 * 60 * 60,

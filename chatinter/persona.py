@@ -1,7 +1,7 @@
 """File-backed Persona registry for ChatInter chat wording.
 
 Persona is a prompt/style layer only. It must not decide tool routing or
-permission. The registry is JSON-backed so P1-6 can land without DB migration.
+permission. The registry is JSON-backed.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import get_config_value
 from .persistence import read_json, state_path, utc_now_iso, write_json
 from .route_text import normalize_message_text
 
@@ -96,7 +95,7 @@ class Persona:
         return cls(
             persona_id=persona_id,
             name=name,
-            prompt=normalize_message_text(str(payload.get("prompt", "") or "")),
+            prompt=_prompt_text(payload.get("prompt")),
             style=normalize_message_text(str(payload.get("style", "") or "")),
             tone_examples=_text_tuple(payload.get("tone_examples"), limit=12),
             preset_dialogues=_text_tuple(payload.get("preset_dialogues"), limit=12),
@@ -173,34 +172,23 @@ def resolve_persona(
                 binding=selected,
                 reason=f"binding:{selected.scope}",
             )
-    persona = personas.get(_DEFAULT_PERSONA_ID) or legacy_config_persona()
+    persona = personas.get(_DEFAULT_PERSONA_ID) or _default_persona()
     return PersonaSelection(persona=persona, binding=None, reason="default")
 
 
-def legacy_config_persona() -> Persona:
-    """Wrap old CHAT_STYLE/CUSTOM_PROMPT into a Persona object."""
-
-    chat_style = normalize_message_text(str(get_config_value("CHAT_STYLE", "") or ""))
-    custom_prompt = normalize_message_text(
-        str(get_config_value("CUSTOM_PROMPT", "") or "")
-    )
-    prompt = custom_prompt
-    style = chat_style or "日式二次元、软萌中带一点傲娇"
+def _default_persona() -> Persona:
     return Persona(
         persona_id=_DEFAULT_PERSONA_ID,
         name="默认人格",
-        prompt=prompt,
-        style=style,
-        tags=("legacy_config",),
         enabled=True,
-        source="legacy_config",
+        source="default",
     )
 
 
 def list_personas() -> list[Persona]:
     personas = _load_personas(_load_payload())
     if not personas:
-        return [legacy_config_persona()]
+        return [_default_persona()]
     return personas
 
 
@@ -233,10 +221,7 @@ def _load_payload() -> dict[str, Any]:
 
 
 def _persona_path() -> Path:
-    configured = normalize_message_text(str(get_config_value("PERSONA_FILE", "") or ""))
-    if not configured:
-        return _DEFAULT_PERSONA_PATH
-    return Path(configured)
+    return _DEFAULT_PERSONA_PATH
 
 
 def _load_personas(payload: dict[str, Any]) -> list[Persona]:
@@ -248,7 +233,7 @@ def _load_personas(payload: dict[str, Any]) -> list[Persona]:
             if persona is not None:
                 personas.append(persona)
     if not personas:
-        personas.append(legacy_config_persona())
+        personas.append(_default_persona())
     return personas
 
 
@@ -356,6 +341,17 @@ def _text_tuple(value: Any, *, limit: int) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _prompt_text(value: Any) -> str:
+    lines: list[str] = []
+    for raw_line in str(value or "").splitlines():
+        line = normalize_message_text(raw_line)
+        if line:
+            lines.append(line)
+        elif lines and lines[-1]:
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _compact_lines(values: tuple[str, ...], *, limit: int) -> list[str]:
     lines: list[str] = []
     for value in values[: max(int(limit or 0), 0)]:
@@ -397,7 +393,6 @@ __all__ = [
     "Persona",
     "PersonaBinding",
     "PersonaSelection",
-    "legacy_config_persona",
     "list_personas",
     "resolve_persona",
     "upsert_persona",

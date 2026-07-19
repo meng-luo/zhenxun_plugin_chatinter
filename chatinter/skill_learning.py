@@ -9,10 +9,14 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from zhenxun.services import logger
-from zhenxun.services.llm import AI
 
-from .config import build_reasoning_generation_config, get_config_value, get_model_name
+from .config import (
+    INTENT_TIMEOUT_SECONDS,
+    build_agent_generation_config,
+    get_agent_model,
+)
 from .feedback import FeedbackStore
+from .llm_compat import AI
 from .route_text import normalize_message_text
 from .skill_store import SkillCandidate, SkillRecord, upsert_skill
 
@@ -87,12 +91,11 @@ async def _extract_skill_with_llm(record: dict[str, Any]) -> SkillCandidate | No
         result = await AI(session_id=f"chatinter-skill:{trace_id}").generate_structured(
             json.dumps(payload, ensure_ascii=False),
             _ExtractedSkill,
-            model=get_model_name(),
-            config=build_reasoning_generation_config(),
+            model=get_agent_model("plugin"),
+            config=build_agent_generation_config("plugin"),
             instruction=_SKILL_EXTRACT_INSTRUCTION,
             timeout=_skill_learning_timeout(),
             max_validation_retries=0,
-            auto_thinking=False,
         )
     except Exception as exc:
         logger.debug(
@@ -309,11 +312,7 @@ def _title_from_input(input_message: str, tools: list[str]) -> str:
 
 
 def _skill_learning_timeout() -> float:
-    try:
-        configured = float(get_config_value("INTENT_TIMEOUT", 20) or 20)
-    except (TypeError, ValueError):
-        configured = 20.0
-    return max(6.0, min(configured, 18.0))
+    return min(float(INTENT_TIMEOUT_SECONDS), 18.0)
 
 
 def _clip_jsonable(value: Any, *, limit: int) -> Any:

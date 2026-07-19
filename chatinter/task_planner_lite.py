@@ -34,12 +34,11 @@ class _Segment:
 class TaskPlannerLite:
     """Deterministic splitter for obvious multi-command turns.
 
-    It deliberately does not infer tools.  The only contract is turning a
-    clearly multi-step message into ordered task texts, so single commands and
-    normal chat stay on the existing fast path.
+    It deliberately does not judge whether a segment is a real task.  The only
+    contract is splitting clearly connected messages; ToolRouter decides later.
     """
 
-    max_tasks = 8
+    max_tasks = 4
 
     @classmethod
     def looks_like_obvious_multi_task(cls, message_text: str) -> bool:
@@ -60,8 +59,6 @@ class TaskPlannerLite:
             return ()
         segments = _split_segments(_strip_wake_words(message_text))
         if len(segments) < 2:
-            return ()
-        if any(not _is_plannable_segment(segment.text) for segment in segments):
             return ()
 
         tasks: list[TaskItem] = []
@@ -84,7 +81,6 @@ class TaskPlannerLite:
                     text=normalized,
                     order=len(tasks) + 1,
                     dependency=dependency,
-                    side_effect=_has_side_effect(normalized),
                 )
             )
         return tuple(tasks) if len(tasks) >= 2 else ()
@@ -92,15 +88,6 @@ class TaskPlannerLite:
 
 def plan_task_items(message_text: str) -> tuple[TaskItem, ...]:
     return TaskPlannerLite.plan(message_text)
-
-
-def task_items_to_payload(
-    tasks: tuple[TaskItem, ...] | list[TaskItem],
-) -> dict[str, Any]:
-    return {
-        "source": "task_planner_lite",
-        "tasks": [task.to_payload() for task in tasks],
-    }
 
 
 _SEQ = "\x1eSEQ\x1e"
@@ -118,82 +105,6 @@ _PARALLEL_CONNECTORS = (
     "同时",
     "并且",
 )
-_ACTION_TERMS = (
-    "查",
-    "查询",
-    "查看",
-    "看看",
-    "搜",
-    "搜索",
-    "帮助",
-    "状态",
-    "信息",
-    "列表",
-    "排行",
-    "统计",
-    "余额",
-    "签到",
-    "抽",
-    "随机",
-    "来",
-    "发",
-    "发送",
-    "设置",
-    "添加",
-    "新增",
-    "删除",
-    "更新",
-    "绑定",
-    "解绑",
-    "播放",
-    "点歌",
-    "翻译",
-    "解析",
-    "识别",
-    "生成",
-    "画",
-    "制作",
-    "调用",
-    "执行",
-    "运行",
-    "打开",
-    "关闭",
-    "测试",
-    "修复",
-    "修改",
-    "分析",
-)
-_SIDE_EFFECT_TERMS = (
-    "签到",
-    "设置",
-    "添加",
-    "新增",
-    "创建",
-    "修改",
-    "删除",
-    "关闭",
-    "开启",
-    "绑定",
-    "解绑",
-    "购买",
-    "兑换",
-    "发送",
-    "发",
-    "禁言",
-    "撤回",
-    "更新",
-)
-_DISCUSSION_ONLY_TERMS = (
-    "为什么",
-    "怎么看",
-    "讨论",
-    "比较",
-    "评价",
-    "区别",
-    "原理",
-    "取舍",
-)
-_COMMAND_LIKE_RE = re.compile(r"^[#/!！./]?[A-Za-z0-9][A-Za-z0-9_\-]{1,}")
 
 
 def _strip_wake_words(text: str) -> str:
@@ -242,38 +153,8 @@ def _clean_segment(segment: str) -> str:
     return text
 
 
-def _is_plannable_segment(segment: str) -> bool:
-    text = _clean_segment(segment)
-    if len(text) < 2:
-        return False
-    if _is_discussion_only(text):
-        return False
-    return _has_action_term(text) or _looks_command_like(text)
-
-
-def _is_discussion_only(text: str) -> bool:
-    normalized = normalize_message_text(text)
-    if not any(term in normalized for term in _DISCUSSION_ONLY_TERMS):
-        return False
-    return not _has_action_term(normalized)
-
-
-def _has_action_term(text: str) -> bool:
-    return any(term in text for term in _ACTION_TERMS)
-
-
-def _looks_command_like(text: str) -> bool:
-    normalized = normalize_message_text(text)
-    return bool(_COMMAND_LIKE_RE.match(normalized)) or "@" in normalized
-
-
-def _has_side_effect(text: str) -> bool:
-    return any(term in text for term in _SIDE_EFFECT_TERMS)
-
-
 __all__ = [
     "TaskItem",
     "TaskPlannerLite",
     "plan_task_items",
-    "task_items_to_payload",
 ]

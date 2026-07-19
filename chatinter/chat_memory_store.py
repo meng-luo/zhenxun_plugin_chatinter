@@ -5,7 +5,6 @@ import re
 import time
 from typing import Any
 
-from .group_memory_digest import GroupMemoryDigest
 from .memory_feedback_reranker import MemoryFeedbackReranker
 from .memory_recall_context import (
     MemoryRecallContext,
@@ -18,12 +17,33 @@ from .memory_vector_index import (
 )
 from .route_text import normalize_message_text
 
-_MEMORY_LIMIT = 8
-_MEMORY_VALUE_MAX_LEN = 80
+_MEMORY_LIMIT = 4
 _MEMORY_CONFIDENCE_DEFAULT = 0.72
+_PRIVATE_RECALL_THRESHOLD = 0.24
+_GROUP_RECALL_THRESHOLD = 0.38
+_GROUP_CONTEXT_RECALL_THRESHOLD = 0.26
 _RECENT_WRITE_CACHE_TTL = 60.0
 _RECENT_WRITE_CACHE_MAX = 512
 _recent_writes: dict[str, float] = {}
+_TEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+", re.IGNORECASE)
+_PROFILE_MEMORY_TYPES = {
+    "nickname",
+    "correction",
+    "person_profile_summary",
+    "preference",
+    "relationship",
+}
+_TYPE_TEXT = {
+    "nickname": "昵称 称呼 叫我",
+    "correction": "称呼 更正 别叫我",
+    "person_profile_summary": "个人 信息",
+    "preference": "偏好 喜欢 不喜欢",
+    "relationship": "关系",
+    "group_digest": "群聊 总结 之前",
+    "thread_digest": "话题 总结 之前",
+    "thread_fact": "话题 事实",
+    "recent_thread_fact": "话题 事实 刚才",
+}
 
 
 def _debug(message: str) -> None:
@@ -50,6 +70,7 @@ class MemoryCandidate:
     key: str
     value: str
     confidence: float = _MEMORY_CONFIDENCE_DEFAULT
+    supersedes: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,7 +119,6 @@ class LayeredMemoryRecall:
             *self.other_facts,
         ]
 
-
 @dataclass
 class _LayerBuckets:
     person_facts: list[str] = field(default_factory=list)
@@ -115,73 +135,6 @@ class _LayerBuckets:
             recent_thread_facts=tuple(self.recent_thread_facts),
             other_facts=tuple(self.other_facts),
         )
-
-
-_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
-    (
-        "nickname",
-        "self_nickname",
-        re.compile(r"(?:以后)?(?:叫我|喊我|称呼我)\s*([^\s，。,.!！?？]{1,24})"),
-    ),
-    (
-        "preference",
-        "like",
-        re.compile(r"我(?:很|比较|最|超)?喜欢\s*([^\n，。,.!！?？]{1,40})"),
-    ),
-    (
-        "preference",
-        "dislike",
-        re.compile(r"我(?:很|比较|最|超)?不喜欢\s*([^\n，。,.!！?？]{1,40})"),
-    ),
-    (
-        "correction",
-        "nickname_correction",
-        re.compile(r"(?:别|不要)叫我\s*([^\s，。,.!！?？]{1,24})"),
-    ),
-    (
-        "relationship",
-        "relationship",
-        re.compile(
-            r"(?:我和|我跟)(?P<target>[^\s，。,.!！?？]{1,24})"
-            r"(?:是|关系是)(?P<relation>[^\s，。,.!！?？]{1,32})"
-        ),
-    ),
-)
-
-
-def _clean_memory_value(value: str) -> str:
-    normalized = normalize_message_text(value)
-    return normalized[:_MEMORY_VALUE_MAX_LEN]
-
-
-def extract_memory_candidates(message_text: str) -> list[MemoryCandidate]:
-    text = normalize_message_text(message_text or "")
-    if not text or text.endswith(("吗", "么", "嘛", "？", "?")):
-        return []
-    candidates: list[MemoryCandidate] = []
-    for memory_type, key, pattern in _PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        if memory_type == "relationship":
-            value = _clean_memory_value(
-                f"{match.group('target')}={match.group('relation')}"
-            )
-        else:
-            value = _clean_memory_value(match.group(1))
-        if not value:
-            continue
-        if value in {"一下", "这个", "那个", "它", "他", "她"}:
-            continue
-        candidates.append(
-            MemoryCandidate(
-                memory_type=memory_type,
-                key=key,
-                value=value,
-                confidence=0.82 if memory_type == "nickname" else 0.72,
-            )
-        )
-    return candidates
 
 
 def _write_cache_key(
@@ -350,20 +303,241 @@ def _rerank_with_feedback(
 ) -> list[Any]:
     if limit <= 0 or not rows:
         return []
+    relevant_rows: list[Any] = []
+    for row in rows:
+        relevance_score = _memory_relevance_score(row, recall_context=recall_context)
+        if relevance_score < _memory_relevance_threshold(
+            row,
+            recall_context=recall_context,
+        ):
+            continue
+        setattr(row, "_chatinter_relevance_score", relevance_score)
+        relevant_rows.append(row)
+    if not relevant_rows:
+        return []
+    prompt_limit = min(limit, 3 if recall_context.group_id else 4)
     ranked = sorted(
-        rows,
+        relevant_rows,
         key=lambda row: (
+            float(getattr(row, "_chatinter_relevance_score", 0.0) or 0.0),
             _memory_rank_score(
                 row,
                 recall_context=recall_context,
                 base_scores=base_scores,
-            ),
+            )
+            * 0.02,
             float(getattr(row, "confidence", 0.0) or 0.0),
+            _memory_recency(row),
             int(getattr(row, "id", 0) or 0),
         ),
         reverse=True,
     )
-    return ranked[:limit]
+    return ranked[:prompt_limit]
+
+
+def _memory_relevance_threshold(
+    row: Any,
+    *,
+    recall_context: MemoryRecallContext,
+) -> float:
+    if not recall_context.group_id:
+        return _PRIVATE_RECALL_THRESHOLD
+    if (
+        normalize_message_text(getattr(row, "scope", "")) == "user"
+        and not normalize_message_text(getattr(row, "group_id", "") or "")
+        and _looks_like_personal_memory_question(recall_context.query)
+    ):
+        return _PRIVATE_RECALL_THRESHOLD
+    if _has_thread_context_match(row, recall_context=recall_context):
+        return _GROUP_CONTEXT_RECALL_THRESHOLD
+    return _GROUP_RECALL_THRESHOLD
+
+
+def _memory_relevance_score(
+    row: Any,
+    *,
+    recall_context: MemoryRecallContext,
+) -> float:
+    vector_score = max(
+        min(float(getattr(row, "_chatinter_vector_score", 0.0) or 0.0), 1.0),
+        0.0,
+    )
+    vector_type = str(getattr(row, "_chatinter_vector_type", "") or "")
+    semantic_score = vector_score if vector_type == "embedding" else 0.0
+    lexical_score = _lexical_overlap_score(
+        recall_context.query,
+        _memory_search_text(row),
+    )
+    if semantic_score > 0:
+        score = semantic_score * 0.62 + lexical_score * 0.18
+    else:
+        score = lexical_score * 0.56
+    score += _scope_relevance(row, recall_context=recall_context)
+    score += _context_relevance(row, recall_context=recall_context)
+    score += _type_prior(row, query=recall_context.query)
+    return max(min(score, 1.0), 0.0)
+
+
+def _memory_search_text(row: Any) -> str:
+    memory_type = normalize_message_text(getattr(row, "memory_type", ""))
+    parts = [
+        _TYPE_TEXT.get(memory_type, memory_type),
+        getattr(row, "key", ""),
+        getattr(row, "value", ""),
+        getattr(row, "topic_key", ""),
+        getattr(row, "source_message", ""),
+    ]
+    return " ".join(normalize_message_text(str(part)) for part in parts if part)
+
+
+def _scope_relevance(
+    row: Any,
+    *,
+    recall_context: MemoryRecallContext,
+) -> float:
+    score = 0.0
+    if normalize_message_text(getattr(row, "user_id", "")) == recall_context.user_id:
+        score += 0.08
+    if (
+        normalize_message_text(getattr(row, "session_id", ""))
+        == recall_context.session_id
+    ):
+        score += 0.06
+    row_group_id = normalize_message_text(getattr(row, "group_id", "") or "") or None
+    if recall_context.group_id and row_group_id == recall_context.group_id:
+        score += 0.08
+    if recall_context.group_id and row_group_id is None:
+        score += 0.04
+    return score
+
+
+def _context_relevance(
+    row: Any,
+    *,
+    recall_context: MemoryRecallContext,
+) -> float:
+    score = 0.0
+    row_thread_id = normalize_message_text(getattr(row, "thread_id", "") or "")
+    row_topic_key = normalize_message_text(getattr(row, "topic_key", "") or "")
+    row_participants = {
+        item for item in str(getattr(row, "participants", "") or "").split(",") if item
+    }
+    if recall_context.thread_id and row_thread_id == recall_context.thread_id:
+        score += 0.22
+    elif recall_context.thread_id and row_thread_id:
+        score -= 0.12
+    if recall_context.topic_key and row_topic_key == recall_context.topic_key:
+        score += 0.1
+    if recall_context.participants and row_participants:
+        overlap = len(set(recall_context.participants) & row_participants)
+        if overlap:
+            score += min(overlap, 2) * 0.05
+    if (
+        recall_context.addressee_user_id
+        and recall_context.addressee_user_id in row_participants
+    ):
+        score += 0.08
+    row_scope = normalize_message_text(getattr(row, "scope", ""))
+    if recall_context.group_id and row_scope == "thread" and not score:
+        score -= 0.08
+    return score
+
+
+def _type_prior(row: Any, *, query: str) -> float:
+    memory_type = normalize_message_text(getattr(row, "memory_type", ""))
+    if memory_type in _PROFILE_MEMORY_TYPES:
+        return 0.12 if _looks_like_personal_memory_question(query) else 0.04
+    if memory_type in {"group_digest", "thread_digest", "thread_fact"}:
+        return 0.03
+    return 0.0
+
+
+def _has_thread_context_match(
+    row: Any,
+    *,
+    recall_context: MemoryRecallContext,
+) -> bool:
+    row_thread_id = normalize_message_text(getattr(row, "thread_id", "") or "")
+    row_topic_key = normalize_message_text(getattr(row, "topic_key", "") or "")
+    if recall_context.thread_id and row_thread_id == recall_context.thread_id:
+        return True
+    if recall_context.topic_key and row_topic_key == recall_context.topic_key:
+        return True
+    row_participants = {
+        item for item in str(getattr(row, "participants", "") or "").split(",") if item
+    }
+    return bool(
+        row_participants
+        and (
+            set(recall_context.participants) & row_participants
+            or recall_context.addressee_user_id in row_participants
+        )
+    )
+
+
+def _looks_like_personal_memory_question(query: str) -> bool:
+    normalized = normalize_message_text(query)
+    if "我" not in normalized:
+        return False
+    return normalized.endswith(("?", "？", "吗", "么", "嘛")) or any(
+        marker in normalized
+        for marker in ("什么", "哪个", "哪种", "谁", "多少", "来着")
+    )
+
+
+def _lexical_overlap_score(query: str, text: str) -> float:
+    query_tokens = _recall_text_tokens(query)
+    text_tokens = _recall_text_tokens(text)
+    if not query_tokens or not text_tokens:
+        return 0.0
+    overlap = query_tokens & text_tokens
+    if not overlap:
+        compact_query = "".join(query_tokens)
+        compact_text = "".join(text_tokens)
+        if len(compact_query) >= 2 and compact_query in compact_text:
+            return 0.45
+        if len(compact_text) >= 2 and compact_text in compact_query:
+            return 0.45
+        return 0.0
+    return min(len(overlap) / max(min(len(query_tokens), len(text_tokens)), 1), 1.0)
+
+
+def _recall_text_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw_token in _TEXT_TOKEN_PATTERN.findall(normalize_message_text(text)):
+        token = raw_token.casefold()
+        if not token:
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            tokens.update(_cjk_ngrams(token))
+        elif len(token) >= 2:
+            tokens.add(token)
+    return tokens
+
+
+def _cjk_ngrams(token: str) -> set[str]:
+    if len(token) <= 2:
+        return {token}
+    result: set[str] = set()
+    for size in (2, 3):
+        result.update(
+            token[index : index + size]
+            for index in range(len(token) - size + 1)
+        )
+    return result
+
+
+def _memory_recency(row: Any) -> float:
+    value = getattr(row, "update_time", None) or getattr(row, "create_time", None)
+    if value is None:
+        return 0.0
+    try:
+        return float(value.timestamp())
+    except Exception:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
 
 
 def _memory_rank_score(
@@ -398,27 +572,6 @@ def _remember_selected_recall(
 
 
 class ChatMemoryStore:
-    @staticmethod
-    async def record_from_dialog(
-        *,
-        session_id: str,
-        user_id: str,
-        group_id: str | None,
-        message_text: str,
-        source_dialog_id: int | None = None,
-    ) -> int:
-        candidates = extract_memory_candidates(message_text)
-        if not candidates:
-            return 0
-        return await ChatMemoryStore.record_candidates(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            candidates=candidates,
-            source_dialog_id=source_dialog_id,
-            source_message=message_text,
-        )
-
     @staticmethod
     async def record_candidates(
         *,
@@ -461,6 +614,7 @@ class ChatMemoryStore:
                     participants=join_memory_participants(participants),
                     source_dialog_id=source_dialog_id,
                     source_message=source_message,
+                    replace_existing=candidate.supersedes,
                 )
                 if row is None:
                     continue
@@ -482,61 +636,6 @@ class ChatMemoryStore:
             except Exception as exc:
                 _debug(f"chatinter memory write skipped: {exc}")
         return written
-
-    @staticmethod
-    async def record_group_digest(digest: GroupMemoryDigest) -> int:
-        memory_model = _get_memory_model()
-        if memory_model is None:
-            return 0
-        candidate = MemoryCandidate(
-            memory_type="group_digest",
-            key=digest.key,
-            value=digest.value,
-            confidence=digest.confidence,
-        )
-        cache_key = _write_cache_key(
-            session_id=digest.session_id,
-            user_id=digest.user_id,
-            candidate=candidate,
-        )
-        if not _remember_recent_write(cache_key):
-            return 0
-        try:
-            row = await memory_model.upsert_memory(
-                session_id=digest.session_id,
-                user_id=digest.user_id,
-                group_id=digest.group_id,
-                memory_type=candidate.memory_type,
-                key=candidate.key,
-                value=candidate.value,
-                confidence=candidate.confidence,
-                scope="thread",
-                thread_id=digest.thread_id,
-                topic_key=digest.key,
-                participants=join_memory_participants(digest.participants),
-                source_dialog_id=None,
-                source_message=digest.source_message,
-            )
-            if row is None:
-                return 0
-            await _upsert_vector_if_needed(
-                row=row,
-                memory_type=candidate.memory_type,
-                key=candidate.key,
-                value=candidate.value,
-                session_id=digest.session_id,
-                user_id=digest.user_id,
-                group_id=digest.group_id,
-                scope="thread",
-                thread_id=digest.thread_id,
-                topic_key=digest.key,
-                participants=digest.participants,
-                confidence=candidate.confidence,
-            )
-            return 1
-        except Exception as exc:
-            _debug(f"chatinter group memory digest skipped: {exc}")
-            return 0
 
     @staticmethod
     async def recall(
@@ -643,6 +742,21 @@ def _format_memory_line(memory: Any) -> str:
     value = normalize_message_text(getattr(memory, "value", ""))
     if not value:
         return ""
+    if memory_type == "preference":
+        if key == "dislike":
+            return f"用户不喜欢：{value}"
+        return f"用户偏好：{value}"
+    if memory_type == "nickname":
+        return f"用户称呼：{value}"
+    if memory_type == "correction":
+        return f"称呼更正：{value}"
+    if memory_type == "relationship":
+        relation = value.replace("=", "是", 1)
+        return f"关系信息：{relation}"
+    if memory_type in {"person_profile_summary", "profile"}:
+        return f"用户信息：{value}"
+    if memory_type in {"group_digest", "thread_digest", "thread_fact"}:
+        return f"话题摘要：{value}"
     label = f"{memory_type}:{key}".strip(":")
     return f"{label}={value}" if label else value
 
@@ -661,16 +775,11 @@ def _append_layered_memory(
         "nickname",
         "correction",
         "person_profile_summary",
-        "thread_nickname",
-        "thread_correction",
-        "thread_person_profile_summary",
     }:
         target = buckets.person_facts
-    elif memory_type in {"relationship", "thread_relationship"} or key.startswith(
-        "relationship"
-    ):
+    elif memory_type == "relationship" or key.startswith("relationship"):
         target = buckets.relationship_facts
-    elif memory_type in {"preference", "thread_preference"}:
+    elif memory_type == "preference":
         target = buckets.preference_facts
     elif (
         memory_type
@@ -693,5 +802,4 @@ __all__ = [
     "ChatMemoryStore",
     "LayeredMemoryRecall",
     "MemoryCandidate",
-    "extract_memory_candidates",
 ]

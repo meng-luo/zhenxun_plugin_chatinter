@@ -13,9 +13,13 @@ from enum import Enum
 from nonebot.adapters import Bot, Event
 
 from .event_runtime import event_is_private, resolve_superuser
-from .route_text import normalize_message_text, strip_invoke_prefix
+from .route_text import normalize_message_text
 
-_COMMAND_PREFIXES = ("/", "!", "！", ".", "。", "#")
+
+def agent_session_is_active(session_key: str) -> bool:
+    from .superuser_agent.store import agent_session_is_active as is_active
+
+    return is_active(session_key)
 
 
 class ChatInterScenario(str, Enum):
@@ -30,7 +34,6 @@ class ScenarioRoute:
     scenario: ChatInterScenario
     reason: str
     allow_plugin_tools: bool
-    allow_agent_tools: bool = False
 
     @property
     def should_handle(self) -> bool:
@@ -62,13 +65,6 @@ def resolve_chatinter_scenario(
             reason="empty_message",
             allow_plugin_tools=False,
         )
-    if _is_direct_command_prefix(message):
-        return ScenarioRoute(
-            scenario=ChatInterScenario.SKIP,
-            reason="direct_command_prefix",
-            allow_plugin_tools=False,
-        )
-
     if group_id:
         return ScenarioRoute(
             scenario=ChatInterScenario.GROUP_PLUGIN_SELECTOR,
@@ -76,12 +72,12 @@ def resolve_chatinter_scenario(
             allow_plugin_tools=True,
         )
 
-    if resolve_superuser(bot, str(user_id)) and event_is_private(event):
+    private_superuser = resolve_superuser(bot, str(user_id)) and event_is_private(event)
+    if private_superuser and agent_session_is_active(str(user_id)):
         return ScenarioRoute(
             scenario=ChatInterScenario.SUPERUSER_AGENT,
-            reason="private_superuser",
+            reason="private_superuser_agent_active",
             allow_plugin_tools=False,
-            allow_agent_tools=True,
         )
 
     return ScenarioRoute(
@@ -89,12 +85,6 @@ def resolve_chatinter_scenario(
         reason="private_user_chat",
         allow_plugin_tools=False,
     )
-
-
-def _is_direct_command_prefix(message: str) -> bool:
-    stripped = normalize_message_text(strip_invoke_prefix(message))
-    return bool(stripped and stripped.startswith(_COMMAND_PREFIXES))
-
 
 __all__ = [
     "ChatInterScenario",

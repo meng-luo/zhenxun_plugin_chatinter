@@ -547,35 +547,7 @@ class FeedbackStore:
         reply_text: str = "",
         weight: float = 0.0,
     ) -> None:
-        normalized_session = normalize_message_text(session_id or "")
-        if not normalized_session:
-            return
-        now = time.monotonic()
-        normalized_message = normalize_message_text(message_text)
-        normalized_reply = normalize_message_text(reply_text)
-        cls._records.append(
-            FeedbackRecord(
-                timestamp=now,
-                domain="chat",
-                session_id=normalized_session,
-                kind=kind,
-                message_preview=normalized_message[:120],
-                reply_preview=normalized_reply[:120],
-                weight=float(weight or 0.0),
-            )
-        )
-        if kind in {"chat_completed", "chat_rewritten"}:
-            cls._last_chat[normalized_session] = _LastChatOutcome(
-                timestamp=now,
-                message=normalized_message,
-                reply=normalized_reply,
-            )
-        cls._record_memory_feedback(
-            session_id=normalized_session,
-            kind=kind,
-            weight=float(weight or 0.0),
-        )
-        cls._prune(now)
+        return
 
     @classmethod
     def record_runtime_guardrail(
@@ -589,46 +561,7 @@ class FeedbackStore:
         tool_name: str = "",
         weight: float = -0.12,
     ) -> None:
-        """Record runtime loop protection in the same bounded feedback store."""
-
-        normalized_session = normalize_message_text(session_id or "")
-        if not normalized_session:
-            return
-        now = time.monotonic()
-        normalized_command_id = normalize_message_text(command_id)
-        normalized_tool = normalize_message_text(tool_name)
-        normalized_reason = normalize_message_text(reason) or "runtime_guardrail"
-        normalized_severity = normalize_message_text(severity) or "light"
-        cls._records.append(
-            FeedbackRecord(
-                timestamp=now,
-                domain="runtime",
-                session_id=normalized_session,
-                kind="runtime_guardrail",
-                message_preview=normalize_message_text(message_text)[:120],
-                command_id=normalized_command_id,
-                command=normalized_tool,
-                route_stage=f"runtime_guardrail:{normalized_severity}",
-                success=False,
-                weight=float(weight or 0.0),
-            )
-        )
-        if normalized_command_id:
-            delta = _clamp_command_feedback(float(weight or 0.0))
-            cls._command_feedback[normalized_command_id] = _clamp_command_feedback(
-                cls._command_feedback.get(normalized_command_id, 0.0) + delta
-            )
-            cls._command_feedback_ts[normalized_command_id] = now
-            reason_bucket = cls._reason_feedback.setdefault(normalized_reason, {})
-            reason_bucket[normalized_command_id] = _clamp_command_feedback(
-                reason_bucket.get(normalized_command_id, 0.0) + delta
-            )
-        if normalized_tool and not normalized_command_id:
-            reason_bucket = cls._reason_feedback.setdefault(normalized_reason, {})
-            reason_bucket[normalized_tool] = _clamp_command_feedback(
-                reason_bucket.get(normalized_tool, 0.0) + float(weight or 0.0)
-            )
-        cls._prune(now)
+        return
 
     @classmethod
     async def record_plugin_outcome(
@@ -736,35 +669,6 @@ class FeedbackStore:
         )
         if plugin_feedback is not None:
             return plugin_feedback
-
-        if any(hint in normalized_message for hint in _CORRECTION_HINTS):
-            cls.record_chat(
-                session_id=normalized_session,
-                kind="user_corrected",
-                message_text=normalized_message,
-                weight=-1.0,
-            )
-            return "user_corrected"
-        if any(hint in normalized_message for hint in _THANKS_HINTS):
-            cls.record_chat(
-                session_id=normalized_session,
-                kind="user_thanks",
-                message_text=normalized_message,
-                weight=0.45,
-            )
-            return "user_thanks"
-
-        last_chat = cls._last_chat.get(normalized_session)
-        if last_chat is None or now - last_chat.timestamp > 240:
-            return None
-        if _shared_token_count(last_chat.message, normalized_message) >= 2:
-            cls.record_chat(
-                session_id=normalized_session,
-                kind="followup_same_topic",
-                message_text=normalized_message,
-                weight=-0.25,
-            )
-            return "followup_same_topic"
         return None
 
     @classmethod

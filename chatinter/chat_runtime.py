@@ -8,6 +8,7 @@ schemas, tool obligation, AgentRuntime or route execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import escape as _xml_escape
 import json
 from typing import Any
 
@@ -16,7 +17,7 @@ from .chat_dialogue_planner import (
     persist_dialogue_state,
 )
 from .chat_runtime_profile import ChatRuntimeProfile, build_chat_runtime_profile
-from .chat_strategy import build_chat_strategy_prompt, build_dialogue_state_prompt
+from .chat_strategy import build_dialogue_state_prompt
 from .response_quality_judge import ResponseQualityJudge, ResponseQualityResult
 from .route_text import normalize_message_text
 
@@ -34,7 +35,6 @@ class ChatIsolationDecision:
 
 @dataclass(frozen=True)
 class ChatPromptContext:
-    system_fragments: tuple[str, ...] = ()
     context_xml: str = ""
     tags: dict[str, str] | None = None
 
@@ -50,12 +50,10 @@ class ChatRuntime:
     @staticmethod
     def isolation_for_frame(frame: Any) -> ChatIsolationDecision:
         scenario = normalize_message_text(str(getattr(frame, "scenario", "") or ""))
-        allow_plugin_tools = bool(getattr(frame, "allow_plugin_tools", False))
-        allow_agent_tools = bool(getattr(frame, "allow_agent_tools", False))
         exposure_state = normalize_message_text(
             str(getattr(frame, "chat_tool_exposure_state", "") or "unknown")
         )
-        if scenario == "private_chat" and not allow_agent_tools:
+        if scenario == "private_chat":
             return ChatIsolationDecision(
                 allow_prompt_profile=True,
                 allow_memory_profile=True,
@@ -64,10 +62,7 @@ class ChatRuntime:
                 reason="private_chat",
             )
         if scenario == "group_plugin_selector":
-            if allow_plugin_tools and exposure_state in {
-                "unknown",
-                "plugin_tools_exposed",
-            }:
+            if exposure_state in {"unknown", "plugin_tools_exposed"}:
                 return ChatIsolationDecision(
                     allow_prompt_profile=False,
                     allow_memory_profile=False,
@@ -117,6 +112,7 @@ class ChatRuntime:
                 previous_state=getattr(frame, "previous_dialogue_state", None),
                 dialogue_context_pack=getattr(frame, "dialogue_context_pack", None),
                 thread_context=getattr(frame, "thread_context", None),
+                legacy_session_key=getattr(frame, "legacy_session_key", ""),
             )
         except Exception:
             return None
@@ -190,28 +186,32 @@ class ChatRuntime:
                 context_xml=base_context_xml,
                 tags={"chat_isolation": "profile_unavailable"},
             )
-        fragments: list[str] = []
-        strategy_prompt = build_chat_strategy_prompt(profile.dialogue_plan)
-        if strategy_prompt:
-            fragments.append(strategy_prompt)
-        state_prompt = build_dialogue_state_prompt(profile.dialogue_state)
+        context_xml = strip_dialogue_state_context(base_context_xml)
+        state_prompt = build_dialogue_state_prompt(
+            profile.dialogue_state,
+            current_message_text=(
+                getattr(frame, "current_message", "")
+                or getattr(frame, "raw_message", "")
+            ),
+        )
         if state_prompt:
-            fragments.append(state_prompt)
-        persona_prompt = profile.persona_prompt_fragment()
-        if persona_prompt:
-            fragments.append("\n当前人格设定：\n" + persona_prompt)
-        fragments.append(profile.to_context_xml())
+            context_xml = "\n".join(
+                part
+                for part in (
+                    context_xml,
+                    "<response_guidance>"
+                    f"{_xml_escape(state_prompt, quote=False)}"
+                    "</response_guidance>",
+                )
+                if part
+            )
         persona = (
             profile.persona_selection.persona
             if profile.persona_selection is not None
             else None
         )
         return ChatPromptContext(
-            system_fragments=tuple(fragments),
-            context_xml=replace_dialogue_state_context(
-                base_context_xml,
-                profile.dialogue_state,
-            ),
+            context_xml=context_xml,
             tags={
                 "chat_isolation": decision.reason,
                 "chat_kind": profile.dialogue_plan.kind,
@@ -285,9 +285,8 @@ def replace_dialogue_state_context(
     context_xml: str,
     dialogue_state: DialogueState,
 ) -> str:
-    block = dialogue_state.to_xml()
-    base = _strip_dialogue_state_block(context_xml)
-    return f"{base}\n{block}".strip() if base else block
+    del dialogue_state
+    return _strip_dialogue_state_block(context_xml)
 
 
 def strip_dialogue_state_context(context_xml: str) -> str:
@@ -297,7 +296,12 @@ def strip_dialogue_state_context(context_xml: str) -> str:
 def _strip_dialogue_state_block(context_xml: str) -> str:
     import re
 
-    pattern = re.compile(r"\n?<dialogue_state>.*?</dialogue_state>", re.DOTALL)
+    pattern = re.compile(
+        r"\n?(?:<dialogue_state>.*?</dialogue_state>|"
+        r"<continuity_context>.*?</continuity_context>|"
+        r"<response_guidance>.*?</response_guidance>)",
+        re.DOTALL,
+    )
     return pattern.sub("", str(context_xml or "")).strip()
 
 

@@ -1,42 +1,39 @@
-"""Scenario-specific ChatInter agent wrappers.
-
-The package defines stable boundaries for the future split between the light
-plugin command router, the full superuser agent, and private chat.  P0 keeps
-runtime behavior unchanged by delegating to the existing main_request module.
-"""
+"""Scenario agent exports without eager cross-scenario imports."""
 
 from typing import TYPE_CHECKING
 
-from .core import (
-    PLUGIN_COMMAND_TOOL_SCOPE,
-    PRIVATE_CHAT_TOOL_SCOPE,
-    SUPERUSER_TOOL_SCOPE,
-    AgentObservation,
-    AgentRequest,
-    AgentResult,
-    ChatInterAgent,
-    LegacyMainRequestKwargs,
-    ProgressHook,
-    ToolScope,
-)
-
 if TYPE_CHECKING:
+    from .chat_reply_agent import ChatReplyAgent
+    from .core import (
+        PLUGIN_COMMAND_TOOL_SCOPE,
+        PRIVATE_CHAT_TOOL_SCOPE,
+        AgentObservation,
+        AgentRequest,
+        AgentResult,
+        ChatInterAgent,
+        PluginCommandRequest,
+        PrivateChatRequest,
+        ProgressHook,
+        ToolScope,
+    )
     from .plugin_command_agent import PluginCommandAgent
     from .private_chat_agent import PrivateChatAgent
-    from .superuser_agent import SuperuserAgent
+    from .superuser_agent import SuperuserAgent, SuperuserRequest
 
 __all__ = [
     "PLUGIN_COMMAND_TOOL_SCOPE",
     "PRIVATE_CHAT_TOOL_SCOPE",
-    "SUPERUSER_TOOL_SCOPE",
     "AgentObservation",
     "AgentRequest",
     "AgentResult",
     "ChatInterAgent",
-    "LegacyMainRequestKwargs",
+    "ChatReplyAgent",
     "PluginCommandAgent",
+    "PluginCommandRequest",
     "PrivateChatAgent",
+    "PrivateChatRequest",
     "ProgressHook",
     "SuperuserAgent",
+    "SuperuserRequest",
     "ToolScope",
 ]

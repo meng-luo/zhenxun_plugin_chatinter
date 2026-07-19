@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 
 from .route_text import normalize_message_text
 from .target_policy import TargetPolicy
@@ -22,7 +23,6 @@ _MEDIA_TERMS = (
 _USER_TARGET_TERMS = (
     "@",
     "at",
-    "qq",
     "user",
     "member",
     "target",
@@ -104,7 +104,7 @@ def resolve_command_target_policy(
         target_requirement = "none"
     schema_text = _schema_text(schema)
     media_related = _contains_any(schema_text, _MEDIA_TERMS)
-    user_target_related = _contains_any(schema_text, _USER_TARGET_TERMS)
+    user_target_related = _contains_user_target_term(schema_text)
     try:
         image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     except Exception:
@@ -234,6 +234,21 @@ def _schema_text(schema) -> str:
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     lowered = normalize_message_text(text).casefold()
     return any(term.casefold() in lowered for term in terms)
+
+
+def _contains_user_target_term(text: str) -> bool:
+    lowered = normalize_message_text(text).casefold()
+    if not lowered:
+        return False
+    if "@" in lowered:
+        return True
+    cjk_terms = tuple(term for term in _USER_TARGET_TERMS if not term.isascii())
+    if _contains_any(lowered, cjk_terms):
+        return True
+    ascii_terms = {
+        term for term in _USER_TARGET_TERMS if term.isascii() and term != "@"
+    }
+    return any(token in ascii_terms for token in re.findall(r"[a-z]+", lowered))
 
 
 def _generic_target_missing_message(*, allow_at: bool, allow_image: bool) -> str:

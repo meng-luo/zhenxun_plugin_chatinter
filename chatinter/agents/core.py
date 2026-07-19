@@ -8,24 +8,22 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from zhenxun.services.llm import LLMMessage
-
+from ..llm_compat import LLMMessage
 from ..models.pydantic_models import PluginKnowledgeBase
 from ..native_executor import ExecuteNativeRoute
 from ..native_route import NativeRouteReport
 from ..provider_capability import ProviderCapabilityAdapter
-from ..route_text import normalize_message_text
+from ..route_text import normalize_reply_text
 from ..turn_runtime import TurnBudgetController, estimate_text_tokens
 
 if TYPE_CHECKING:
-    from zhenxun.services.llm.types.models import ToolResult
-
+    from ..llm_compat import ToolResult
     from ..main_request_models import MainRequestResult
 
 ProgressHook = Callable[[str], Awaitable[None] | None]
-AgentKind = Literal["plugin_command", "superuser", "private_chat"]
+AgentKind = Literal["plugin_command", "private_chat"]
 AgentObservationStatus = Literal["ok", "error", "fallback"]
 
 
@@ -35,29 +33,10 @@ class ToolScope:
 
     kind: AgentKind
     allow_plugin: bool = False
-    allow_superuser: bool = False
-    allow_mcp: bool = False
 
 
 PLUGIN_COMMAND_TOOL_SCOPE = ToolScope(kind="plugin_command", allow_plugin=True)
-SUPERUSER_TOOL_SCOPE = ToolScope(
-    kind="superuser",
-    allow_superuser=True,
-    allow_mcp=True,
-)
 PRIVATE_CHAT_TOOL_SCOPE = ToolScope(kind="private_chat")
-
-
-class LegacyMainRequestKwargs(TypedDict, total=False):
-    """Optional keyword arguments accepted by the legacy main request entry."""
-
-    route_completed_hook: Any
-    reply_hook: Any
-    enable_plugin_tools: bool
-    initial_command_exposure: bool
-    enable_agent_tools: bool
-    progress_hook: Any
-    _skip_agent_wrapper: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +69,8 @@ class AgentResult:
 
 
 @dataclass(slots=True)
-class AgentRequest:
-    """Common request envelope used by scenario-specific ChatInter agents."""
+class PluginCommandRequest:
+    """Request envelope for the group plugin router."""
 
     message_text: str
     knowledge_base: PluginKnowledgeBase
@@ -99,10 +78,23 @@ class AgentRequest:
     budget_controller: TurnBudgetController | None
     has_reply: bool
     command_tools: list[Any] | None
-    messages: list[LLMMessage]
     route_executor: ExecuteNativeRoute
-    kwargs: LegacyMainRequestKwargs
+    router_context: dict[str, object] | None = None
     report: NativeRouteReport | None = None
+
+
+@dataclass(slots=True)
+class PrivateChatRequest:
+    """Request envelope for ordinary private chat."""
+
+    message_text: str
+    session_key: str | None
+    budget_controller: TurnBudgetController | None
+    messages: list[LLMMessage]
+    report: NativeRouteReport | None = None
+
+
+AgentRequest = PluginCommandRequest | PrivateChatRequest
 
 
 class ChatInterAgent(Protocol):
@@ -134,7 +126,7 @@ def fallback_text(
 ) -> str:
     """Normalize final text and provide the shared empty-response fallback."""
 
-    return normalize_message_text(str(text or "")) or default
+    return normalize_reply_text(str(text or "")) or default
 
 
 def record_prompt_tokens(
@@ -194,12 +186,12 @@ def error_observation(*, kind: str, error: BaseException) -> AgentObservation:
 __all__ = [
     "PLUGIN_COMMAND_TOOL_SCOPE",
     "PRIVATE_CHAT_TOOL_SCOPE",
-    "SUPERUSER_TOOL_SCOPE",
     "AgentObservation",
     "AgentRequest",
     "AgentResult",
     "ChatInterAgent",
-    "LegacyMainRequestKwargs",
+    "PluginCommandRequest",
+    "PrivateChatRequest",
     "ProgressHook",
     "ToolScope",
     "error_observation",

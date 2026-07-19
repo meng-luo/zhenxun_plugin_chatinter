@@ -44,6 +44,9 @@ class AutoMetadataBuilder:
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
     _regex_head_pattern: ClassVar[re.Pattern[str]] = re.compile(r"[\[\(\.\*\+\?\|\$\\]")
+    _optional_regex_param_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"\(\?P<([^>]+)>\.\*\??\)"
+    )
     _image_type_hints: ClassVar[tuple[str, ...]] = (
         "image",
         "uniimg",
@@ -51,11 +54,20 @@ class AutoMetadataBuilder:
         "img",
         "bytesio",
     )
-    _at_type_hints: ClassVar[tuple[str, ...]] = (
+    _ascii_at_type_hints: ClassVar[set[str]] = {
         "at",
-        "target",
+        "user",
         "member",
-        "qq",
+        "target",
+        "nickname",
+    }
+    _cjk_at_type_hints: ClassVar[tuple[str, ...]] = (
+        "用户",
+        "成员",
+        "群友",
+        "目标",
+        "对象",
+        "昵称",
     )
 
     @classmethod
@@ -119,12 +131,11 @@ class AutoMetadataBuilder:
                 else cls._default_parser_schema()
             )
             handler_hint = cls._extract_handler_hint(matcher)
-            context_hint = cls._extract_matcher_context_hint(matcher)
-            parser_shortcut_aliases = (
-                cls._extract_parser_shortcut_aliases(parser)
-                if parser is not None
-                else []
+            parser_schema = cls._apply_runtime_param_bounds(
+                parser_schema,
+                handler_hint.get("runtime_bounds"),
             )
+            context_hint = cls._extract_matcher_context_hint(matcher)
             for payload in cls._extract_rule_command_data(
                 matcher=matcher,
                 parser_schema=parser_schema,
@@ -159,61 +170,61 @@ class AutoMetadataBuilder:
 
             if parser is None:
                 continue
-            command_head = cls._extract_parser_command_head(parser)
-            if not command_head:
+            command_heads = cls._extract_parser_command_heads(parser)
+            if not command_heads:
                 continue
-            access_level = cls._resolve_access_level(
-                access_map.get(command_head.casefold()),
-                handler_hint.get("requires_superuser"),
-            )
-            result.append(
-                {
-                    "command": command_head,
-                    "aliases": cls._merge_unique_strings(
-                        cls._extract_parser_aliases(parser, command_head),
-                        alias_map.get(command_head.casefold(), []),
-                        parser_shortcut_aliases,
-                    ),
-                    "prefixes": cls._merge_unique_strings(
-                        parser_schema["prefixes"],
-                        prefix_map.get(command_head.casefold(), []),
-                    ),
-                    "params": parser_schema["params"],
-                    "slot_choices": parser_schema.get("slot_choices", {}),
-                    "shortcut_renders": cls._merge_shortcut_renders(
-                        parser_schema.get("shortcut_renders", []),
-                        shortcut_render_map.get(command_head.casefold(), []),
-                    ),
-                    "text_min": parser_schema["text_min"],
-                    "text_max": parser_schema["text_max"],
-                    "image_min": parser_schema["image_min"],
-                    "image_max": parser_schema["image_max"],
-                    "allow_at": handler_hint["allow_at"]
-                    if handler_hint["allow_at"] is not None
-                    else parser_schema["allow_at"],
-                    "target_sources": handler_hint["target_sources"]
-                    or parser_schema["target_sources"],
-                    "requires_reply": cls._merge_context_hint(
-                        context_hint,
-                        context_map.get(command_head.casefold(), {}),
-                    )["requires_reply"]
-                    or handler_hint["requires_reply"],
-                    "requires_private": cls._merge_context_hint(
-                        context_hint,
-                        context_map.get(command_head.casefold(), {}),
-                    )["requires_private"],
-                    "requires_to_me": cls._merge_context_hint(
-                        context_hint,
-                        context_map.get(command_head.casefold(), {}),
-                    )["requires_to_me"],
-                    "allow_sticky_arg": cls._probe_sticky_arg(
-                        parser=parser,
-                        command_head=command_head,
-                        sample_text=parser_schema["sample_text"],
-                    ),
-                    "access_level": access_level,
-                }
-            )
+            for command_head in command_heads:
+                runtime_shortcut_renders = cls._extract_runtime_shortcut_renders(
+                    matcher,
+                    command_head,
+                )
+                access_level = cls._resolve_access_level(
+                    access_map.get(command_head.casefold()),
+                    handler_hint.get("requires_superuser"),
+                )
+                merged_context_hint = cls._merge_context_hint(
+                    context_hint,
+                    context_map.get(command_head.casefold(), {}),
+                )
+                result.append(
+                    {
+                        "command": command_head,
+                        "aliases": cls._merge_unique_strings(
+                            cls._extract_parser_aliases(parser, command_head),
+                            alias_map.get(command_head.casefold(), []),
+                        ),
+                        "prefixes": cls._merge_unique_strings(
+                            parser_schema["prefixes"],
+                            prefix_map.get(command_head.casefold(), []),
+                        ),
+                        "params": parser_schema["params"],
+                        "slot_choices": parser_schema.get("slot_choices", {}),
+                        "shortcut_renders": runtime_shortcut_renders
+                        or cls._merge_shortcut_renders(
+                            parser_schema.get("shortcut_renders", []),
+                            shortcut_render_map.get(command_head.casefold(), []),
+                        ),
+                        "text_min": parser_schema["text_min"],
+                        "text_max": parser_schema["text_max"],
+                        "image_min": parser_schema["image_min"],
+                        "image_max": parser_schema["image_max"],
+                        "allow_at": handler_hint["allow_at"]
+                        if handler_hint["allow_at"] is not None
+                        else parser_schema["allow_at"],
+                        "target_sources": handler_hint["target_sources"]
+                        or parser_schema["target_sources"],
+                        "requires_reply": merged_context_hint["requires_reply"]
+                        or handler_hint["requires_reply"],
+                        "requires_private": merged_context_hint["requires_private"],
+                        "requires_to_me": merged_context_hint["requires_to_me"],
+                        "allow_sticky_arg": cls._probe_sticky_arg(
+                            parser=parser,
+                            command_head=command_head,
+                            sample_text=parser_schema["sample_text"],
+                        ),
+                        "access_level": access_level,
+                    }
+                )
         return result
 
     @classmethod
@@ -292,6 +303,22 @@ class AutoMetadataBuilder:
             "target_sources": [],
             "sample_text": AutoMetadataBuilder._sticky_probe_token,
         }
+
+    @classmethod
+    def _apply_runtime_param_bounds(
+        cls,
+        parser_schema: dict[str, Any],
+        runtime_bounds: object,
+    ) -> dict[str, Any]:
+        if not isinstance(runtime_bounds, dict) or not runtime_bounds:
+            return parser_schema
+        result = dict(parser_schema)
+        for field in ("text_min", "text_max", "image_min", "image_max"):
+            value = cls._safe_int(runtime_bounds.get(field))
+            if value is not None:
+                result[field] = max(value, 0)
+        cls._normalize_requirement_bounds(result)
+        return result
 
     @classmethod
     def _extract_rule_command_data(
@@ -401,10 +428,9 @@ class AutoMetadataBuilder:
                     )
                 continue
             if checker_name == "RegexRule":
-                command_head = cls._extract_regex_head(
+                for command_head in cls._extract_regex_heads(
                     str(getattr(checker_call, "regex", "") or "")
-                )
-                if command_head:
+                ):
                     command_key = cls._normalize_command(command_head).casefold()
                     merged_context_hint = cls._merge_context_hint(
                         context_hint,
@@ -616,12 +642,17 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _extract_parser_command_head(cls, parser: object) -> str:
+        heads = cls._extract_parser_command_heads(parser)
+        return heads[0] if heads else ""
+
+    @classmethod
+    def _extract_parser_command_heads(cls, parser: object) -> list[str]:
         command_head = cls._normalize_command(str(getattr(parser, "command", "") or ""))
         if not command_head:
-            return ""
+            return []
         if command_head.startswith("re:"):
-            return cls._extract_regex_head(command_head[3:]) or ""
-        return command_head
+            return cls._extract_regex_heads(command_head[3:])
+        return [command_head]
 
     @classmethod
     def _extract_parser_aliases(
@@ -634,6 +665,11 @@ class AutoMetadataBuilder:
         if isinstance(raw_aliases, list | tuple | set | frozenset):
             for alias in raw_aliases:
                 alias_text = cls._normalize_command(str(alias or ""))
+                if (
+                    alias_text.startswith("re:")
+                    and command_head in cls._extract_regex_heads(alias_text[3:])
+                ):
+                    continue
                 if alias_text and alias_text != command_head:
                     aliases.append(alias_text)
         return cls._merge_unique_strings(aliases, [])
@@ -665,18 +701,6 @@ class AutoMetadataBuilder:
         return cls._merge_unique_strings(prefixes, [])
 
     @classmethod
-    def _extract_parser_shortcut_aliases(cls, parser: object) -> list[str]:
-        shortcuts: list[str] = []
-        for shortcut_key, shortcut_obj in cls._iter_shortcut_records(parser):
-            shortcuts.extend(
-                cls._extract_shortcut_labels(
-                    shortcut_key=shortcut_key,
-                    shortcut_obj=shortcut_obj,
-                )
-            )
-        return cls._merge_unique_strings(shortcuts, [])
-
-    @classmethod
     def _extract_parser_shortcut_renders(
         cls, parser: object
     ) -> list[dict[str, object]]:
@@ -690,10 +714,71 @@ class AutoMetadataBuilder:
             command = cls._extract_shortcut_command(shortcut_obj)
             if not labels or not command:
                 continue
+            optional_params = cls._extract_shortcut_optional_params(
+                shortcut_key=shortcut_key,
+                shortcut_obj=shortcut_obj,
+            )
             for label in labels:
                 render = cls._render_shortcut_command(command, args)
                 if render:
-                    renders.append({"alias": label, "render": render, "args": args})
+                    renders.append(
+                        {
+                            "alias": label,
+                            "render": render,
+                            "args": args,
+                            "optional_params": optional_params,
+                        }
+                    )
+        return cls._merge_shortcut_renders(renders)
+
+    @classmethod
+    def _extract_runtime_shortcut_renders(
+        cls,
+        matcher: object,
+        command_head: str,
+    ) -> list[dict[str, object]]:
+        command_getter = getattr(matcher, "command", None)
+        if not callable(command_getter):
+            return []
+        try:
+            command_obj = command_getter()
+            from arclet.alconna import command_manager
+
+            shortcuts = command_manager.get_shortcut(command_obj)
+        except Exception:
+            return []
+        if not isinstance(shortcuts, dict):
+            return []
+
+        renders: list[dict[str, object]] = []
+        normalized_head = cls._normalize_command(command_head)
+        for shortcut_key, shortcut_obj in shortcuts.items():
+            labels = cls._extract_shortcut_labels(
+                shortcut_key=shortcut_key,
+                shortcut_obj=shortcut_obj,
+            )
+            if not labels:
+                continue
+            args = cls._extract_shortcut_args(shortcut_obj)
+            command = cls._extract_shortcut_command(shortcut_obj) or normalized_head
+            if cls._normalize_command(command).casefold() != normalized_head.casefold():
+                continue
+            optional_params = cls._extract_shortcut_optional_params(
+                shortcut_key=shortcut_key,
+                shortcut_obj=shortcut_obj,
+            )
+            render = cls._render_shortcut_command(command, args)
+            if not render:
+                continue
+            for label in labels:
+                renders.append(
+                    {
+                        "alias": label,
+                        "render": render,
+                        "args": args,
+                        "optional_params": optional_params,
+                    }
+                )
         return cls._merge_shortcut_renders(renders)
 
     @classmethod
@@ -730,7 +815,7 @@ class AutoMetadataBuilder:
             if is_optional and arg_name:
                 optional_params.append(arg_name)
             has_image = cls._contains_any(arg_repr, cls._image_type_hints)
-            has_at = cls._contains_any(arg_repr, cls._at_type_hints)
+            has_at = cls._contains_at_hint(arg_repr)
             has_text = cls._contains_any(arg_repr, ("text", "str", "string"))
             if has_image:
                 image_min += 0 if is_optional else 1
@@ -897,6 +982,7 @@ class AutoMetadataBuilder:
         target_sources: list[str] = []
         requires_reply = False
         requires_superuser = False
+        runtime_bounds: dict[str, int] = {}
         for handler in getattr(matcher, "handlers", []) or []:
             call = getattr(handler, "call", None)
             if call is None:
@@ -916,11 +1002,14 @@ class AutoMetadataBuilder:
                 target_sources.append("self")
             if hint.get("requires_superuser"):
                 requires_superuser = True
+            if isinstance(hint.get("runtime_bounds"), dict):
+                runtime_bounds.update(hint["runtime_bounds"])
         return {
             "allow_at": allow_at,
             "target_sources": target_sources,
             "requires_reply": requires_reply,
             "requires_superuser": requires_superuser,
+            "runtime_bounds": runtime_bounds,
         }
 
     @classmethod
@@ -946,7 +1035,8 @@ class AutoMetadataBuilder:
         }
 
     @classmethod
-    def _load_handler_hint(cls, call: object) -> dict[str, bool]:
+    def _load_handler_hint(cls, call: object) -> dict[str, Any]:
+        runtime_bounds = cls._extract_runtime_param_bounds(call)
         source_file = inspect.getsourcefile(cast(Any, call))
         qualname = str(getattr(call, "__qualname__", "") or repr(call))
         cache_key = f"{source_file or ''}:{qualname}"
@@ -957,7 +1047,7 @@ class AutoMetadataBuilder:
 
         cached = cls._handler_hint_cache.get(cache_key)
         if cached is not None and cached[0] == mtime_ns:
-            return cached[1]
+            return {**cached[1], "runtime_bounds": runtime_bounds}
 
         try:
             source = inspect.getsource(cast(Any, call))
@@ -976,7 +1066,7 @@ class AutoMetadataBuilder:
                 "reply_message",
             )
         )
-        # reply_to=True 只是“回复用户消息”的发送方式，不代表命令需要回复上下文。
+
         reply_source = reply_source and "reply_to" not in lowered
         hint = {
             "allow_at": "at(" in lowered
@@ -996,7 +1086,42 @@ class AutoMetadataBuilder:
             or ("is_superuser" in lowered and "depends(" in lowered),
         }
         cls._handler_hint_cache[cache_key] = (mtime_ns, hint)
-        return hint
+        return {**hint, "runtime_bounds": runtime_bounds}
+
+    @classmethod
+    def _extract_runtime_param_bounds(cls, call: object) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for value in cls._iter_runtime_hint_objects(call):
+            params = getattr(getattr(value, "info", None), "params", None)
+            if params is None:
+                continue
+            for attr, field in (
+                ("min_texts", "text_min"),
+                ("max_texts", "text_max"),
+                ("min_images", "image_min"),
+                ("max_images", "image_max"),
+            ):
+                number = cls._safe_int(getattr(params, attr, None))
+                if number is not None:
+                    result[field] = max(number, 0)
+            if result:
+                return result
+        return result
+
+    @staticmethod
+    def _iter_runtime_hint_objects(call: object) -> list[object]:
+        result: list[object] = []
+        closure = getattr(call, "__closure__", None) or ()
+        for cell in closure:
+            try:
+                result.append(cell.cell_contents)
+            except ValueError:
+                continue
+        defaults = getattr(call, "__defaults__", None) or ()
+        kwdefaults = getattr(call, "__kwdefaults__", None) or {}
+        result.extend(defaults)
+        result.extend(kwdefaults.values())
+        return result
 
     @classmethod
     def _load_module_access_map(cls, module_obj: object) -> dict[str, str]:
@@ -1334,15 +1459,6 @@ class AutoMetadataBuilder:
             command = cls._extract_command_from_call_node(node)
             aliases = cls._extract_aliases_from_call_node(node)
             if not command or not aliases:
-                shortcut_command, shortcut_aliases = (
-                    cls._extract_shortcut_from_call_node(node)
-                )
-                if not shortcut_command or not shortcut_aliases:
-                    continue
-                alias_map[shortcut_command.casefold()] = cls._merge_unique_strings(
-                    alias_map.get(shortcut_command.casefold()),
-                    shortcut_aliases,
-                )
                 continue
             alias_map[command.casefold()] = cls._merge_unique_strings(
                 alias_map.get(command.casefold()),
@@ -1379,7 +1495,12 @@ class AutoMetadataBuilder:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            shortcut_command, shortcut_aliases, shortcut_args = (
+            (
+                shortcut_command,
+                shortcut_aliases,
+                shortcut_args,
+                optional_params,
+            ) = (
                 cls._extract_shortcut_render_from_call_node(node)
             )
             if not shortcut_command or not shortcut_aliases:
@@ -1389,7 +1510,12 @@ class AutoMetadataBuilder:
                 render = cls._render_shortcut_command(shortcut_command, shortcut_args)
                 if render:
                     entries.append(
-                        {"alias": alias, "render": render, "args": shortcut_args}
+                        {
+                            "alias": alias,
+                            "render": render,
+                            "args": shortcut_args,
+                            "optional_params": optional_params,
+                        }
                     )
         render_map = {
             key: cls._merge_shortcut_renders(value) for key, value in render_map.items()
@@ -1523,23 +1649,29 @@ class AutoMetadataBuilder:
 
     @classmethod
     def _extract_shortcut_from_call_node(cls, node: ast.Call) -> tuple[str, list[str]]:
-        command, aliases, _args = cls._extract_shortcut_render_from_call_node(node)
+        command, aliases, _args, _optional = (
+            cls._extract_shortcut_render_from_call_node(node)
+        )
         return command, aliases
 
     @classmethod
     def _extract_shortcut_render_from_call_node(
         cls,
         node: ast.Call,
-    ) -> tuple[str, list[str], list[str]]:
+    ) -> tuple[str, list[str], list[str], list[str]]:
         if cls._get_call_name(node.func) != "shortcut" or not node.args:
-            return "", [], []
+            return "", [], [], []
 
         shortcut_key = ""
+        optional_params: list[str] = []
         first_arg = node.args[0]
         if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
             shortcut_key = cls._coerce_shortcut_alias(first_arg.value)
+            optional_params = cls._extract_optional_regex_shortcut_params(
+                first_arg.value
+            )
         if not shortcut_key:
-            return "", [], []
+            return "", [], [], []
 
         target_command = ""
         humanized_aliases: list[str] = [shortcut_key]
@@ -1573,12 +1705,39 @@ class AutoMetadataBuilder:
                         if cls._normalize_command(str(item or ""))
                     ]
         if not target_command:
-            return "", [], []
+            return "", [], [], []
         return (
             target_command,
             cls._merge_unique_strings(humanized_aliases, []),
             shortcut_args,
+            optional_params,
         )
+
+    @classmethod
+    def _extract_optional_regex_shortcut_params(cls, pattern: object) -> list[str]:
+        names = [
+            cls._normalize_command(match.group(1))
+            for match in cls._optional_regex_param_pattern.finditer(str(pattern or ""))
+        ]
+        return cls._merge_unique_strings([name for name in names if name], [])
+
+    @classmethod
+    def _extract_shortcut_optional_params(
+        cls,
+        *,
+        shortcut_key: object | None,
+        shortcut_obj: object | None,
+    ) -> list[str]:
+        patterns: list[object] = [shortcut_key]
+        if shortcut_obj is not None:
+            patterns.extend(
+                getattr(shortcut_obj, attr_name, None)
+                for attr_name in ("origin_key", "key", "pattern")
+            )
+        names: list[str] = []
+        for pattern in patterns:
+            names.extend(cls._extract_optional_regex_shortcut_params(pattern))
+        return cls._merge_unique_strings(names, [])
 
     @classmethod
     def _normalize_command(cls, command: str) -> str:
@@ -1694,6 +1853,23 @@ class AutoMetadataBuilder:
         return records
 
     @classmethod
+    def _extract_regex_heads(cls, pattern: str) -> list[str]:
+        text = str(pattern or "").strip()
+        if text.startswith("re:"):
+            text = text[3:].strip()
+        text = text.lstrip("^").rstrip("$").strip()
+        if text.startswith("(") and text.endswith(")") and "|" in text:
+            inner = text[1:-1]
+
+            if not any(char in inner for char in "\\[]{}.*+?^$:()"):
+                return cls._merge_unique_strings(
+                    [cls._normalize_command(part) for part in inner.split("|")],
+                    [],
+                )
+        head = cls._extract_regex_head(text)
+        return [head] if head else []
+
+    @classmethod
     def _extract_regex_head(cls, pattern: str) -> str | None:
         text = str(pattern or "").strip().lstrip("^")
         if not text or text.startswith("(?:") or text.startswith("(?"):
@@ -1706,6 +1882,18 @@ class AutoMetadataBuilder:
     @staticmethod
     def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
         return any(keyword and keyword in text for keyword in keywords)
+
+    @classmethod
+    def _contains_at_hint(cls, text: str) -> bool:
+        normalized = cls._normalize_command(text).lower()
+        if not normalized:
+            return False
+        if "@" in normalized or cls._contains_any(normalized, cls._cjk_at_type_hints):
+            return True
+        return any(
+            token in cls._ascii_at_type_hints
+            for token in re.findall(r"[a-z]+", normalized)
+        )
 
     @staticmethod
     def _safe_int(value: object) -> int | None:
@@ -1824,19 +2012,30 @@ class AutoMetadataBuilder:
                     continue
                 seen.add(marker)
                 args = item.get("args")
-                merged.append(
-                    {
-                        "alias": alias,
-                        "render": render,
-                        "args": [
-                            cls._normalize_command(str(arg or ""))
-                            for arg in args
-                            if cls._normalize_command(str(arg or ""))
-                        ]
-                        if isinstance(args, list | tuple)
-                        else [],
-                    }
+                raw_optional_params = item.get("optional_params", [])
+                optional_params = (
+                    [
+                        cls._normalize_command(str(param or ""))
+                        for param in raw_optional_params
+                        if cls._normalize_command(str(param or ""))
+                    ]
+                    if isinstance(raw_optional_params, list | tuple)
+                    else []
                 )
+                payload: dict[str, object] = {
+                    "alias": alias,
+                    "render": render,
+                    "args": [
+                        cls._normalize_command(str(arg or ""))
+                        for arg in args
+                        if cls._normalize_command(str(arg or ""))
+                    ]
+                    if isinstance(args, list | tuple)
+                    else [],
+                }
+                if optional_params:
+                    payload["optional_params"] = optional_params
+                merged.append(payload)
         return merged
 
     @classmethod

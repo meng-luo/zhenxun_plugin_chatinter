@@ -19,7 +19,15 @@ _INDEX_PATH = Path("data/cache/chatinter/memory_vector_index.json")
 _FALLBACK_DIM = 384
 _EMBEDDING_COOLDOWN = 120.0
 _TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+")
-_INDEXABLE_TYPES = {"group_digest", "thread_digest", "person_profile_summary"}
+_INDEXABLE_TYPES = {
+    "nickname",
+    "correction",
+    "preference",
+    "relationship",
+    "person_profile_summary",
+    "thread_digest",
+    "group_digest",
+}
 _SEARCH_LIMIT = 16
 
 
@@ -187,6 +195,8 @@ class MemoryVectorIndex:
                 try:
                     memory_id = int(raw_id)
                     metadata = _metadata_from_payload(item.get("metadata", {}))
+                    if not cls.is_indexable_type(metadata.memory_type):
+                        continue
                     vector = item.get("vector", [])
                     if not isinstance(vector, list) or not vector:
                         continue
@@ -367,14 +377,13 @@ def _matches_context(
     metadata: MemoryVectorMetadata,
     context: MemoryRecallContext,
 ) -> bool:
-    if metadata.group_id and context.group_id and metadata.group_id != context.group_id:
-        return False
-    if metadata.scope == "user" and metadata.user_id != context.user_id:
-        return False
+    if metadata.scope == "user":
+        return metadata.user_id == context.user_id and (
+            metadata.group_id is None or metadata.group_id == context.group_id
+        )
     if metadata.scope in {"group", "thread"}:
-        if not context.group_id or metadata.group_id != context.group_id:
-            return False
-    return True
+        return bool(context.group_id and metadata.group_id == context.group_id)
+    return False
 
 
 def _structured_boost(
@@ -491,9 +500,9 @@ def _fallback_vector(text: str, dim: int = _FALLBACK_DIM) -> list[float]:
 
 def _get_llm_func(name: str) -> Any | None:
     try:
-        from zhenxun.services import llm
+        from .llm_compat import __dict__ as _llm_api
 
-        return getattr(llm, name, None)
+        return _llm_api.get(name)
     except Exception as exc:
         _debug(f"chatinter memory embedding api unavailable: {exc}")
         return None

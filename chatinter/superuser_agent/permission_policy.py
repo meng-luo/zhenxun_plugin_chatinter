@@ -1,270 +1,120 @@
-"""Configurable allow/ask/deny policy for superuser agent tools."""
+"""Small operation guardrail for the superuser Agent."""
 
 from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+import os
 from pathlib import Path
-from typing import Any, Literal, cast
+import re
+from typing import Any, Literal
 
-from loguru import logger
+from ..persistence import read_json, state_path, write_json
 
 Decision = Literal["allow", "ask", "deny"]
-PermissionMode = Literal["default", "ask_all", "auto_readonly", "bypass"]
-
-_CONFIG_PATH = Path("data/configs/chatinter_agent_permissions.yaml")
-_VALID_PERMISSION_MODES = frozenset({"default", "ask_all", "auto_readonly", "bypass"})
-_CURRENT_SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "chatinter_superuser_permission_session",
+PermissionMode = Literal["ask", "read_only", "full_access"]
+_PERMISSION_MODES = frozenset({"ask", "read_only", "full_access"})
+_WINDOWS_CASE_INSENSITIVE = os.name == "nt"
+_CURRENT_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "chatinter_superuser_permission_run",
     default="",
 )
-# ponytail: process-memory override; add TTL only if stale sessions become measurable.
-_SESSION_PERMISSION_MODES: dict[str, PermissionMode] = {}
+_CURRENT_MODE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "chatinter_superuser_permission_mode",
+    default="",
+)
+_CONVERSATION_GRANTS_PATH = state_path("agent_conversation_grants.json")
+_WORKSPACE_SHELL_GRANT = "workspace_non_dangerous_shell"
+
 _DEFAULT_POLICY: dict[str, Any] = {
-    "superuser_agent": {
-        "shell": {
-            "allow": [
-                "pwd",
-                "cd",
-                "dir",
-                "ls",
-                "echo*",
-                "type *",
-                "cat *",
-                "docker ps",
-                "docker ps *",
-                "docker info",
-                "docker info *",
-                "docker stats --no-stream",
-                "docker stats --no-stream *",
-                "df",
-                "df *",
-                "free",
-                "free *",
-                "uptime",
-                "uptime *",
-                "whoami",
-                "hostname",
-                "hostname *",
-            ],
-            "ask": [],
-            "deny": [
-                "git *",
-                "uv *",
-                "uvx *",
-                "python*",
-                "pip *",
-                "systemctl *",
-                "service *",
-                "pm2 *",
-                "screen *",
-                "taskkill *",
-                "kill *",
-                "netstat *",
-                "ss *",
-                "lsof *",
-                "ps *",
-                "top*",
-                "rm -rf*",
-                "del /s*",
-                "rmdir /s*",
-                "format *",
-                "shutdown*",
-                "reboot*",
-                "poweroff*",
-            ],
-        },
-        "git": {
-            "allow": [
-                "git status*",
-                "git diff*",
-                "git log*",
-                "git branch*",
-                "git worktree list*",
-                "git show*",
-                "git remote -v*",
-                "git rev-parse*",
-                "git ls-files*",
-            ],
-            "ask": [
-                "git worktree add*",
-                "git worktree remove*",
-                "git worktree prune*",
-                "git add*",
-                "git commit*",
-                "git push*",
-                "git pull*",
-                "git fetch*",
-                "git checkout*",
-                "git switch*",
-                "git merge*",
-                "git rebase*",
-                "git stash*",
-                "git restore*",
-                "git clean -n*",
-            ],
-            "deny": [
-                "git reset --hard*",
-                "git clean -f*",
-                "git clean -fd*",
-                "git filter-branch*",
-                "git gc --prune=now*",
-            ],
-        },
-        "server": {
-            "allow": [
-                "server_status",
-                "mcp_runtime_status*",
-                "mcp_runtime_refresh*",
-                "process_list*",
-                "disk_usage*",
-                "systemctl status*",
-                "service * status*",
-                "pm2 status*",
-                "pm2 list*",
-                "screen -ls*",
-                "tasklist*",
-                "ps *",
-                "netstat *",
-                "ss *",
-                "lsof *",
-                "df *",
-                "free *",
-                "uptime*",
-            ],
-            "ask": [
-                "mcp_runtime_reload*",
-                "systemctl restart*",
-                "systemctl start*",
-                "systemctl stop*",
-                "service * restart*",
-                "service * start*",
-                "service * stop*",
-                "pm2 restart*",
-                "pm2 start*",
-                "pm2 stop*",
-                "screen -S * -X *",
-                "taskkill *",
-                "kill *",
-            ],
-            "deny": [
-                "shutdown*",
-                "reboot*",
-                "poweroff*",
-                "format *",
-                "rm -rf*",
-                "del /s*",
-                "rmdir /s*",
-                "kill -9*",
-                "taskkill /f*",
-            ],
-        },
-        "plugin_dev": {
-            "allow": [
-                "plugin_dev_inspect*",
-                "plugin_dev_validate_name*",
-            ],
-            "ask": [
-                "plugin_dev_scaffold*",
-                "plugin_dev_write_file*",
-                "plugin_dev_publish*",
-            ],
-            "deny": [
-                "plugin_dev_delete*",
-                "plugin_dev_remove*",
-                "plugin_dev_overwrite_builtin*",
-            ],
-        },
-        "patch": {
-            "allow": [
-                "patch_prepare*",
-                "patch_show*",
-            ],
-            "ask": [
-                "patch_apply*",
-                "patch_rollback*",
-            ],
-            "deny": [],
-        },
-        "background": {
-            "allow": [
-                "background_task_status*",
-                "background_task_list*",
-            ],
-            "ask": [
-                "background_task_start*",
-                "background_task_cancel*",
-            ],
-            "deny": [],
-        },
-        "uv": {
-            "allow": [
-                "uv --version*",
-                "uv tree*",
-                "uv pip list*",
-                "uv lock*",
-                "uv run ruff*",
-                "uv run pyright*",
-            ],
-            "ask": [
-                "uv sync*",
-                "uv add*",
-                "uv remove*",
-                "uv pip install*",
-                "uv pip uninstall*",
-                "uv run*",
-                "uvx*",
-            ],
-            "deny": [],
-        },
-        "python": {
-            "allow": [
-                "python --version*",
-                "python -V*",
-                "python -m py_compile*",
-            ],
-            "ask": [
-                "python_exec*",
-                "python_module*",
-                "python *",
-            ],
-            "deny": [],
-        },
-        "eval": {
-            "allow": [
-                "engineering_loop_start*",
-                "engineering_loop_status*",
-                "engineering_lsp_read*",
-                "semantic_patch_plan*",
-                "engineering_loop_bind*",
-                "engineering_failure_diagnose*",
-                "engineering_eval_gate*",
-                "engineering_loop_complete*",
-                "engineering_eval_plan*",
-                "engineering_eval_status*",
-            ],
-            "ask": [
-                "engineering_eval_run*",
-                "engineering_eval_rollback*",
-            ],
-            "deny": [],
-        },
-        "file": {
-            "allow_read": ["C:/zhenxun/**"],
-            "ask_read": [],
-            "allow_write": [],
-            "ask_write": ["C:/zhenxun/**"],
-            "deny": [
-                "C:/Windows/**",
-                "C:/Program Files/**",
-                "C:/Program Files (x86)/**",
-                "C:/Users/*/.ssh/**",
-                "C:/Users/*/AppData/Roaming/Microsoft/Windows/PowerShell/**",
-            ],
-        },
-    }
+    "preset": "python",
+    "default_mode": "ask",
+    "dangerous_policy": "ask",
+    "allow": [],
+    "ask": [],
+    "dangerous": [],
+    "deny": [],
 }
+_PYTHON_PRESET: dict[str, tuple[str, ...]] = {
+    "allow": (
+        "File(@workspace/**)",
+        "Shell(pwd)",
+        "Shell(cd)",
+        "Shell(whoami)",
+        "Shell(hostname)",
+        "Shell(git status)",
+        "Shell(git status *)",
+        "Shell(git diff)",
+        "Shell(git diff *)",
+        "Shell(git branch)",
+        "Shell(git branch --list)",
+        "Shell(git branch --show-current)",
+    ),
+    "ask": (
+        "Shell(pytest*)",
+        "Shell(python -m pytest*)",
+        "Shell(py -m pytest*)",
+        "Shell(ruff*)",
+        "Shell(mypy*)",
+        "Shell(uv run*)",
+        "Shell(poetry run*)",
+    ),
+    "dangerous": (
+        "Shell(rm *)",
+        "Shell(del *)",
+        "Shell(rmdir *)",
+        "Shell(remove-item *)",
+        "Shell(git reset *)",
+        "Shell(git clean *)",
+        "Shell(git push *)",
+        "Shell(pip install*)",
+        "Shell(python -m pip install*)",
+        "Shell(py -m pip install*)",
+        "Shell(uv add*)",
+        "Shell(uv lock*)",
+        "Shell(poetry add*)",
+        "Shell(curl *)",
+        "Shell(wget *)",
+        "Shell(docker run *)",
+        "Shell(docker rm *)",
+        "Shell(docker system prune*)",
+        "Shell(kill *)",
+        "Shell(taskkill *)",
+        "Shell(systemctl *)",
+        "Shell(service *)",
+        "Shell(sc *)",
+    ),
+    "deny": (
+        "File(**/.env*)",
+        "File(**/.git)",
+        "File(**/.git/**)",
+        "File(**/.ssh)",
+        "File(**/.ssh/**)",
+        "File(**/.aws)",
+        "File(**/.aws/**)",
+        "File(**/.azure)",
+        "File(**/.azure/**)",
+        "File(**/.config/gcloud)",
+        "File(**/.config/gcloud/**)",
+        "File(**/AppData/Roaming/gcloud)",
+        "File(**/AppData/Roaming/gcloud/**)",
+        "File(**/.kube)",
+        "File(**/.kube/**)",
+        "File(**/.docker/config.json)",
+        "File(**/secrets)",
+        "File(**/secrets/**)",
+        "File(**/.secrets)",
+        "File(**/.secrets/**)",
+        "Shell(shutdown*)",
+        "Shell(reboot*)",
+        "Shell(poweroff*)",
+        "Shell(halt*)",
+        "Shell(mkfs*)",
+        "Shell(format *)",
+    ),
+}
+_PRESETS = {"python": _PYTHON_PRESET, "none": {}}
 
 
 @dataclass(frozen=True)
@@ -272,170 +122,429 @@ class PermissionResult:
     decision: Decision
     reason: str
     matched_pattern: str = ""
+    section: str = ""
+    grant_key: str = ""
 
 
-def set_current_permission_session(
-    session_key: str | None,
-) -> contextvars.Token[str]:
-    """Bind the active superuser permission session for this task."""
-
-    return _CURRENT_SESSION_KEY.set(str(session_key or ""))
+def set_current_permission_run(run_id: str | None) -> contextvars.Token[str]:
+    return _CURRENT_RUN_ID.set(str(run_id or ""))
 
 
-def reset_current_permission_session(token: contextvars.Token[str]) -> None:
-    _CURRENT_SESSION_KEY.reset(token)
+def reset_current_permission_run(token: contextvars.Token[str]) -> None:
+    _CURRENT_RUN_ID.reset(token)
 
 
-def set_session_permission_mode(
-    session_key: str,
-    mode: str,
-) -> PermissionMode:
-    """Override permission mode for one session until process restart/clear."""
-
-    normalized = _coerce_permission_mode(mode)
-    if normalized is None:
-        raise ValueError(f"invalid permission mode: {mode}")
-    key = str(session_key or "").strip()
-    if not key:
-        raise ValueError("session_key is required")
-    _SESSION_PERMISSION_MODES[key] = normalized
-    return normalized
+def set_current_permission_mode(mode: str | None) -> contextvars.Token[str]:
+    return _CURRENT_MODE.set(str(mode or ""))
 
 
-def clear_session_permission_mode(session_key: str) -> None:
-    _SESSION_PERMISSION_MODES.pop(str(session_key or "").strip(), None)
+def reset_current_permission_mode(token: contextvars.Token[str]) -> None:
+    _CURRENT_MODE.reset(token)
 
 
-def get_session_permission_mode(
-    session_key: str | None = None,
-) -> PermissionMode | None:
-    key = str(session_key if session_key is not None else _CURRENT_SESSION_KEY.get())
-    key = key.strip()
-    return _SESSION_PERMISSION_MODES.get(key) if key else None
+def get_current_permission_mode() -> PermissionMode:
+    return _resolve_permission_mode()
 
 
-def decide_shell(command: str) -> PermissionResult:
-    return _decide_command("shell", command, default="ask")
-
-
-def decide_git(command: str) -> PermissionResult:
-    return _decide_command("git", command, default="ask")
-
-
-def decide_server(command: str) -> PermissionResult:
-    return _decide_command("server", command, default="ask")
-
-
-def decide_plugin_dev(command: str) -> PermissionResult:
-    return _decide_command("plugin_dev", command, default="ask")
-
-
-def decide_patch(command: str) -> PermissionResult:
-    return _decide_command("patch", command, default="ask")
-
-
-def decide_background(command: str) -> PermissionResult:
-    return _decide_command("background", command, default="ask")
-
-
-def decide_uv(command: str) -> PermissionResult:
-    return _decide_command("uv", command, default="ask")
-
-
-def decide_python(command: str) -> PermissionResult:
-    return _decide_command("python", command, default="ask")
-
-
-def decide_eval(command: str) -> PermissionResult:
-    return _decide_command("eval", command, default="ask")
-
-
-def decide_file_read(path: str) -> PermissionResult:
-    policy = _policy_section("file")
-    result = _decide_by_patterns(
-        value=_normalize_path(path),
-        allow=policy.get("allow_read", []),
-        ask=policy.get("ask_read", []),
-        deny=policy.get("deny", []),
-        default="ask",
-    )
-    return _apply_permission_mode(result, read_only=True)
-
-
-def decide_file_write(path: str) -> PermissionResult:
-    policy = _policy_section("file")
-    result = _decide_by_patterns(
-        value=_normalize_path(path),
-        allow=policy.get("allow_write", []),
-        ask=policy.get("ask_write", []),
-        deny=policy.get("deny", []),
-        default="ask",
-    )
-    return _apply_permission_mode(result, read_only=False)
-
-
-def _decide_command(
-    section: str, command: str, *, default: Decision
-) -> PermissionResult:
-    hard_floor = _hard_floor_command_deny(command)
-    if hard_floor is not None:
-        return hard_floor
-    policy = _policy_section(section)
-    result = _decide_by_patterns(
-        value=_normalize_text(command),
-        allow=policy.get("allow", []),
-        ask=policy.get("ask", []),
-        deny=policy.get("deny", []),
-        default=default,
-    )
-    if (
-        section == "shell"
-        and result.reason == "default_ask"
-        and _is_builtin_readonly_shell_command(command)
-    ):
-        result = PermissionResult("allow", "builtin_readonly_allow")
-    return _apply_permission_mode(
-        result,
-        read_only=_is_read_only_command(section, command, result),
+def get_default_permission_mode() -> PermissionMode:
+    policy = _effective_policy()
+    return _resolve_permission_mode(
+        str(policy.get("default_mode", "ask") or "ask"),
+        policy=policy,
     )
 
 
-def _policy_section(name: str) -> dict[str, Any]:
-    section = _load_policy().get("superuser_agent", {}).get(name, {})
-    return section if isinstance(section, dict) else {}
+def resolve_permission_mode(mode: str | None) -> PermissionMode:
+    return _resolve_permission_mode(mode)
 
 
-def _decide_by_patterns(
+def grant_conversation_permission(
+    run_id: str,
     *,
-    value: str,
-    allow: Any,
-    ask: Any,
-    deny: Any,
-    default: Decision,
+    section: str,
+    grant_key: str,
+) -> bool:
+    run = str(run_id or "").strip()
+    scope = str(section or "").strip()
+    key = str(grant_key or "").strip()
+    if not run or not scope or not key:
+        return False
+    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
+    if not isinstance(grants, dict):
+        grants = {}
+    values = grants.get(run)
+    entries = list(values) if isinstance(values, list) else []
+    item = {"section": scope, "grant_key": key}
+    if item not in entries:
+        entries.append(item)
+    grants[run] = entries[-100:]
+    write_json(_CONVERSATION_GRANTS_PATH, grants)
+    return True
+
+
+def clear_conversation_permissions(run_id: str) -> None:
+    run = str(run_id or "").strip()
+    if not run:
+        return
+    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
+    if not isinstance(grants, dict) or run not in grants:
+        return
+    grants.pop(run, None)
+    write_json(_CONVERSATION_GRANTS_PATH, grants)
+
+
+def conversation_has_workspace_shell_grant(run_id: str) -> bool:
+    run = str(run_id or "").strip()
+    if not run:
+        return False
+    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
+    entries = grants.get(run) if isinstance(grants, dict) else None
+    return isinstance(entries, list) and {
+        "section": "shell",
+        "grant_key": _WORKSPACE_SHELL_GRANT,
+    } in entries
+
+
+def permission_reason_text(result: PermissionResult) -> str:
+    if result.decision == "deny":
+        if result.reason == "hard_floor_deny":
+            return "该操作可能造成不可恢复的系统破坏，已被安全边界拒绝"
+        if result.reason == "read_only_mode_deny":
+            return "当前处于只读模式，该操作不会执行"
+        if result.reason == "opaque_shell_wrapper_deny":
+            return "该命令包含无法检查的编码 Shell 内容，已被拒绝"
+        if result.reason == "dangerous_policy_deny":
+            return "该命令属于危险操作，当前配置禁止执行"
+        if result.reason == "default_deny":
+            return "该操作不在允许范围内"
+        return "该操作命中了当前禁止规则"
+    if result.decision == "ask":
+        if result.reason == "dangerous_operation":
+            return "该命令可能删除、发布或改变系统状态，需要你的确认"
+        return "该操作会修改文件、进程或外部状态，需要你的确认"
+    return "当前权限模式允许该操作"
+
+
+def decide_shell(
+    command: str,
+    *,
+    cwd: str | None = None,
+    mode: str | None = None,
 ) -> PermissionResult:
-    for pattern in _patterns(deny):
-        if _match(value, pattern):
-            return PermissionResult("deny", "matched_deny", pattern)
-    for pattern in _patterns(allow):
-        if _match(value, pattern):
-            return PermissionResult("allow", "matched_allow", pattern)
-    for pattern in _patterns(ask):
-        if _match(value, pattern):
-            return PermissionResult("ask", "matched_ask", pattern)
-    return PermissionResult(default, "default_" + default)
+    policy = _effective_policy()
+    value = _normalize_text(command)
+    permission_mode = _resolve_permission_mode(mode, policy=policy)
+    if permission_mode == "full_access":
+        return PermissionResult(
+            "allow", "full_access_mode_allow", section="shell", grant_key=value
+        )
+
+    denied = _shell_command_deny(command, policy=policy)
+    if denied is not None:
+        return denied
+
+    cwd_is_safe = _cwd_is_within_workspace(cwd)
+    is_readonly = cwd_is_safe and _is_builtin_readonly_shell_command(command)
+    if permission_mode == "read_only":
+        if is_readonly:
+            return PermissionResult(
+                "allow", "builtin_readonly_allow", section="shell", grant_key=value
+            )
+        return PermissionResult("deny", "read_only_mode_deny", section="shell")
+
+    dangerous = _matched_shell_rule(command, policy.get("dangerous", ()))
+    if dangerous:
+        if str(policy.get("dangerous_policy", "ask")).strip().lower() == "deny":
+            return PermissionResult("deny", "dangerous_policy_deny", dangerous)
+        return PermissionResult("ask", "dangerous_operation", dangerous)
+
+    allowed = _matched_shell_rule(command, policy.get("allow", ()))
+    if cwd_is_safe and allowed and _is_simple_shell_command(command):
+        if not _allowed_shell_has_side_effect_flag(command):
+            return PermissionResult(
+                "allow", "matched_allow", allowed, "shell", allowed
+            )
+    if is_readonly:
+        return PermissionResult(
+            "allow", "builtin_readonly_allow", section="shell", grant_key=value
+        )
+
+    ask_pattern = _matched_shell_rule(command, policy.get("ask", ()))
+    pending = PermissionResult(
+        "ask",
+        "matched_ask" if ask_pattern else "shell_requires_approval",
+        ask_pattern,
+        "shell",
+        ask_pattern or _WORKSPACE_SHELL_GRANT,
+    )
+    if not cwd_is_safe:
+        return pending
+    return _apply_conversation_grant(pending)
 
 
-def _hard_floor_command_deny(command: str) -> PermissionResult | None:
+def decide_file_read(path: str, *, mode: str | None = None) -> PermissionResult:
+    policy = _effective_policy()
+    permission_mode = _resolve_permission_mode(mode, policy=policy)
+    if permission_mode == "full_access":
+        return PermissionResult("allow", "full_access_mode_allow")
+    denied = _file_path_deny(path, policy=policy)
+    if denied is not None:
+        return denied
+    matched = _matched_file_rule(path, policy.get("allow", ()))
+    if matched:
+        return PermissionResult("allow", "matched_allow", matched)
+    return PermissionResult("deny", "default_deny")
+
+
+def decide_file_write(path: str, *, mode: str | None = None) -> PermissionResult:
+    policy = _effective_policy()
+    value = _normalize_path(path)
+    permission_mode = _resolve_permission_mode(mode, policy=policy)
+    if permission_mode == "full_access":
+        return PermissionResult(
+            "allow", "full_access_mode_allow", section="file", grant_key=value
+        )
+    if permission_mode == "read_only":
+        return PermissionResult(
+            "deny", "read_only_mode_deny", section="file", grant_key=value
+        )
+    denied = _file_path_deny(path, policy=policy)
+    if denied is not None:
+        return denied
+    matched = _matched_file_rule(path, policy.get("allow", ()))
+    if matched:
+        return PermissionResult("allow", "matched_allow", matched, "file", matched)
+    ask_pattern = _matched_file_rule(path, policy.get("ask", ()))
+    pending = PermissionResult(
+        "ask",
+        "matched_ask" if ask_pattern else "default_ask",
+        ask_pattern,
+        "file",
+        ask_pattern or value,
+    )
+    return _apply_conversation_grant(pending)
+
+
+def _resolve_permission_mode(
+    requested: str | None = None,
+    *,
+    policy: dict[str, Any] | None = None,
+) -> PermissionMode:
+    current_policy = policy or _effective_policy()
+    configured_default = str(
+        current_policy.get("default_mode", "ask") or "ask"
+    ).strip().lower()
+    if configured_default == "full_access":
+        return "full_access"
+    raw = requested
+    if raw is None:
+        raw = _CURRENT_MODE.get().strip() or configured_default
+    normalized = str(raw or "").strip().lower()
+    return normalized if normalized in _PERMISSION_MODES else "ask"  # type: ignore[return-value]
+
+
+def _apply_conversation_grant(result: PermissionResult) -> PermissionResult:
+    if result.decision != "ask" or not result.section or not result.grant_key:
+        return result
+    run_id = _CURRENT_RUN_ID.get().strip()
+    if not run_id:
+        return result
+    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
+    entries = grants.get(run_id) if isinstance(grants, dict) else None
+    expected = {"section": result.section, "grant_key": result.grant_key}
+    if not isinstance(entries, list) or expected not in entries:
+        return result
+    return PermissionResult(
+        "allow",
+        "conversation_grant",
+        result.matched_pattern,
+        result.section,
+        result.grant_key,
+    )
+
+
+def expand_shell_command_candidates(command: str) -> tuple[str, ...]:
+    """Return original, compound, unwrapped, and canonical command forms."""
+
+    root = _normalize_text(command)
+    if not root:
+        return ()
+    pending = [root]
+    candidates: list[str] = []
+    seen: set[str] = set()
+    while pending:
+        candidate = _normalize_text(pending.pop(0))
+        identity = candidate.casefold()
+        if not candidate or identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append(candidate)
+        canonical = _canonical_command(candidate)
+        if canonical and canonical.casefold() not in seen:
+            pending.append(canonical)
+        if wrapped := _unwrap_shell_command(candidate):
+            pending.append(wrapped)
+        segments = [
+            _strip_outer_quotes(part.lstrip(" \t([{"))
+            for part in re.split(r"[;&|\r\n]+", candidate)
+            if part.strip()
+        ]
+        pending.extend(segment for segment in segments if segment != candidate)
+    return tuple(candidates)
+
+
+def hard_floor_command_deny(command: str) -> PermissionResult | None:
     value = _normalize_text(command).lower()
     if not value:
         return None
-    if _matches_hard_floor(value):
-        return PermissionResult("deny", "hard_floor_deny", value[:120])
+    for candidate in expand_shell_command_candidates(command):
+        if _matches_hard_floor(candidate.lower()):
+            return PermissionResult("deny", "hard_floor_deny", value[:120])
     return None
 
 
+def shell_command_deny(command: str) -> PermissionResult | None:
+    return _shell_command_deny(command, policy=_effective_policy())
+
+
+def file_path_deny(path: str) -> PermissionResult | None:
+    return _file_path_deny(path, policy=_effective_policy())
+
+
+def _file_path_deny(path: str, *, policy: dict[str, Any]) -> PermissionResult | None:
+    matched = _matched_file_rule(path, policy.get("deny", ()))
+    return PermissionResult("deny", "matched_deny", matched) if matched else None
+
+
+def _shell_command_deny(
+    command: str,
+    *,
+    policy: dict[str, Any],
+) -> PermissionResult | None:
+    candidates = expand_shell_command_candidates(command)
+    for candidate in candidates:
+        if _is_encoded_powershell_command(candidate):
+            return PermissionResult(
+                "deny",
+                "opaque_shell_wrapper_deny",
+                candidate[:120],
+                section="shell",
+            )
+    hard_floor = hard_floor_command_deny(command)
+    if hard_floor is not None:
+        return hard_floor
+    matched = _matched_shell_rule(command, policy.get("deny", ()))
+    if matched:
+        return PermissionResult("deny", "matched_deny", matched)
+    dangerous = _matched_shell_rule(command, policy.get("dangerous", ()))
+    dangerous_policy = str(policy.get("dangerous_policy", "ask")).strip().lower()
+    if dangerous and dangerous_policy == "deny":
+        return PermissionResult("deny", "dangerous_policy_deny", dangerous)
+    return None
+
+
+def _matched_file_rule(path: str, rules: Any) -> str:
+    value = _normalize_path(path)
+    compared_value = value.casefold() if _WINDOWS_CASE_INSENSITIVE else value
+    for rule in _patterns(rules):
+        kind, pattern = _parse_rule(rule)
+        if kind != "file":
+            continue
+        expanded = _expand_workspace_pattern(pattern)
+        compared = expanded.casefold() if _WINDOWS_CASE_INSENSITIVE else expanded
+        if _match(compared_value, compared):
+            return rule
+    return ""
+
+
+def _matched_shell_rule(command: str, rules: Any) -> str:
+    values = tuple(item.casefold() for item in expand_shell_command_candidates(command))
+    for rule in _patterns(rules):
+        kind, pattern = _parse_rule(rule)
+        if kind != "shell":
+            continue
+        compared = _normalize_text(pattern).casefold()
+        if any(_match(value, compared) for value in values):
+            return rule
+    return ""
+
+
+def _parse_rule(rule: str) -> tuple[str, str]:
+    match = re.fullmatch(r"\s*(File|Shell)\((.*)\)\s*", rule, flags=re.IGNORECASE)
+    if not match:
+        return "", ""
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def _expand_workspace_pattern(pattern: str) -> str:
+    marker = "@workspace"
+    if pattern.casefold().startswith(marker):
+        suffix = pattern[len(marker) :].replace("\\", "/")
+        return Path.cwd().resolve().as_posix().rstrip("/") + suffix
+    return pattern.replace("\\", "/")
+
+
+def _canonical_command(value: str) -> str:
+    match = re.match(r'^\s*("[^"]+"|\'[^\']+\'|\S+)(.*)$', value)
+    if not match:
+        return ""
+    executable = (
+        _strip_outer_quotes(match.group(1)).replace("\\", "/").rsplit("/", 1)[-1]
+    )
+    executable = re.sub(r"\.(?:exe|cmd|bat|com)$", "", executable, flags=re.IGNORECASE)
+    rest = match.group(2).strip()
+    return _normalize_text(f"{executable} {rest}" if rest else executable)
+
+
+def _unwrap_shell_command(value: str) -> str:
+    cmd_match = re.match(
+        r'^"?cmd(?:\.exe)?"?\s+(?:/[a-z](?::\S+)?\s+)*?/[ck]'
+        r'(?:\s+|(?=["\']))(.+)$',
+        value,
+        flags=re.IGNORECASE,
+    )
+    if cmd_match:
+        return _strip_outer_quotes(cmd_match.group(1).strip())
+    powershell_match = re.match(
+        r'^"?(?:powershell|pwsh)(?:\.exe)?"?\s+.*?'
+        r"(?:-|/)(?:command|c)(?:\s+|:)(.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if powershell_match:
+        return _strip_outer_quotes(powershell_match.group(1).strip())
+    posix_match = re.match(
+        r'^"?(?:sh|bash|zsh)"?\s+-[a-z]*c[a-z]*\s+(.+)$',
+        value,
+        flags=re.IGNORECASE,
+    )
+    if posix_match:
+        return _strip_outer_quotes(posix_match.group(1).strip())
+    return ""
+
+
+def _is_encoded_powershell_command(value: str) -> bool:
+    if not re.match(
+        r'^\s*"?(?:powershell|pwsh)(?:\.exe)?"?(?:\s|$)',
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    options = re.findall(
+        r'(?:^|\s)["\']?[-/]([a-z]+)(?=["\']?(?:\s|[:=]|$))',
+        value,
+        flags=re.IGNORECASE,
+    )
+    return any("encodedcommand".startswith(option.casefold()) for option in options)
+
+
+def _strip_outer_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1].strip()
+    return value
+
+
 def _matches_hard_floor(value: str) -> bool:
-    # ponytail: tiny disaster floor; policy config handles ordinary risk.
     if "sudo -s" in value and "|" in value:
         return True
     if value.startswith(("shutdown", "reboot", "poweroff", "halt")):
@@ -450,146 +559,82 @@ def _matches_hard_floor(value: str) -> bool:
 
 
 def _dd_writes_disk(value: str) -> bool:
-    parts = value.split()
     return any(
         part.startswith("of=/dev/")
         or part.startswith("of=\\\\.\\")
         or part.startswith("of=//./")
-        for part in parts
+        for part in value.split()
     )
-
-
-def _permission_mode() -> PermissionMode:
-    override = get_session_permission_mode()
-    if override is not None:
-        return override
-    from ..config import get_config_value
-
-    return (
-        _coerce_permission_mode(
-            str(get_config_value("SUPERUSER_PERMISSION_MODE", "default") or "default")
-        )
-        or "default"
-    )
-
-
-def _coerce_permission_mode(value: str) -> PermissionMode | None:
-    normalized = str(value or "").strip().lower()
-    if normalized in _VALID_PERMISSION_MODES:
-        return cast(PermissionMode, normalized)
-    return None
-
-
-def _apply_permission_mode(
-    result: PermissionResult,
-    *,
-    read_only: bool,
-) -> PermissionResult:
-    if result.decision == "deny":
-        return result
-    mode = _permission_mode()
-    if mode == "default":
-        return result
-    if mode == "ask_all":
-        return PermissionResult("ask", "mode_ask_all", result.matched_pattern)
-    if mode == "bypass":
-        return PermissionResult("allow", "mode_bypass", result.matched_pattern)
-    if mode == "auto_readonly":
-        decision: Decision = "allow" if read_only else "ask"
-        return PermissionResult(decision, "mode_auto_readonly", result.matched_pattern)
-    return result
-
-
-def _is_read_only_command(
-    section: str,
-    command: str,
-    result: PermissionResult,
-) -> bool:
-    if result.decision != "allow":
-        return False
-    value = _normalize_text(command).lower()
-    if section == "shell":
-        return value.startswith(("pwd", "cd", "dir", "ls", "type ", "cat ")) or (
-            _is_builtin_readonly_shell_command(value)
-        )
-    if section == "git":
-        return True
-    if section == "server":
-        return not value.startswith("mcp_runtime_refresh")
-    if section == "plugin_dev":
-        return value.startswith(("plugin_dev_inspect", "plugin_dev_validate_name"))
-    if section == "patch":
-        return value.startswith("patch_show")
-    if section == "background":
-        return value.startswith(("background_task_status", "background_task_list"))
-    if section == "uv":
-        return value.startswith(("uv --version", "uv tree", "uv pip list"))
-    if section == "python":
-        return value.startswith(("python --version", "python -v"))
-    if section == "eval":
-        return value.startswith(
-            (
-                "engineering_eval_gate",
-                "engineering_eval_status",
-                "engineering_loop_status",
-                "engineering_lsp_read",
-                "engineering_failure_diagnose",
-                "semantic_patch_plan",
-            )
-        )
-    return False
 
 
 def _is_builtin_readonly_shell_command(command: str) -> bool:
-    value = _normalize_text(command).lower()
-    if not value or any(token in value for token in (";", "&&", "||", "|", "\n")):
+    if not _is_simple_shell_command(command):
         return False
+    value = _canonical_command(_normalize_text(command)).casefold()
     parts = value.split()
     if not parts:
         return False
-    if parts[0] in {"df", "free", "uptime"}:
-        return True
-    if parts[0] == "whoami":
-        return len(parts) == 1
-    if parts[0] == "hostname":
-        return True
-    if len(parts) < 2 or parts[0] != "docker":
+    if parts[0] in {"pwd", "cd", "whoami", "hostname", "df", "free", "uptime"}:
+        return len(parts) == 1 or parts[0] in {"df", "free", "uptime"}
+    if parts[0] != "git" or len(parts) < 2:
         return False
-    if parts[1] in {"ps", "info"}:
+    if parts[1:] in (
+        ["remote", "-v"],
+        ["branch"],
+        ["branch", "--list"],
+        ["branch", "--show-current"],
+    ):
         return True
-    return parts[1] == "stats" and "--no-stream" in parts[2:]
+    if parts[1] == "status":
+        return True
+    return parts[1] == "diff" and not _allowed_shell_has_side_effect_flag(value)
+
+
+def _is_simple_shell_command(command: str) -> bool:
+    value = _normalize_text(command)
+    return bool(value) and not any(
+        token in value for token in (";", "&", "|", ">", "<", "\n", "\r")
+    ) and not _unwrap_shell_command(value)
+
+
+def _allowed_shell_has_side_effect_flag(command: str) -> bool:
+    value = _normalize_text(command).casefold()
+    return any(token in value for token in ("--output", "--ext-diff", "--fix"))
+
+
+def _cwd_is_within_workspace(cwd: str | None) -> bool:
+    if not cwd:
+        return True
+    try:
+        return Path(cwd).resolve().is_relative_to(Path.cwd().resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+def _effective_policy() -> dict[str, Any]:
+    raw = _load_policy()
+    preset_name = str(raw.get("preset", "python") or "python").strip().lower()
+    preset = _PRESETS.get(preset_name, _PYTHON_PRESET)
+    result = {
+        "preset": preset_name,
+        "default_mode": str(raw.get("default_mode", "ask") or "ask"),
+        "dangerous_policy": str(raw.get("dangerous_policy", "ask") or "ask"),
+    }
+    for key in ("allow", "ask", "dangerous", "deny"):
+        result[key] = [*_patterns(preset.get(key, ())), *_patterns(raw.get(key, ()))]
+    return result
 
 
 def _load_policy() -> dict[str, Any]:
-    if not _CONFIG_PATH.exists():
-        return _DEFAULT_POLICY
-    try:
-        import yaml
+    from ..config import get_permission_policy
 
-        data = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        logger.warning(f"ChatInter agent 权限配置读取失败，使用默认策略: {exc}")
-        return _DEFAULT_POLICY
-    if not isinstance(data, dict):
-        return _DEFAULT_POLICY
-    return _deep_merge(_DEFAULT_POLICY, data)
-
-
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = dict(base)
-    for key, value in override.items():
-        old_value = result.get(key)
-        if isinstance(old_value, dict) and isinstance(value, dict):
-            result[key] = _deep_merge(old_value, value)
-        else:
-            result[key] = value
-    return result
+    return {**_DEFAULT_POLICY, **get_permission_policy()}
 
 
 def _patterns(values: Any) -> list[str]:
     if isinstance(values, str):
         values = [values]
-    if not isinstance(values, list):
+    if not isinstance(values, list | tuple | set):
         return []
     return [_normalize_text(str(item or "")) for item in values if str(item or "")]
 
@@ -612,20 +657,22 @@ def _normalize_path(value: str) -> str:
 __all__ = [
     "PermissionMode",
     "PermissionResult",
-    "clear_session_permission_mode",
-    "decide_background",
-    "decide_eval",
+    "clear_conversation_permissions",
+    "conversation_has_workspace_shell_grant",
     "decide_file_read",
     "decide_file_write",
-    "decide_git",
-    "decide_patch",
-    "decide_plugin_dev",
-    "decide_python",
-    "decide_server",
     "decide_shell",
-    "decide_uv",
-    "get_session_permission_mode",
-    "reset_current_permission_session",
-    "set_current_permission_session",
-    "set_session_permission_mode",
+    "expand_shell_command_candidates",
+    "file_path_deny",
+    "get_current_permission_mode",
+    "get_default_permission_mode",
+    "grant_conversation_permission",
+    "hard_floor_command_deny",
+    "permission_reason_text",
+    "reset_current_permission_mode",
+    "reset_current_permission_run",
+    "resolve_permission_mode",
+    "set_current_permission_mode",
+    "set_current_permission_run",
+    "shell_command_deny",
 ]

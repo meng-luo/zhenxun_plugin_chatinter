@@ -191,13 +191,13 @@ def search_skills(query: str, *, limit: int = _MAX_MATCHED_SKILLS) -> list[Skill
     return matches[: max(1, min(int(limit or _MAX_MATCHED_SKILLS), 8))]
 
 
-# --- semantic skill retrieval (补强4) -----------------------------------------
-# Skill 数量小(<=200)且仅在超级用户注入提示时调用(非热路径),因此可承担
-# 一次 query embedding + 技能向量缓存的成本。真实 embedding 不可用时(hash
-# fallback)语义分无意义,自动退回纯 Jaccard 的 search_skills。
 
-_SKILL_VECTOR_CACHE: dict[str, tuple[str, list[float]]] = {}  # skill_id -> (sig, vec)
-_SEMANTIC_BLEND = 0.6  # cosine 权重;Jaccard 占 1-该值
+
+
+
+
+_SKILL_VECTOR_CACHE: dict[str, tuple[str, list[float]]] = {}
+_SEMANTIC_BLEND = 0.6
 
 
 def _skill_embed_text(record: SkillRecord) -> str:
@@ -227,7 +227,7 @@ async def search_skills_semantic(
         query_vec = await MemoryVectorIndex._embed_query(normalized_query)
         if not query_vec:
             return baseline[:limit]
-        # baseline 已含 Jaccard 命中,作为候选池;池空时退化为全量技能。
+
         candidates = baseline or [
             SkillMatch(record=record, score=0.0, reason="semantic_pool")
             for record in load_skills()

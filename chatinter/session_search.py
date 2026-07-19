@@ -9,8 +9,7 @@ from typing import Any, Literal
 from tortoise import Tortoise
 from tortoise.expressions import Q
 
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-
+from .llm_compat import ToolDefinition, ToolResult
 from .models.chat_history import ChatInterChatHistory
 from .route_text import normalize_message_text
 

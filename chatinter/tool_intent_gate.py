@@ -13,8 +13,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from zhenxun.services import logger
-from zhenxun.services.llm import AI
 
+from .llm_compat import AI
 from .route_text import normalize_message_text
 from .soft_tool_policy import (
     is_soft_command_candidate,
@@ -92,7 +92,6 @@ class ToolIntentGate:
                 instruction=_TOOL_INTENT_GATE_INSTRUCTION,
                 timeout=self.timeout,
                 max_validation_retries=0,
-                auto_thinking=False,
             )
             return _normalize_result(result, candidates=candidates)
         except Exception as exc:

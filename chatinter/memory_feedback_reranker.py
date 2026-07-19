@@ -120,7 +120,7 @@ class MemoryFeedbackReranker:
             session_score = cls._session_memory_feedback.get(
                 normalized_session, {}
             ).get(memory_id, 0.0)
-        # Keep feedback as a reranker, not a bypass for context.
+
         return max(min(global_score * 0.15 + session_score * 0.35, 0.42), -0.62)
 
     @classmethod

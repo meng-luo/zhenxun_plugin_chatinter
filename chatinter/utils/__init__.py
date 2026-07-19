@@ -15,6 +15,8 @@ from .impression_provider import (
     set_impression_provider,
 )
 from .multimodal import (
+    extract_chat_images_from_message,
+    extract_chat_images_from_reply_chain,
     extract_images_from_message,
     extract_images_from_reply_chain,
 )
@@ -28,6 +30,8 @@ __all__ = [
     "ImpressionProvider",
     "SignUserImpressionProvider",
     "clear_impression_cache",
+    "extract_chat_images_from_message",
+    "extract_chat_images_from_reply_chain",
     "extract_images_from_message",
     "extract_images_from_reply_chain",
     "extract_reply_from_message",

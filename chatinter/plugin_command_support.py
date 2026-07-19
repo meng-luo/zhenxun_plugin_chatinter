@@ -6,9 +6,8 @@ import re
 import time
 from typing import Any
 
-from zhenxun.services.llm.types.protocols import ToolExecutable
-
 from .command_catalog_tool import CommandCatalogState
+from .llm_compat import ToolExecutable
 from .main_request_models import CandidateObligationEvaluation, ToolObligationDecision
 from .native_executor import NativeCommandExecutionContext
 from .native_route import NativeRouteReport
@@ -455,7 +454,7 @@ def _cheap_tool_obligation_decision(
             reason="cheap:weak_or_explicit_only_candidates",
         )
 
-    # Ambiguous but non-trivial: keep the LLM gate for the hard middle band.
+
     return None
 
 def _media_edit_alignment_decision(
@@ -1119,34 +1118,8 @@ def _gate_obligation_reason(result: ToolIntentGateResult) -> str:
         f"{result.reason or 'no_reason'}"
     )
 
-def _tool_obligation_metadata(
-    decision: ToolObligationDecision,
-) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "tool_obligation": decision.obligation,
-        "tool_obligation_reason": decision.reason,
-        "required_tool_names": list(decision.required_tool_names),
-    }
-    result = decision.gate_result
-    if result is not None:
-        metadata.update(
-            {
-                "gate_intent_type": result.intent_type,
-                "gate_request_strength": result.request_strength,
-                "gate_mention_only": result.mention_only,
-                "gate_obligation": result.obligation,
-                "gate_reason": result.reason,
-                "required_command_ids": list(result.required_command_ids),
-                "allowed_command_ids": list(result.allowed_command_ids),
-                "candidate_intent_types": list(result.candidate_intent_types),
-                "needs_real_execution": result.needs_real_execution,
-            }
-        )
-    return metadata
-
 __all__ = [
     "_apply_tool_exposure_policy",
     "_candidates_for_task_routes",
     "_resolve_tool_obligation",
-    "_tool_obligation_metadata",
 ]

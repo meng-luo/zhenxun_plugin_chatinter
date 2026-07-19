@@ -67,10 +67,10 @@ class PluginSelectionContext:
 class PluginRegistry:
     """插件信息注册表"""
 
-    # 缓存相关
+
     _cache: ClassVar[dict[str, tuple[PluginKnowledgeBase, datetime]]] = {}
     _cache_plugin_info_refresh: ClassVar[dict[str, float]] = {}
-    _cache_ttl: ClassVar[int] = 300  # 缓存有效期（秒）
+    _cache_ttl: ClassVar[int] = 300
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _command_tool_cache: ClassVar[dict[str, tuple[list[CommandToolSnapshot], int]]] = {}
     _command_tool_cache_order: ClassVar[list[str]] = []
@@ -79,8 +79,7 @@ class PluginRegistry:
 
     @classmethod
     def invalidate_knowledge_cache(cls) -> None:
-        """插件安装/卸载/更新后调用,强制下一次访问重建知识库与命令 schema
-        (P0-4 schema 重建触发;常规时效仍由 _cache_ttl 兜底)。"""
+        """插件安装、卸载或更新后使知识库与命令 schema 缓存失效。"""
         cls._cache.clear()
         cls._cache_plugin_info_refresh.clear()
         cls._clear_command_tool_cache(bump_revision=True)
@@ -97,6 +96,21 @@ class PluginRegistry:
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
     _self_only_command_keywords: ClassVar[tuple[str, ...]] = ("签到", "打卡", "补签")
+    _ascii_target_terms: ClassVar[set[str]] = {
+        "at",
+        "user",
+        "member",
+        "target",
+        "nickname",
+    }
+    _cjk_target_terms: ClassVar[tuple[str, ...]] = (
+        "用户",
+        "成员",
+        "群友",
+        "目标",
+        "对象",
+        "昵称",
+    )
     _session_plugin_overrides: ClassVar[dict[str, dict[str, bool]]] = {}
     _group_plugin_overrides: ClassVar[dict[str, dict[str, bool]]] = {}
     _restricted_plugin_types: ClassVar[set[PluginType]] = {
@@ -162,7 +176,7 @@ class PluginRegistry:
         """
         cache_key = "normal_user"
 
-        # 检查缓存
+
         async with cls._lock:
             if not force_refresh and cache_key in cls._cache:
                 cached_data, cached_time = cls._cache[cache_key]
@@ -178,14 +192,14 @@ class PluginRegistry:
                     logger.debug("使用缓存的插件知识库")
                     return cached_data
 
-        # 从数据库获取插件信息（只获取普通用户可访问的）
+
         knowledge_base = await cls._build_knowledge_base()
 
-        # 更新缓存
+
         async with cls._lock:
             cls._cache[cache_key] = (knowledge_base, datetime.now())
             cls._cache_plugin_info_refresh[cache_key] = cls._plugin_info_refresh_ts()
-            # 清理过期缓存
+
             cls._cleanup_cache()
             cls._clear_command_tool_cache(bump_revision=True)
 
@@ -432,29 +446,26 @@ class PluginRegistry:
         text = normalize_message_text(
             " ".join([*(params or ()), *(examples or ())])
         ).lower()
-        target_like = any(
-            token in text
-            for token in (
-                "@",
-                "at",
-                "qq",
-                "user",
-                "member",
-                "target",
-                "nickname",
-                "用户",
-                "成员",
-                "群友",
-                "目标",
-                "对象",
-                "昵称",
-            )
-        )
+        target_like = cls._contains_target_term(text)
         if target_like:
             return "required"
         if allow_at or (image_min or 0) > 0:
             return "optional"
         return "none"
+
+    @classmethod
+    def _contains_target_term(cls, text: str) -> bool:
+        normalized = normalize_message_text(text).lower()
+        if not normalized:
+            return False
+        if "@" in normalized or any(
+            term in normalized for term in cls._cjk_target_terms
+        ):
+            return True
+        return any(
+            token in cls._ascii_target_terms
+            for token in re.findall(r"[a-z]+", normalized)
+        )
 
     @staticmethod
     def _normalize_target_sources(
@@ -687,17 +698,28 @@ class PluginRegistry:
                     continue
                 seen.add(marker)
                 args = item.get("args")
-                merged.append(
-                    {
-                        "alias": alias,
-                        "render": render,
-                        "args": [
-                            str(arg).strip() for arg in args if str(arg or "").strip()
-                        ]
-                        if isinstance(args, list | tuple)
-                        else [],
-                    }
+                raw_optional_params = item.get("optional_params")
+                payload: dict[str, object] = {
+                    "alias": alias,
+                    "render": render,
+                    "args": [
+                        str(arg).strip() for arg in args if str(arg or "").strip()
+                    ]
+                    if isinstance(args, list | tuple)
+                    else [],
+                }
+                optional_params = (
+                    [
+                        str(param).strip()
+                        for param in raw_optional_params
+                        if str(param or "").strip()
+                    ]
+                    if isinstance(raw_optional_params, list | tuple)
+                    else []
                 )
+                if optional_params:
+                    payload["optional_params"] = optional_params
+                merged.append(payload)
         return merged
 
     @staticmethod
@@ -834,99 +856,36 @@ class PluginRegistry:
         cls,
         metas: list[PluginInfo.PluginCommandMeta],
     ) -> list[PluginInfo.PluginCommandMeta]:
-        if len(metas) <= 1:
+        return cls._prune_sibling_head_aliases(cls._merge_command_meta_groups(metas))
+
+    @classmethod
+    def _prune_sibling_head_aliases(
+        cls,
+        metas: list[PluginInfo.PluginCommandMeta],
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        heads = {
+            cls._normalize_command(str(getattr(meta, "command", "") or "")).casefold()
+            for meta in metas
+            if cls._normalize_command(str(getattr(meta, "command", "") or ""))
+        }
+        if not heads:
             return metas
 
-        command_to_index: dict[str, int] = {}
-        for index, meta in enumerate(metas):
-            command = str(getattr(meta, "command", "") or "").strip()
-            if command:
-                command_to_index[command.casefold()] = index
-
-        parent: dict[int, int] = {index: index for index in range(len(metas))}
-
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
-
-        def union(left: int, right: int) -> None:
-            left_root = find(left)
-            right_root = find(right)
-            if left_root != right_root:
-                parent[right_root] = left_root
-
-        for index, meta in enumerate(metas):
-            aliases = {
-                str(alias).strip().casefold()
-                for alias in (getattr(meta, "aliases", []) or [])
-                if str(alias).strip()
-            }
-            for alias in aliases:
-                other_index = command_to_index.get(alias)
-                if other_index is None or other_index == index:
-                    continue
-                union(index, other_index)
-
-        groups: dict[int, list[PluginInfo.PluginCommandMeta]] = {}
-        for index, meta in enumerate(metas):
-            groups.setdefault(find(index), []).append(meta)
-
-        canonicalized: list[PluginInfo.PluginCommandMeta] = []
-        for items in groups.values():
-            if len(items) == 1:
-                canonicalized.append(items[0])
-                continue
-            canonical = max(items, key=cls._command_meta_richness)
-            payload = cls._meta_to_dict(canonical)
-            for item in items:
-                if item is canonical:
-                    continue
-                item_payload = cls._meta_to_dict(item)
-                payload["aliases"] = cls._merge_unique_strings(
-                    payload.get("aliases"), [item_payload.get("command") or ""]
-                )
-                payload["aliases"] = cls._merge_unique_strings(
-                    payload.get("aliases"), item_payload.get("aliases")
-                )
-                payload["params"] = cls._merge_unique_strings(
-                    payload.get("params"), item_payload.get("params")
-                )
-                payload["description"] = cls._merge_text_fields(
-                    payload.get("description"), item_payload.get("description")
-                )
-                payload["examples"] = cls._merge_unique_strings(
-                    payload.get("examples"), item_payload.get("examples")
-                )
-                payload["prefixes"] = cls._merge_unique_strings(
-                    payload.get("prefixes"), item_payload.get("prefixes")
-                )
-                payload["target_sources"] = cls._merge_unique_strings(
-                    payload.get("target_sources"), item_payload.get("target_sources")
-                )
-                payload["access_level"] = cls._merge_access_level(
-                    payload.get("access_level"), item_payload.get("access_level")
-                )
-                for field in (
-                    "text_min",
-                    "text_max",
-                    "image_min",
-                    "image_max",
-                    "allow_at",
-                    "actor_scope",
-                    "target_requirement",
-                    "allow_sticky_arg",
-                    "access_level",
-                ):
-                    if (
-                        payload.get(field) is None
-                        and item_payload.get(field) is not None
-                    ):
-                        payload[field] = item_payload.get(field)
-            canonicalized.append(cls._with_command_meta_defaults(**payload))
-
-        return cls._merge_command_meta_groups(canonicalized)
+        pruned: list[PluginInfo.PluginCommandMeta] = []
+        for meta in metas:
+            payload = cls._meta_to_dict(meta)
+            command_fold = cls._normalize_command(
+                str(payload.get("command") or "")
+            ).casefold()
+            payload["aliases"] = [
+                alias
+                for alias in payload.get("aliases", [])
+                if (alias_fold := cls._normalize_command(str(alias or "")).casefold())
+                and alias_fold != command_fold
+                and alias_fold not in heads
+            ]
+            pruned.append(cls._with_command_meta_defaults(**payload))
+        return pruned
 
     @classmethod
     def _fold_plugin_alias_command_meta(
@@ -944,6 +903,14 @@ class PluginRegistry:
         }
         alias_heads = {head for head in alias_heads if head}
         if not alias_heads or len(metas) <= 1:
+            return metas
+        command_heads = {
+            cls._normalize_command(getattr(meta, "command", "")).casefold()
+            for meta in metas
+            if cls._normalize_command(getattr(meta, "command", ""))
+        }
+        alias_heads = {head for head in alias_heads if head not in command_heads}
+        if not alias_heads:
             return metas
 
         target_candidates = [
@@ -1607,7 +1574,7 @@ class PluginRegistry:
             ),
         )
 
-        # ── 阶段 1：移除完全相同指纹的插件 ──
+
         deduplicated: list[PluginInfo] = []
         seen_fingerprints: set[tuple[str, tuple[str, ...]]] = set()
         for plugin in ordered:
@@ -1623,15 +1590,15 @@ class PluginRegistry:
             seen_fingerprints.add(fingerprint)
             deduplicated.append(plugin)
 
-        # ── 阶段 2：移除命令被子模块完全覆盖的父模块 ──
-        # 当父模块（如 csgo）的所有命令都已出现在子模块（如 csgo.commands）中时，
-        # 父模块只是一个空壳容器，注册它会导致同一命令出现在多个能力记录中，
-        # 造成交叉路由混淆。此处将这类父模块过滤掉。
+
+
+
+
         parent_modules_to_remove: set[str] = set()
 
         for plugin in deduplicated:
             parent_module = plugin.module
-            # 收集所有直接子模块
+
             children = [
                 p
                 for p in deduplicated
@@ -1641,7 +1608,7 @@ class PluginRegistry:
             if not children:
                 continue
 
-            # 计算所有子模块命令的并集
+
             children_commands: set[str] = set()
             for child in children:
                 for cmd in child.commands:
@@ -1649,14 +1616,14 @@ class PluginRegistry:
                     if normalized_cmd:
                         children_commands.add(normalized_cmd)
 
-            # 计算父模块的命令集
+
             parent_commands: set[str] = set()
             for cmd in plugin.commands:
                 normalized_cmd = cmd.strip().lower()
                 if normalized_cmd:
                     parent_commands.add(normalized_cmd)
 
-            # 如果父模块的命令全部被子模块覆盖，标记为移除
+
             if parent_commands and parent_commands <= children_commands:
                 parent_modules_to_remove.add(parent_module)
                 logger.debug(
@@ -1686,6 +1653,7 @@ class PluginRegistry:
                 candidates.extend(
                     str(alias).strip() for alias in raw_aliases if str(alias).strip()
                 )
+            candidates.extend(cls._shortcut_aliases_from_payload(payload))
             for candidate in candidates:
                 normalized = cls._normalize_command(candidate)
                 if not normalized or normalized in seen:
@@ -1696,6 +1664,20 @@ class PluginRegistry:
         if len(commands) > cls._max_matcher_commands:
             commands = commands[: cls._max_matcher_commands]
         return commands
+
+    @classmethod
+    def _shortcut_aliases_from_payload(cls, payload: dict[str, object]) -> list[str]:
+        raw_shortcuts = payload.get("shortcut_renders")
+        if not isinstance(raw_shortcuts, list | tuple):
+            return []
+        aliases: list[str] = []
+        for item in raw_shortcuts:
+            if not isinstance(item, dict):
+                continue
+            alias = cls._normalize_command(str(item.get("alias") or ""))
+            if alias:
+                aliases.append(alias)
+        return aliases
 
     @classmethod
     def _build_matcher_command_lookup(
@@ -1769,15 +1751,29 @@ class PluginRegistry:
                 for alias in original_aliases
                 if cls._command_matches_matcher_lookup(alias, matcher_lookup)
             ]
+            shortcut_aliases = cls._shortcut_aliases_from_payload(payload)
+            matched_shortcuts = [
+                alias
+                for alias in shortcut_aliases
+                if cls._command_matches_matcher_lookup(alias, matcher_lookup)
+            ]
 
-            if not matched_command and not matched_aliases:
+            if not matched_command and not matched_aliases and not matched_shortcuts:
                 continue
 
-            if not matched_command and matched_aliases:
-                payload["command"] = matched_aliases[0]
-                matched_aliases = matched_aliases[1:]
+            if not matched_command:
+                if matched_aliases:
+                    payload["command"] = matched_aliases[0]
+                    matched_aliases = matched_aliases[1:]
+                elif matched_shortcuts:
+                    payload["command"] = matched_shortcuts[0]
+                    matched_shortcuts = matched_shortcuts[1:]
             normalized_command = cls._normalize_command(str(payload.get("command", "")))
-            alias_source = original_aliases if matched_command else matched_aliases
+            alias_source = (
+                original_aliases
+                if matched_command
+                else matched_aliases
+            )
             payload["aliases"] = [
                 alias
                 for alias in alias_source
@@ -2029,6 +2025,8 @@ class PluginRegistry:
         knowledge_base: PluginKnowledgeBase,
         selection_context: PluginSelectionContext | None = None,
     ) -> PluginKnowledgeBase:
+        """权限、开关、群内屏蔽的统一过滤边界。"""
+
         if not knowledge_base.plugins:
             return knowledge_base
         selected: list[PluginInfo] = []
@@ -2099,6 +2097,8 @@ class PluginRegistry:
         selection_context: PluginSelectionContext | None = None,
         limit: int | None = None,
     ) -> list[CommandToolSnapshot]:
+        """构建 router 可见命令；必须复用同一权限过滤边界。"""
+
         snapshots = cls._get_cached_command_tool_snapshots(
             knowledge_base,
             selection_context=selection_context,
@@ -2133,13 +2133,43 @@ class PluginRegistry:
             selection_context=selection_context,
             limit=None,
         )
-        snapshots = build_command_tool_snapshots(graph, limit=None)
+        snapshots = cls._dedupe_execution_identity_snapshots(
+            build_command_tool_snapshots(graph, limit=None)
+        )
         cls._command_tool_cache[cache_key] = (list(snapshots), len(snapshots))
         cls._command_tool_cache_order.append(cache_key)
         while len(cls._command_tool_cache_order) > cls._command_tool_cache_max:
             old_key = cls._command_tool_cache_order.pop(0)
             cls._command_tool_cache.pop(old_key, None)
         return list(snapshots)
+
+    @staticmethod
+    def _dedupe_execution_identity_snapshots(
+        snapshots: list[CommandToolSnapshot],
+    ) -> list[CommandToolSnapshot]:
+        deduped: list[CommandToolSnapshot] = []
+        seen: set[tuple[object, ...]] = set()
+        for snapshot in snapshots:
+            matcher_key = str(snapshot.matcher_key or "").strip().casefold()
+            source_signature = str(snapshot.source_signature or "").strip()
+            if not matcher_key and not source_signature:
+                deduped.append(snapshot)
+                continue
+            execution_id = (
+                ("matcher", matcher_key)
+                if matcher_key
+                else ("source", source_signature)
+            )
+            identity = (
+                execution_id,
+                normalize_message_text(snapshot.render).casefold(),
+                tuple(slot.model_dump_json() for slot in snapshot.slots),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped.append(snapshot)
+        return deduped
 
     @classmethod
     def _command_tool_cache_key(
@@ -2172,8 +2202,8 @@ class PluginRegistry:
         if selection_context is None:
             digest.update(b"context:none")
         else:
-            # Only plugin-level filters belong in this key. Per-message capability
-            # checks (image/reply/at/private) are still applied after the cache hit.
+
+
             parts = (
                 str(selection_context.session_id or ""),
                 str(selection_context.group_id or ""),

@@ -422,11 +422,11 @@ def is_low_reliability_candidate(
         false_trigger_score = float(
             getattr(features, "false_trigger_score", 0.0) or 0.0
         )
-        # Missing target/image/visible-output failures often mean the selected
-        # capability was semantically correct but under-specified or poorly
-        # observed.  For an explicit current request, keep the command
-        # executable unless there is strong false-trigger evidence; reliability
-        # can still down-rank it, but should not make it disappear.
+
+
+
+
+
         if (
             false_trigger_score > -14.0
             and profile.false_trigger_rate < 0.36
@@ -540,9 +540,9 @@ def _schema_strength(schema: Any, *, snapshot: Any | None = None) -> float:
 def _risk_bonus(snapshot: Any | None) -> float:
     if snapshot is None:
         return 0.0
-    # Higher risk/capability tools are not "more desirable"; the bonus only keeps
-    # concrete external-action tools above vague soft text tools when already
-    # recalled for an explicit user request.
+
+
+
     output_mode = normalize_message_text(
         str(getattr(snapshot, "output_mode", "") or "")
     )

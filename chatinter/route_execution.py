@@ -26,6 +26,7 @@ from .route_text import (
     is_usage_question,
     normalize_action_phrases,
     normalize_message_text,
+    parse_command_with_head,
 )
 from .schema_policy import resolve_command_target_policy
 from .target_policy import TargetPolicy, get_target_policy
@@ -527,14 +528,20 @@ def _build_route_message_with_explicit_context(
     reply_image_count: int,
     reply_sender_id: str | None,
     target_policy: TargetPolicy | None = None,
+    command_heads: set[str] | None = None,
 ) -> str:
     policy = target_policy or TargetPolicy()
     normalized = normalize_message_text(message_text or "")
     if not normalized:
         return normalized
 
+    self_target_command_match = _contains_bare_self_target_for_command(
+        normalized,
+        command_heads,
+    )
     should_enrich = not is_usage_question(normalized) and (
         contains_any(normalized, ROUTE_ACTION_WORDS)
+        or self_target_command_match
         or _has_adapter_context_hint(normalized, policy)
         or "[image" in normalized
         or "[@" in normalized
@@ -556,7 +563,10 @@ def _build_route_message_with_explicit_context(
     if (
         policy_accepts_target
         and not at_tokens
-        and _contains_strong_self_reference(normalized)
+        and (
+            _contains_strong_self_reference(normalized)
+            or self_target_command_match
+        )
     ):
         enriched = normalize_message_text(f"{enriched} [@{user_id}]")
         at_tokens.append(f"[@{user_id}]")
@@ -814,6 +824,23 @@ def _contains_strong_self_reference(message_text: str) -> bool:
         marker in normalized
         for marker in ("我的", "我自己", "自己的", "本人", "本人的", "自己")
     )
+
+
+def _contains_bare_self_target_for_command(
+    message_text: str,
+    command_heads: set[str] | None,
+) -> bool:
+    normalized = normalize_message_text(normalize_action_phrases(message_text or ""))
+    if not normalized or not command_heads:
+        return False
+    for head in sorted(command_heads, key=len, reverse=True):
+        parsed = parse_command_with_head(normalized, head, allow_sticky=True)
+        if parsed is None:
+            continue
+        payload = normalize_message_text(parsed.payload_text).strip(" 的：:,，。.!！？?")
+        if payload in {"我", "自己", "本人", "我自己"}:
+            return True
+    return False
 
 
 def _build_followup_message(

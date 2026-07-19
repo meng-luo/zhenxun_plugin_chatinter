@@ -17,14 +17,12 @@ import inspect
 import json
 import os
 from pathlib import Path
-import re
 import time
 from typing import Any
 
 from zhenxun.services import logger
-from zhenxun.services.llm.types.models import ToolDefinition, ToolResult
-from zhenxun.services.llm.types.protocols import ToolExecutable
 
+from .llm_compat import ToolDefinition, ToolExecutable, ToolResult
 from .route_text import normalize_message_text
 
 try:
@@ -588,22 +586,11 @@ def get_mcp_runtime_manager() -> MCPRuntimeManager:
     return _MANAGER
 
 
-def ensure_mcp_config() -> Path:
-    if not _CONFIG_PATH.exists():
-        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_PATH.write_text(_default_mcp_config_text(), encoding="utf-8")
-        return _CONFIG_PATH
-    text = _CONFIG_PATH.read_text(encoding="utf-8")
-    if _has_mcp_servers_key(text):
-        return _CONFIG_PATH
-    _CONFIG_PATH.write_text(_insert_mcp_servers_key(text), encoding="utf-8")
-    return _CONFIG_PATH
-
-
 def load_mcp_server_configs() -> list[MCPServerConfig]:
-    ensure_mcp_config()
     if yaml is None:
         logger.warning("[ChatInter MCP] PyYAML 不可用，MCP 配置无法读取", "mcp_runtime")
+        return []
+    if not _CONFIG_PATH.exists():
         return []
     try:
         raw = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
@@ -1023,57 +1010,6 @@ def _list(value: Any) -> list[Any]:
     return []
 
 
-def _has_mcp_servers_key(text: str) -> bool:
-    return re.search(r"(?m)^\s{2}MCP_SERVERS\s*:", text) is not None
-
-
-def _insert_mcp_servers_key(text: str) -> str:
-    block = _mcp_config_block()
-    lines = text.splitlines()
-    chatinter_index: int | None = None
-    for index, line in enumerate(lines):
-        if re.match(r"^chatinter\s*:\s*(?:#.*)?$", line):
-            chatinter_index = index
-            break
-    if chatinter_index is None:
-        suffix = "\n" if text and not text.endswith("\n") else ""
-        return f"{text}{suffix}{_default_mcp_config_text()}"
-
-    insert_at = len(lines)
-    for index in range(chatinter_index + 1, len(lines)):
-        line = lines[index]
-        if line and not line.startswith((" ", "\t", "#")):
-            insert_at = index
-            break
-    lines[insert_at:insert_at] = block.rstrip("\n").splitlines()
-    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
-
-
-def _mcp_config_block() -> str:
-    return """  # MCP_SERVERS: 超级用户私聊 Agent 可用的 MCP server 配置。
-  # 仅 superuser_agent 场景暴露，不进入群聊/普通私聊。
-  # 示例:
-  # MCP_SERVERS:
-  #   filesystem:
-  #     enabled: false
-  #     command: npx
-  #     args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/zhenxun"]
-  #     tools:
-  #       include: []
-  #       exclude: []
-  #     max_tools: 80
-  #     max_concurrency: 3
-  #     timeout: 12
-  #     tool_timeout: 60
-  MCP_SERVERS: {}
-"""
-
-
-def _default_mcp_config_text() -> str:
-    return """chatinter:
-""" + _mcp_config_block()
-
-
 __all__ = [
     "MCPDiscoveryResult",
     "MCPRuntimeManager",
@@ -1081,7 +1017,6 @@ __all__ = [
     "MCPServerConnection",
     "MCPServerStatus",
     "MCPToolExecutable",
-    "ensure_mcp_config",
     "get_mcp_runtime_manager",
     "load_mcp_server_configs",
     "normalize_mcp_input_schema",

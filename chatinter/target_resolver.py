@@ -169,24 +169,6 @@ def _command_can_use_target(
     )
 
 
-def _missing_target_message(
-    *,
-    target_hint: str,
-    command_policy: CommandTargetPolicy | None,
-    adapter_policy: TargetPolicy,
-) -> str:
-    if target_hint:
-        return (
-            f"我没能稳定匹配到“{target_hint}”是谁。"
-            "请重新发送完整命令并直接@目标成员，或发对方头像。"
-        )
-    if command_policy is not None and command_policy.target_missing_message:
-        return command_policy.target_missing_message
-    if adapter_policy.target_missing_message:
-        return adapter_policy.target_missing_message
-    return "这个命令需要明确目标，请重新发送完整命令并@目标成员，或补充图片。"
-
-
 async def resolve_pre_route_target(
     *,
     group_id: str | None,
@@ -211,12 +193,10 @@ async def resolve_pre_route_target(
         command_heads=command_heads,
     )
     if prompt:
-        status: TargetResolveStatus = "ambiguous" if "好几个" in prompt else "missing"
         return TargetResolveResult(
-            status=status,
+            status="not_needed",
             message_text=route_message,
             mention_profiles=enriched_profiles,
-            prompt=prompt,
             target_hint=extract_fuzzy_target_hint(route_message, command_heads),
         )
     if enriched_message != route_message:
@@ -360,11 +340,6 @@ async def resolve_execution_target(
             status="missing",
             message_text=task_message,
             mention_profiles=mention_profiles,
-            prompt=_missing_target_message(
-                target_hint=resolved_target_hint,
-                command_policy=command_policy,
-                adapter_policy=adapter_policy,
-            ),
             target_hint=resolved_target_hint,
         )
 

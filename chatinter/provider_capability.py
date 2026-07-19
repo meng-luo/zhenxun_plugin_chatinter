@@ -14,14 +14,10 @@ from dataclasses import dataclass
 import re
 from typing import Any, Literal
 
-from zhenxun.services.llm.types.capabilities import (
+from zhenxun.services.ai.llm.system.capabilities import (
     ModelModality,
     get_model_capabilities,
 )
-from zhenxun.services.llm.types.models import (
-    LLMContentPart as HostLLMContentPart,
-)
-from zhenxun.services.llm.types.models import LLMMessage as HostLLMMessage
 
 from .config import COMMAND_TWO_STAGE_THRESHOLD, build_tool_generation_config
 from .llm_compat import (
@@ -507,16 +503,16 @@ class ProviderCapabilityAdapter:
         )
 
     def adapt_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
-        host_messages = _to_host_messages(messages)
+        host_messages = list(messages)
         if self.profile.supports_image_input:
             return host_messages
         changed = False
-        adapted: list[HostLLMMessage] = []
+        adapted: list[LLMMessage] = []
         for message in host_messages:
             if not isinstance(message.content, list):
                 adapted.append(message)
                 continue
-            parts: list[HostLLMContentPart] = []
+            parts: list[LLMContentPart] = []
             for part in message.content:
                 if part.type == "text":
                     parts.append(part)
@@ -638,8 +634,7 @@ class ProviderCapabilityAdapter:
             "Now use the selected real command tool(s) with the full schema "
             "and fill arguments from the user's current task. "
             "If the selected tool is not actually appropriate, answer briefly "
-            "instead of calling it. If TaskLedger exists, map each call to one "
-            "listed task goal in task_text; do not split by connector words. "
+            "instead of calling it. "
             f"{provider_hint}"
         )
 
@@ -939,49 +934,6 @@ def _clip_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(limit - 3, 0)] + "..."
-
-
-def _to_host_messages(messages: list[LLMMessage]) -> list[HostLLMMessage]:
-    """Convert lightweight ChatInter message shims before calling host LLM.
-
-    Several core modules use ``llm_compat`` so they remain importable before
-    NoneBot services are initialized.  The real LLM service validates against
-    its own Pydantic ``LLMMessage`` class, so normalize at this boundary instead
-    of forcing every lightweight module to import runtime services.
-    """
-
-    return [_to_host_message(message) for message in messages]
-
-
-def _to_host_message(message: Any) -> HostLLMMessage:
-    if isinstance(message, HostLLMMessage):
-        return message
-    return HostLLMMessage(
-        role=str(getattr(message, "role", "") or "user"),
-        content=_to_host_content(getattr(message, "content", "")),
-        name=getattr(message, "name", None),
-        tool_calls=getattr(message, "tool_calls", None),
-        tool_call_id=getattr(message, "tool_call_id", None),
-        thought_signature=getattr(message, "thought_signature", None),
-    )
-
-
-def _to_host_content(value: Any) -> str | list[HostLLMContentPart]:
-    if not isinstance(value, list):
-        return str(value)
-    return [_to_host_content_part(part) for part in value]
-
-
-def _to_host_content_part(part: Any) -> HostLLMContentPart:
-    if isinstance(part, HostLLMContentPart):
-        return part
-    return HostLLMContentPart(
-        type=str(getattr(part, "type", "") or "text"),
-        text=getattr(part, "text", None),
-        thought_text=getattr(part, "thought_text", None),
-        image_source=getattr(part, "image_source", None),
-        mime_type=getattr(part, "mime_type", None),
-    )
 
 
 def _is_command_tool(tool: ToolExecutable) -> bool:

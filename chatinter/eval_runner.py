@@ -23,7 +23,7 @@ try:
         DEFAULT_THRESHOLDS,
         THRESHOLD_SCHEMA_VERSION,
     )
-except ImportError:  # Allows `py zhenxun/plugins/chatinter/eval_runner.py`.
+except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent))
     from eval_dataset import (  # type: ignore[no-redef]
         DATASET_SCHEMA_VERSION,

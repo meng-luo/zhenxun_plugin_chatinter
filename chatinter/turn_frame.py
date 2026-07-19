@@ -5,7 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from zhenxun.services.llm import LLMMessage
+    from .llm_compat import LLMMessage
 
 from .middleware import TurnMiddlewareState
 from .trace import StageTrace
@@ -56,7 +56,6 @@ class TurnFrame:
     is_superuser: bool
     scenario: str
     allow_plugin_tools: bool
-    allow_agent_tools: bool
     trace: StageTrace
     budget_controller: TurnBudgetController
     current_message: str = ""
@@ -82,6 +81,7 @@ class TurnFrame:
     post_gate_callback: Any | None = None
     turn_finished: bool = False
     turn_messages: list[str] = field(default_factory=list)
+    turn_message_sources: list[Any] = field(default_factory=list)
     pending_human_updates: list[str] = field(default_factory=list)
     turn_priority: int = 0
     event_context: Any | None = None
@@ -108,9 +108,14 @@ class TurnFrame:
     reply_image_segments_for_reroute: list[Any] = field(default_factory=list)
     image_parts: list[Any] = field(default_factory=list)
     agent_messages: list[LLMMessage] = field(default_factory=list)
+    router_context: dict[str, object] = field(default_factory=dict)
     has_reply: bool = False
     reply_sender_id: str | None = None
     reply_image_count: int = 0
+    legacy_session_key: str = ""
+    turn_generation: int = 0
+    current_turn_guard: Any | None = None
+    delivery_succeeded: bool = False
 
     @classmethod
     def create(
@@ -125,10 +130,11 @@ class TurnFrame:
         is_superuser: bool,
         scenario: str = "group_plugin_selector",
         allow_plugin_tools: bool = True,
-        allow_agent_tools: bool = False,
         message_id: str = "",
+        session_key: str | None = None,
+        legacy_session_key: str = "",
     ) -> "TurnFrame":
-        session_key = str(group_id or user_id)
+        session_key = str(session_key or group_id or user_id)
         trace = StageTrace(
             "chatinter",
             tags={
@@ -149,11 +155,15 @@ class TurnFrame:
             is_superuser=is_superuser,
             scenario=str(scenario or "group_plugin_selector"),
             allow_plugin_tools=bool(allow_plugin_tools),
-            allow_agent_tools=bool(allow_agent_tools),
             trace=trace,
             budget_controller=TurnBudgetController.for_session(session_key),
             current_message=raw_message,
+            legacy_session_key=str(legacy_session_key or group_id or user_id),
         )
+
+    def is_current_turn(self) -> bool:
+        guard = self.current_turn_guard
+        return bool(guard()) if callable(guard) else True
 
     def bind_runtime(
         self,

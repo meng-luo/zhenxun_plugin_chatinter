@@ -157,8 +157,11 @@ class CommandCatalogTool:
                 "最终是否执行、执行哪个命令必须由模型结合完整 schema 判断。"
             ),
             "commands": [
-                _candidate_payload(result.capability_payloads, index=index)
-                for index in range(1, len(candidates) + 1)
+                self.state.retriever.registry.candidate_payload(
+                    candidate,
+                    index=index,
+                )
+                for index, candidate in enumerate(candidates, 1)
             ],
             "next_step": (
                 "如果新注入的命令工具与用户子任务匹配，可以在下一步调用对应"
@@ -175,92 +178,6 @@ class CommandCatalogTool:
                 f"已注入 {len(injected_tools)} 个可执行 schema。"
             ),
         )
-
-
-def _candidate_payload(
-    payloads: tuple[dict[str, Any], ...],
-    *,
-    index: int,
-) -> dict[str, Any]:
-    raw = dict(payloads[index - 1]) if index - 1 < len(payloads) else {}
-    capability_raw = raw.get("capability")
-    capability: dict[str, Any] = (
-        capability_raw if isinstance(capability_raw, dict) else {}
-    )
-    target_policy_raw = capability.get("target_policy")
-    target_policy = target_policy_raw if isinstance(target_policy_raw, dict) else {}
-    compact: dict[str, Any] = {
-        "rank": raw.get("rank", index),
-        "score": raw.get("score"),
-        "command_id": raw.get("command_id"),
-        "plugin_name": raw.get("plugin_name"),
-        "plugin_module": raw.get("plugin_module"),
-        "head": raw.get("head"),
-        "role": raw.get("role"),
-        "payload_policy": raw.get("payload_policy"),
-        "target_policy": {
-            "requirement": target_policy.get("requirement")
-            or raw.get("target_requirement"),
-            "sources": target_policy.get("sources") or raw.get("target_sources") or [],
-            "allow_at": target_policy.get("allow_at", raw.get("allow_at")),
-        },
-        "slots": _compact_slots(raw.get("slots")),
-        "render": raw.get("render"),
-        "output_mode": capability.get("output_mode"),
-        "requires_real_tool": capability.get("requires_real_tool"),
-        "source_of_truth": capability.get("source_of_truth"),
-        "selection_note": "已注入同名 command tool；若匹配当前任务，请调用对应工具。",
-        "tool_injected": True,
-    }
-    reason = normalize_message_text(str(raw.get("reason", "") or ""))
-    if reason:
-        compact["reason"] = reason[:180]
-    aliases = raw.get("aliases")
-    if isinstance(aliases, list) and aliases:
-        compact["aliases"] = [
-            normalize_message_text(str(item or ""))
-            for item in aliases[:4]
-            if normalize_message_text(str(item or ""))
-        ]
-    description = normalize_message_text(str(raw.get("description", "") or ""))
-    if description:
-        compact["description"] = description[:160]
-    return {
-        key: value for key, value in compact.items() if value not in (None, "", [], {})
-    }
-
-
-def _compact_slots(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    slots: list[dict[str, Any]] = []
-    for item in value[:6]:
-        if not isinstance(item, dict):
-            continue
-        slot = {
-            "name": item.get("name"),
-            "type": item.get("type"),
-            "required": item.get("required"),
-        }
-        aliases = item.get("aliases")
-        if isinstance(aliases, list) and aliases:
-            slot["aliases"] = [
-                normalize_message_text(str(alias or ""))
-                for alias in aliases[:3]
-                if normalize_message_text(str(alias or ""))
-            ]
-        description = normalize_message_text(str(item.get("description", "") or ""))
-        if description:
-            slot["description"] = description[:80]
-        slots.append(
-            {
-                key: item_value
-                for key, item_value in slot.items()
-                if item_value not in (None, "", [])
-            }
-        )
-    return slots
-
 
 def _guardrail_hint(*, retrieved: int, active_tools: int) -> str:
     if retrieved <= 0:

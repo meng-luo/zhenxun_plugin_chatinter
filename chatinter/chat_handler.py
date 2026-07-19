@@ -621,7 +621,7 @@ def normalize_ai_reply_text(text: str) -> str:
     normalized = (text or "").strip()
     if not normalized:
         return normalized
-    # 代码回复保留 Markdown，避免代码块/语言标记被剥离。
+
     if _has_code_markdown(normalized):
         return normalized
     if not _looks_like_markdown(normalized):

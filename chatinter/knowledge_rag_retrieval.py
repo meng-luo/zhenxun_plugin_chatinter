@@ -9,9 +9,9 @@ import re
 import time
 from typing import ClassVar
 
-from zhenxun.services.llm import embed_documents, embed_query, list_embedding_models
 from zhenxun.services.log import logger
 
+from .llm_compat import embed_documents, embed_query, list_embedding_models
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy

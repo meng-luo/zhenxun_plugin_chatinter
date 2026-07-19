@@ -1,12 +1,27 @@
 import json
 
 from tortoise import fields
-from tortoise.expressions import F
+from tortoise.expressions import F, Q
 
 from zhenxun.services.db_context import Model, with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
 
 _CHATINTER_DB_TIMEOUT = 2.5
+_MEMORY_RECALL_CANDIDATE_LIMIT = 64
+_GLOBAL_USER_MEMORY_TYPES = (
+    "nickname",
+    "correction",
+    "preference",
+    "relationship",
+    "person_profile_summary",
+)
+_THREAD_TO_USER_MEMORY_TYPES = {
+    "thread_nickname": "nickname",
+    "thread_correction": "correction",
+    "thread_preference": "preference",
+    "thread_relationship": "relationship",
+    "thread_person_profile_summary": "person_profile_summary",
+}
 
 
 async def _db_or_default(coro, *, operation: str, default):
@@ -65,7 +80,11 @@ class ChatInterChatHistory(Model):
 
     @classmethod
     async def get_recent_dialogs(
-        cls, session_id: str, limit: int = 5
+        cls,
+        session_id: str,
+        limit: int = 5,
+        *,
+        user_id: str | None = None,
     ) -> list["ChatInterChatHistory"]:
         """
         获取指定会话最近的 N 轮对话（用于语境前缀）
@@ -73,21 +92,40 @@ class ChatInterChatHistory(Model):
         参数:
             session_id: 会话标识
             limit: 获取数量（对话轮次）
+            user_id: 可选的用户过滤
 
         返回:
             list[ChatInterChatHistory]: 按时间正序排列的对话列表
         """
         if is_db_unhealthy():
             return []
+        query = cls.filter(session_id=session_id, reset=False)
+        if user_id:
+            query = query.filter(user_id=user_id)
         dialogs = await _db_or_default(
-            cls.filter(session_id=session_id, reset=False)
-            .order_by("-create_time", "-id")
-            .limit(limit),
+            query.order_by("-create_time", "-id").limit(limit),
             operation="ChatInterChatHistory.get_recent_dialogs",
             default=[],
         )
-        # 反转为正序（从旧到新）
+
         return list(reversed(dialogs))
+
+    @classmethod
+    async def migrate_session_id(cls, old_session_id: str, new_session_id: str) -> int:
+        """Move ambiguous legacy rows on first use of the scoped session key."""
+
+        old = str(old_session_id or "").strip()
+        new = str(new_session_id or "").strip()
+        if not old or not new or old == new or is_db_unhealthy():
+            return 0
+        return int(
+            await _db_or_default(
+                cls.filter(session_id=old).update(session_id=new),
+                operation="ChatInterChatHistory.migrate_session_id",
+                default=0,
+            )
+            or 0
+        )
 
     @classmethod
     async def get_conversation_history(
@@ -187,7 +225,13 @@ class ChatInterChatHistory(Model):
         return fallback
 
     @classmethod
-    async def prune_old_dialogs(cls, session_id: str, max_limit: int):
+    async def prune_old_dialogs(
+        cls,
+        session_id: str,
+        max_limit: int,
+        *,
+        reset_limit: int = 32,
+    ):
         """
         删除超出上限的旧对话（保留最近的 N 轮）
 
@@ -217,6 +261,19 @@ class ChatInterChatHistory(Model):
                     operation="ChatInterChatHistory.prune_old_dialogs.delete",
                     default=0,
                 )
+        reset_rows = await _db_or_default(
+            cls.filter(session_id=session_id, reset=True)
+            .order_by("-create_time", "-id")
+            .offset(max(int(reset_limit or 0), 0)),
+            operation="ChatInterChatHistory.prune_old_dialogs.reset_list",
+            default=[],
+        )
+        if reset_rows:
+            await _db_or_default(
+                cls.filter(id__in=[dialog.id for dialog in reset_rows]).delete(),
+                operation="ChatInterChatHistory.prune_old_dialogs.reset_delete",
+                default=0,
+            )
 
     @classmethod
     async def reset_session(cls, session_id: str) -> int:
@@ -284,7 +341,7 @@ class ChatInterMemory(Model):
 
     @classmethod
     async def _run_script(cls):
-        return [
+        scripts = [
             "ALTER TABLE chatinter_memory ADD COLUMN scope VARCHAR(32) DEFAULT 'user';",
             "ALTER TABLE chatinter_memory ADD COLUMN thread_id VARCHAR(64);",
             "ALTER TABLE chatinter_memory ADD COLUMN topic_key "
@@ -292,6 +349,27 @@ class ChatInterMemory(Model):
             "ALTER TABLE chatinter_memory ADD COLUMN participants TEXT DEFAULT '';",
             "ALTER TABLE chatinter_memory ADD COLUMN recall_count INT DEFAULT 0;",
         ]
+        global_types = ", ".join(f"'{item}'" for item in _GLOBAL_USER_MEMORY_TYPES)
+        scripts.append(
+            "UPDATE chatinter_memory "
+            "SET session_id = user_id, group_id = NULL, scope = 'user', "
+            "thread_id = NULL, topic_key = '', participants = '' "
+            f"WHERE memory_type IN ({global_types});"
+        )
+        for old_type, new_type in _THREAD_TO_USER_MEMORY_TYPES.items():
+            scripts.append(
+                "UPDATE chatinter_memory "
+                f"SET memory_type = '{new_type}', session_id = user_id, "
+                "group_id = NULL, scope = 'user', thread_id = NULL, "
+                "topic_key = '', participants = '' "
+                f"WHERE memory_type = '{old_type}';"
+            )
+        scripts.append(
+            "UPDATE chatinter_memory "
+            "SET session_id = group_id, scope = 'thread' "
+            "WHERE memory_type = 'thread_digest' AND group_id IS NOT NULL;"
+        )
+        return scripts
 
     @classmethod
     async def upsert_memory(
@@ -310,6 +388,7 @@ class ChatInterMemory(Model):
         participants: str = "",
         source_dialog_id: int | None = None,
         source_message: str | None = None,
+        replace_existing: bool = False,
     ) -> "ChatInterMemory | None":
         if is_db_unhealthy():
             return None
@@ -327,7 +406,9 @@ class ChatInterMemory(Model):
         if is_db_unhealthy():
             return None
         if existing is not None:
-            if float(existing.confidence or 0.0) <= float(confidence or 0.0):
+            if replace_existing or float(existing.confidence or 0.0) <= float(
+                confidence or 0.0
+            ):
                 existing.value = value
                 existing.confidence = float(confidence or 0.0)
                 existing.group_id = group_id
@@ -405,11 +486,29 @@ class ChatInterMemory(Model):
             if token
         }
         participant_set = {str(item) for item in participants if str(item)}
-        structured_limit = max(int(limit or 0) * 8, int(limit or 0), 1)
+        candidate_limit = min(
+            max(int(limit or 0) * 8, int(limit or 0), 1),
+            _MEMORY_RECALL_CANDIDATE_LIMIT,
+        )
+        scope_q = Q(user_id=user_id, scope="user", group_id__isnull=True)
+        if group_id:
+            scope_q |= Q(group_id=group_id) & (
+                Q(scope__in=["group", "thread"]) | Q(memory_type="group_digest")
+            )
+        thread_q = Q()
+        if thread_id:
+            thread_q = (
+                ~Q(scope="thread")
+                | Q(thread_id=thread_id)
+                | Q(thread_id__isnull=True)
+                | Q(thread_id="")
+            )
         rows = await _db_or_default(
             cls.filter(expired=False)
+            .filter(scope_q)
+            .filter(thread_q)
             .order_by("-confidence", "-update_time", "-id")
-            .limit(structured_limit),
+            .limit(candidate_limit),
             operation="ChatInterMemory.recall_memories",
             default=[],
         )
@@ -423,6 +522,13 @@ class ChatInterMemory(Model):
             row_participants = {
                 item for item in str(row.participants or "").split(",") if item
             }
+            if row_scope == "user":
+                if row_user_id != user_id or row_group_id is not None:
+                    continue
+                if str(row.session_id or "") != row_user_id:
+                    continue
+            elif not (group_id and row_group_id == group_id):
+                continue
             if row_user_id != user_id:
                 if not (
                     (
@@ -433,8 +539,6 @@ class ChatInterMemory(Model):
                     and row_group_id == group_id
                 ):
                     continue
-            if row.session_id != session_id and row_group_id not in {group_id, None}:
-                continue
             value_text = str(row.value or "")
             key_text = f"{row.memory_type} {row.key} {value_text}"
             score = float(row.confidence or 0.0)

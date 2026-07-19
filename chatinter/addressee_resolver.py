@@ -119,7 +119,7 @@ async def resolve_addressee(
         return AddresseeResult(None, None, "broadcast", 0.45, reason="broadcast_hint")
 
     if speaker_profile and speaker_profile.display_name:
-        # 当前发送者姓名只作为 speaker，不反推 addressee，避免把自述误判为目标。
+
         pass
 
     return AddresseeResult(None, None, "unknown", 0.0, reason="no_signal")

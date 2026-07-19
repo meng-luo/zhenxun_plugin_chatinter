@@ -188,7 +188,7 @@ def sqlite_vec_available() -> bool:
 
 
 class SqliteVecStore:
-    """Optional disk-backed KNN store (补强3).
+    """Optional disk-backed KNN store.
 
     Activated only when the ``sqlite_vec`` extension is installed; it implements
     the same ``VectorStore`` surface as :class:`InMemoryVectorStore` but keeps
@@ -301,7 +301,7 @@ class SqliteVecStore:
             return []
         if len(query_vector) != self._dim:
             return []
-        # Over-fetch so post-filter/boost still yields top_k.
+
         fetch = top_k * 4 if (filter_fn or boost_fn) else top_k
         rows = self._conn.execute(
             "SELECT doc_id, distance FROM vec_items "
@@ -315,7 +315,7 @@ class SqliteVecStore:
                 continue
             if filter_fn is not None and not filter_fn(document):
                 continue
-            score = 1.0 - float(distance)  # cosine distance -> similarity
+            score = 1.0 - float(distance)
             if boost_fn is not None:
                 score += float(boost_fn(document) or 0.0)
             if score <= 0:
@@ -335,13 +335,11 @@ class SqliteVecStore:
 def create_vector_store(
     namespace: str = "default", *, dim: int | None = None
 ) -> VectorStore:
-    """Return the best available vector backend (补强3 factory).
+    """Return the best available vector backend.
 
     Prefers the disk-backed ``SqliteVecStore`` when ``sqlite_vec`` is installed
     and the ``CHATINTER_VECTOR_BACKEND`` config is ``auto``/``sqlite``; otherwise
-    falls back to the in-memory store (current default, identical behaviour).
-    Callers stay backend-agnostic — installing ``sqlite-vec`` upgrades them with
-    no code change.
+    falls back to the in-memory store.
     """
     backend = "auto"
     try:

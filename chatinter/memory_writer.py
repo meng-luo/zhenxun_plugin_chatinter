@@ -6,10 +6,8 @@ import re
 from .chat_memory_store import (
     ChatMemoryStore,
     MemoryCandidate,
-    extract_memory_candidates,
 )
-from .group_memory_digest import build_group_memory_digest
-from .memory_policy import MemoryPolicyDecision, decide_memory_policy
+from .memory_extractor import MemoryExtractionRequest, schedule_memory_extraction
 from .person_registry import upsert_person_alias
 from .reflection_observer import record_reflection_observation
 from .route_text import normalize_message_text
@@ -52,6 +50,16 @@ _SELF_ALIAS_UNSAFE_SUFFIXES = (
     "在",
     "从",
 )
+_REGEX_AT_ALIAS_CONFIDENCE = 0.74
+_REGEX_SELF_ALIAS_CONFIDENCE = 0.68
+_GLOBAL_USER_MEMORY_TYPES = {
+    "nickname",
+    "correction",
+    "preference",
+    "relationship",
+    "person_profile_summary",
+}
+_THREAD_MEMORY_TYPES = {"thread_digest"}
 
 
 @dataclass(frozen=True)
@@ -60,7 +68,6 @@ class MemoryWriteContext:
     user_id: str
     group_id: str | None
     message_text: str
-    response_text: str = ""
     source_dialog_id: int | None = None
     thread_id: str | None = None
     topic_key: str = ""
@@ -70,7 +77,6 @@ class MemoryWriteContext:
 @dataclass(frozen=True)
 class MemoryWriteResult:
     written: int
-    policy: MemoryPolicyDecision
     candidate_count: int = 0
 
 
@@ -86,83 +92,34 @@ class MemoryWriter:
     @classmethod
     async def write_from_dialog(cls, context: MemoryWriteContext) -> MemoryWriteResult:
         message_text = normalize_message_text(context.message_text)
-        response_text = normalize_message_text(context.response_text)
-        candidates = extract_memory_candidates(message_text)
         person_aliases = extract_person_alias_candidates(
             message_text=message_text,
             current_user_id=context.user_id,
         )
-        policy = decide_memory_policy(
-            message_text=message_text,
-            response_text=response_text,
-            group_id=context.group_id,
-            thread_id=context.thread_id,
-            memory_candidate_count=len(candidates) + len(person_aliases),
-        )
-        if not policy.should_write:
+        _schedule_stable_memory_extraction(context=context, message_text=message_text)
+        if not person_aliases:
             _record_reflection(
                 context,
                 action="memory_skip",
-                policy=policy,
                 written=0,
-                candidate_count=len(candidates) + len(person_aliases),
+                candidate_count=0,
             )
-            return MemoryWriteResult(
-                written=0,
-                policy=policy,
-                candidate_count=len(candidates) + len(person_aliases),
-            )
+            return MemoryWriteResult(written=0, candidate_count=0)
 
-        memory_scope = _memory_scope_from_policy(policy)
-        memory_type_prefix = ""
-        if memory_scope == "thread":
-            memory_type_prefix = "thread_"
-        scoped_candidates = _scope_candidates(candidates, prefix=memory_type_prefix)
-        scoped_candidates.extend(_dialogue_fact_candidates(context))
-        written = await ChatMemoryStore.record_candidates(
-            session_id=context.session_id,
-            user_id=context.user_id,
-            group_id=context.group_id,
-            candidates=scoped_candidates,
-            source_dialog_id=context.source_dialog_id,
-            source_message=message_text,
-            scope=memory_scope,
-            thread_id=context.thread_id,
-            topic_key=context.topic_key,
-            participants=context.participants,
-        )
         person_alias_written = await _record_person_aliases(
             context=context,
             candidates=person_aliases,
         )
-        written += person_alias_written
-        action = "memory_write"
-        if policy.action == "digest":
-            digest = build_group_memory_digest(
-                session_id=context.session_id,
-                user_id=context.user_id,
-                group_id=context.group_id,
-                thread_id=context.thread_id,
-                topic_key=context.topic_key,
-                participants=context.participants,
-                message_text=message_text,
-                response_text=response_text,
-            )
-            if digest is not None:
-                written += await ChatMemoryStore.record_group_digest(digest)
-                action = "memory_digest"
 
         _record_reflection(
             context,
-            action=action,
-            policy=policy,
-            written=written,
-            candidate_count=len(candidates) + len(person_aliases),
+            action="memory_write",
+            written=person_alias_written,
+            candidate_count=len(person_aliases),
         )
         return MemoryWriteResult(
-            written=written,
-            policy=policy,
-            candidate_count=len(candidates) + len(person_aliases),
+            written=person_alias_written,
+            candidate_count=len(person_aliases),
         )
 
 
@@ -201,7 +158,7 @@ def extract_person_alias_candidates(
                 match.group("user_id"),
                 match.group("alias"),
                 "explicit_at_alias",
-                0.88,
+                _REGEX_AT_ALIAS_CONFIDENCE,
             )
 
     if current_user_id:
@@ -209,9 +166,74 @@ def extract_person_alias_candidates(
             for match in pattern.finditer(text):
                 if not _is_safe_self_alias_match(text, match):
                     continue
-                add(current_user_id, match.group("alias"), "self_alias", 0.82)
+                add(
+                    current_user_id,
+                    match.group("alias"),
+                    "self_alias",
+                    _REGEX_SELF_ALIAS_CONFIDENCE,
+                )
 
     return candidates[:6]
+
+
+def _schedule_stable_memory_extraction(
+    *,
+    context: MemoryWriteContext,
+    message_text: str,
+) -> bool:
+    request = MemoryExtractionRequest(
+        session_id=context.session_id,
+        user_id=context.user_id,
+        group_id=context.group_id,
+        message_text=message_text,
+        source_dialog_id=context.source_dialog_id,
+        thread_id=context.thread_id,
+        topic_key=context.topic_key,
+        participants=context.participants,
+    )
+
+    async def write(candidates: list[MemoryCandidate]) -> int:
+        global_candidates = [
+            candidate
+            for candidate in candidates
+            if _candidate_memory_type(candidate) in _GLOBAL_USER_MEMORY_TYPES
+        ]
+        thread_candidates = [
+            candidate
+            for candidate in candidates
+            if _candidate_memory_type(candidate) in _THREAD_MEMORY_TYPES
+        ]
+        written = 0
+        if global_candidates:
+            written += await ChatMemoryStore.record_candidates(
+                session_id=context.user_id,
+                user_id=context.user_id,
+                group_id=None,
+                candidates=global_candidates,
+                source_dialog_id=context.source_dialog_id,
+                source_message=message_text,
+                scope="user",
+            )
+        if thread_candidates and context.group_id and context.thread_id:
+            written += await ChatMemoryStore.record_candidates(
+                session_id=context.session_id,
+                user_id=context.user_id,
+                group_id=context.group_id,
+                candidates=thread_candidates,
+                source_dialog_id=context.source_dialog_id,
+                source_message=message_text,
+                scope="thread",
+                thread_id=context.thread_id,
+                topic_key=context.topic_key,
+                participants=context.participants,
+            )
+        return written
+
+    return schedule_memory_extraction(request, write)
+
+
+def _candidate_memory_type(candidate: MemoryCandidate) -> str:
+    return normalize_message_text(candidate.memory_type)
 
 
 async def _record_person_aliases(
@@ -242,57 +264,6 @@ def _clean_alias(value: str) -> str:
     return alias[:24]
 
 
-def _memory_scope_from_policy(policy: MemoryPolicyDecision) -> str:
-    if policy.scope in {"user", "group", "thread"}:
-        return policy.scope
-    return "user"
-
-
-def _scope_candidates(
-    candidates: list[MemoryCandidate],
-    *,
-    prefix: str,
-) -> list[MemoryCandidate]:
-    if not prefix:
-        return candidates
-    return [
-        MemoryCandidate(
-            memory_type=f"{prefix}{candidate.memory_type}",
-            key=candidate.key,
-            value=candidate.value,
-            confidence=candidate.confidence,
-        )
-        for candidate in candidates
-    ]
-
-
-def _dialogue_fact_candidates(context: MemoryWriteContext) -> list[MemoryCandidate]:
-    """Write generic chat-side facts without touching tool/plugin policy."""
-
-    candidates: list[MemoryCandidate] = []
-    message = normalize_message_text(context.message_text)
-    response = normalize_message_text(context.response_text)
-    if context.thread_id and context.topic_key and message:
-        candidates.append(
-            MemoryCandidate(
-                memory_type="recent_thread_fact",
-                key=normalize_message_text(context.topic_key)[:96],
-                value=message[:160],
-                confidence=0.48,
-            )
-        )
-    if response and len(response) <= 160 and message and len(message) <= 180:
-        candidates.append(
-            MemoryCandidate(
-                memory_type="dialogue_style",
-                key="last_chat_exchange",
-                value=f"user={message[:80]} | bot={response[:80]}",
-                confidence=0.34,
-            )
-        )
-    return candidates[:2]
-
-
 def _is_safe_self_alias_match(text: str, match: re.Match[str]) -> bool:
     start = max(int(match.start()), 0)
     prefix = normalize_message_text(text[max(0, start - 6) : start])
@@ -311,20 +282,17 @@ def _record_reflection(
     context: MemoryWriteContext,
     *,
     action: str,
-    policy: MemoryPolicyDecision,
     written: int,
     candidate_count: int,
 ) -> None:
+    is_write = action == "memory_write"
     record_reflection_observation(
         action=action,
         session_id=context.session_id,
         user_id=context.user_id,
         group_id=context.group_id,
         thread_id=context.thread_id,
-        reason=policy.reason,
-        policy_action=policy.action,
-        policy_scope=policy.scope,
-        policy_confidence=policy.confidence,
+        reason="explicit_alias" if is_write else "no_explicit_alias",
         written=written,
         candidate_count=candidate_count,
         message_text=context.message_text,

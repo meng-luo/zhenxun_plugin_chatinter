@@ -1,4 +1,4 @@
-﻿"""Stable result types for ChatInter main request dispatch."""
+"""Stable result types for ChatInter main request dispatch."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from zhenxun.services.llm.types.models import ToolResult
-
+from .llm_compat import ToolResult
 from .native_executor import NativeToolExecutionResult
 from .native_route import NativeRouteDecision, NativeRouteReport, NativeRouteResult
 

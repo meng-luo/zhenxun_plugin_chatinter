@@ -9,7 +9,7 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.services import logger
 
-from .config import get_config_value, get_model_name
+from .config import chatinter_enabled, get_agent_model
 from .event_runtime import (
     get_nickname,
     is_already_handled,
@@ -18,7 +18,12 @@ from .event_runtime import (
 )
 from .event_signals import get_event_signal, set_event_signal
 from .prompt_pipeline import PromptPipeline
-from .scenario_router import ScenarioRoute, resolve_chatinter_scenario
+from .scenario_router import (
+    ChatInterScenario,
+    ScenarioRoute,
+    resolve_chatinter_scenario,
+)
+from .session_identity import conversation_session_key, legacy_session_key
 from .turn_frame import TurnFrame
 
 
@@ -37,7 +42,7 @@ async def handle_fallback(
 ) -> None:
     """Handle one ChatInter fallback turn."""
 
-    if not get_config_value("ENABLE_FALLBACK", True):
+    if not chatinter_enabled():
         logger.debug("ChatInter fallback disabled")
         return
 
@@ -63,19 +68,9 @@ async def handle_fallback(
     if not scenario_route.should_handle:
         logger.debug(f"ChatInter scenario skip: {scenario_route.reason}")
         return
-
-    if scenario_route.allow_agent_tools:
-        from .superuser_agent.runtime_approval import try_handle_runtime_approval
-
-        if await try_handle_runtime_approval(
-            bot=bot,
-            event=event,
-            session=session,
-            raw_message=raw_message,
-        ):
-            if not queued:
-                mark_as_handled(event)
-            return
+    if scenario_route.scenario is ChatInterScenario.SUPERUSER_AGENT:
+        logger.debug("superuser agent must use its direct entry")
+        return
 
     frame = TurnFrame.create(
         raw_message=raw_message,
@@ -83,12 +78,25 @@ async def handle_fallback(
         group_id=group_id,
         nickname=get_nickname(session),
         bot_id=str(bot.self_id) if hasattr(bot, "self_id") else None,
-        model_name=get_model_name(),
+        model_name=get_agent_model(
+            "plugin"
+            if scenario_route.scenario is ChatInterScenario.GROUP_PLUGIN_SELECTOR
+            else "chat"
+        ),
         is_superuser=resolve_superuser(bot, user_id),
         scenario=scenario_route.scenario.value,
         allow_plugin_tools=scenario_route.allow_plugin_tools,
-        allow_agent_tools=scenario_route.allow_agent_tools,
         message_id=str(getattr(event, "message_id", "")),
+        session_key=conversation_session_key(session),
+        legacy_session_key=legacy_session_key(session),
+    )
+    frame.turn_generation = int(
+        get_event_signal(event, "_chatinter_turn_generation", 0) or 0
+    )
+    frame.current_turn_guard = get_event_signal(
+        event,
+        "_chatinter_turn_is_current",
+        None,
     )
     frame.update_tags(
         scenario=scenario_route.scenario.value,
@@ -102,6 +110,16 @@ async def handle_fallback(
             "_chatinter_turn_messages",
             [],
         )
+    )
+    turn_message_sources = get_event_signal(
+        event,
+        "_chatinter_turn_message_sources",
+        [],
+    )
+    frame.turn_message_sources = (
+        list(turn_message_sources)
+        if isinstance(turn_message_sources, list | tuple)
+        else []
     )
     pending_updates_value = (
         pending_human_updates

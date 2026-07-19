@@ -121,9 +121,6 @@ def _capability_text(
         schema.description or reference.does,
         "动作:" + "/".join(task_verbs) if task_verbs else "",
         "输入:" + "/".join(input_requirements) if input_requirements else "",
-        "来源:" + schema.source if schema.source else "",
-        "角色:" + schema.command_role if schema.command_role else "",
-        "负载:" + schema.payload_policy if schema.payload_policy else "",
     ]
     return normalize_message_text("；".join(part for part in parts if part))
 
@@ -196,8 +193,8 @@ def _merge_requires(left: dict[str, bool], right: dict[str, bool]) -> dict[str, 
 def _summarize_schema_requires(
     schemas: list[PluginCommandSchema],
 ) -> dict[str, bool]:
-    # 插件级卡片保留“任一命令可能需要”的摘要，真正的上下文过滤走
-    # command-level snapshot，避免在插件级误杀可用命令。
+
+
     keys = {"text", "image", "reply", "at", "private", "to_me"}
     if not schemas:
         return {key: False for key in keys}
@@ -271,8 +268,7 @@ def build_plugin_references(
 
 
 def _schema_blocked_by_quality_gate(schema: Any, *, module: str) -> bool:
-    """Schema quality gate (P0-4): fallback-source schemas are too unreliable
-    to expose to the LLM tool pool unless explicitly allowlisted."""
+    """Keep fallback-source schemas out of the tool pool unless allowlisted."""
     from .config import EXPOSE_FALLBACK_SCHEMAS, SCHEMA_FALLBACK_ALLOWLIST
 
     if str(getattr(schema, "source", "") or "") != "fallback":
@@ -297,6 +293,7 @@ def build_command_tool_snapshots(
     for plugin in graph.plugins:
         reference = build_plugin_reference(plugin)
         plugin_usage = normalize_message_text(plugin.usage or "") or None
+        multi_command = len(reference.command_schemas) > 1
         for schema in reference.command_schemas:
             if _schema_blocked_by_quality_gate(schema, module=reference.module):
                 continue
@@ -309,6 +306,11 @@ def build_command_tool_snapshots(
                 task_verbs=task_verbs,
                 input_requirements=input_requirements,
             )
+            global_phrases = (
+                []
+                if multi_command
+                else [reference.does, plugin_usage or "", *reference.examples]
+            )
             phrases: list[str] = []
             for value in [
                 schema.command_id,
@@ -318,9 +320,7 @@ def build_command_tool_snapshots(
                 capability_text,
                 " ".join(task_verbs),
                 " ".join(input_requirements),
-                reference.does,
-                plugin_usage or "",
-                *reference.examples,
+                *global_phrases,
                 *schema.retrieval_phrases,
             ]:
                 _append_unique(phrases, value)
@@ -330,9 +330,10 @@ def build_command_tool_snapshots(
                 plugin_name=reference.name,
                 head=schema.head,
                 aliases=list(schema.aliases),
-                description=schema.description or reference.does,
-                usage=plugin_usage,
-                examples=list(reference.examples),
+                description=schema.description
+                or ("" if multi_command else reference.does),
+                usage=None if multi_command else plugin_usage,
+                examples=[] if multi_command else list(reference.examples),
                 slots=list(schema.slots),
                 requires=dict(schema.requires or {}),
                 allow_at=schema.allow_at,

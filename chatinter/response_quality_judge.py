@@ -7,25 +7,13 @@ before a message is sent.
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import asdict, dataclass
-import hashlib
-import json
-from typing import Any, Literal
-
-from pydantic import BaseModel, Field
-
-from zhenxun.services import logger
-from zhenxun.services.llm import AI
+from dataclasses import dataclass
+from typing import Literal
 
 from .chat_dialogue_planner import DialogueState
-from .config import build_reasoning_generation_config, get_config_value, get_model_name
-from .persistence import append_jsonl, state_path, utc_now_iso
 from .route_text import normalize_message_text
-from .trajectory_eval import record_response_quality_eval
 
 QualityAction = Literal["ok", "revise", "block"]
-ShadowQualityVerdict = Literal["ok", "minor_issue", "bad", "unsafe"]
 
 _STIFF_PHRASES = (
     "尊敬的用户",
@@ -76,11 +64,6 @@ _HALLUCINATION_MARKERS = (
     "已经为你完成",
     "我查到了",
 )
-_MAX_SHADOW_TASKS = 16
-_SHADOW_TASKS: set[asyncio.Task[None]] = set()
-_SHADOW_LOG_PATH = state_path("quality", "shadow_judge.jsonl")
-
-
 @dataclass(frozen=True)
 class ResponseQualityResult:
     action: QualityAction
@@ -89,8 +72,6 @@ class ResponseQualityResult:
     instruction: str = ""
     severity: str = "info"
     rule_hits: tuple[str, ...] = ()
-    shadow_verdict: str = ""
-    shadow_reason: str = ""
 
     @property
     def ok(self) -> bool:
@@ -165,58 +146,6 @@ class ResponseQualityJudge:
                 rule_hits=tuple(rule_hits),
             )
         return ResponseQualityResult(action="ok")
-
-
-class ShadowQualityResult(BaseModel):
-    verdict: ShadowQualityVerdict = Field(default="ok")
-    reason: str = ""
-    should_revise_next_time: bool = False
-    tags: list[str] = Field(default_factory=list)
-
-
-def schedule_shadow_quality_judge(
-    *,
-    final_text: str,
-    original_message: str,
-    scenario: str,
-    session_key: str,
-    trace_id: str = "",
-    quality_result: ResponseQualityResult | None = None,
-) -> None:
-    if not _shadow_enabled():
-        return
-    if len(_SHADOW_TASKS) >= _MAX_SHADOW_TASKS:
-        return
-    if not _should_sample_shadow(
-        final_text=final_text,
-        original_message=original_message,
-        quality_result=quality_result,
-    ):
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    task = loop.create_task(
-        _shadow_quality_judge_safely(
-            final_text=final_text,
-            original_message=original_message,
-            scenario=scenario,
-            session_key=session_key,
-            trace_id=trace_id,
-            quality_result=quality_result,
-        )
-    )
-    _SHADOW_TASKS.add(task)
-    task.add_done_callback(_SHADOW_TASKS.discard)
-
-
-def result_to_record(result: ResponseQualityResult | None) -> dict[str, Any]:
-    if result is None:
-        return {}
-    payload = asdict(result)
-    payload["ok"] = result.ok
-    return payload
 
 
 def _looks_stiff(reply: str, state: DialogueState | None) -> bool:
@@ -321,160 +250,7 @@ def _too_long_for_state(reply: str, state: DialogueState | None) -> bool:
     return len(reply) > 360 and state.dialogue_purpose in {"chat", "support"}
 
 
-def _shadow_enabled() -> bool:
-    return _shadow_sample_rate() > 0.0
-
-
-def _shadow_sample_rate() -> float:
-    try:
-        value = float(get_config_value("QUALITY_SHADOW_SAMPLE_RATE", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        value = 0.0
-    return max(0.0, min(value, 1.0))
-
-
-def _should_sample_shadow(
-    *,
-    final_text: str,
-    original_message: str,
-    quality_result: ResponseQualityResult | None,
-) -> bool:
-    if quality_result is not None and quality_result.rule_hits:
-        return True
-    sample_rate = _shadow_sample_rate()
-    if sample_rate <= 0:
-        return False
-    key = f"{original_message}\n---\n{final_text}"
-    digest = hashlib.blake2b(key.encode("utf-8", "ignore"), digest_size=8).digest()
-    stable = int.from_bytes(digest, "big") / float(2**64 - 1)
-    return stable < sample_rate
-
-
-async def _shadow_quality_judge_safely(
-    *,
-    final_text: str,
-    original_message: str,
-    scenario: str,
-    session_key: str,
-    trace_id: str,
-    quality_result: ResponseQualityResult | None,
-) -> None:
-    started = asyncio.get_running_loop().time()
-    try:
-        result = await _run_shadow_quality_judge(
-            final_text=final_text,
-            original_message=original_message,
-            scenario=scenario,
-        )
-        latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        append_jsonl(
-            _SHADOW_LOG_PATH,
-            {
-                "schema_version": "chatinter.quality_shadow.v1",
-                "created_at": utc_now_iso(),
-                "trace_id": trace_id,
-                "session_key": session_key,
-                "scenario": scenario,
-                "verdict": result.verdict,
-                "reason": result.reason,
-                "should_revise_next_time": result.should_revise_next_time,
-                "tags": result.tags[:12],
-                "local_quality": result_to_record(quality_result),
-                "latency_ms": latency_ms,
-            },
-        )
-        await _record_shadow_eval_projection(
-            result=result,
-            final_text=final_text,
-            original_message=original_message,
-            scenario=scenario,
-            session_key=session_key,
-            trace_id=trace_id,
-        )
-    except Exception as exc:
-        logger.debug(f"[ChatInter] shadow quality judge skipped: {exc}")
-
-
-async def _run_shadow_quality_judge(
-    *,
-    final_text: str,
-    original_message: str,
-    scenario: str,
-) -> ShadowQualityResult:
-    prompt = {
-        "scenario": normalize_message_text(scenario),
-        "user_message": normalize_message_text(original_message)[:1200],
-        "assistant_reply": normalize_message_text(final_text)[:1800],
-    }
-    return await AI(session_id="chatinter-quality-shadow").generate_structured(
-        json.dumps(prompt, ensure_ascii=False),
-        ShadowQualityResult,
-        model=get_model_name(),
-        config=build_reasoning_generation_config(),
-        instruction=_SHADOW_QUALITY_INSTRUCTION,
-        timeout=_shadow_timeout(),
-        max_validation_retries=0,
-        auto_thinking=False,
-    )
-
-
-def _shadow_timeout() -> float:
-    try:
-        configured = float(get_config_value("INTENT_TIMEOUT", 20) or 20)
-    except (TypeError, ValueError):
-        configured = 20.0
-    return max(4.0, min(configured, 12.0))
-
-
-async def _record_shadow_eval_projection(
-    *,
-    result: ShadowQualityResult,
-    final_text: str,
-    original_message: str,
-    scenario: str,
-    session_key: str,
-    trace_id: str,
-) -> None:
-    try:
-        await asyncio.to_thread(
-            record_response_quality_eval,
-            quality_result=None,
-            final_text=final_text,
-            original_message=original_message,
-            scenario=scenario,
-            session_key=session_key,
-            trace_id=trace_id,
-            shadow_verdict=result.verdict,
-            shadow_reason=result.reason,
-        )
-    except Exception:
-        return
-
-
-_SHADOW_QUALITY_INSTRUCTION = """
-你是 ChatInter 的回复质量抽检器。只做事后评估,不要改写回复。
-
-判定维度:
-- 是否直接回应用户当前消息。
-- 是否有空泛敷衍、客服腔、过度拒绝。
-- 是否声称做了未观察到的事情。
-- 是否在没有依据时过度确定。
-- 是否存在明显不安全回复。
-
-只返回 JSON:
-{
-  "verdict": "ok",
-  "reason": "",
-  "should_revise_next_time": false,
-  "tags": []
-}
-""".strip()
-
-
 __all__ = [
     "ResponseQualityJudge",
     "ResponseQualityResult",
-    "ShadowQualityResult",
-    "result_to_record",
-    "schedule_shadow_quality_judge",
 ]

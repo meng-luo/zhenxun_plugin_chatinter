@@ -13,7 +13,6 @@ TaskCoverageStatus = Literal[
     "completed",
     "failed",
     "unsupported",
-    "clarify",
     "missing",
 ]
 
@@ -86,10 +85,6 @@ class TaskCoverageReport:
         return tuple(item for item in self.items if item.status == "unsupported")
 
     @property
-    def clarify(self) -> tuple[TaskCoverageItem, ...]:
-        return tuple(item for item in self.items if item.status == "clarify")
-
-    @property
     def missing(self) -> tuple[TaskCoverageItem, ...]:
         return tuple(item for item in self.items if item.status == "missing")
 
@@ -102,7 +97,6 @@ class TaskCoverageReport:
             "completed_count": len(self.completed),
             "failed_count": len(self.failed),
             "unsupported_count": len(self.unsupported),
-            "clarify_count": len(self.clarify),
             "missing_count": len(self.missing),
             "orphan_observation_count": self.orphan_observation_count,
             "items": [item.to_payload() for item in self.items],
@@ -147,30 +141,6 @@ def build_task_coverage_report(
     )
 
 
-def synthesize_task_coverage_reply(report: TaskCoverageReport) -> str:
-    """Build the final reply from coverage facts only.
-
-    This keeps the LLM out of completion judgment: completed means a task has
-    an ok observation, while every other state is explicitly listed as not done.
-    """
-
-    if not report.items:
-        return "没有可执行的明确任务。"
-
-    completed = [_format_completed_item(item) for item in report.completed]
-    unfinished = [
-        _format_unfinished_item(item)
-        for item in report.items
-        if item.status != "completed"
-    ]
-    parts: list[str] = []
-    if completed:
-        parts.append("已完成：" + "；".join(completed))
-    if unfinished:
-        parts.append("未完成：" + "；".join(unfinished))
-    return "；".join(parts)
-
-
 def _coverage_item_for_route(
     route: TaskRouteResult,
     observation_pair: tuple[int, TaskObservation] | None,
@@ -186,16 +156,6 @@ def _coverage_item_for_route(
 
     observation_index, observation = observation_pair
     command_id = observation.command_id or route.command_id
-    if route.status == "clarify":
-        return TaskCoverageItem(
-            task_id=route.task_id,
-            text=route.text,
-            status="clarify",
-            command_id=command_id,
-            reason=_route_reason(route, observation, fallback="需要澄清"),
-            observation_index=observation_index,
-            output_summary=_output_summary(observation.output),
-        )
     if route.status == "unsupported":
         return TaskCoverageItem(
             task_id=route.task_id,
@@ -235,7 +195,6 @@ def _route_reason(
 ) -> str:
     for value in (
         observation.error,
-        route.clarification_question,
         route.reason,
         _output_error(observation.output),
     ):
@@ -243,51 +202,6 @@ def _route_reason(
         if text:
             return text
     return fallback
-
-
-def _format_completed_item(item: TaskCoverageItem) -> str:
-    label = _item_label(item)
-    if item.output_summary:
-        return f"{label}（{item.output_summary}）"
-    return label
-
-
-def _format_unfinished_item(item: TaskCoverageItem) -> str:
-    reason = _friendly_reason(item.status, item.reason)
-    return f"{_item_label(item)}（{reason}）"
-
-
-def _friendly_reason(status: TaskCoverageStatus, reason: str) -> str:
-    text = normalize_message_text(reason)
-    if status == "unsupported":
-        return "未找到可用命令" if _is_internal_unsupported_reason(text) else text
-    if status == "clarify":
-        return f"需要澄清：{text}" if text else "需要澄清"
-    if status == "missing":
-        return text or "没有执行结果"
-    if status == "failed":
-        return f"执行失败：{text}" if text else "执行失败"
-    return text or status
-
-
-def _is_internal_unsupported_reason(reason: str) -> bool:
-    if not reason:
-        return True
-    return reason in {
-        "no_candidates",
-        "no_match",
-        "unsupported",
-        "task_router:no_match",
-        "select_below_confidence_or_missing_binding",
-    }
-
-
-def _item_label(item: TaskCoverageItem) -> str:
-    return (
-        normalize_message_text(item.text)
-        or normalize_message_text(item.task_id)
-        or "任务"
-    )
 
 
 def _output_error(output: dict[str, Any]) -> str:
@@ -315,5 +229,4 @@ __all__ = [
     "TaskCoverageReport",
     "TaskCoverageStatus",
     "build_task_coverage_report",
-    "synthesize_task_coverage_reply",
 ]

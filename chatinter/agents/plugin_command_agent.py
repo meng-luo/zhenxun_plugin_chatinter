@@ -6,16 +6,27 @@ No superuser tools, MCP, approval, delegate_task or AgentRuntime fallback live h
 
 from __future__ import annotations
 
-from collections.abc import Callable
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 import uuid
 
-from ..config import build_reasoning_generation_config, get_config_value, get_model_name
+from zhenxun.services.ai.core.engine.token_counter import parse_usage_info
+
+from ..config import (
+    INTENT_TIMEOUT_SECONDS,
+    build_agent_generation_config,
+    get_agent_model,
+)
+from ..main_request_models import (
+    MainRequestOutput,
+    MainRequestResult,
+    MainRequestTimelineItem,
+)
 from ..native_executor import NativeCommandExecutionContext
-from ..native_route import NativeRouteReport
+from ..native_route import NativeRouteDecision, NativeRouteReport
 from ..route_text import is_usage_question, normalize_message_text
-from ..task_coverage import build_task_coverage_report, synthesize_task_coverage_reply
+from ..runtime_result import _result_from_task_execution_queue
+from ..task_coverage import build_task_coverage_report
 from ..task_execution_queue import TaskExecutionQueue
 from ..task_planner_lite import TaskItem, plan_task_items
 from ..task_router import TaskRouter
@@ -23,33 +34,15 @@ from ..tool_retriever import CommandToolRetriever
 from .core import (
     PLUGIN_COMMAND_TOOL_SCOPE,
     AgentObservation,
-    AgentRequest,
     AgentResult,
+    PluginCommandRequest,
 )
-
-if TYPE_CHECKING:
-    from ..main_request_models import MainRequestResult
-
-CandidatesForTaskRoutes = Callable[..., list[Any]]
-ResultFromTaskExecutionQueue = Callable[..., "MainRequestResult"]
-TryLocalDirectCommand = Callable[..., Any]
 
 
 class PluginCommandAgent:
     """Boundary for group plugin command routing."""
 
-    def __init__(
-        self,
-        *,
-        candidates_for_task_routes: CandidatesForTaskRoutes,
-        result_from_task_execution_queue: ResultFromTaskExecutionQueue,
-        try_local_direct_command: TryLocalDirectCommand,
-    ) -> None:
-        self._candidates_for_task_routes = candidates_for_task_routes
-        self._result_from_task_execution_queue = result_from_task_execution_queue
-        self._try_local_direct_command = try_local_direct_command
-
-    async def run(self, request: AgentRequest) -> AgentResult:
+    async def run(self, request: PluginCommandRequest) -> AgentResult:
         started = time.perf_counter()
         message_text = normalize_message_text(request.message_text)
         report = request.report or NativeRouteReport(
@@ -76,31 +69,43 @@ class PluginCommandAgent:
             message_text=message_text,
         )
 
-        direct_result = await self._try_local_direct_command(
-            message_text=message_text,
-            retriever=retriever,
-            command_context=command_context,
-            report=report,
-            route_executor=request.route_executor,
-            budget_controller=request.budget_controller,
-        )
-        if direct_result is not None:
-            return _agent_result(
-                direct_result,
-                started=started,
-                observation="local_direct_command",
+        trace_id = uuid.uuid4().hex[:12]
+
+        def _record_usage(usage_info: dict[str, Any] | None) -> None:
+            if request.budget_controller is None:
+                return
+            usage = parse_usage_info(usage_info)
+            request.budget_controller.record_model_usage(
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
             )
 
-        trace_id = uuid.uuid4().hex[:12]
         task_router_result = await TaskRouter(
             retriever=retriever,
             trace_id=trace_id,
-            model_name=get_model_name(),
-            generation_config=build_reasoning_generation_config(),
-            timeout=float(get_config_value("INTENT_TIMEOUT", 20) or 20),
-        ).route_tasks(_router_tasks(message_text, plan_task_items(message_text)))
-        task_queue_candidates = self._candidates_for_task_routes(
-            retriever=retriever,
+            model_name=get_agent_model("plugin"),
+            generation_config=build_agent_generation_config("plugin"),
+            timeout=float(INTENT_TIMEOUT_SECONDS),
+            usage_callback=(
+                _record_usage if request.budget_controller is not None else None
+            ),
+        ).route_tasks(
+            _router_tasks(message_text, plan_task_items(message_text)),
+            router_context=request.router_context,
+        )
+        if task_router_result.selected_count == 0:
+            return _agent_result(
+                _no_selection_result(
+                    message_text=message_text,
+                    report=report,
+                    task_router_payload=task_router_result.to_payload(),
+                ),
+                started=started,
+                observation="no_plugin_selection",
+            )
+
+        task_queue_candidates = _candidates_for_task_routes(
+            candidates=task_router_result.candidates,
             routes=list(task_router_result.routes),
         )
         command_context.candidates = task_queue_candidates
@@ -123,7 +128,7 @@ class PluginCommandAgent:
             task_queue_result,
         )
         return _agent_result(
-            self._result_from_task_execution_queue(
+            _result_from_task_execution_queue(
                 message_text=message_text,
                 report=report,
                 command_context=command_context,
@@ -131,7 +136,7 @@ class PluginCommandAgent:
                 task_queue_payload=task_queue_result.to_payload(),
                 task_coverage_report=task_coverage_report,
                 tool_results=list(task_queue_result.tool_results),
-                final_text=synthesize_task_coverage_reply(task_coverage_report),
+                final_text="",
             ),
             started=started,
             observation="task_execution_queue",
@@ -148,6 +153,66 @@ def _router_tasks(
     if not text:
         return ()
     return (TaskItem(task_id="task_1", text=text, order=1),)
+
+
+def _candidates_for_task_routes(
+    *,
+    candidates: tuple[Any, ...],
+    routes: list[Any],
+) -> list[Any]:
+    candidates_by_id = {
+        normalize_message_text(candidate.schema.command_id): candidate
+        for candidate in candidates
+        if normalize_message_text(candidate.schema.command_id)
+    }
+    selected: list[Any] = []
+    for route in routes:
+        command_id = normalize_message_text(str(getattr(route, "command_id", "") or ""))
+        if not command_id or getattr(route, "status", "") != "selected":
+            continue
+        candidate = candidates_by_id.get(command_id)
+        if candidate is not None and candidate not in selected:
+            selected.append(candidate)
+    return selected
+
+
+def _no_selection_result(
+    *,
+    message_text: str,
+    report: NativeRouteReport,
+    task_router_payload: dict[str, Any],
+) -> MainRequestResult:
+    reason = "plugin_router:no_selection"
+    report.finalize(reason=reason, stage="plugin_command_agent")
+    return MainRequestResult(
+        decision=NativeRouteDecision(
+            action="chat",
+            confidence=0.0,
+            reason=reason,
+        ),
+        route_result=None,
+        report=report,
+        timeline=(
+            MainRequestTimelineItem(
+                role="user",
+                kind="current_user",
+                content=message_text,
+            ),
+            MainRequestTimelineItem(
+                role="system",
+                kind="task_router",
+                metadata=task_router_payload,
+            ),
+        ),
+        output=MainRequestOutput(
+            final_text="",
+            should_send=False,
+            outcome="plugin_no_selection",
+            feedback_kind="plugin_no_selection",
+            record_chat_feedback=False,
+            observation_reason=reason,
+        ),
+    )
 
 
 def _agent_result(

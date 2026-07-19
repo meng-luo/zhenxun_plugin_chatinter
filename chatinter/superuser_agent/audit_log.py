@@ -4,13 +4,30 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import threading
 from typing import Any
-
-from ..runtime_events import emit_runtime_event
 
 _AUDIT_LOG_PATH = Path("data/log/chatinter_agent_audit.log")
 _MAX_QUERY_LINES = 2000
+_MAX_LOG_BYTES = 2_000_000
+_MAX_TEXT_CHARS = 1000
+_AUDIT_LOCK = threading.Lock()
+_REDACTED_KEYS = {
+    "api_key",
+    "authorization",
+    "content",
+    "env",
+    "environment",
+    "new_text",
+    "old_text",
+    "password",
+    "secret",
+    "stderr",
+    "stdout",
+    "token",
+}
 
 
 def record_audit_event(
@@ -28,33 +45,18 @@ def record_audit_event(
         "user_id": str(user_id or ""),
         "session_key": str(session_key or ""),
         "action": str(action or ""),
-        "payload": payload or {},
-        "result": result or {},
+        "payload": _compact_value(payload or {}),
+        "result": _compact_value(result or {}),
     }
     try:
-        _AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _AUDIT_LOG_PATH.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        with _AUDIT_LOCK:
+            _AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_if_full()
+            with _AUDIT_LOG_PATH.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     except Exception:
-        # Audit must never break the bot turn. Tool results still contain the
-        # user-visible status if logging fails.
-        pass
-    try:
-        emit_runtime_event(
-            kind="audit",
-            status="info",
-            source=f"audit:{event}",
-            session_key=entry["session_key"],
-            user_id=entry["user_id"],
-            summary=f"{event}:{action}",
-            payload={
-                "event": event,
-                "action": action,
-                "payload": payload or {},
-                "result": result or {},
-            },
-        )
-    except Exception:
+
+
         pass
 
 
@@ -105,6 +107,34 @@ def query_audit_events(
 
 def audit_log_path() -> Path:
     return _AUDIT_LOG_PATH
+
+
+def _rotate_if_full() -> None:
+    try:
+        if (
+            not _AUDIT_LOG_PATH.exists()
+            or _AUDIT_LOG_PATH.stat().st_size < _MAX_LOG_BYTES
+        ):
+            return
+        backup = _AUDIT_LOG_PATH.with_name(_AUDIT_LOG_PATH.name + ".1")
+        os.replace(_AUDIT_LOG_PATH, backup)
+    except OSError:
+        return
+
+
+def _compact_value(value: Any, *, key: str = "") -> Any:
+    if key.lower() in _REDACTED_KEYS:
+        return f"[redacted:{len(str(value or ''))}]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _compact_value(item, key=str(item_key))
+            for item_key, item in list(value.items())[:40]
+        }
+    if isinstance(value, list | tuple):
+        return [_compact_value(item) for item in value[:40]]
+    if isinstance(value, str) and len(value) > _MAX_TEXT_CHARS:
+        return value[:_MAX_TEXT_CHARS] + "...[truncated]"
+    return value
 
 
 __all__ = ["audit_log_path", "query_audit_events", "record_audit_event"]
