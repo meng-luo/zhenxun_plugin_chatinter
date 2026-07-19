@@ -204,7 +204,7 @@ chatinter/
 
 `重置会话` 对数据库历史执行软重置，不会直接删除记录。
 
-## 最近更新
+## v1.4.0
 
 - 将运行时拆分为插件命令、聊天回复和 Superuser 三类 Agent，收紧跨场景工具暴露
 - 重构为基于 `TurnFrame` 的 Prompt Pipeline，并加入同会话 turn 队列
