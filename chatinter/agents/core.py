@@ -8,22 +8,25 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+import json
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ..llm_compat import LLMMessage
-from ..models.pydantic_models import PluginKnowledgeBase
-from ..native_executor import ExecuteNativeRoute
+from ..native_executor import NativeCommandExecutionContext
 from ..native_route import NativeRouteReport
 from ..provider_capability import ProviderCapabilityAdapter
+from ..response_defaults import EMPTY_REPLY_TEXT
 from ..route_text import normalize_reply_text
 from ..turn_runtime import TurnBudgetController, estimate_text_tokens
 
 if TYPE_CHECKING:
+    from ..context_budget import ChatContextBundle
     from ..llm_compat import ToolResult
     from ..main_request_models import MainRequestResult
+    from ..mixed_tool_catalog import MixedToolCatalog
 
 ProgressHook = Callable[[str], Awaitable[None] | None]
-AgentKind = Literal["plugin_command", "private_chat"]
+AgentKind = Literal["unified_chat", "superuser"]
 AgentObservationStatus = Literal["ok", "error", "fallback"]
 
 
@@ -35,8 +38,7 @@ class ToolScope:
     allow_plugin: bool = False
 
 
-PLUGIN_COMMAND_TOOL_SCOPE = ToolScope(kind="plugin_command", allow_plugin=True)
-PRIVATE_CHAT_TOOL_SCOPE = ToolScope(kind="private_chat")
+UNIFIED_CHAT_TOOL_SCOPE = ToolScope(kind="unified_chat", allow_plugin=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,32 +71,29 @@ class AgentResult:
 
 
 @dataclass(slots=True)
-class PluginCommandRequest:
-    """Request envelope for the group plugin router."""
-
-    message_text: str
-    knowledge_base: PluginKnowledgeBase
-    session_key: str | None
-    budget_controller: TurnBudgetController | None
-    has_reply: bool
-    command_tools: list[Any] | None
-    route_executor: ExecuteNativeRoute
-    router_context: dict[str, object] | None = None
-    report: NativeRouteReport | None = None
-
-
-@dataclass(slots=True)
-class PrivateChatRequest:
-    """Request envelope for ordinary private chat."""
+class UnifiedChatRequest:
+    """Request envelope for the unified chat + plugin-invocation turn."""
 
     message_text: str
     session_key: str | None
     budget_controller: TurnBudgetController | None
     messages: list[LLMMessage]
-    report: NativeRouteReport | None = None
+    report: NativeRouteReport
+    scenario: str = "private_chat"
+    user_id: str = ""
+    group_id: str | None = None
+    bot_id: str | None = None
+    platform: str | None = None
+    channel_id: str | None = None
+    command_candidate_text: str = ""
+    tools: dict[str, Any] | None = None
+    tool_catalog: MixedToolCatalog | None = None
+    command_context: NativeCommandExecutionContext | None = None
+    context_bundle: ChatContextBundle | None = None
+    context_xml: str = ""
 
 
-AgentRequest = PluginCommandRequest | PrivateChatRequest
+AgentRequest = UnifiedChatRequest
 
 
 class ChatInterAgent(Protocol):
@@ -105,10 +104,19 @@ class ChatInterAgent(Protocol):
         ...
 
 
-def provider_adapter_for(model_name: str | None) -> ProviderCapabilityAdapter:
+def provider_adapter_for(
+    model_name: str | None,
+    *,
+    api_type: str | None = None,
+    capabilities: Any | None = None,
+) -> ProviderCapabilityAdapter:
     """Return the provider adapter used by an agent without owning policy."""
 
-    return ProviderCapabilityAdapter.for_model(model_name)
+    return ProviderCapabilityAdapter.for_model(
+        model_name,
+        api_type=api_type,
+        capabilities=capabilities,
+    )
 
 
 def normalize_tool_result_output(value: Any) -> dict[str, Any]:
@@ -121,9 +129,7 @@ def normalize_tool_result_output(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
-def fallback_text(
-    text: str | None, *, default: str = "我暂时没想好怎么回答你。"
-) -> str:
+def fallback_text(text: str | None, *, default: str = EMPTY_REPLY_TEXT) -> str:
     """Normalize final text and provide the shared empty-response fallback."""
 
     return normalize_reply_text(str(text or "")) or default
@@ -144,14 +150,44 @@ def record_prompt_tokens(
 def estimate_prompt_tokens(messages: Sequence[object]) -> int:
     total = 0
     for message in messages:
+        total += 4
+        if str(getattr(message, "role", "") or "") == "tool":
+            total += 40
         content = getattr(message, "content", "")
         if isinstance(content, list):
-            total += sum(
-                estimate_text_tokens(str(getattr(part, "text", "") or ""))
-                for part in content
-            )
+            for part in content:
+                part_type = str(getattr(part, "type", "") or "").casefold()
+                if part_type == "image" or getattr(part, "image_source", None):
+                    total += 1_032
+                    continue
+                total += estimate_text_tokens(
+                    str(
+                        getattr(part, "text", "")
+                        or getattr(part, "thought_text", "")
+                        or ""
+                    )
+                )
         else:
             total += estimate_text_tokens(str(content or ""))
+        for value in (
+            getattr(message, "name", None),
+            getattr(message, "tool_call_id", None),
+            getattr(message, "thought_signature", None),
+        ):
+            if value:
+                total += estimate_text_tokens(str(value))
+        for call in getattr(message, "tool_calls", None) or ():
+            function = getattr(call, "function", None)
+            total += estimate_text_tokens(str(getattr(function, "name", "") or ""))
+            arguments = getattr(function, "arguments", "") or ""
+            if not isinstance(arguments, str):
+                arguments = json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            total += estimate_text_tokens(arguments)
     return total
 
 
@@ -184,16 +220,14 @@ def error_observation(*, kind: str, error: BaseException) -> AgentObservation:
 
 
 __all__ = [
-    "PLUGIN_COMMAND_TOOL_SCOPE",
-    "PRIVATE_CHAT_TOOL_SCOPE",
+    "UNIFIED_CHAT_TOOL_SCOPE",
     "AgentObservation",
     "AgentRequest",
     "AgentResult",
     "ChatInterAgent",
-    "PluginCommandRequest",
-    "PrivateChatRequest",
     "ProgressHook",
     "ToolScope",
+    "UnifiedChatRequest",
     "error_observation",
     "estimate_prompt_tokens",
     "fallback_text",

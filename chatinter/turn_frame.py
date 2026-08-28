@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .context_budget import ChatContextBundle
     from .llm_compat import LLMMessage
+    from .reaction_models import ReactionAction, ReactionTurnState, RecentReactionFact
+    from .reply_delivery import DeliveryReceipt, ReplyDeliveryPlan
 
-from .middleware import TurnMiddlewareState
 from .trace import StageTrace
 from .turn_runtime import TurnBudgetController
 
@@ -17,6 +20,7 @@ class PipelineStage(str, Enum):
     IDENTITY = "identity"
     KNOWLEDGE = "knowledge"
     EVENT_CONTEXT = "event_context"
+    GSCORE_ROUTE = "gscore_route"
     THREAD_CONTEXT = "thread_context"
     DIALOGUE_STATE = "dialogue_state"
     CONTEXT = "context"
@@ -63,8 +67,8 @@ class TurnFrame:
     system_prompt: str = ""
     context_xml: str = ""
     enriched_context_xml: str = ""
+    context_bundle: ChatContextBundle | None = None
     history_messages: list[LLMMessage] = field(default_factory=list)
-    post_gate_dispatched: bool = False
     event_message: Any | None = None
     uni_msg: Any | None = None
     bot: Any | None = None
@@ -72,21 +76,19 @@ class TurnFrame:
     session: Any | None = None
     message: Any | None = None
     cached_plain_text: str | None = None
-    middleware: Any | None = None
-    middleware_state: TurnMiddlewareState | None = None
     main_result: Any | None = None
     final_envelope: Any | None = None
     response_quality_result: Any | None = None
     chat_execution_frame: Any | None = None
-    post_gate_callback: Any | None = None
     turn_finished: bool = False
-    turn_messages: list[str] = field(default_factory=list)
-    turn_message_sources: list[Any] = field(default_factory=list)
-    pending_human_updates: list[str] = field(default_factory=list)
     turn_priority: int = 0
+    queue_wait_ms: float = 0.0
     event_context: Any | None = None
+    gscore_route_result: Any | None = None
     dialogue_context_pack: Any | None = None
+    person_candidate_ledger: Any | None = None
     addressee_result: Any | None = None
+    verified_action_target: Any | None = None
     thread_context: Any | None = None
     intervention_decision: Any | None = None
     knowledge_base: Any | None = None
@@ -107,7 +109,12 @@ class TurnFrame:
     reply_images_data: list[Any] = field(default_factory=list)
     reply_image_segments_for_reroute: list[Any] = field(default_factory=list)
     image_parts: list[Any] = field(default_factory=list)
+    current_image_parts: list[Any] = field(default_factory=list)
+    reaction_turn_state: ReactionTurnState | None = None
+    reaction_action: ReactionAction | None = None
+    recent_reactions: list[RecentReactionFact] = field(default_factory=list)
     agent_messages: list[LLMMessage] = field(default_factory=list)
+    agent_observations: list[Any] = field(default_factory=list)
     router_context: dict[str, object] = field(default_factory=dict)
     has_reply: bool = False
     reply_sender_id: str | None = None
@@ -116,6 +123,11 @@ class TurnFrame:
     turn_generation: int = 0
     current_turn_guard: Any | None = None
     delivery_succeeded: bool = False
+    delivery_plan: ReplyDeliveryPlan | None = None
+    delivery_receipt: DeliveryReceipt | None = None
+    delivery_persisted: bool = False
+    cancelled_reroute_receipt: dict[str, Any] | None = None
+    started_at: float = field(default_factory=time.perf_counter)
 
     @classmethod
     def create(
@@ -133,8 +145,10 @@ class TurnFrame:
         message_id: str = "",
         session_key: str | None = None,
         legacy_session_key: str = "",
+        queue_wait_ms: float = 0.0,
     ) -> "TurnFrame":
         session_key = str(session_key or group_id or user_id)
+        queue_wait_ms = max(float(queue_wait_ms), 0.0)
         trace = StageTrace(
             "chatinter",
             tags={
@@ -142,6 +156,7 @@ class TurnFrame:
                 "group": str(group_id) if group_id else "private",
                 "message_id": str(message_id or ""),
                 "scenario": str(scenario or ""),
+                "queue_wait_ms": f"{queue_wait_ms:.2f}",
             },
         )
         return cls(
@@ -159,6 +174,7 @@ class TurnFrame:
             budget_controller=TurnBudgetController.for_session(session_key),
             current_message=raw_message,
             legacy_session_key=str(legacy_session_key or group_id or user_id),
+            queue_wait_ms=queue_wait_ms,
         )
 
     def is_current_turn(self) -> bool:
@@ -173,17 +189,12 @@ class TurnFrame:
         session: Any,
         message: Any | None,
         cached_plain_text: str | None,
-        middleware: Any,
-        post_gate_callback: Any | None = None,
     ) -> None:
         self.bot = bot
         self.event = event
         self.session = session
         self.message = message
         self.cached_plain_text = cached_plain_text
-        self.middleware = middleware
-        self.middleware_state = self.create_middleware_state()
-        self.post_gate_callback = post_gate_callback
 
     def stage(self, stage: PipelineStage | str) -> None:
         label = stage.value if isinstance(stage, PipelineStage) else str(stage)
@@ -194,40 +205,6 @@ class TurnFrame:
 
     def set_tag(self, key: str, value: str | float | None) -> None:
         self.trace.set_tag(key, value)
-
-    def create_middleware_state(self) -> TurnMiddlewareState:
-        return TurnMiddlewareState(
-            session_key=self.session_key,
-            user_id=self.user_id,
-            group_id=self.group_id,
-            message_text=self.current_message or self.raw_message,
-            system_prompt=self.system_prompt,
-            context_xml=self.context_xml,
-            model_name=self.model_name,
-            budget_controller=self.budget_controller,
-            metadata={"phase": PipelineStage.PRE_GATE.value},
-        )
-
-    def sync_to_middleware(
-        self,
-        state: TurnMiddlewareState,
-        *,
-        phase: str,
-        route_message: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        state.message_text = self.current_message
-        state.system_prompt = self.system_prompt
-        state.context_xml = self.context_xml
-        if route_message is not None:
-            state.route_message = route_message
-        state.metadata = {"phase": phase, **(metadata or {})}
-
-    def apply_prompt_state(self, state: TurnMiddlewareState) -> None:
-        self.system_prompt = state.system_prompt
-        self.context_xml = state.context_xml
-        if state.route_message:
-            self.route_message = state.route_message
 
     def set_context(
         self,

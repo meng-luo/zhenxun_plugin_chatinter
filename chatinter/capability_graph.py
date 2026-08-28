@@ -58,6 +58,10 @@ _INFRA_MODULE_MARKERS = (
     ".webui",
     ".web_ui",
 )
+_INFRA_MODULE_ROOTS = {
+    "zhenxun.builtin_plugins.admin",
+    "zhenxun.builtin_plugins.superuser",
+}
 _PRIVATE_ACCESS_LEVELS = {"admin", "superuser", "restricted"}
 
 
@@ -91,6 +95,11 @@ def is_public_capability_source(plugin: PluginInfo) -> bool:
     module_lower = module.lower()
     if _module_tail(module_lower) in _INFRA_MODULE_TAILS:
         return False
+    if any(
+        module_lower == root or module_lower.startswith(f"{root}.")
+        for root in _INFRA_MODULE_ROOTS
+    ):
+        return False
     if any(marker in module_lower for marker in _INFRA_MODULE_MARKERS):
         return False
     public_meta = [
@@ -110,6 +119,8 @@ def requirement_from_meta(meta: PluginInfo.PluginCommandMeta) -> CommandRequirem
             if normalize_message_text(param)
         ],
         choices=dict(getattr(meta, "choices", {}) or {}),
+        slot_types=dict(getattr(meta, "slot_types", {}) or {}),
+        slot_renderers=dict(getattr(meta, "slot_renderers", {}) or {}),
         text_min=max(int(meta.text_min or 0), 0),
         text_max=meta.text_max,
         image_min=max(int(meta.image_min or 0), 0),
@@ -121,6 +132,7 @@ def requirement_from_meta(meta: PluginInfo.PluginCommandMeta) -> CommandRequirem
         requires_reply=bool(meta.requires_reply),
         requires_private=bool(meta.requires_private),
         requires_to_me=bool(meta.requires_to_me),
+        argument_source=meta.argument_source,
     )
     return requirement
 

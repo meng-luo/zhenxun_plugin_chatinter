@@ -19,17 +19,6 @@ class TargetPolicy:
     allow_image_as_target: bool = False
     allow_reply_image_as_target: bool = False
     require_target_for_third_person: bool = False
-    target_missing_message: str = ""
 
 
-def get_target_policy(
-    *,
-    plugin_module: str = "",
-    plugin_name: str = "",
-    command_id: str = "",
-) -> TargetPolicy:
-    _ = plugin_module, plugin_name, command_id
-    return TargetPolicy()
-
-
-__all__ = ["TargetPolicy", "get_target_policy"]
+__all__ = ["TargetPolicy"]

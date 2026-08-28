@@ -10,6 +10,7 @@ from typing import Any
 from ...llm_compat import ToolDefinition, ToolResult
 from ..audit_log import record_audit_event
 from ..patch_operations import FileChange, apply_changes_transaction
+from ..patch_parser import parse_v4a_patch, patch_file_changes
 from ..permission_policy import decide_file_read, decide_file_write
 from ..process_control import (
     attach_process_tree,
@@ -36,7 +37,10 @@ class ReadFileTool:
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
-            description="按行分页读取文本文件。",
+            description=(
+                "按行分页读取文本文件；content 中每行均以 `行号| ` 前缀返回，"
+                "可将该行号用于定位和构造精确替换文本。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -262,8 +266,11 @@ class ReplaceInFileTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "在文本文件中精确替换 old_text 为 new_text。"
-                "适合小范围代码修改。"
+                "在一个或多个文本文件中精确替换 old_text 为 new_text。"
+                "单文件使用 path/old_text/new_text，多文件使用 changes。"
+                "每项默认必须且只能命中一处；"
+                "多处替换必须显式设置 replace_all=true；"
+                "优先使用完整上下文保持修改精确。"
             ),
             parameters={
                 "type": "object",
@@ -273,62 +280,144 @@ class ReplaceInFileTool:
                     "new_text": {"type": "string", "description": "替换后的文本。"},
                     "expected_replacements": {
                         "type": ["integer", "null"],
-                        "description": "期望替换次数；为空则允许任意正次数。",
+                        "description": "replace_all=true 时可断言实际替换次数。",
+                    },
+                    "replace_all": {
+                        "type": ["boolean", "null"],
+                        "description": "是否允许替换全部命中处，默认 false。",
+                    },
+                    "changes": {
+                        "type": ["array", "null"],
+                        "description": "需要作为一批执行的 1-20 个精确替换。",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "文件路径。"},
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "要替换的原文。",
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "替换后的文本。",
+                                },
+                                "expected_replacements": {
+                                    "type": ["integer", "null"],
+                                    "description": "replace_all=true 时断言替换次数。",
+                                },
+                                "replace_all": {
+                                    "type": ["boolean", "null"],
+                                    "description": "是否替换全部命中处，默认 false。",
+                                },
+                            },
+                            "required": ["path", "old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
                     },
                 },
-                "required": [
-                    "path",
-                    "old_text",
-                    "new_text",
+                "required": [],
+                "oneOf": [
+                    {"required": ["path", "old_text", "new_text"]},
+                    {"required": ["changes"]},
                 ],
                 "additionalProperties": False,
             },
         )
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        path = str(kwargs.get("path", "") or "").strip()
-        old_text = str(kwargs.get("old_text", "") or "")
-        new_text = str(kwargs.get("new_text", "") or "")
-        expected = kwargs.get("expected_replacements")
-        expected_replacements = None
-        if expected not in (None, ""):
-            try:
-                expected_replacements = max(1, int(expected))
-            except (TypeError, ValueError):
-                expected_replacements = None
+        changes, error = build_replace_changes(kwargs)
+        if error:
+            return tool_result(False, "invalid_replace_changes", error=error)
         reason = str(kwargs.get("reason", "") or "")
         actor = actor_from_context(context)
-        path = str(Path(path or ".").resolve())
-        decision = decide_file_write(path)
-        payload = {
-            "path": path,
-            "old_text": old_text,
-            "new_text": new_text,
-            "expected_replacements": expected_replacements,
-            "reason": reason,
-        }
-        if decision.decision == "deny":
-            return permission_denied_result(
-                actor=actor,
-                action="replace_in_file",
-                payload=_safe_file_payload(payload),
-                permission=decision,
-            )
-        if decision.decision == "ask":
+        payload = _replace_payload(
+            changes,
+            batch=kwargs.get("changes") is not None,
+            reason=reason,
+        )
+        pending_permission = None
+        for change in changes:
+            decision = decide_file_write(change.path)
+            if decision.decision == "deny":
+                return permission_denied_result(
+                    actor=actor,
+                    action="replace_in_file",
+                    payload=_safe_file_payload(payload),
+                    permission=decision,
+                )
+            if decision.decision == "ask" and pending_permission is None:
+                pending_permission = decision
+        if pending_permission is not None:
             return approval_required_result(
                 actor=actor,
                 action="replace_in_file",
                 payload=payload,
-                permission=decision,
+                permission=pending_permission,
             )
-        return await replace_in_file(
-            path=path,
-            old_text=old_text,
-            new_text=new_text,
-            expected_replacements=expected_replacements,
+        return await replace_files(
+            changes=changes,
             actor=actor,
             reason=reason,
         )
+
+
+class ApplyPatchTool:
+    name = "apply_patch"
+    read_only = False
+
+    async def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "原子应用一个或多个文件补丁，支持新增、更新、删除和移动。"
+                "格式为 *** Begin Patch，随后使用 *** Add File、"
+                "*** Update File、*** Delete File 或 *** Move to，"
+                "最后以 *** End Patch 结束。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string", "description": "V4A 补丁文本。"},
+                    "cwd": {
+                        "type": ["string", "null"],
+                        "description": "相对路径的基准目录，默认当前项目目录。",
+                    },
+                },
+                "required": ["patch"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        patch = str(kwargs.get("patch", "") or "")
+        cwd = str(kwargs.get("cwd", "") or "").strip() or None
+        actor = actor_from_context(context)
+        payload = {"patch": patch, "cwd": cwd}
+        paths, error = patch_paths(patch, cwd=cwd)
+        if error:
+            return tool_result(False, "invalid_patch", error=error)
+        pending_permission = None
+        for path in paths:
+            decision = decide_file_write(path)
+            if decision.decision == "deny":
+                return permission_denied_result(
+                    actor=actor,
+                    action="apply_patch",
+                    payload={"paths": paths},
+                    permission=decision,
+                )
+            if decision.decision == "ask" and pending_permission is None:
+                pending_permission = decision
+        if pending_permission is not None:
+            return approval_required_result(
+                actor=actor,
+                action="apply_patch",
+                payload=payload,
+                permission=pending_permission,
+            )
+        return await apply_patch_text(patch=patch, cwd=cwd, actor=actor)
 
 
 _FILE_PAGE_CHAR_LIMIT = 8000
@@ -784,6 +873,7 @@ async def replace_in_file(
     new_text: str,
     expected_replacements: int | None,
     actor: dict[str, str],
+    replace_all: bool = False,
     approval_id: str | None = None,
     reason: str = "",
 ) -> ToolResult:
@@ -801,9 +891,143 @@ async def replace_in_file(
                 old_text=old_text,
                 new_text=new_text,
                 expected_replacements=expected_replacements,
+                replace_all=replace_all,
             )
         ],
     )
+
+
+async def replace_files(
+    *,
+    changes: list[FileChange],
+    actor: dict[str, str],
+    approval_id: str | None = None,
+    reason: str = "",
+) -> ToolResult:
+    return apply_changes_transaction(
+        actor=actor,
+        action="replace_in_file",
+        reason=reason or "replace text in files",
+        approval_id=approval_id,
+        changes=changes,
+    )
+
+
+async def apply_patch_text(
+    *,
+    patch: str,
+    cwd: str | None,
+    actor: dict[str, str],
+    approval_id: str | None = None,
+) -> ToolResult:
+    changes, error = patch_file_changes(patch, cwd=cwd)
+    if error:
+        return tool_result(False, "invalid_patch", error=error)
+    return apply_changes_transaction(
+        actor=actor,
+        action="apply_patch",
+        approval_id=approval_id,
+        changes=changes,
+    )
+
+
+def patch_paths(patch: str, *, cwd: str | None) -> tuple[list[str], str]:
+    operations, error = parse_v4a_patch(patch)
+    if error:
+        return [], error
+    root = Path(cwd).resolve() if cwd else Path.cwd().resolve()
+    paths: list[str] = []
+    for operation in operations:
+        values = [operation.path]
+        if operation.destination:
+            values.append(operation.destination)
+        for value in values:
+            path = Path(value)
+            resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+            paths.append(str(resolved))
+    if len(paths) > 20:
+        return [], "patch exceeds 20 file changes"
+    return paths, ""
+
+
+def build_replace_changes(values: dict[str, Any]) -> tuple[list[FileChange], str]:
+    allowed = {
+        "path",
+        "old_text",
+        "new_text",
+        "expected_replacements",
+        "replace_all",
+    }
+    raw_changes = values.get("changes")
+    if raw_changes is None:
+        raw_changes = [{key: values[key] for key in allowed if key in values}]
+    elif not isinstance(raw_changes, list):
+        return [], "changes must be an array"
+    if not raw_changes or len(raw_changes) > 20:
+        return [], "changes must contain between 1 and 20 items"
+
+    changes: list[FileChange] = []
+    for index, item in enumerate(raw_changes, start=1):
+        if not isinstance(item, dict):
+            return [], f"changes[{index}] must be an object"
+        unexpected = sorted(str(key) for key in item if key not in allowed)
+        if unexpected:
+            return [], (
+                f"changes[{index}] contains unknown fields: {', '.join(unexpected)}"
+            )
+        path = str(item.get("path", "") or "").strip()
+        old_text = str(item.get("old_text", "") or "")
+        if not path:
+            return [], f"changes[{index}].path is required"
+        if not old_text:
+            return [], f"changes[{index}].old_text is required"
+        if "new_text" not in item:
+            return [], f"changes[{index}].new_text is required"
+        expected = item.get("expected_replacements")
+        if expected in (None, ""):
+            expected_replacements = None
+        elif (
+            isinstance(expected, int)
+            and not isinstance(expected, bool)
+            and expected > 0
+        ):
+            expected_replacements = expected
+        else:
+            return [], (
+                f"changes[{index}].expected_replacements must be a positive integer"
+            )
+        changes.append(
+            FileChange(
+                path=str(Path(path).resolve()),
+                mode="replace",
+                old_text=old_text,
+                new_text=str(item.get("new_text", "") or ""),
+                expected_replacements=expected_replacements,
+                replace_all=bool(item.get("replace_all") or False),
+            )
+        )
+    return changes, ""
+
+
+def _replace_payload(
+    changes: list[FileChange],
+    *,
+    batch: bool,
+    reason: str,
+) -> dict[str, Any]:
+    items = [
+        {
+            "path": change.path,
+            "old_text": change.old_text,
+            "new_text": change.new_text,
+            "expected_replacements": change.expected_replacements,
+            "replace_all": change.replace_all,
+        }
+        for change in changes
+    ]
+    if batch:
+        return {"changes": items, "reason": reason}
+    return {**items[0], "reason": reason}
 
 
 def _safe_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -811,17 +1035,27 @@ def _safe_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for key in ("content", "old_text", "new_text"):
         if key in safe:
             safe[key] = compact_text(str(safe[key]), max_chars=240)
+    if isinstance(safe.get("changes"), list):
+        safe["changes"] = [
+            _safe_file_payload(item) if isinstance(item, dict) else item
+            for item in safe["changes"]
+        ]
     return safe
 
 
 __all__ = [
+    "ApplyPatchTool",
     "ListDirTool",
     "ReadFileTool",
     "ReplaceInFileTool",
     "SearchFilesTool",
     "WriteFileTool",
+    "apply_patch_text",
+    "build_replace_changes",
     "list_dir",
+    "patch_paths",
     "read_file",
+    "replace_files",
     "replace_in_file",
     "search_files",
     "write_file",

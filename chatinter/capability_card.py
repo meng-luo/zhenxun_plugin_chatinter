@@ -80,6 +80,7 @@ _QUERY_TERMS = (
     "查询",
     "查看",
     "搜索",
+    "详情",
     "识别",
     "解析",
     "排行",
@@ -94,8 +95,6 @@ _GENERATE_TERMS = (
     "制作",
     "绘制",
     "画",
-    "表情",
-    "模板",
     "随机",
     "抽",
     "roll",
@@ -256,10 +255,12 @@ def build_capability_card(
     tool: Any,
     family: str,
     description: str = "",
+    semantic_text: str | None = None,
 ) -> CapabilityCard:
     """Build a capability card from a command snapshot-like object."""
 
-    text = _search_text(tool, description=description)
+    search_text = _search_text(tool, description=description)
+    text = normalize_message_text(semantic_text or "") or search_text
     task_verbs = _tuple_texts(getattr(tool, "task_verbs", None) or ())
     input_requirements = _tuple_texts(getattr(tool, "input_requirements", None) or ())
     output_mode = _infer_output_mode(
@@ -365,7 +366,7 @@ def build_capability_card(
         execution_policy=execution_policy,
         risk_tags=risk_tags,
         permission_tags=permission_tags,
-        search_text=text,
+        search_text=search_text,
     )
 
 
@@ -487,9 +488,7 @@ def _infer_intent_types(
         if value and value not in intents:
             intents.append(value)
 
-    if role in {"helper", "usage", "catalog"} or any(
-        term in lowered for term in _HELP_TERMS
-    ):
+    if role in {"helper", "usage", "catalog"} or "帮助" in task_verbs:
         add("help")
     if role == "random" or any(term.casefold() in lowered for term in _RANDOM_TERMS):
         add("random")
@@ -537,7 +536,7 @@ def _is_generative(
         return True
     if output_mode == "image":
         return True
-    if any(intent in intent_types for intent in ("generate", "random", "media")):
+    if any(intent in intent_types for intent in ("generate", "random")):
         return True
     lowered = text.casefold()
     return any(term.casefold() in lowered for term in _GENERATE_TERMS)
@@ -911,12 +910,8 @@ def _anti_use_cases(
     generative: bool,
     execution_policy: CapabilityExecutionPolicy,
 ) -> tuple[str, ...]:
-    if not soft_tool and not generative and execution_policy != "explicit_only":
-        return ()
-    cases = [
-        "普通闲聊、安慰、吐槽或概念讨论时不要调用",
-        "只是提到命令词或插件名但没有请求真实结果时不要调用",
-    ]
+    del soft_tool, execution_policy
+    cases: list[str] = []
     if generative:
         cases.append("没有明确生成、制作、随机或发送请求时不要调用")
     return tuple(dict.fromkeys(cases))

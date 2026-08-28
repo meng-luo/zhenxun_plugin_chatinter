@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any
+import uuid
 
 from ...artifact_store import get_artifact_store
 from ...llm_compat import ToolDefinition, ToolResult
@@ -32,6 +34,10 @@ from .common import (
 SHELL_TIMEOUT_SECONDS = 120.0
 _STREAM_READ_BYTES = 64 * 1024
 _STREAM_PREVIEW_BYTES = 8_000
+_MAX_BACKGROUND_TASKS_PER_RUN = 3
+_BACKGROUND_TASKS: dict[str, dict[str, dict[str, Any]]] = {}
+
+
 class _StreamCapture:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -94,6 +100,11 @@ class ShellCommandTool:
             parameters={
                 "type": "object",
                 "properties": {
+                    "action": {
+                        "type": ["string", "null"],
+                        "enum": ["run", "start", "status", "list", "stop", None],
+                        "description": "默认 run；start 后可用 status/list/stop 管理。",
+                    },
                     "command": {
                         "type": "string",
                         "description": "要执行的完整 shell 命令。",
@@ -109,13 +120,18 @@ class ShellCommandTool:
                             f"最大 {MAX_TIMEOUT_SECONDS:.0f} 秒。"
                         ),
                     },
+                    "task_id": {
+                        "type": ["string", "null"],
+                        "description": "status 或 stop 使用的后台任务 ID。",
+                    },
                 },
-                "required": ["command"],
+                "required": [],
                 "additionalProperties": False,
             },
         )
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
+        action = str(kwargs.get("action", "") or "run").strip().lower()
         command = str(kwargs.get("command", "") or "").strip()
         cwd = str(kwargs.get("cwd", "") or "").strip() or None
         reason = str(kwargs.get("reason", "") or "")
@@ -124,6 +140,16 @@ class ShellCommandTool:
             default=SHELL_TIMEOUT_SECONDS,
         )
         actor = actor_from_context(context)
+        run_id = actor.get("run_id") or actor["session_key"]
+        task_id = str(kwargs.get("task_id", "") or "").strip()
+        if action == "list":
+            return background_shell_list(run_id)
+        if action == "status":
+            return background_shell_status(run_id, task_id)
+        if action == "stop":
+            return await stop_background_shell_task(run_id, task_id)
+        if action not in {"run", "start"}:
+            return tool_result(False, "shell_action_invalid", action=action)
         cwd = str(Path(cwd).resolve()) if cwd else None
         if not command:
             return tool_result(False, "shell_empty_command", command=command)
@@ -131,6 +157,7 @@ class ShellCommandTool:
         payload = {
             "command": command,
             "cwd": cwd,
+            "action": action,
             "reason": reason,
             "timeout_seconds": timeout_seconds,
         }
@@ -148,6 +175,13 @@ class ShellCommandTool:
                 payload=payload,
                 permission=decision,
             )
+        if action == "start":
+            return start_background_shell_command(
+                command=command,
+                cwd=cwd,
+                actor=actor,
+                timeout_seconds=timeout_seconds,
+            )
         return await run_shell_command(
             command=command,
             cwd=cwd,
@@ -155,6 +189,145 @@ class ShellCommandTool:
             approval_id=None,
             timeout_seconds=timeout_seconds,
         )
+
+
+def start_background_shell_command(
+    *,
+    command: str,
+    cwd: str | None,
+    actor: dict[str, str],
+    timeout_seconds: float | None = None,
+    approval_id: str | None = None,
+) -> ToolResult:
+    run_id = str(actor.get("run_id") or actor.get("session_key") or "global")
+    tasks = _BACKGROUND_TASKS.setdefault(run_id, {})
+    _prune_background_tasks(tasks)
+    if sum(not item["task"].done() for item in tasks.values()) >= (
+        _MAX_BACKGROUND_TASKS_PER_RUN
+    ):
+        return tool_result(False, "background_task_limit_reached")
+    task_id = uuid.uuid4().hex[:8]
+    task = asyncio.create_task(
+        run_shell_command(
+            command=command,
+            cwd=cwd,
+            actor=actor,
+            approval_id=approval_id,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    tasks[task_id] = {
+        "task": task,
+        "command": command,
+        "cwd": cwd,
+        "started_at": time.time(),
+    }
+    return tool_result(
+        True,
+        "background_task_started",
+        task_id=task_id,
+        command=command,
+        cwd=cwd,
+    )
+
+
+def background_shell_status(run_id: str, task_id: str) -> ToolResult:
+    record = _BACKGROUND_TASKS.get(str(run_id), {}).get(str(task_id))
+    if record is None:
+        return tool_result(False, "background_task_not_found", task_id=task_id)
+    task = record["task"]
+    if not task.done():
+        return tool_result(
+            True,
+            "background_task_running",
+            task_id=task_id,
+            command=record["command"],
+            cwd=record["cwd"],
+            elapsed_seconds=max(round(time.time() - record["started_at"], 1), 0),
+        )
+    return _background_result(task_id, record)
+
+
+def background_shell_list(run_id: str) -> ToolResult:
+    tasks = _BACKGROUND_TASKS.get(str(run_id), {})
+    return tool_result(
+        True,
+        "background_task_list",
+        tasks=[
+            {
+                "task_id": task_id,
+                "status": "completed" if item["task"].done() else "running",
+                "command": item["command"],
+                "cwd": item["cwd"],
+            }
+            for task_id, item in tasks.items()
+        ],
+    )
+
+
+def has_running_background_shell_tasks(run_id: str) -> bool:
+    return any(
+        not item["task"].done()
+        for item in _BACKGROUND_TASKS.get(str(run_id), {}).values()
+    )
+
+
+async def stop_background_shell_task(run_id: str, task_id: str) -> ToolResult:
+    record = _BACKGROUND_TASKS.get(str(run_id), {}).get(str(task_id))
+    if record is None:
+        return tool_result(False, "background_task_not_found", task_id=task_id)
+    task = record["task"]
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return _background_result(task_id, record)
+
+
+async def stop_background_shell_tasks(run_id: str) -> int:
+    tasks = _BACKGROUND_TASKS.get(str(run_id), {})
+    running = [item["task"] for item in tasks.values() if not item["task"].done()]
+    for task in running:
+        task.cancel()
+    if running:
+        await asyncio.gather(*running, return_exceptions=True)
+    return len(running)
+
+
+def _background_result(task_id: str, record: dict[str, Any]) -> ToolResult:
+    task = record["task"]
+    if task.cancelled():
+        return tool_result(
+            False,
+            "background_task_completed",
+            task_id=task_id,
+            result_status="cancelled",
+            cancelled=True,
+        )
+    try:
+        result = task.result()
+    except Exception as exc:
+        return tool_result(
+            False,
+            "background_task_failed",
+            task_id=task_id,
+            error=str(exc),
+        )
+    output = dict(result.output) if isinstance(result.output, dict) else {}
+    result_ok = bool(output.pop("ok", False))
+    result_status = str(output.pop("status", "") or "")
+    return tool_result(
+        result_ok,
+        "background_task_completed",
+        task_id=task_id,
+        result_status=result_status,
+        **output,
+    )
+
+
+def _prune_background_tasks(tasks: dict[str, dict[str, Any]]) -> None:
+    completed = [key for key, item in tasks.items() if item["task"].done()]
+    for key in completed[:-10]:
+        tasks.pop(key, None)
 
 
 async def run_shell_command(
@@ -398,4 +571,13 @@ def _finalize_captures(
     return output
 
 
-__all__ = ["ShellCommandTool", "run_shell_command"]
+__all__ = [
+    "ShellCommandTool",
+    "background_shell_list",
+    "background_shell_status",
+    "has_running_background_shell_tasks",
+    "run_shell_command",
+    "start_background_shell_command",
+    "stop_background_shell_task",
+    "stop_background_shell_tasks",
+]

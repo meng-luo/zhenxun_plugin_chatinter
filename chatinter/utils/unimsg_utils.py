@@ -157,7 +157,7 @@ def extract_reply_from_message(message: UniMessage | Message) -> str | None:
     return None
 
 
-def remove_reply_segment(message: UniMessage) -> UniMessage:
+def remove_reply_segment(message: UniMessage | Message) -> UniMessage | Message:
     """从消息中移除回复 Segment
 
     参数:
@@ -166,4 +166,6 @@ def remove_reply_segment(message: UniMessage) -> UniMessage:
     返回:
         移除回复后的消息
     """
-    return message.exclude(Reply)
+    if isinstance(message, UniMessage):
+        return message.exclude(Reply)
+    return message.exclude("reply")

@@ -5,19 +5,24 @@ ChatInter - 聊天响应处理
 """
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import re
 import time
-from typing import Any, cast
+from typing import Any
 import uuid
 
 from nonebot.adapters import Bot, Event
+from nonebot.adapters.onebot.v11 import (
+    Bot as OneBotV11Bot,
+)
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
     MessageSegment,
     PrivateMessageEvent,
 )
+from nonebot.message import handle_event as handle_nonebot_event
 from nonebot.plugin import get_loaded_plugins
 
 from zhenxun.services import logger
@@ -28,10 +33,11 @@ from zhenxun.services.send_queue import (
 )
 
 from .artifact_store import get_artifact_store
-from .event_signals import set_event_signal
+from .event_signals import get_event_signal, set_event_signal
 from .route_text import normalize_message_text
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
+_REROUTE_CANCEL_GRACE_SECONDS = 1.0
 _REROUTE_TOKEN_PATTERN = re.compile(
     r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
@@ -60,6 +66,23 @@ _OBSERVED_IMAGE_OUTPUT_PATTERN = re.compile(
     r"(?:\[image\b|\[CQ:image\b|type=['\"]?image)",
     re.IGNORECASE,
 )
+_FORWARD_SEND_APIS = frozenset(
+    {
+        "send_forward_msg",
+        "send_group_forward_msg",
+        "send_private_forward_msg",
+    }
+)
+_FORWARD_SEND_CAPTURE: ContextVar[tuple[str, Bot, list[SendObservation]] | None] = (
+    ContextVar("chatinter_forward_send_capture", default=None)
+)
+
+
+async def _dispatch_rerouted_event(bot: Bot, event: Event) -> None:
+    if isinstance(bot, OneBotV11Bot):
+        await handle_nonebot_event(bot, event)
+        return
+    await bot.handle_event(event)
 
 
 @dataclass(frozen=True)
@@ -70,15 +93,60 @@ class RerouteExecutionResult:
     outputs: list[SendObservation] = field(default_factory=list)
     error: str = ""
     timed_out: bool = False
+    cancelled: bool = False
+    execution_uncertain: bool = False
+    execution_started: bool = False
+    task_stopped: bool = True
+    dispatched: bool = False
 
     @property
     def observed_text(self) -> str:
         return "\n".join(item.text for item in self.outputs if item.text).strip()
 
 
+_REROUTE_CANCELLATION_RECEIPT = ContextVar(
+    "chatinter_reroute_cancellation_receipt",
+    default=None,
+)
+
+
+def consume_reroute_cancellation_receipt() -> RerouteExecutionResult | None:
+    receipt = _REROUTE_CANCELLATION_RECEIPT.get()
+    _REROUTE_CANCELLATION_RECEIPT.set(None)
+    return receipt
+
+
+async def _cancel_and_wait_reroute_task(
+    task: asyncio.Task[Any],
+    *,
+    trace_id: str,
+) -> bool:
+    if not task.done():
+        task.cancel()
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=_REROUTE_CANCEL_GRACE_SECONDS,
+    )
+    if task in done:
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+    task.add_done_callback(lambda _done_task: pop_send_observations(trace_id))
+    return False
+
+
 def _captured_send_count(bot: Bot) -> int | None:
     records = getattr(bot, "sent_messages", None)
     return len(records) if isinstance(records, list) else None
+
+
+def _reroute_execution_observed(
+    event: Event,
+) -> bool:
+    return bool(get_event_signal(event, "_ai_plugin_execution_started", False))
+
+
+def _reroute_execution_failed(event: Event) -> bool:
+    return bool(get_event_signal(event, "_ai_plugin_execution_failed", False))
 
 
 def _captured_send_observations(
@@ -173,15 +241,56 @@ def _message_payload_to_text(message: Any) -> str:
         return ""
 
 
+async def _observe_forward_send_api(
+    bot: Bot,
+    exception: Exception | None,
+    api: str,
+    data: dict[str, Any],
+    result: Any,
+) -> None:
+    capture = _FORWARD_SEND_CAPTURE.get()
+    if (
+        capture is None
+        or capture[1] is not bot
+        or api not in _FORWARD_SEND_APIS
+        or len(capture[2]) >= 12
+    ):
+        return
+    raw = _message_payload_to_text(data.get("message"))
+    if not raw:
+        raw = _message_payload_to_text(data.get("messages"))
+    if not raw:
+        raw = "[plugin forward message]"
+    capture[2].append(
+        SendObservation(
+            trace_id=capture[0],
+            api=api,
+            text=normalize_message_text(raw)[:900],
+            raw_message=raw[:900],
+            result=(
+                {"ok": False, "error": str(exception)}
+                if exception is not None
+                else result
+            ),
+            timestamp=time.time(),
+        )
+    )
+
+
+Bot.on_called_api(_observe_forward_send_api)
+
+
 def _merge_captured_outputs_if_empty(
     outputs: list[SendObservation],
     *,
     bot: Bot,
     trace_id: str,
     start_index: int | None,
+    additional_outputs: list[SendObservation] | None = None,
 ) -> list[SendObservation]:
-    if outputs:
-        return outputs
+    merged = [*outputs, *(additional_outputs or ())]
+    if merged:
+        return merged[:12]
     return _captured_send_observations(
         bot,
         trace_id=trace_id,
@@ -198,7 +307,7 @@ def artifacts_from_send_observations(
 
     store = get_artifact_store()
     artifacts: list[dict[str, Any]] = []
-    for index, output in enumerate(outputs, 1):
+    for index, output in enumerate(_successful_send_observations(outputs), 1):
         raw = str(output.raw_message or "")
         text = str(output.text or "")
         if _OBSERVED_IMAGE_OUTPUT_PATTERN.search(raw):
@@ -244,7 +353,7 @@ def messages_summary_from_send_observations(
     """Summarize real plugin sends; image-only sends still count as visible."""
 
     summaries: list[str] = []
-    for index, output in enumerate(outputs, 1):
+    for index, output in enumerate(_successful_send_observations(outputs), 1):
         text = normalize_message_text(str(output.text or ""))
         raw = str(output.raw_message or "")
         if text:
@@ -254,6 +363,31 @@ def messages_summary_from_send_observations(
         elif raw:
             summaries.append(normalize_message_text(raw)[:260])
     return summaries[:8]
+
+
+def _successful_send_observations(
+    outputs: list[SendObservation],
+) -> list[SendObservation]:
+    return [output for output in outputs if not _send_result_failed(output.result)]
+
+
+def _send_result_failed(result: Any) -> bool:
+    if isinstance(result, BaseException):
+        return True
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False:
+        return True
+    status = normalize_message_text(str(result.get("status", "") or "")).casefold()
+    if status in {"failed", "failure", "error"}:
+        return True
+    retcode = result.get("retcode")
+    if retcode is None:
+        return False
+    try:
+        return int(retcode) != 0
+    except (TypeError, ValueError):
+        return True
 
 
 async def reroute_to_plugin(
@@ -285,6 +419,7 @@ async def reroute_to_plugin_with_result(
     wait: bool = True,
     timeout: float = 10.0,
 ) -> RerouteExecutionResult:
+    _REROUTE_CANCELLATION_RECEIPT.set(None)
     trace_key = trace_id or uuid.uuid4().hex
     command_text = command.strip()
     try:
@@ -365,12 +500,18 @@ async def reroute_to_plugin_with_result(
         if route_heads:
             set_event_signal(new_event, "_ai_route_heads", frozenset(route_heads))
 
-        handle_event = cast(Any, bot.handle_event)
+        forward_send_outputs: list[SendObservation] = []
         if wait:
-            with observe_send_trace(trace_key):
-                task = asyncio.create_task(handle_event(new_event))
+            capture_token = _FORWARD_SEND_CAPTURE.set(
+                (trace_key, bot, forward_send_outputs)
+            )
+            try:
+                with observe_send_trace(trace_key):
+                    task = asyncio.create_task(_dispatch_rerouted_event(bot, new_event))
+            finally:
+                _FORWARD_SEND_CAPTURE.reset(capture_token)
         else:
-            task = asyncio.create_task(handle_event(new_event))
+            task = asyncio.create_task(_dispatch_rerouted_event(bot, new_event))
         _REROUTE_TASKS.add(task)
         task.add_done_callback(lambda done_task: _REROUTE_TASKS.discard(done_task))
         if wait:
@@ -380,16 +521,19 @@ async def reroute_to_plugin_with_result(
                     timeout=max(float(timeout), 0.5),
                 )
             except asyncio.TimeoutError:
+                task_stopped = await _cancel_and_wait_reroute_task(
+                    task,
+                    trace_id=trace_key,
+                )
                 outputs = _merge_captured_outputs_if_empty(
                     pop_send_observations(trace_key),
                     bot=bot,
                     trace_id=trace_key,
                     start_index=captured_send_start,
+                    additional_outputs=forward_send_outputs,
                 )
-                task.add_done_callback(
-                    lambda _done_task: pop_send_observations(trace_key)
-                )
-                logger.warning(f"消息重路由等待超时：{command_text}")
+                execution_started = _reroute_execution_observed(new_event)
+                logger.warning(f"消息重路由等待超时，执行结果不确定：{command_text}")
                 return RerouteExecutionResult(
                     success=False,
                     command=command_text,
@@ -397,14 +541,54 @@ async def reroute_to_plugin_with_result(
                     outputs=outputs,
                     error="reroute timeout",
                     timed_out=True,
+                    execution_uncertain=True,
+                    execution_started=execution_started,
+                    task_stopped=task_stopped,
+                    dispatched=True,
                 )
+            except asyncio.CancelledError:
+                task_stopped = await _cancel_and_wait_reroute_task(
+                    task,
+                    trace_id=trace_key,
+                )
+                outputs = _merge_captured_outputs_if_empty(
+                    pop_send_observations(trace_key),
+                    bot=bot,
+                    trace_id=trace_key,
+                    start_index=captured_send_start,
+                    additional_outputs=forward_send_outputs,
+                )
+                execution_started = _reroute_execution_observed(new_event)
+                cancellation_result = RerouteExecutionResult(
+                    success=False,
+                    command=command_text,
+                    trace_id=trace_key,
+                    outputs=outputs,
+                    error="reroute cancelled",
+                    cancelled=True,
+                    execution_uncertain=execution_started or not task_stopped,
+                    execution_started=execution_started,
+                    task_stopped=task_stopped,
+                    dispatched=True,
+                )
+                if cancellation_result.execution_uncertain:
+                    setattr(task, "_chatinter_reroute_receipt", cancellation_result)
+                    _REROUTE_CANCELLATION_RECEIPT.set(cancellation_result)
+                logger.warning(
+                    "消息重路由取消收据："
+                    f"trace_id={trace_key}, task_stopped={task_stopped}, "
+                    f"execution_uncertain={cancellation_result.execution_uncertain}"
+                )
+                raise
             except Exception as exc:
                 outputs = _merge_captured_outputs_if_empty(
                     pop_send_observations(trace_key),
                     bot=bot,
                     trace_id=trace_key,
                     start_index=captured_send_start,
+                    additional_outputs=forward_send_outputs,
                 )
+                execution_started = _reroute_execution_observed(new_event)
                 logger.warning(f"消息重路由执行异常：{command_text}, error={exc}")
                 return RerouteExecutionResult(
                     success=False,
@@ -412,19 +596,40 @@ async def reroute_to_plugin_with_result(
                     trace_id=trace_key,
                     outputs=outputs,
                     error=str(exc),
+                    execution_uncertain=True,
+                    execution_started=execution_started,
+                    dispatched=True,
                 )
         outputs = _merge_captured_outputs_if_empty(
             pop_send_observations(trace_key),
             bot=bot,
             trace_id=trace_key,
             start_index=captured_send_start,
+            additional_outputs=forward_send_outputs,
         )
-        logger.info(f"消息重路由成功：{command_text}")
+        execution_started = _reroute_execution_observed(new_event)
+        execution_failed = _reroute_execution_failed(new_event)
+        if execution_started and not execution_failed:
+            logger.info(f"消息重路由执行完成：{command_text}")
+        elif execution_failed:
+            logger.info(f"消息重路由目标插件执行异常：{command_text}")
+        else:
+            logger.info(f"消息重路由未观察到目标插件执行：{command_text}")
         return RerouteExecutionResult(
-            success=True,
+            success=execution_started and not execution_failed,
             command=command_text,
             trace_id=trace_key,
             outputs=outputs,
+            error=(
+                "plugin_execution_failed"
+                if execution_failed
+                else ""
+                if execution_started
+                else "plugin_not_observed"
+            ),
+            execution_uncertain=execution_failed,
+            execution_started=execution_started,
+            dispatched=True,
         )
 
     except Exception as e:

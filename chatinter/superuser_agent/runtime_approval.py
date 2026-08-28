@@ -23,8 +23,10 @@ from ..config import (
     SUPERUSER_MODEL_TIMEOUT_SECONDS,
     build_superuser_generation_config,
     get_agent_model,
+    get_fallback_models,
 )
 from ..event_runtime import event_is_private, resolve_superuser
+from ..host_llm import resolve_host_model_candidates
 from ..llm_compat import (
     LLMMessage,
     LLMToolCall,
@@ -46,9 +48,15 @@ from .progress import AgentProgressReporter
 from .runtime import (
     AgentRuntime,
     SuperuserSessionBusyError,
+    _permission_mode_for_run,
+    _refresh_superuser_runtime_messages,
     superuser_session_execution,
 )
-from .state import AgentObservation, repair_interrupted_tool_protocol
+from .state import (
+    AgentObservation,
+    repair_interrupted_tool_protocol,
+    runtime_control_message,
+)
 from .store import (
     clear_agent_run_cancel_signal,
     get_active_agent_run_id,
@@ -120,7 +128,31 @@ async def _handle_runtime_approval_locked(
         if _approval_run_id(approval) == active_run_id
     ]
     if not approvals:
-        return False
+        state = (
+            load_agent_run_state(active_run_id, tool_map=build_superuser_tools())
+            if active_run_id
+            else None
+        )
+        if state is not None and state.pending_approval:
+            state.pending_approval = ""
+            state.paused_reason = "approval_expired"
+            state.final_text = ""
+            state.final_source = ""
+            persist_agent_run_state(
+                state,
+                stage="approval_expired",
+                metadata={"reason": "pending_approval_not_found"},
+            )
+            reply = "该确认已过期，操作未执行，请重新发送任务。"
+        else:
+            reply = "当前没有待确认操作。"
+        await _send_runtime_reply(
+            bot=bot,
+            event=event,
+            session=session,
+            text=reply,
+        )
+        return True
     approval = approvals[0]
 
     if intent == "reject":
@@ -138,7 +170,6 @@ async def _handle_runtime_approval_locked(
                     "approval_id": rejected.approval_id,
                     "action": rejected.action,
                     "reason": rejection_reason or "用户拒绝了该操作",
-                    "error": rejection_reason or "用户拒绝了该操作",
                 },
                 is_error=True,
                 is_retryable=False,
@@ -340,7 +371,7 @@ async def _execute_approved_action_durably(
         is_retryable=action_result.is_retryable,
     )
     state.messages.append(
-        LLMMessage.user(
+        runtime_control_message(
             _resume_message(
                 approval,
                 persisted_result,
@@ -491,9 +522,27 @@ async def _resume_agent_run(
             run_id=run_id,
             run_status=state.status,
         )
+    refreshed_messages = _refresh_superuser_runtime_messages(
+        state.messages,
+        permission_mode=_permission_mode_for_run(state),
+    )
+    if refreshed_messages != state.messages:
+        state.messages = refreshed_messages
+        state.budget.last_usage_message_count = 0
+        state.budget.last_usage_schema_tokens = 0
 
-    model_name = get_agent_model("superuser")
-    provider_adapter = ProviderCapabilityAdapter.for_model(model_name)
+    configured_model = get_agent_model("superuser")
+    model_candidates = await resolve_host_model_candidates(
+        configured_model,
+        get_fallback_models(configured_model),
+    )
+    primary_candidate = model_candidates[0]
+    model_name = primary_candidate.name
+    provider_adapter = ProviderCapabilityAdapter.for_model(
+        model_name,
+        capabilities=primary_candidate.capabilities,
+        api_type=primary_candidate.api_type,
+    )
     repair = repair_interrupted_tool_protocol(
         state,
         provider_adapter=provider_adapter,
@@ -509,9 +558,10 @@ async def _resume_agent_run(
             approval,
             action_result,
             decision=decision,
-            decision_reason=decision_reason,
         )
-        state.messages.append(LLMMessage.user(resume_message))
+        state.messages.append(runtime_control_message(resume_message))
+        if decision == "reject" and decision_reason:
+            state.messages.append(LLMMessage.user(decision_reason))
         state.pending_approval = ""
         state.append_synthetic_observation(
             _approval_observation(
@@ -551,6 +601,7 @@ async def _resume_agent_run(
             "run_id": state.run_id,
             "resumed_run_id": state.run_id,
             "artifact_refs": state.artifact_refs,
+            "plan_items": state.plan_items,
             "provider_capability": provider_adapter.profile.to_metadata(),
         },
     )
@@ -561,6 +612,7 @@ async def _resume_agent_run(
         model_name=model_name,
         generation_config=build_superuser_generation_config(),
         timeout=SUPERUSER_MODEL_TIMEOUT_SECONDS,
+        model_candidates=model_candidates,
     ).run()
     return tool_result(
         result.status != "failed",
@@ -579,23 +631,13 @@ def _resume_message(
     result: ToolResult,
     *,
     decision: str,
-    decision_reason: str = "",
 ) -> str:
     payload = _compact_result_payload(result, trace_id=_approval_run_id(approval))
     if decision == "reject":
-        return (
-            f"用户拒绝了操作 {approval.action}，该操作未执行。"
-            + (f"理由：{decision_reason}。" if decision_reason else "")
-            + "请基于这个结果继续当前任务：\n"
-            + json.dumps(payload, ensure_ascii=False, default=str)
-        )
+        return f"用户拒绝了操作 {approval.action}，该操作未执行。请继续当前任务。"
     scope = ""
     if decision == "allow_conversation":
-        scope = (
-            "，本对话内工作区普通命令后续不再提示，危险操作仍需确认"
-            if approval.action == "shell_command"
-            else "，本对话后续相同权限范围也已允许"
-        )
+        scope = "，本对话后续相同权限范围不再提示，其他操作仍按策略判断"
     return f"用户允许执行 {approval.action}{scope}。" "执行结果：\n" + json.dumps(
         payload, ensure_ascii=False, default=str
     )

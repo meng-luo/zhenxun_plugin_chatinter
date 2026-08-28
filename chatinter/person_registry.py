@@ -7,7 +7,11 @@ import re
 import time
 from typing import Any
 
-from .member_similarity import MemberAliasEntry, score_member_alias
+from .member_similarity import (
+    MemberAliasEntry,
+    build_member_alias_entries,
+    score_member_alias,
+)
 from .route_text import normalize_message_text
 
 _PROFILE_CACHE_TTL = 300.0
@@ -393,6 +397,14 @@ async def resolve_alias_candidates(
     return scored[: max(int(limit or 0), 0)]
 
 
+async def list_group_person_profiles(group_id: str | None) -> tuple[PersonProfile, ...]:
+    """Return the persisted alias snapshot for one group without ranking it."""
+
+    if not group_id:
+        return ()
+    return tuple(await _load_group_profiles(group_id))
+
+
 async def resolve_relevant_people(
     *,
     group_id: str | None,
@@ -402,7 +414,9 @@ async def resolve_relevant_people(
     mention_user_ids: tuple[str, ...] = (),
     reply_sender_id: str | None = None,
     thread_user_ids: tuple[str, ...] = (),
+    recent_user_ids: tuple[str, ...] = (),
     entity_hints: tuple[str, ...] = (),
+    alias_candidates: list[AliasCandidate] | None = None,
     limit: int = 8,
 ) -> tuple[RelevantPerson, ...]:
     """Collect compact person candidates for LLM grounding.
@@ -489,13 +503,16 @@ async def resolve_relevant_people(
         remaining = max_items - len(people)
         if remaining <= 0 or not group_id or not search_text:
             continue
-        alias_candidates = await resolve_alias_candidates(
-            group_id=group_id,
-            text=search_text,
-            exclude_user_id=None,
-            limit=max(remaining + 2, 4),
-        )
-        for candidate in alias_candidates:
+        if reason == "alias_match" and alias_candidates is not None:
+            candidates = alias_candidates
+        else:
+            candidates = await resolve_alias_candidates(
+                group_id=group_id,
+                text=search_text,
+                exclude_user_id=None,
+                limit=max(remaining + 2, 4),
+            )
+        for candidate in candidates:
             if len(people) >= max_items:
                 break
             if candidate.profile.user_id in skipped_ids:
@@ -503,9 +520,25 @@ async def resolve_relevant_people(
             upsert(
                 candidate.profile,
                 reason=reason,
-                confidence=max(candidate.score, candidate.profile.confidence),
+                confidence=candidate.score,
                 matched_alias=candidate.matched_alias,
             )
+
+    for offset, user_id in enumerate(recent_user_ids):
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id or normalized_user_id in skipped_ids:
+            continue
+        if normalized_user_id in people:
+            continue
+        profile = await get_person_profile(
+            user_id=normalized_user_id,
+            group_id=group_id,
+        )
+        upsert(
+            profile,
+            reason="recent_participant",
+            confidence=max(profile.confidence, 0.78 - offset * 0.03),
+        )
 
     ordered = sorted(
         people.values(),
@@ -721,38 +754,35 @@ async def _load_group_profiles(group_id: str) -> list[PersonProfile]:
 
 
 def _score_alias_match(alias_key: str, profile: PersonProfile) -> tuple[float, str]:
-    candidates: dict[str, tuple[float, str]] = {}
-    for alias, weight in (
-        (profile.nickname, 0.72),
-        (profile.group_card, 0.78),
-    ):
-        key = _normalize_alias(alias)
-        if len(key) >= 2:
-            candidates[key] = (max(candidates.get(key, (0.0, ""))[0], weight), alias)
+    # All identity paths use the same full, prefix, suffix, and fuzzy evidence.
+    weighted_entries: list[tuple[MemberAliasEntry, float, str]] = []
+
+    def register(value: str, weight: float) -> None:
+        source = str(value or "").strip()
+        if not source:
+            return
+        for entry in build_member_alias_entries(source):
+            # entry.source carries the original alias string the entry was
+            # derived from, even for prefix/suffix/chunk fragments; downstream
+            # callers (target_resolver) need the literal alias, not a fragment.
+            weighted_entries.append((entry, weight, entry.source or source))
+
+    register(profile.nickname, 0.72)
+    register(profile.group_card, 0.78)
     for alias in profile.aliases:
-        key = _normalize_alias(alias)
-        if len(key) >= 2:
-            candidates[key] = (max(candidates.get(key, (0.0, ""))[0], 0.68), alias)
+        register(alias, 0.68)
     for alias, weight in profile.alias_weights:
-        key = _normalize_alias(alias)
-        if len(key) >= 2:
-            candidates[key] = (
-                max(candidates.get(key, (0.0, ""))[0], float(weight or 0.0)),
-                alias,
-            )
+        register(alias, float(weight or 0.0))
 
     best_score = 0.0
     best_weight = 0.0
     best_alias = ""
-    for candidate, (weight, alias) in candidates.items():
-        score = score_member_alias(
-            alias_key,
-            MemberAliasEntry(candidate, "full", alias or candidate),
-        )
+    for entry, weight, display_alias in weighted_entries:
+        score = score_member_alias(alias_key, entry)
         if score > best_score or (score == best_score and weight > best_weight):
             best_score = score
             best_weight = weight
-            best_alias = alias or candidate
+            best_alias = display_alias
     if profile.conflict_state:
         best_score -= 0.18
     return max(best_score, 0.0), best_alias
@@ -891,6 +921,7 @@ __all__ = [
     "format_person_fact_layers",
     "format_person_history_label",
     "get_person_profile",
+    "list_group_person_profiles",
     "normalize_alias_key",
     "resolve_alias_candidates",
     "resolve_relevant_people",

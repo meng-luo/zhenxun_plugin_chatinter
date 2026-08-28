@@ -58,6 +58,7 @@ def build_command_observation(
         "messages_sent": sent[:_MAX_OBSERVED_MESSAGES],
         "messages_sent_summary": sent_summary,
         "visible_output": bool(sent_summary or artifact_payloads),
+        "delivery_observed": bool(sent_summary or artifact_payloads),
         "slots": _compact_slots(slots or {}),
         "artifacts": artifact_payloads[:_MAX_OBSERVED_ARTIFACTS],
         "need_continue": bool(remaining),

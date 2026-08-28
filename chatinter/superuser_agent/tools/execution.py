@@ -6,7 +6,13 @@ import asyncio
 import json
 from typing import Any
 
-from ...llm_compat import LLMToolCall, RunContext, ToolInvoker, ToolResult
+from ...llm_compat import (
+    LLMToolCall,
+    RunContext,
+    ToolInvoker,
+    ToolResult,
+    validate_tool_call_arguments,
+)
 from ...route_text import normalize_message_text
 
 _TASK_TEXT_FIELD = "task_text"
@@ -38,112 +44,11 @@ async def validate_superuser_tool_call(
     tool_call: LLMToolCall,
     tool_map: dict[str, Any],
 ) -> ToolResult | None:
-    tool_name = str(tool_call.function.name or "")
-    tool = tool_map.get(tool_name)
-    if tool is None:
-        return _tool_validation_result(
-            tool_name,
-            status="tool_not_found",
-            error=f"未知工具：{tool_name or '<empty>'}",
-        )
-
-    raw_arguments = str(tool_call.function.arguments or "").strip()
-    try:
-        arguments = json.loads(raw_arguments)
-    except (TypeError, ValueError) as exc:
-        return _tool_validation_result(
-            tool_name,
-            validation_error="invalid_json",
-            error=f"工具参数不是有效 JSON：{exc}",
-        )
-    if not isinstance(arguments, dict):
-        return _tool_validation_result(
-            tool_name,
-            validation_error="arguments_not_object",
-            error="工具参数必须是 JSON object。",
-        )
-
-    definition = await tool.get_definition()
-    schema = definition.parameters if isinstance(definition.parameters, dict) else {}
-    properties = schema.get("properties")
-    properties = properties if isinstance(properties, dict) else {}
-    required = schema.get("required")
-    required = required if isinstance(required, list | tuple) else ()
-    missing = [str(name) for name in required if str(name) not in arguments]
-    if missing:
-        return _tool_validation_result(
-            tool_name,
-            validation_error="missing_required",
-            error="缺少必填参数：" + ", ".join(missing),
-            missing_fields=missing,
-        )
-
-    if schema.get("additionalProperties") is False:
-        unexpected = sorted(str(name) for name in arguments if name not in properties)
-        if unexpected:
-            return _tool_validation_result(
-                tool_name,
-                validation_error="unexpected_arguments",
-                error="包含未定义参数：" + ", ".join(unexpected),
-                unexpected_fields=unexpected,
-            )
-
-    for name, value in arguments.items():
-        property_schema = properties.get(name)
-        if not isinstance(property_schema, dict):
-            continue
-        expected = property_schema.get("type")
-        expected_types = [expected] if isinstance(expected, str) else expected
-        if not isinstance(expected_types, list | tuple):
-            continue
-        if any(_matches_json_type(value, item) for item in expected_types):
-            continue
-        return _tool_validation_result(
-            tool_name,
-            validation_error="type_mismatch",
-            error=f"参数 {name} 类型无效，期望：{', '.join(map(str, expected_types))}",
-            field=name,
-            expected_types=list(expected_types),
-        )
-    return None
-
-
-def _matches_json_type(value: Any, expected: Any) -> bool:
-    return {
-        "array": lambda: isinstance(value, list),
-        "boolean": lambda: isinstance(value, bool),
-        "integer": lambda: isinstance(value, int) and not isinstance(value, bool),
-        "null": lambda: value is None,
-        "number": lambda: isinstance(value, int | float)
-        and not isinstance(value, bool),
-        "object": lambda: isinstance(value, dict),
-        "string": lambda: isinstance(value, str),
-    }.get(str(expected), lambda: False)()
-
-
-def _tool_validation_result(
-    tool_name: str,
-    *,
-    status: str = "invalid_tool_arguments",
-    validation_error: str = "",
-    error: str,
-    **details: Any,
-) -> ToolResult:
-    return ToolResult(
-        output={
-            "ok": False,
-            "status": status,
-            "tool_name": tool_name,
-            "validation_error": validation_error,
-            "error": error,
-            "retryable": True,
-            "need_continue": True,
-            **details,
-        },
-        display_content=error,
-        is_error=True,
-        is_retryable=True,
+    _tool, _arguments, error = await validate_tool_call_arguments(
+        tool_call,
+        tool_map,
     )
+    return error
 
 
 def superuser_tool_deadline_seconds(

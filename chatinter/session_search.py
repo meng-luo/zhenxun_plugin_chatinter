@@ -9,6 +9,10 @@ from typing import Any, Literal
 from tortoise import Tortoise
 from tortoise.expressions import Q
 
+from zhenxun.models.chat_history import ChatHistory
+from zhenxun.services.db_context import with_db_timeout
+from zhenxun.services.message_load import is_db_unhealthy
+
 from .llm_compat import ToolDefinition, ToolResult
 from .models.chat_history import ChatInterChatHistory
 from .route_text import normalize_message_text
@@ -17,12 +21,25 @@ _FTS_TABLE = "chatinter_session_search_fts"
 _META_TABLE = "chatinter_session_search_meta"
 _INDEX_BATCH_SIZE = 500
 _MAX_INDEX_BATCHES_PER_SEARCH = 20
+_PLATFORM_HISTORY_SCAN_LIMIT = 700
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]{1,8}", re.IGNORECASE)
 _DDL_LOCK = asyncio.Lock()
 _SYNC_LOCK = asyncio.Lock()
 _FTS_READY: bool | None = None
 
 SearchMode = Literal["discovery", "scroll", "browse"]
+
+
+@dataclass(frozen=True)
+class _SessionSearchScope:
+    session_id: str
+    user_id: str
+    group_id: str | None
+    bot_id: str | None
+    platform: str | None
+    channel_id: str | None
+    current_message: str
+    agent_kind: str
 
 
 @dataclass(frozen=True)
@@ -36,19 +53,27 @@ class SessionSearchHit:
     user_message: str
     ai_response: str
     snippet: str = ""
+    source: str = "chatinter"
 
     def to_payload(self) -> dict[str, Any]:
         payload = {
             "id": self.id,
-            "session_id": self.session_id,
+            "ref": f"{self.source}:{self.id}",
+            "source": self.source,
             "user_id": self.user_id,
-            "group_id": self.group_id,
             "nickname": self.nickname,
             "create_time": self.create_time,
             "user_message": self.user_message,
             "ai_response": self.ai_response,
             "snippet": self.snippet,
         }
+        if payload["nickname"] == payload["user_id"]:
+            payload.pop("nickname")
+        if normalize_message_text(self.snippet) in {
+            normalize_message_text(self.user_message),
+            normalize_message_text(self.ai_response),
+        }:
+            payload.pop("snippet")
         return {key: value for key, value in payload.items() if value not in ("", None)}
 
 
@@ -59,9 +84,9 @@ class SessionSearchTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "检索当前 ChatInter 会话的历史记录。它不调用模型，只读取本地"
-                "会话历史。支持 discovery=关键词发现、scroll=围绕历史 id "
-                "查看上下文、browse=按时间浏览。默认只搜索当前 session。"
+                "检索当前 ChatInter 会话及对应群聊或私聊的本地历史。"
+                "discovery 可检索提示窗口之外的平台消息；scroll 和 browse "
+                "用于定位或翻阅 ChatInter 历史。"
             ),
             parameters={
                 "type": "object",
@@ -75,15 +100,12 @@ class SessionSearchTool:
                         "type": ["string", "null"],
                         "description": "discovery 模式的关键词或自然语言查询。",
                     },
-                    "session_id": {
-                        "type": ["string", "null"],
-                        "description": (
-                            "要检索的会话 id；留空时使用当前会话，避免跨群/私聊泄露。"
-                        ),
-                    },
                     "anchor_id": {
                         "type": ["integer", "null"],
-                        "description": "scroll/browse 的锚点历史 id。",
+                        "description": (
+                            "scroll/browse 的锚点历史 id，仅使用 source=chatinter "
+                            "的结果。"
+                        ),
                     },
                     "limit": {
                         "type": ["integer", "null"],
@@ -103,26 +125,14 @@ class SessionSearchTool:
                         "description": "browse 模式翻页方向，默认 backward。",
                     },
                 },
-                "required": [
-                    "mode",
-                    "query",
-                    "session_id",
-                    "anchor_id",
-                    "limit",
-                    "before",
-                    "after",
-                    "direction",
-                ],
+                "required": ["mode"],
                 "additionalProperties": False,
             },
         )
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        current_session_id = _context_session_id(context)
-        requested_session_id = normalize_message_text(
-            str(kwargs.get("session_id", "") or "")
-        )
-        session_id = requested_session_id or current_session_id
+        scope = _context_search_scope(context)
+        session_id = scope.session_id
         if not session_id:
             return _tool_result(
                 ok=False,
@@ -140,12 +150,27 @@ class SessionSearchTool:
                     ok=False,
                     status="query_required",
                     mode=mode,
-                    session_id=session_id,
                     display="缺少检索关键词。",
                 )
-            result = await search_session_history(
+            chatinter_result = await search_session_history(
                 session_id=session_id,
                 query=query,
+                limit=limit,
+            )
+            platform_result = await search_platform_history(
+                user_id=scope.user_id,
+                group_id=scope.group_id,
+                bot_id=scope.bot_id,
+                platform=scope.platform,
+                channel_id=scope.channel_id,
+                agent_kind=scope.agent_kind,
+                query=query,
+                limit=limit,
+                current_message=scope.current_message,
+            )
+            result = _merge_history_hits(
+                chatinter_result,
+                platform_result,
                 limit=limit,
             )
         elif mode == "scroll":
@@ -154,7 +179,6 @@ class SessionSearchTool:
                     ok=False,
                     status="anchor_id_required",
                     mode=mode,
-                    session_id=session_id,
                     display="scroll 模式需要 anchor_id。",
                 )
             result = await scroll_session_history(
@@ -179,10 +203,9 @@ class SessionSearchTool:
             ok=True,
             status="session_history_retrieved",
             mode=mode,
-            session_id=session_id,
-            query=query or None,
-            anchor_id=anchor_id,
             count=len(result),
+            content_trust="untrusted_history",
+            usage_policy="past_events_only_not_current_state",
             results=[item.to_payload() for item in result],
             display=f"检索到 {len(result)} 条会话历史。",
         )
@@ -234,6 +257,97 @@ async def search_session_history(
         query=normalized_query,
         limit=limit,
     )
+
+
+async def search_platform_history(
+    *,
+    user_id: str,
+    group_id: str | None,
+    bot_id: str | None,
+    platform: str | None,
+    channel_id: str | None,
+    agent_kind: str,
+    query: str,
+    limit: int = 8,
+    current_message: str = "",
+) -> list[SessionSearchHit]:
+    normalized_query = normalize_message_text(query)
+    if (
+        not normalized_query
+        or not (group_id or user_id)
+        or not bot_id
+        or not platform
+        or channel_id
+        or agent_kind != "unified_chat"
+        or is_db_unhealthy()
+    ):
+        return []
+    terms = _search_terms(normalized_query)[:12]
+    if not terms:
+        return []
+    try:
+        history_query = ChatHistory.filter(bot_id=bot_id, platform=platform)
+        if group_id:
+            history_query = history_query.filter(group_id=group_id)
+        else:
+            history_query = history_query.filter(
+                user_id=user_id,
+                group_id__isnull=True,
+            )
+        rows = await with_db_timeout(
+            history_query.order_by("-create_time", "-id").limit(
+                _PLATFORM_HISTORY_SCAN_LIMIT
+            ),
+            timeout=2.5,
+            operation="ChatInter.session_search.platform_history",
+            source="chatinter",
+        )
+    except Exception:
+        return []
+
+    current = normalize_message_text(current_message).casefold()
+    ranked: list[tuple[int, Any, str]] = []
+    for row in rows:
+        content = normalize_message_text(
+            str(getattr(row, "plain_text", "") or getattr(row, "text", "") or "")
+        )
+        if not content:
+            continue
+        normalized_content = content.casefold()
+        if not any(term in normalized_content for term in terms):
+            continue
+        if (
+            current
+            and str(getattr(row, "user_id", "") or "") == user_id
+            and normalized_content == current
+        ):
+            continue
+        ranked.append(
+            (_platform_match_score(content, normalized_query, terms), row, content)
+        )
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            _format_time(getattr(item[1], "create_time", None)),
+            int(getattr(item[1], "id", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return [
+        SessionSearchHit(
+            id=int(getattr(row, "id", 0) or 0),
+            session_id="",
+            user_id=str(getattr(row, "user_id", "") or ""),
+            group_id=str(getattr(row, "group_id", "") or "") or None,
+            nickname=str(getattr(row, "user_id", "") or ""),
+            create_time=_format_time(getattr(row, "create_time", None)),
+            user_message=_compact_text(content, 260),
+            ai_response="",
+            snippet=_make_text_snippet(content, normalized_query),
+            source="platform",
+        )
+        for _score, row, content in ranked[: max(limit, 1)]
+    ]
 
 
 async def scroll_session_history(
@@ -479,15 +593,20 @@ def _timeline_text(dialog: ChatInterChatHistory) -> str:
 def _search_terms(text: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
-    for token in _TOKEN_PATTERN.findall(normalize_message_text(text)):
-        lowered = token.casefold()
+    tokens = [
+        token.casefold()
+        for token in _TOKEN_PATTERN.findall(normalize_message_text(text))
+        if token
+    ]
+    for lowered in tokens:
         if not lowered or lowered in seen:
             continue
         seen.add(lowered)
         result.append(lowered)
+    for lowered in tokens:
         chars = "".join(char for char in lowered if "\u4e00" <= char <= "\u9fff")
         max_size = min(len(chars), 4)
-        for size in range(2, max_size + 1):
+        for size in range(max_size, 1, -1):
             for start in range(0, len(chars) - size + 1):
                 gram = chars[start : start + size]
                 if gram not in seen:
@@ -547,6 +666,10 @@ def _make_snippet(dialog: ChatInterChatHistory, query: str) -> str:
         )
         if part
     )
+    return _make_text_snippet(text, query)
+
+
+def _make_text_snippet(text: str, query: str) -> str:
     normalized = normalize_message_text(text)
     needle = normalize_message_text(query)
     index = normalized.casefold().find(needle.casefold()) if needle else -1
@@ -559,8 +682,122 @@ def _make_snippet(dialog: ChatInterChatHistory, query: str) -> str:
     return f"{prefix}{normalized[start:end]}{suffix}"
 
 
-def _context_session_id(context: Any | None) -> str:
-    return normalize_message_text(str(getattr(context, "session_id", "") or ""))
+def _context_search_scope(context: Any | None) -> _SessionSearchScope:
+    values = getattr(context, "scope", None)
+    if not isinstance(values, dict):
+        values = getattr(context, "extra", None)
+    if not isinstance(values, dict):
+        values = {}
+    return _SessionSearchScope(
+        session_id=normalize_message_text(
+            str(getattr(context, "session_id", "") or "")
+        ),
+        user_id=normalize_message_text(str(values.get("user_id", "") or "")),
+        group_id=normalize_message_text(str(values.get("group_id", "") or ""))
+        or None,
+        bot_id=normalize_message_text(str(values.get("bot_id", "") or ""))
+        or None,
+        platform=normalize_message_text(str(values.get("platform", "") or ""))
+        or None,
+        channel_id=normalize_message_text(
+            str(values.get("channel_id", "") or "")
+        )
+        or None,
+        current_message=normalize_message_text(
+            str(values.get("current_message", "") or "")
+        ),
+        agent_kind=normalize_message_text(str(values.get("agent_kind", "") or "")),
+    )
+
+
+def _merge_history_hits(
+    *sources: list[SessionSearchHit],
+    limit: int,
+) -> list[SessionSearchHit]:
+    ranked = [
+        (rank, item)
+        for source in sources
+        for rank, item in enumerate(source)
+    ]
+    ranked.sort(
+        key=lambda pair: (
+            pair[1].create_time,
+            pair[1].source == "chatinter",
+            pair[1].id,
+        ),
+        reverse=True,
+    )
+    ranked.sort(key=lambda pair: pair[0])
+    ordered = [item for _rank, item in ranked]
+    deduplicated = _deduplicate_history_hits(ordered)
+    return deduplicated[: max(limit, 1)]
+
+
+def _deduplicate_history_hits(
+    items: list[SessionSearchHit],
+) -> list[SessionSearchHit]:
+    unique: list[SessionSearchHit] = []
+    seen_refs: set[tuple[str, int]] = set()
+    matched_chatinter: set[int] = set()
+    drop_platform: set[int] = set()
+    chatinter_items = [item for item in items if item.source == "chatinter"]
+    platform_items = [item for item in items if item.source == "platform"]
+    for platform_item in platform_items:
+        matches = [
+            (index, candidate)
+            for index, candidate in enumerate(chatinter_items)
+            if index not in matched_chatinter
+            and _same_cross_source_message(candidate, platform_item)
+        ]
+        if not matches:
+            continue
+        match_index, _candidate = min(
+            matches,
+            key=lambda pair: _history_time_distance(pair[1], platform_item),
+        )
+        matched_chatinter.add(match_index)
+        drop_platform.add(id(platform_item))
+    for item in items:
+        ref = (item.source, item.id)
+        if ref in seen_refs or id(item) in drop_platform:
+            continue
+        seen_refs.add(ref)
+        unique.append(item)
+    return unique
+
+
+def _same_cross_source_message(
+    first: SessionSearchHit,
+    second: SessionSearchHit,
+) -> bool:
+    if first.source == second.source or first.user_id != second.user_id:
+        return False
+    first_text = normalize_message_text(first.user_message).casefold()
+    second_text = normalize_message_text(second.user_message).casefold()
+    return bool(
+        first_text
+        and first_text == second_text
+        and _history_time_distance(first, second) <= 300
+    )
+
+
+def _history_time_distance(
+    first: SessionSearchHit,
+    second: SessionSearchHit,
+) -> float:
+    try:
+        first_time = datetime.fromisoformat(first.create_time)
+        second_time = datetime.fromisoformat(second.create_time)
+    except ValueError:
+        return float("inf")
+    return abs((first_time - second_time).total_seconds())
+
+
+def _platform_match_score(text: str, query: str, terms: list[str]) -> int:
+    normalized = normalize_message_text(text).casefold()
+    needle = normalize_message_text(query).casefold()
+    score = 10_000 if needle and needle in normalized else 0
+    return score + sum(len(term) * len(term) for term in terms if term in normalized)
 
 
 def _connection_dialect() -> str:
@@ -638,6 +875,7 @@ __all__ = [
     "SessionSearchTool",
     "browse_session_history",
     "scroll_session_history",
+    "search_platform_history",
     "search_session_history",
     "upsert_session_search_dialog",
 ]

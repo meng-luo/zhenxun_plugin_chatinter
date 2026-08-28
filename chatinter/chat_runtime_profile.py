@@ -27,11 +27,6 @@ class ChatRuntimeProfile:
     persona_selection: PersonaSelection | None = None
     reason: str = "chat_runtime_profile"
 
-    def persona_prompt_fragment(self) -> str:
-        if self.persona_selection is None:
-            return ""
-        return self.persona_selection.persona.prompt_fragment()
-
 
 def build_chat_runtime_profile(
     *,

@@ -56,8 +56,6 @@ class ChatInterEventContext:
     mentions: list[MentionTarget] = field(default_factory=list)
     reply: ReplyContext | None = None
     images: list[ImageContext] = field(default_factory=list)
-    turn_messages: list[str] = field(default_factory=list)
-    pending_human_updates: list[str] = field(default_factory=list)
     turn_priority: int = 0
     is_private: bool = False
     is_to_me: bool = False
@@ -187,22 +185,14 @@ def build_event_context(
     bot_id = str(bot.self_id) if hasattr(bot, "self_id") else None
     user_id = str(session.user.id)
     group_id = str(session.group.id) if session.group else None
-    turn_messages = _coerce_text_list(
-        get_event_signal(event, "_chatinter_turn_messages", [])
-    )
-    pending_human_updates = _coerce_text_list(
-        get_event_signal(event, "_chatinter_pending_human_updates", [])
-    )
     try:
         turn_priority = int(get_event_signal(event, "_chatinter_turn_priority", 0) or 0)
     except (TypeError, ValueError):
         turn_priority = 0
 
-    if turn_messages:
-        message_text = str(raw_message or "").strip()
-    elif event_message is not None:
+    if event_message is not None:
         message_text = uni_to_text_with_tags(
-            cast(UniMessage | Message | str, event_message)
+            remove_reply_segment(cast(UniMessage | Message, event_message))
         )
     elif uni_msg is not None:
         message_text = uni_to_text_with_tags(remove_reply_segment(uni_msg))
@@ -240,23 +230,10 @@ def build_event_context(
         mentions=mentions,
         reply=reply,
         images=images,
-        turn_messages=turn_messages,
-        pending_human_updates=pending_human_updates,
         turn_priority=turn_priority,
         is_private=_event_is_private(event),
         is_to_me=_event_is_to_me(event, bot_id, message_text),
     )
-
-
-def _coerce_text_list(value: object) -> list[str]:
-    if not isinstance(value, list | tuple):
-        return []
-    result: list[str] = []
-    for item in value:
-        text = normalize_message_text(str(item or ""))
-        if text:
-            result.append(text)
-    return result
 
 
 __all__ = [

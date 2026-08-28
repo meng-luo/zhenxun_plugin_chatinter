@@ -14,6 +14,10 @@ _ROOT = Path("data/chatinter_agent")
 _LOCK = threading.RLock()
 
 
+class JsonStateReadError(RuntimeError):
+    pass
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -33,6 +37,16 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return default
+
+
+def read_json_strict(path: Path, default: Any) -> Any:
+    with _LOCK:
+        if not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise JsonStateReadError(f"invalid JSON state: {path}") from exc
 
 
 def write_json(path: Path, payload: Any, *, compact: bool = False) -> None:
@@ -104,8 +118,10 @@ def to_jsonable(value: Any) -> Any:
 
 
 __all__ = [
+    "JsonStateReadError",
     "append_jsonl",
     "read_json",
+    "read_json_strict",
     "state_path",
     "to_jsonable",
     "utc_now_iso",

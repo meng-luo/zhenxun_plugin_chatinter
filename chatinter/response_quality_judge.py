@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .chat_dialogue_planner import DialogueState
+from .response_defaults import EMPTY_REPLY_TEXT
 from .route_text import normalize_message_text
 
 QualityAction = Literal["ok", "revise", "block"]
@@ -20,6 +21,18 @@ _STIFF_PHRASES = (
     "您好，关于您的问题",
     "作为一个人工智能",
     "我无法提供情感",
+    "感谢您的提问",
+    "希望对您有所帮助",
+    "希望能帮到您",
+    "请问有什么我可以帮",
+    "有什么我可以帮助您",
+    "如有疑问请随时",
+    "请随时提问",
+    "我是一个AI",
+    "我是AI助手",
+    "作为AI",
+    "作为人工智能",
+    "身为AI",
 )
 _QUESTION_MARKERS = ("吗", "么", "嘛", "？", "?", "怎么", "为什么", "是什么", "是啥")
 _GENERIC_FILLER_REPLIES = frozenset(
@@ -31,6 +44,19 @@ _GENERIC_FILLER_REPLIES = frozenset(
         "明白了",
         "我知道了",
         "了解",
+        "好嘞",
+        "收到了",
+        "知道了",
+        "好的好的",
+        "嗯",
+        "哦",
+        "哦哦",
+        "嗯嗯嗯",
+        "好",
+        "ok",
+        "OK",
+        "okay",
+        "okok",
     }
 )
 _REFUSAL_MARKERS = (
@@ -64,6 +90,8 @@ _HALLUCINATION_MARKERS = (
     "已经为你完成",
     "我查到了",
 )
+
+
 @dataclass(frozen=True)
 class ResponseQualityResult:
     action: QualityAction
@@ -94,7 +122,7 @@ class ResponseQualityJudge:
             return ResponseQualityResult(
                 action="block",
                 reason="empty_final_reply",
-                revised_text="我暂时没想好怎么回答你。",
+                revised_text=EMPTY_REPLY_TEXT,
                 severity="error",
                 rule_hits=("empty_final_reply",),
             )
@@ -110,14 +138,6 @@ class ResponseQualityJudge:
                 revised_text="这个我不能帮你完成，但可以换个安全的方向一起看。",
                 severity="error",
                 rule_hits=tuple(rule_hits),
-            )
-        if _looks_stiff(reply, dialogue_state):
-            return ResponseQualityResult(
-                action="revise",
-                reason="too_stiff_for_dialogue_state",
-                revised_text=_soften_reply(reply),
-                severity="warn",
-                rule_hits=(*rule_hits, "too_stiff_for_dialogue_state"),
             )
         if _looks_off_topic(message, reply, dialogue_state):
             return ResponseQualityResult(
@@ -149,18 +169,22 @@ class ResponseQualityJudge:
 
 
 def _looks_stiff(reply: str, state: DialogueState | None) -> bool:
-    if not any(phrase in reply for phrase in _STIFF_PHRASES):
-        return False
-    if state is None:
-        return True
-    return state.tone in {"casual", "warm", "playful", "empathetic"}
+    return any(phrase in reply for phrase in _STIFF_PHRASES)
 
 
 def _soften_reply(reply: str) -> str:
+    import re
     softened = reply
     for phrase in _STIFF_PHRASES:
-        softened = softened.replace(phrase, "")
-    return normalize_message_text(softened).lstrip("，,。.!！？?") or reply
+        softened = re.sub(
+            r"[^，,。.!！？?\n]*"
+            + re.escape(phrase)
+            + r"[^，,。.!！？?\n]*[，,。.!！？?]?\s*",
+            "",
+            softened,
+        )
+    softened = re.sub(r"^[\s，,。.!！？?]+", "", softened)
+    return normalize_message_text(softened) or reply
 
 
 def _looks_off_topic(
@@ -198,13 +222,23 @@ def _quality_rule_hits(
         hits.append("unsupported_grounding_claim")
     if _overconfident_without_basis(message, reply):
         hits.append("overconfident_without_basis")
+    if _looks_stiff(reply, state):
+        hits.append("too_stiff_for_dialogue_state")
     if _too_long_for_state(reply, state):
         hits.append("too_long_for_short_state")
     return hits
 
 
 def _generic_filler(message: str, reply: str) -> bool:
-    return reply in _GENERIC_FILLER_REPLIES and len(message) >= 10
+    if reply in _GENERIC_FILLER_REPLIES and len(message) >= 10:
+        return True
+    if (
+        len(reply) <= 3
+        and len(message) >= 15
+        and not any(c in reply for c in "！!？?…")
+    ):
+        return True
+    return False
 
 
 def _unhelpful_refusal(message: str, reply: str) -> bool:
@@ -247,7 +281,7 @@ def _overconfident_without_basis(message: str, reply: str) -> bool:
 def _too_long_for_state(reply: str, state: DialogueState | None) -> bool:
     if state is None or state.response_length != "short":
         return False
-    return len(reply) > 360 and state.dialogue_purpose in {"chat", "support"}
+    return len(reply) > 200 and state.dialogue_purpose in {"chat", "support"}
 
 
 __all__ = [

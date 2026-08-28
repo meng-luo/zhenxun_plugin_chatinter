@@ -117,8 +117,10 @@ def progress_phase(tool_name: str) -> str:
         return ""
     if tool_name in {"read_file", "list_dir", "search_files", "artifact_read"}:
         return "正在读取文件"
-    if tool_name in {"write_file", "replace_in_file"}:
+    if tool_name in {"write_file", "replace_in_file", "apply_patch"}:
         return "正在应用修改"
+    if tool_name == "plan":
+        return "正在规划任务"
     if tool_name == "shell_command":
         return "正在执行命令"
     return "正在处理任务"

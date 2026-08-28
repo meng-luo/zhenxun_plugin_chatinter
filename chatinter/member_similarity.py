@@ -46,15 +46,25 @@ def build_member_alias_entries(
             if len(normalized) > size:
                 add(normalized[-size:], "suffix", source)
 
+    def add_prefixes(value: str, source: str) -> None:
+        normalized = normalize_member_alias(value)
+        if not include_suffixes or len(normalized) > 4:
+            return
+        for size in (2, 3):
+            if len(normalized) > size:
+                add(normalized[:size], "prefix", source)
+
     for raw in aliases:
         source = str(raw or "").strip()
         if not source:
             continue
         add(source, kind, source)
         add_suffixes(source, source)
+        add_prefixes(source, source)
         for chunk in _CJK_RUN_RE.findall(source):
             add(chunk, "chunk", source)
             add_suffixes(chunk, source)
+            add_prefixes(chunk, source)
     return tuple(entries)
 
 
@@ -111,9 +121,11 @@ def score_member_alias(
     score = 0.0
     exact_match = query_key == alias_key
     if exact_match:
-        score = 0.86 if kind == "suffix" else 1.0
+        score = 0.86 if kind in ("suffix", "prefix") else 1.0
     elif _safe_substring_match(query_key, alias_key):
-        overlap = min(len(query_key), len(alias_key)) / max(len(query_key), len(alias_key))
+        overlap = min(len(query_key), len(alias_key)) / max(
+            len(query_key), len(alias_key)
+        )
         score = 0.80 + overlap * 0.12
     elif not _unsafe_fragment(query_key, alias_key):
         score = max(
@@ -126,9 +138,57 @@ def score_member_alias(
 
     if len(query_key) == 2 and score < 0.86 and not exact_match:
         score = 0.0
-    if kind == "suffix":
+    if kind in ("suffix", "prefix"):
         score = min(score, 0.88)
     return score
+
+
+def score_alias_in_message(
+    message: str,
+    alias_key: str,
+    *,
+    kind: str = "full",
+) -> float:
+    """Score literal containment of an alias inside a full message.
+
+    ``score_member_alias`` compares a *name* against a *name*: its substring
+    branch divides by the query length, so feeding it a whole sentence dilutes
+    the score into uselessness (a 2-char nickname can never clear 0.90 unless
+    the message is 4 chars long).  This helper answers the different question
+    "does the message literally contain this alias?" and therefore never scales
+    by message length.
+    """
+
+    message_key = normalize_member_alias(message)
+    alias = normalize_member_alias(alias_key)
+    if len(alias) < 2 or not message_key:
+        return 0.0
+    if alias not in message_key:
+        return 0.0
+    if _is_ascii(alias) and not _has_ascii_word_boundary(message, alias):
+        # ASCII aliases require token boundaries; CJK aliases use containment.
+        return 0.0
+    if kind in ("suffix", "prefix"):
+        # Partial alias matches share the weaker score cap used by name matching.
+        return 0.88
+    return 0.94 if len(alias) >= 3 else 0.90
+
+
+def _has_ascii_word_boundary(message: str, alias: str) -> bool:
+    spaced = _ALIAS_CLEAN_RE.sub(" ", str(message or "")).lower()
+    start = spaced.find(alias)
+    while start >= 0:
+        before = spaced[start - 1] if start > 0 else ""
+        end = start + len(alias)
+        after = spaced[end] if end < len(spaced) else ""
+        if not _is_ascii_alnum(before) and not _is_ascii_alnum(after):
+            return True
+        start = spaced.find(alias, start + 1)
+    return False
+
+
+def _is_ascii_alnum(char: str) -> bool:
+    return bool(char) and char.isascii() and char.isalnum()
 
 
 def _jaro_similarity(left: str, right: str) -> float:
@@ -174,7 +234,10 @@ def _jaro_similarity(left: str, right: str) -> float:
 
 def _cjk_bigrams(value: str) -> set[str]:
     cjk_chars = [char for char in normalize_member_alias(value) if _is_cjk(char)]
-    return {"".join(cjk_chars[index : index + 2]) for index in range(len(cjk_chars) - 1)}
+    return {
+        "".join(cjk_chars[index : index + 2])
+        for index in range(len(cjk_chars) - 1)
+    }
 
 
 def _safe_substring_match(query_key: str, alias_key: str) -> bool:
@@ -214,12 +277,24 @@ def _is_cjk(char: str) -> bool:
     return "\u4e00" <= char <= "\u9fff"
 
 
+# Shared thresholds for alias resolution and persistence.
+ALIAS_MATCH_THRESHOLD = 0.86  # Minimum score for a unique candidate.
+ALIAS_AMBIGUOUS_TOP = 0.90  # Minimum leading score when candidates conflict.
+ALIAS_AMBIGUOUS_GAP = 0.12  # Minimum gap between the top two candidates.
+ALIAS_MEMORY_WRITE_THRESHOLD = 0.90  # Minimum score for alias persistence.
+
+
 __all__ = (
+    "ALIAS_AMBIGUOUS_GAP",
+    "ALIAS_AMBIGUOUS_TOP",
+    "ALIAS_MATCH_THRESHOLD",
+    "ALIAS_MEMORY_WRITE_THRESHOLD",
     "MemberAliasEntry",
     "build_member_alias_entries",
     "cjk_bigram_dice",
     "jaro_winkler_similarity",
     "normalize_member_alias",
     "ordered_subsequence_score",
+    "score_alias_in_message",
     "score_member_alias",
 )

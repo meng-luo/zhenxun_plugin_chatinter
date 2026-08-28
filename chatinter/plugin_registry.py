@@ -13,6 +13,7 @@ import importlib
 import inspect
 import re
 import traceback
+from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, cast
 
 import nonebot
@@ -27,6 +28,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import BlockType, PluginType
 
 from .capability_graph import build_capability_graph_snapshot
+from .command_meta_enrichment import enrich_command_meta_payload
 from .metadata_builder import AutoMetadataBuilder
 from .models.pydantic_models import (
     CapabilityGraphSnapshot,
@@ -34,6 +36,7 @@ from .models.pydantic_models import (
     PluginInfo,
     PluginKnowledgeBase,
     PluginReference,
+    SemanticToolContract,
 )
 from .plugin_reference import (
     build_command_tool_snapshots,
@@ -55,6 +58,8 @@ class PluginSelectionContext:
     has_image: bool = False
     has_at: bool = False
     has_reply: bool = False
+    has_verified_target: bool = False
+    verified_target_source: str = ""
     supports_image: bool = True
     supports_at: bool = True
     supports_reply: bool = True
@@ -67,25 +72,40 @@ class PluginSelectionContext:
 class PluginRegistry:
     """插件信息注册表"""
 
-
     _cache: ClassVar[dict[str, tuple[PluginKnowledgeBase, datetime]]] = {}
-    _cache_plugin_info_refresh: ClassVar[dict[str, float]] = {}
-    _cache_ttl: ClassVar[int] = 300
+    _cache_active_plugin_modules: ClassVar[dict[str, frozenset[str]]] = {}
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _command_tool_cache: ClassVar[dict[str, tuple[list[CommandToolSnapshot], int]]] = {}
-    _command_tool_cache_order: ClassVar[list[str]] = []
+    _command_tool_cache: ClassVar[
+        dict[
+            tuple[object, ...],
+            tuple[list[CommandToolSnapshot], int, PluginKnowledgeBase],
+        ]
+    ] = {}
+    _command_tool_cache_order: ClassVar[list[tuple[object, ...]]] = []
     _command_tool_cache_max: ClassVar[int] = 16
+    _filter_kb_cache: ClassVar[dict[tuple[object, ...], "PluginKnowledgeBase"]] = {}
+    _filter_kb_cache_order: ClassVar[list[tuple[object, ...]]] = []
+    _filter_kb_cache_max: ClassVar[int] = 32
     _knowledge_revision: ClassVar[int] = 0
+    _knowledge_build_task: ClassVar[asyncio.Task[PluginKnowledgeBase] | None] = None
+    _knowledge_build_forced: ClassVar[bool] = False
+    _argument_source_rank: ClassVar[dict[str, int]] = {
+        "unknown": 0,
+        "identity_fallback": 1,
+        "usage": 2,
+        "declared": 3,
+        "discovery": 4,
+        "runtime_parser": 5,
+        "runtime_handler": 6,
+    }
 
     @classmethod
     def invalidate_knowledge_cache(cls) -> None:
         """插件安装、卸载或更新后使知识库与命令 schema 缓存失效。"""
         cls._cache.clear()
-        cls._cache_plugin_info_refresh.clear()
+        cls._cache_active_plugin_modules.clear()
         cls._clear_command_tool_cache(bump_revision=True)
 
-    _max_matcher_commands: ClassVar[int] = 800
-    _max_discovered_commands: ClassVar[int] = 2000
     _command_discovery_entrypoints: ClassVar[tuple[str, ...]] = (
         "chatinter_command_discovery",
         "__chatinter_command_discovery__",
@@ -95,7 +115,6 @@ class PluginRegistry:
     _command_placeholder_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"\s*(?:\[[^\]]+\]|<[^>]+>|\{[^}]+\})\s*"
     )
-    _self_only_command_keywords: ClassVar[tuple[str, ...]] = ("签到", "打卡", "补签")
     _ascii_target_terms: ClassVar[set[str]] = {
         "at",
         "user",
@@ -155,6 +174,10 @@ class PluginRegistry:
         "web_ui",
         "withdraw_hook",
     }
+    _infra_module_roots: ClassVar[set[str]] = {
+        "zhenxun.builtin_plugins.admin",
+        "zhenxun.builtin_plugins.superuser",
+    }
     _infra_module_markers: ClassVar[tuple[str, ...]] = (
         ".builtin_plugins.hooks",
         ".builtin_plugins.init",
@@ -175,35 +198,99 @@ class PluginRegistry:
             PluginKnowledgeBase: 插件知识库
         """
         cache_key = "normal_user"
-
-
+        retry_forced_refresh = False
         async with cls._lock:
             if not force_refresh and cache_key in cls._cache:
-                cached_data, cached_time = cls._cache[cache_key]
-                plugin_refresh_ts = cls._plugin_info_refresh_ts()
-                cache_fresh = (
-                    datetime.now() - cached_time
-                ).total_seconds() < cls._cache_ttl
-                plugin_cache_same = (
-                    cls._cache_plugin_info_refresh.get(cache_key, 0.0)
-                    == plugin_refresh_ts
-                )
-                if cache_fresh and plugin_cache_same:
+                cached_data, _cached_time = cls._cache[cache_key]
+                if not cls._active_plugin_modules_changed(cache_key):
                     logger.debug("使用缓存的插件知识库")
                     return cached_data
+                logger.info("检测到活动插件集合变化，刷新 ChatInter 插件知识快照")
+            task = cls._knowledge_build_task
+            if force_refresh and task is not None and not cls._knowledge_build_forced:
+                cls._cache.clear()
+                cls._cache_active_plugin_modules.clear()
+                cls._clear_command_tool_cache(bump_revision=True)
+                retry_forced_refresh = True
+            elif task is None:
+                if force_refresh:
+                    cls._cache.clear()
+                    cls._cache_active_plugin_modules.clear()
+                    cls._clear_command_tool_cache(bump_revision=True)
+                task = asyncio.create_task(
+                    cls._build_and_cache_knowledge(
+                        cache_key=cache_key,
+                        revision=cls._knowledge_revision,
+                    )
+                )
+                cls._knowledge_build_task = task
+                cls._knowledge_build_forced = force_refresh
+        result = await asyncio.shield(task)
+        if retry_forced_refresh:
+            return await cls.get_plugin_knowledge_base(force_refresh=True)
+        return result
 
+    @classmethod
+    async def _build_and_cache_knowledge(
+        cls,
+        *,
+        cache_key: str,
+        revision: int,
+    ) -> PluginKnowledgeBase:
+        current_task = asyncio.current_task()
+        try:
+            await PluginInfoMemoryCache.ensure_loaded()
+            active_modules_before = cls._active_plugin_modules()
+            knowledge_base = await cls._build_knowledge_base()
+            active_modules_after = cls._active_plugin_modules()
+            async with cls._lock:
+                if (
+                    revision == cls._knowledge_revision
+                    and active_modules_before == active_modules_after
+                ):
+                    cls._cache[cache_key] = (knowledge_base, datetime.now())
+                    cls._cache_active_plugin_modules[cache_key] = active_modules_after
+                    cls._clear_command_tool_cache(bump_revision=True)
+            return knowledge_base
+        finally:
+            async with cls._lock:
+                if cls._knowledge_build_task is current_task:
+                    cls._knowledge_build_task = None
+                    cls._knowledge_build_forced = False
 
-        knowledge_base = await cls._build_knowledge_base()
-
-
+    @classmethod
+    async def shutdown(cls) -> None:
         async with cls._lock:
-            cls._cache[cache_key] = (knowledge_base, datetime.now())
-            cls._cache_plugin_info_refresh[cache_key] = cls._plugin_info_refresh_ts()
+            task = cls._knowledge_build_task
+            if task is not None and not task.done():
+                task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
 
-            cls._cleanup_cache()
-            cls._clear_command_tool_cache(bump_revision=True)
+    @staticmethod
+    def _active_plugin_modules() -> frozenset[str]:
+        snapshots = getattr(PluginInfoMemoryCache, "_by_module", {})
+        active = {
+            f"cache:{module}"
+            f":al{getattr(snapshot, 'admin_level', '')}"
+            f":ls{int(bool(getattr(snapshot, 'limit_superuser', False)))}"
+            for module, snapshot in snapshots.items()
+            if bool(getattr(snapshot, "load_status", True))
+            and bool(getattr(snapshot, "status", True))
+        }
+        active.update(
+            f"runtime:{module_name}"
+            for plugin in nonebot.get_loaded_plugins()
+            if (module_name := str(getattr(plugin, "module_name", "") or "").strip())
+        )
+        return frozenset(active)
 
-        return knowledge_base
+    @classmethod
+    def _active_plugin_modules_changed(cls, cache_key: str) -> bool:
+        previous = cls._cache_active_plugin_modules.get(cache_key)
+        if previous is None:
+            return False
+        return previous != cls._active_plugin_modules()
 
     @classmethod
     async def get_runtime_plugin_knowledge_base(cls) -> PluginKnowledgeBase:
@@ -280,6 +367,7 @@ class PluginRegistry:
                     target_requirement=getattr(raw, "target_requirement", None),
                     target_sources=getattr(raw, "target_sources", None),
                     allow_sticky_arg=getattr(raw, "allow_sticky_arg", None),
+                    argument_source="declared",
                 )
             )
         return command_metas
@@ -349,7 +437,12 @@ class PluginRegistry:
             command_text = str(command).strip()
             if not command_text:
                 continue
-            result.append(cls._with_command_meta_defaults(command=command_text))
+            result.append(
+                cls._with_command_meta_defaults(
+                    command=command_text,
+                    argument_source="identity_fallback",
+                )
+            )
         return result
 
     @staticmethod
@@ -380,6 +473,11 @@ class PluginRegistry:
         if level in {"public", "admin", "superuser", "restricted"}:
             return level
         return "public"
+
+    @classmethod
+    def _normalize_argument_source(cls, value: object) -> str:
+        source = str(value or "").strip().lower()
+        return source if source in cls._argument_source_rank else "unknown"
 
     @classmethod
     def _merge_access_level(
@@ -417,14 +515,10 @@ class PluginRegistry:
 
     @classmethod
     def _infer_actor_scope(cls, command: str, actor_scope: object) -> str:
-        normalize = str(command or "").strip()
+        del command
         parsed = str(actor_scope or "").strip().lower()
         if parsed in {"self_only", "allow_other"}:
             return parsed
-        if normalize.startswith(("我的", "自己", "本人")) or any(
-            keyword in normalize for keyword in cls._self_only_command_keywords
-        ):
-            return "self_only"
         return "allow_other"
 
     @classmethod
@@ -525,6 +619,8 @@ class PluginRegistry:
         allow_at: bool | None = None,
         choices: dict[str, list[str]] | None = None,
         slot_choices: dict[str, list[str]] | None = None,
+        slot_types: dict[str, str] | None = None,
+        slot_renderers: dict[str, str] | None = None,
         shortcut_renders: list[dict[str, object]] | None = None,
         actor_scope: object = None,
         target_requirement: object = None,
@@ -534,6 +630,7 @@ class PluginRegistry:
         requires_to_me: object = None,
         allow_sticky_arg: object = None,
         access_level: object = None,
+        argument_source: object = None,
     ) -> PluginInfo.PluginCommandMeta:
         normalized_command = str(command or "").strip()
         if slot_choices is None:
@@ -576,6 +673,8 @@ class PluginRegistry:
             prefixes=cls._merge_unique_strings(prefixes, []),
             params=normalized_params,
             choices=dict(slot_choices or {}),
+            slot_types=cls._merge_slot_mapping(slot_types),
+            slot_renderers=cls._merge_slot_mapping(slot_renderers),
             shortcut_renders=list(shortcut_renders or []),
             description=str(description or "").strip(),
             examples=normalized_examples,
@@ -597,6 +696,7 @@ class PluginRegistry:
             requires_private=resolved_requires_private,
             requires_to_me=resolved_requires_to_me,
             allow_sticky_arg=resolved_allow_sticky_arg,
+            argument_source=cls._normalize_argument_source(argument_source),
             access_level=cast(
                 Literal["public", "admin", "superuser", "restricted"],
                 resolved_access_level,
@@ -619,6 +719,8 @@ class PluginRegistry:
                 or getattr(meta, "slot_choices", None)
                 or {}
             ),
+            "slot_types": dict(getattr(meta, "slot_types", None) or {}),
+            "slot_renderers": dict(getattr(meta, "slot_renderers", None) or {}),
             "shortcut_renders": list(getattr(meta, "shortcut_renders", []) or []),
             "description": str(getattr(meta, "description", "") or "").strip(),
             "examples": list(getattr(meta, "examples", []) or []),
@@ -638,6 +740,9 @@ class PluginRegistry:
             "requires_private": bool(getattr(meta, "requires_private", False)),
             "requires_to_me": bool(getattr(meta, "requires_to_me", False)),
             "allow_sticky_arg": cls._safe_bool(getattr(meta, "allow_sticky_arg", None)),
+            "argument_source": cls._normalize_argument_source(
+                getattr(meta, "argument_source", None)
+            ),
             "access_level": cls._normalize_access_level(
                 getattr(meta, "access_level", None)
             ),
@@ -680,6 +785,19 @@ class PluginRegistry:
         return merged
 
     @classmethod
+    def _merge_slot_mapping(cls, *values: object) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for raw_key, raw_item in value.items():
+                key = str(raw_key or "").strip()
+                item = str(raw_item or "").strip()
+                if key and item and key not in merged:
+                    merged[key] = item
+        return merged
+
+    @classmethod
     def _merge_shortcut_renders(cls, *values: object) -> list[dict[str, object]]:
         merged: list[dict[str, object]] = []
         seen: set[tuple[str, str]] = set()
@@ -702,9 +820,7 @@ class PluginRegistry:
                 payload: dict[str, object] = {
                     "alias": alias,
                     "render": render,
-                    "args": [
-                        str(arg).strip() for arg in args if str(arg or "").strip()
-                    ]
+                    "args": [str(arg).strip() for arg in args if str(arg or "").strip()]
                     if isinstance(args, list | tuple)
                     else [],
                 }
@@ -751,6 +867,7 @@ class PluginRegistry:
                     continue
                 left = cls._meta_to_dict(current)
                 right = cls._meta_to_dict(meta)
+                argument_contract = cls._merge_argument_meta(left, right)
                 merged[key] = cls._with_command_meta_defaults(
                     command=left.get("command") or right.get("command") or command_text,
                     aliases=cls._merge_unique_strings(
@@ -759,11 +876,15 @@ class PluginRegistry:
                     prefixes=cls._merge_unique_strings(
                         left.get("prefixes"), right.get("prefixes")
                     ),
-                    params=cls._merge_unique_strings(
-                        left.get("params"), right.get("params")
-                    ),
+                    params=argument_contract["params"],
                     slot_choices=cls._merge_slot_choices(
                         left.get("slot_choices"), right.get("slot_choices")
+                    ),
+                    slot_types=cls._merge_slot_mapping(
+                        left.get("slot_types"), right.get("slot_types")
+                    ),
+                    slot_renderers=cls._merge_slot_mapping(
+                        left.get("slot_renderers"), right.get("slot_renderers")
                     ),
                     shortcut_renders=cls._merge_shortcut_renders(
                         left.get("shortcut_renders"), right.get("shortcut_renders")
@@ -774,18 +895,10 @@ class PluginRegistry:
                     examples=cls._merge_unique_strings(
                         left.get("examples"), right.get("examples")
                     ),
-                    text_min=left.get("text_min")
-                    if left.get("text_min") is not None
-                    else right.get("text_min"),
-                    text_max=left.get("text_max")
-                    if left.get("text_max") is not None
-                    else right.get("text_max"),
-                    image_min=left.get("image_min")
-                    if left.get("image_min") is not None
-                    else right.get("image_min"),
-                    image_max=left.get("image_max")
-                    if left.get("image_max") is not None
-                    else right.get("image_max"),
+                    text_min=argument_contract["text_min"],
+                    text_max=argument_contract["text_max"],
+                    image_min=argument_contract["image_min"],
+                    image_max=argument_contract["image_max"],
                     allow_at=left.get("allow_at")
                     if left.get("allow_at") is not None
                     else right.get("allow_at"),
@@ -804,6 +917,7 @@ class PluginRegistry:
                     allow_sticky_arg=left.get("allow_sticky_arg")
                     if left.get("allow_sticky_arg") is not None
                     else right.get("allow_sticky_arg"),
+                    argument_source=argument_contract["argument_source"],
                     access_level=cls._merge_access_level(
                         left.get("access_level"), right.get("access_level")
                     ),
@@ -811,6 +925,67 @@ class PluginRegistry:
         return sorted(
             merged.values(), key=lambda item: (len(item.command), item.command)
         )
+
+    @classmethod
+    def _merge_argument_meta(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> dict[str, Any]:
+        fields = ("text_min", "text_max", "image_min", "image_max")
+
+        def has_facts(payload: dict[str, Any]) -> bool:
+            return bool(payload.get("params")) or any(
+                payload.get(field) is not None for field in fields
+            )
+
+        left_source = cls._normalize_argument_source(left.get("argument_source"))
+        right_source = cls._normalize_argument_source(right.get("argument_source"))
+        left_facts = has_facts(left)
+        right_facts = has_facts(right)
+        left_rank = cls._argument_source_rank[left_source] if left_facts else -1
+        right_rank = cls._argument_source_rank[right_source] if right_facts else -1
+
+        if left_rank != right_rank:
+            primary, secondary = (
+                (left, right) if left_rank > right_rank else (right, left)
+            )
+            source = left_source if left_rank > right_rank else right_source
+            result = {
+                "params": cls._merge_unique_strings(primary.get("params"), []),
+                **{field: primary.get(field) for field in fields},
+                "argument_source": source,
+            }
+            for field in fields:
+                if result[field] is None:
+                    result[field] = secondary.get(field)
+            if not result["params"] and result["text_max"] != 0:
+                result["params"] = cls._merge_unique_strings(
+                    secondary.get("params"), []
+                )
+            return result
+
+        source = left_source if left_rank >= 0 else right_source
+        result = {
+            "params": cls._merge_unique_strings(
+                left.get("params"), right.get("params")
+            ),
+            "argument_source": source,
+        }
+        for field in fields:
+            left_value = left.get(field)
+            right_value = right.get(field)
+            if left_value is None:
+                result[field] = right_value
+            elif right_value is None:
+                result[field] = left_value
+            elif field.endswith("_min"):
+                result[field] = max(int(left_value), int(right_value))
+            elif int(left_value) == 0 or int(right_value) == 0:
+                result[field] = 0
+            else:
+                result[field] = min(int(left_value), int(right_value))
+        return result
 
     @classmethod
     def _command_meta_richness(
@@ -1020,7 +1195,10 @@ class PluginRegistry:
         if isinstance(item, str):
             command_text = str(item).strip()
             if command_text:
-                return cls._with_command_meta_defaults(command=command_text)
+                return cls._with_command_meta_defaults(
+                    command=command_text,
+                    argument_source="identity_fallback",
+                )
             return None
         if not isinstance(item, dict):
             return None
@@ -1073,6 +1251,10 @@ class PluginRegistry:
             ],
             params=[str(param).strip() for param in params if str(param or "").strip()],
             slot_choices=item.get("slot_choices", schema.get("slot_choices")),
+            slot_types=item.get("slot_types", schema.get("slot_types")),
+            slot_renderers=item.get(
+                "slot_renderers", schema.get("slot_renderers")
+            ),
             shortcut_renders=item.get(
                 "shortcut_renders", schema.get("shortcut_renders")
             ),
@@ -1105,6 +1287,7 @@ class PluginRegistry:
             allow_sticky_arg=item.get(
                 "allow_sticky_arg", schema.get("allow_sticky_arg")
             ),
+            argument_source=item.get("argument_source", "discovery"),
             access_level=item.get("access_level", schema.get("access_level")),
         )
 
@@ -1131,8 +1314,6 @@ class PluginRegistry:
             meta = cls._parse_discovery_item(item)
             if meta is not None:
                 metas.append(meta)
-        if len(metas) > cls._max_discovered_commands:
-            metas = metas[: cls._max_discovered_commands]
         return metas
 
     @classmethod
@@ -1175,10 +1356,13 @@ class PluginRegistry:
             discovered.extend(cls._parse_discovery_payload(payload))
         discovered.extend(
             cls._parse_discovery_payload(
-                await AutoMetadataBuilder.build(
-                    module_name=module_name,
-                    module_obj=module_obj,
-                    loaded_plugin=loaded_plugin,
+                enrich_command_meta_payload(
+                    module_name,
+                    await AutoMetadataBuilder.build(
+                        module_name=module_name,
+                        module_obj=module_obj,
+                        loaded_plugin=loaded_plugin,
+                    ),
                 )
             )
         )
@@ -1242,10 +1426,17 @@ class PluginRegistry:
             return []
 
         known_heads: list[str] = []
+        meta_by_head: dict[str, PluginInfo.PluginCommandMeta] = {}
         for meta in command_meta:
             cls._append_command(known_heads, meta.command)
+            normalized_command = cls._normalize_command(meta.command).casefold()
+            if normalized_command:
+                meta_by_head[normalized_command] = meta
             for alias in meta.aliases:
                 cls._append_command(known_heads, alias)
+                normalized_alias = cls._normalize_command(alias).casefold()
+                if normalized_alias:
+                    meta_by_head[normalized_alias] = meta
         known_heads = sorted(known_heads, key=len, reverse=True)
 
         result: list[PluginInfo.PluginCommandMeta] = []
@@ -1273,6 +1464,22 @@ class PluginRegistry:
                     matched_head = cls._normalize_command(head_parts[0])
             if not matched_head:
                 continue
+            matched_meta = meta_by_head.get(
+                cls._normalize_command(matched_head).casefold()
+            )
+            if (
+                not description
+                and matched_meta is not None
+                and matched_meta.text_max == 0
+                and cls._argument_source_rank[
+                    cls._normalize_argument_source(matched_meta.argument_source)
+                ]
+                >= cls._argument_source_rank["runtime_parser"]
+            ):
+                prose_tail = re.search(r"\s+--(?=\S)", command_part)
+                if prose_tail is not None:
+                    description = command_part[prose_tail.end() :].strip()
+                    command_part = command_part[: prose_tail.start()].strip()
             if len(matched_head) > 32 or any(
                 mark in matched_head for mark in "，。！？；"
             ):
@@ -1284,6 +1491,7 @@ class PluginRegistry:
                     params=params,
                     description=description,
                     examples=[command_part],
+                    argument_source="usage",
                 )
             )
         return result
@@ -1307,6 +1515,11 @@ class PluginRegistry:
             return True
         tail = normalized.rsplit(".", 1)[-1]
         if tail in cls._infra_module_tails:
+            return True
+        if any(
+            normalized == root or normalized.startswith(f"{root}.")
+            for root in cls._infra_module_roots
+        ):
             return True
         if any(marker in normalized for marker in cls._infra_module_markers):
             return True
@@ -1366,6 +1579,7 @@ class PluginRegistry:
             else None
         )
         commands = cls._extract_commands(extra_data, command_meta)
+        matcher_commands: list[str] = []
         if loaded_plugin is not None:
             matcher_commands = cls._extract_commands_from_matchers(loaded_plugin)
             if matcher_commands:
@@ -1386,15 +1600,34 @@ class PluginRegistry:
             command_meta,
             cls._extract_usage_command_meta(resolved_usage, command_meta),
         )
+        if loaded_plugin is not None:
+            command_meta = cls._fold_matcher_alias_command_meta(
+                command_meta,
+                loaded_plugin=loaded_plugin,
+            )
         command_meta = cls._fold_plugin_alias_command_meta(
             command_meta,
             plugin_aliases=list(extra_data.aliases or []),
         )
+        if matcher_commands:
+            commands, command_meta = cls._filter_to_matcher_executable(
+                commands=commands,
+                command_meta=command_meta,
+                matcher_commands=matcher_commands,
+            )
         command_meta = cls._canonicalize_command_meta_groups(command_meta)
         command_meta = cls._filter_public_command_meta(command_meta)
-        commands = cls._extract_commands(extra_data, command_meta)
+        commands = cls._merge_unique_strings(
+            [meta.command for meta in command_meta if meta.command],
+            [],
+        )
         if not commands:
             return None
+        semantic_tools = cls._extract_semantic_tool_contracts(
+            extra_data,
+            loaded_plugin=loaded_plugin,
+            command_meta=command_meta,
+        )
 
         setting = extra_data.setting
         resolved_limit_superuser = (
@@ -1422,6 +1655,12 @@ class PluginRegistry:
             ),
             command_meta=command_meta,
             usage=resolved_usage,
+            introduction=str(extra_data.introduction or "").strip() or None,
+            precautions=cls._merge_unique_strings(
+                list(extra_data.precautions or []),
+                [],
+            ),
+            semantic_tools=semantic_tools,
             admin_level=resolved_admin_level,
             limit_superuser=resolved_limit_superuser,
             status=bool(status),
@@ -1429,6 +1668,147 @@ class PluginRegistry:
             load_status=bool(load_status),
             block_keys=cls._merge_unique_strings([module_name], block_keys or []),
         )
+
+    @classmethod
+    def _extract_semantic_tool_contracts(
+        cls,
+        extra_data: PluginExtraData,
+        *,
+        loaded_plugin: object | None,
+        command_meta: list[PluginInfo.PluginCommandMeta],
+    ) -> list[SemanticToolContract]:
+        contracts: list[SemanticToolContract] = []
+        command_heads = cls._merge_unique_strings(
+            [meta.command for meta in command_meta if meta.command],
+            [],
+        )
+        seen_names: set[str] = set()
+        for raw_tool in extra_data.smart_tools or []:
+            name = normalize_message_text(str(getattr(raw_tool, "name", "") or ""))
+            key = name.casefold()
+            if not name or key in seen_names:
+                continue
+            seen_names.add(key)
+            parameters = cls._semantic_tool_parameters(
+                getattr(raw_tool, "parameters", None)
+            )
+            bound_commands = cls._commands_bound_to_smart_handler(
+                getattr(raw_tool, "func", None),
+                loaded_plugin=loaded_plugin,
+            )
+            if not bound_commands and len(command_heads) == 1:
+                bound_commands = list(command_heads)
+            contracts.append(
+                SemanticToolContract(
+                    name=name,
+                    description=normalize_message_text(
+                        str(getattr(raw_tool, "description", "") or "")
+                    ),
+                    parameters=parameters,
+                    bound_commands=bound_commands,
+                )
+            )
+        return sorted(contracts, key=lambda item: (item.name.casefold(), item.name))
+
+    @staticmethod
+    def _semantic_tool_parameters(raw_parameters: object | None) -> dict[str, Any]:
+        if raw_parameters is None:
+            return {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            }
+        if hasattr(raw_parameters, "model_dump"):
+            payload = raw_parameters.model_dump(mode="json")
+        elif isinstance(raw_parameters, dict):
+            payload = dict(raw_parameters)
+        else:
+            payload = {}
+        properties = payload.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        normalized_properties: dict[str, dict[str, Any]] = {}
+        for raw_name, raw_schema in properties.items():
+            name = normalize_message_text(str(raw_name or ""))
+            if not name:
+                continue
+            if hasattr(raw_schema, "model_dump"):
+                schema = raw_schema.model_dump(mode="json")
+            elif isinstance(raw_schema, dict):
+                schema = dict(raw_schema)
+            else:
+                schema = {}
+            normalized_properties[name] = {
+                key: value
+                for key, value in schema.items()
+                if key in {"type", "description", "enum", "default"}
+            }
+        required = [
+            name
+            for item in payload.get("required", []) or []
+            if (name := normalize_message_text(str(item or "")))
+            and name in normalized_properties
+        ]
+        return {
+            "type": "object",
+            "properties": normalized_properties,
+            "required": list(dict.fromkeys(required)),
+            "additionalProperties": False,
+        }
+
+    @classmethod
+    def _commands_bound_to_smart_handler(
+        cls,
+        func: object | None,
+        *,
+        loaded_plugin: object | None,
+    ) -> list[str]:
+        if func is None or loaded_plugin is None:
+            return []
+        matched: list[object] = []
+        for matcher in AutoMetadataBuilder._iter_plugin_matchers(loaded_plugin):
+            if any(
+                cls._same_callable(getattr(handler, "call", None), func)
+                for handler in getattr(matcher, "handlers", []) or []
+            ):
+                matched.append(matcher)
+        if len(matched) != 1:
+            return []
+        proxy = SimpleNamespace(
+            matcher=[matched[0]],
+            sub_plugins=set(),
+            module_name="",
+            module=None,
+        )
+        payloads = AutoMetadataBuilder._extract_matcher_command_data(
+            loaded_plugin=proxy
+        )
+        return cls._merge_unique_strings(
+            [
+                str(payload.get("command") or "")
+                for payload in payloads
+                if isinstance(payload, dict)
+            ],
+            [],
+        )
+
+    @staticmethod
+    def _same_callable(left: object | None, right: object | None) -> bool:
+        if left is None or right is None:
+            return False
+        if left is right:
+            return True
+        left_func = getattr(left, "__func__", left)
+        right_func = getattr(right, "__func__", right)
+        if left_func is right_func:
+            return True
+        try:
+            return inspect.unwrap(cast(Any, left_func)) is inspect.unwrap(
+                cast(Any, right_func)
+            )
+        except (TypeError, ValueError):
+            return False
 
     @classmethod
     def _is_public_plugin(cls, extra_data: PluginExtraData) -> bool:
@@ -1574,7 +1954,6 @@ class PluginRegistry:
             ),
         )
 
-
         deduplicated: list[PluginInfo] = []
         seen_fingerprints: set[tuple[str, tuple[str, ...]]] = set()
         for plugin in ordered:
@@ -1590,10 +1969,6 @@ class PluginRegistry:
             seen_fingerprints.add(fingerprint)
             deduplicated.append(plugin)
 
-
-
-
-
         parent_modules_to_remove: set[str] = set()
 
         for plugin in deduplicated:
@@ -1608,7 +1983,6 @@ class PluginRegistry:
             if not children:
                 continue
 
-
             children_commands: set[str] = set()
             for child in children:
                 for cmd in child.commands:
@@ -1616,13 +1990,11 @@ class PluginRegistry:
                     if normalized_cmd:
                         children_commands.add(normalized_cmd)
 
-
             parent_commands: set[str] = set()
             for cmd in plugin.commands:
                 normalized_cmd = cmd.strip().lower()
                 if normalized_cmd:
                     parent_commands.add(normalized_cmd)
-
 
             if parent_commands and parent_commands <= children_commands:
                 parent_modules_to_remove.add(parent_module)
@@ -1646,23 +2018,28 @@ class PluginRegistry:
         matcher_meta = AutoMetadataBuilder._extract_matcher_command_data(
             loaded_plugin=nb_plugin,
         )
+        alias_identities = {
+            normalized.casefold()
+            for payload in matcher_meta
+            for alias in [
+                *(payload.get("aliases") or ()),
+                *cls._shortcut_aliases_from_payload(payload),
+            ]
+            if (normalized := cls._normalize_command(str(alias or "")))
+        }
         for payload in matcher_meta:
-            candidates = [str(payload.get("command") or "").strip()]
-            raw_aliases = payload.get("aliases") or []
-            if isinstance(raw_aliases, set | list | tuple | frozenset):
-                candidates.extend(
-                    str(alias).strip() for alias in raw_aliases if str(alias).strip()
-                )
-            candidates.extend(cls._shortcut_aliases_from_payload(payload))
-            for candidate in candidates:
-                normalized = cls._normalize_command(candidate)
-                if not normalized or normalized in seen:
-                    continue
-                seen.add(normalized)
-                commands.append(normalized)
+            normalized = cls._normalize_command(
+                str(payload.get("command") or "").strip()
+            )
+            if (
+                not normalized
+                or normalized.casefold() in alias_identities
+                or normalized in seen
+            ):
+                continue
+            seen.add(normalized)
+            commands.append(normalized)
         commands.sort(key=lambda cmd: (len(cmd), cmd))
-        if len(commands) > cls._max_matcher_commands:
-            commands = commands[: cls._max_matcher_commands]
         return commands
 
     @classmethod
@@ -1678,6 +2055,81 @@ class PluginRegistry:
             if alias:
                 aliases.append(alias)
         return aliases
+
+    @classmethod
+    def _fold_matcher_alias_command_meta(
+        cls,
+        metas: list[PluginInfo.PluginCommandMeta],
+        *,
+        loaded_plugin: object,
+    ) -> list[PluginInfo.PluginCommandMeta]:
+        alias_targets: dict[str, set[str]] = {}
+        for payload in AutoMetadataBuilder._extract_matcher_command_data(
+            loaded_plugin=loaded_plugin,
+        ):
+            command = cls._normalize_command(str(payload.get("command") or ""))
+            if not command:
+                continue
+            # Parser aliases are alternate spellings of one command. Shortcuts
+            # with their own render/arguments are independent executable views.
+            for alias in payload.get("aliases") or ():
+                normalized_alias = cls._normalize_command(str(alias or ""))
+                if (
+                    normalized_alias
+                    and normalized_alias.casefold() != command.casefold()
+                ):
+                    alias_targets.setdefault(normalized_alias.casefold(), set()).add(
+                        command.casefold()
+                    )
+
+        unique_targets = {
+            alias: next(iter(targets))
+            for alias, targets in alias_targets.items()
+            if len(targets) == 1
+        }
+        if not unique_targets:
+            return metas
+
+        by_head = {
+            cls._normalize_command(meta.command).casefold(): meta
+            for meta in metas
+            if cls._normalize_command(meta.command)
+        }
+        folded_aliases: set[str] = set()
+        replacements: dict[str, PluginInfo.PluginCommandMeta] = {}
+        for alias_head, target_head in unique_targets.items():
+            alias_meta = by_head.get(alias_head)
+            target_meta = replacements.get(target_head) or by_head.get(target_head)
+            if alias_meta is None or target_meta is None or alias_meta is target_meta:
+                continue
+            target_payload = cls._meta_to_dict(target_meta)
+            alias_payload = cls._meta_to_dict(alias_meta)
+            target_payload["aliases"] = cls._merge_unique_strings(
+                target_payload.get("aliases"),
+                [str(alias_payload.get("command") or "")],
+            )
+            target_payload["aliases"] = cls._merge_unique_strings(
+                target_payload.get("aliases"), alias_payload.get("aliases")
+            )
+            target_payload["description"] = cls._merge_text_fields(
+                target_payload.get("description"), alias_payload.get("description")
+            )
+            target_payload["examples"] = cls._merge_unique_strings(
+                target_payload.get("examples"), alias_payload.get("examples")
+            )
+            replacements[target_head] = cls._with_command_meta_defaults(
+                **target_payload
+            )
+            folded_aliases.add(alias_head)
+
+        return cls._merge_command_meta_groups(
+            [
+                replacements.get(head, meta)
+                for meta in metas
+                if (head := cls._normalize_command(meta.command).casefold())
+                not in folded_aliases
+            ]
+        )
 
     @classmethod
     def _build_matcher_command_lookup(
@@ -1731,10 +2183,28 @@ class PluginRegistry:
             return commands, command_meta
 
         matcher_lookup = cls._build_matcher_command_lookup(matcher_commands)
+        executable_lookup = set(matcher_lookup)
+        command_identity_lookup = set(matcher_lookup)
+        for meta in command_meta:
+            payload = cls._meta_to_dict(meta)
+            if not cls._command_matches_matcher_lookup(
+                str(payload.get("command") or ""), matcher_lookup
+            ):
+                continue
+            for identity in payload.get("aliases") or ():
+                normalized = cls._normalize_command(str(identity or ""))
+                if normalized:
+                    command_identity_lookup.add(normalized.casefold())
+            for identity in cls._shortcut_aliases_from_payload(payload):
+                normalized = cls._normalize_command(str(identity or ""))
+                if normalized:
+                    folded = normalized.casefold()
+                    executable_lookup.add(folded)
+                    command_identity_lookup.add(folded)
         filtered_commands = [
             command
             for command in commands
-            if cls._command_matches_matcher_lookup(command, matcher_lookup)
+            if cls._command_matches_matcher_lookup(command, command_identity_lookup)
         ]
 
         filtered_meta: list[PluginInfo.PluginCommandMeta] = []
@@ -1742,20 +2212,20 @@ class PluginRegistry:
             payload = cls._meta_to_dict(meta)
             command_text = str(payload.get("command") or "").strip()
             matched_command = cls._command_matches_matcher_lookup(
-                command_text, matcher_lookup
+                command_text, executable_lookup
             )
 
             original_aliases = payload.get("aliases", [])
             matched_aliases = [
                 alias
                 for alias in original_aliases
-                if cls._command_matches_matcher_lookup(alias, matcher_lookup)
+                if cls._command_matches_matcher_lookup(alias, command_identity_lookup)
             ]
             shortcut_aliases = cls._shortcut_aliases_from_payload(payload)
             matched_shortcuts = [
                 alias
                 for alias in shortcut_aliases
-                if cls._command_matches_matcher_lookup(alias, matcher_lookup)
+                if cls._command_matches_matcher_lookup(alias, executable_lookup)
             ]
 
             if not matched_command and not matched_aliases and not matched_shortcuts:
@@ -1769,11 +2239,7 @@ class PluginRegistry:
                     payload["command"] = matched_shortcuts[0]
                     matched_shortcuts = matched_shortcuts[1:]
             normalized_command = cls._normalize_command(str(payload.get("command", "")))
-            alias_source = (
-                original_aliases
-                if matched_command
-                else matched_aliases
-            )
+            alias_source = original_aliases if matched_command else matched_aliases
             payload["aliases"] = [
                 alias
                 for alias in alias_source
@@ -1787,11 +2253,11 @@ class PluginRegistry:
         )
 
         if not filtered_meta:
-            filtered_meta = cls._build_command_meta_from_commands(filtered_commands)
+            filtered_meta = cls._build_command_meta_from_commands(matcher_commands)
         else:
             filtered_meta = cls._merge_command_meta_groups(
                 filtered_meta,
-                cls._build_command_meta_from_commands(filtered_commands),
+                cls._build_command_meta_from_commands(matcher_commands),
             )
 
         filtered_commands = cls._extract_commands(
@@ -1851,23 +2317,10 @@ class PluginRegistry:
         return head
 
     @classmethod
-    def _cleanup_cache(cls):
-        """清理过期的缓存"""
-        now = datetime.now()
-        expired_keys = [
-            key
-            for key, (_, cached_time) in cls._cache.items()
-            if (now - cached_time).total_seconds() >= cls._cache_ttl
-        ]
-        for key in expired_keys:
-            del cls._cache[key]
-            cls._cache_plugin_info_refresh.pop(key, None)
-
-    @classmethod
     def clear_cache(cls):
         """清空所有缓存"""
         cls._cache.clear()
-        cls._cache_plugin_info_refresh.clear()
+        cls._cache_active_plugin_modules.clear()
         cls._clear_command_tool_cache(bump_revision=True)
         logger.info("插件知识库缓存已清空")
 
@@ -1907,11 +2360,7 @@ class PluginRegistry:
             return False
         if requires.get("reply") and not selection_context.supports_reply:
             return False
-        if requires.get("reply") and not selection_context.has_reply:
-            return False
         if requires.get("private") and not selection_context.is_private:
-            return False
-        if requires.get("to_me") and not selection_context.has_at:
             return False
         if tool.payload_policy in {"image_only", "text_or_image"}:
             if not selection_context.supports_image:
@@ -1997,7 +2446,7 @@ class PluginRegistry:
     ) -> bool:
         if selection_context is None:
             return True
-        if plugin.limit_superuser and selection_context.is_superuser:
+        if plugin.limit_superuser and not selection_context.is_superuser:
             return False
         admin_level = int(plugin.admin_level or 0)
         if admin_level > 0 and not selection_context.is_superuser:
@@ -2008,7 +2457,7 @@ class PluginRegistry:
     def _is_allowed_plugin_info(cls, plugin: PluginInfo) -> bool:
         if not plugin.load_status:
             return False
-        if not plugin.commands:
+        if not plugin.commands and not plugin.command_meta:
             return False
         if cls._is_infrastructure_module(plugin.module, plugin.name):
             return False
@@ -2029,23 +2478,66 @@ class PluginRegistry:
 
         if not knowledge_base.plugins:
             return knowledge_base
+
+        _sel_key = cls._command_tool_selection_cache_key(selection_context)
+        _kb_identity = cls._command_tool_knowledge_identity(knowledge_base)
+        if _kb_identity is not None:
+            _fk: tuple[object, ...] = (
+                "identity",
+                cls._knowledge_revision,
+                _kb_identity,
+                _sel_key,
+            )
+        else:
+            _digest = hashlib.blake2b(digest_size=16)
+            _digest.update(knowledge_base.model_dump_json().encode("utf-8", "ignore"))
+            _fk = ("content", cls._knowledge_revision, _digest.hexdigest(), _sel_key)
+        _cached_filtered = cls._filter_kb_cache.get(_fk)
+        if _cached_filtered is not None:
+            try:
+                cls._filter_kb_cache_order.remove(_fk)
+            except ValueError:
+                pass
+            cls._filter_kb_cache_order.append(_fk)
+            return _cached_filtered
         selected: list[PluginInfo] = []
         for plugin in knowledge_base.plugins:
             if not cls._is_allowed_plugin_info(plugin):
+                logger.debug(
+                    f"插件 {plugin.name}（{plugin.module}）被过滤，原因："
+                    "_is_allowed_plugin_info 返回 False"
+                )
                 continue
             if not cls._is_plugin_status_allowed(plugin, selection_context):
+                logger.debug(
+                    f"插件 {plugin.name}（{plugin.module}）被过滤，原因：插件状态不允许"
+                )
                 continue
             if not cls._is_group_plugin_allowed(plugin, selection_context):
+                logger.debug(
+                    f"插件 {plugin.name}（{plugin.module}）被过滤，原因：群内屏蔽"
+                )
                 continue
             if not cls._is_plugin_enabled(plugin, selection_context):
+                logger.debug(
+                    f"插件 {plugin.name}（{plugin.module}）被过滤，原因：插件未启用"
+                )
                 continue
             if not cls._is_plugin_authorized(plugin, selection_context):
+                logger.debug(
+                    f"插件 {plugin.name}（{plugin.module}）被过滤，原因：权限不足"
+                )
                 continue
             selected.append(plugin)
-        return PluginKnowledgeBase(
+        _result = PluginKnowledgeBase(
             plugins=selected,
             user_role=knowledge_base.user_role,
         )
+        cls._filter_kb_cache[_fk] = _result
+        cls._filter_kb_cache_order.append(_fk)
+        while len(cls._filter_kb_cache_order) > cls._filter_kb_cache_max:
+            cls._filter_kb_cache.pop(cls._filter_kb_cache_order.pop(0), None)
+        return _result
 
     @classmethod
     def build_capability_graph(
@@ -2120,12 +2612,23 @@ class PluginRegistry:
         *,
         selection_context: PluginSelectionContext | None,
     ) -> list[CommandToolSnapshot]:
-        cache_key = cls._command_tool_cache_key(
-            knowledge_base,
-            selection_context=selection_context,
+        from .command_metadata_overrides import load_command_overrides
+
+        overrides = load_command_overrides()
+        cache_key = (
+            cls._command_tool_cache_key(
+                knowledge_base,
+                selection_context=selection_context,
+            ),
+            overrides.version,
         )
         cached = cls._command_tool_cache.get(cache_key)
         if cached is not None:
+            try:
+                cls._command_tool_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            cls._command_tool_cache_order.append(cache_key)
             return list(cached[0])
 
         graph = cls.build_capability_graph(
@@ -2133,10 +2636,20 @@ class PluginRegistry:
             selection_context=selection_context,
             limit=None,
         )
-        snapshots = cls._dedupe_execution_identity_snapshots(
-            build_command_tool_snapshots(graph, limit=None)
+        snapshots = overrides.apply(
+            cls._dedupe_execution_identity_snapshots(
+                build_command_tool_snapshots(graph, limit=None)
+            )
         )
-        cls._command_tool_cache[cache_key] = (list(snapshots), len(snapshots))
+        snapshots = cls._attach_semantic_tool_contracts(
+            snapshots,
+            knowledge_base=knowledge_base,
+        )
+        cls._command_tool_cache[cache_key] = (
+            list(snapshots),
+            len(snapshots),
+            knowledge_base,
+        )
         cls._command_tool_cache_order.append(cache_key)
         while len(cls._command_tool_cache_order) > cls._command_tool_cache_max:
             old_key = cls._command_tool_cache_order.pop(0)
@@ -2172,58 +2685,248 @@ class PluginRegistry:
         return deduped
 
     @classmethod
+    def _attach_semantic_tool_contracts(
+        cls,
+        snapshots: list[CommandToolSnapshot],
+        *,
+        knowledge_base: PluginKnowledgeBase,
+    ) -> list[CommandToolSnapshot]:
+        updated = list(snapshots)
+        for plugin in knowledge_base.plugins:
+            module_key = normalize_message_text(plugin.module).casefold()
+            if not module_key:
+                continue
+            for contract in plugin.semantic_tools:
+                bound = {
+                    normalize_message_text(value).casefold()
+                    for value in contract.bound_commands
+                    if normalize_message_text(value)
+                }
+                if not bound:
+                    continue
+                matches = [
+                    index
+                    for index, snapshot in enumerate(updated)
+                    if normalize_message_text(snapshot.plugin_module).casefold()
+                    == module_key
+                    and normalize_message_text(snapshot.head).casefold() in bound
+                ]
+                if len(matches) != 1:
+                    continue
+                index = matches[0]
+                snapshot = updated[index]
+                if not cls._semantic_contract_matches_slots(contract, snapshot):
+                    continue
+                meta = dict(snapshot.meta or {})
+                meta["semantic_tool_name"] = contract.name
+                meta["semantic_contract"] = contract.model_dump(mode="json")
+                use_cases = cls._merge_unique_strings(
+                    snapshot.use_cases,
+                    [contract.description, *contract.use_cases],
+                )
+                anti_use_cases = cls._merge_unique_strings(
+                    snapshot.anti_use_cases,
+                    contract.anti_use_cases,
+                )
+                update: dict[str, object] = {
+                    "description": snapshot.description or contract.description,
+                    "capability_text": snapshot.capability_text or contract.description,
+                    "use_cases": use_cases,
+                    "anti_use_cases": anti_use_cases,
+                    "meta": meta,
+                }
+                for field_name in (
+                    "output_mode",
+                    "side_effect",
+                    "source_of_truth",
+                    "requires_real_tool",
+                    "entity_scope",
+                    "requires_real_result",
+                    "execution_policy",
+                ):
+                    value = getattr(contract, field_name)
+                    if value is not None:
+                        update[field_name] = value
+                if contract.risk is not None:
+                    update["risk"] = contract.risk
+                    update["risk_level"] = contract.risk
+                if contract.intent_types:
+                    update["intent_types"] = cls._merge_unique_strings(
+                        snapshot.intent_types,
+                        contract.intent_types,
+                    )
+                updated[index] = snapshot.model_copy(
+                    update=update,
+                )
+        return updated
+
+    @staticmethod
+    def _semantic_contract_matches_slots(
+        contract: SemanticToolContract,
+        snapshot: CommandToolSnapshot,
+    ) -> bool:
+        parameters = dict(contract.parameters or {})
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return False
+        property_names = {
+            normalize_message_text(str(name or "")) for name in properties
+        }
+        slot_by_name = {
+            normalize_message_text(slot.name): slot
+            for slot in snapshot.slots
+            if normalize_message_text(slot.name)
+        }
+        if not property_names or property_names != set(slot_by_name):
+            return False
+        required = {
+            normalize_message_text(str(name or ""))
+            for name in parameters.get("required", []) or []
+        }
+        slot_required = {name for name, slot in slot_by_name.items() if slot.required}
+        if required != slot_required:
+            return False
+        expected_types = {
+            "text": "string",
+            "str": "string",
+            "image": "string",
+            "at": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+        }
+        for name, slot in slot_by_name.items():
+            raw_schema = properties.get(name)
+            if not isinstance(raw_schema, dict):
+                return False
+            declared = raw_schema.get("type")
+            if isinstance(declared, list):
+                declared_types = {str(item) for item in declared}
+            else:
+                declared_types = {str(declared or "")}
+            expected = expected_types.get(slot.type, "string")
+            if expected not in declared_types:
+                return False
+        return True
+
+    @classmethod
     def _command_tool_cache_key(
         cls,
         knowledge_base: PluginKnowledgeBase,
         *,
         selection_context: PluginSelectionContext | None,
-    ) -> str:
-        digest = hashlib.blake2b(digest_size=16)
-        digest.update(str(cls._knowledge_revision).encode("ascii", "ignore"))
-        digest.update(b"\x00")
-        digest.update(str(len(knowledge_base.plugins)).encode("ascii", "ignore"))
-        digest.update(b"\x00")
-        for plugin in knowledge_base.plugins:
-            digest.update(str(plugin.module or "").encode("utf-8", "ignore"))
-            digest.update(b"\x1f")
-            digest.update(str(plugin.name or "").encode("utf-8", "ignore"))
-            digest.update(b"\x1f")
-            digest.update(str(plugin.admin_level or 0).encode("ascii", "ignore"))
-            digest.update(b"\x1f")
-            digest.update(str(bool(plugin.limit_superuser)).encode("ascii", "ignore"))
-            digest.update(b"\x1f")
-            digest.update(str(len(plugin.command_meta)).encode("ascii", "ignore"))
-            digest.update(b"\x1f")
-            for command in plugin.commands:
-                digest.update(str(command or "").encode("utf-8", "ignore"))
-                digest.update(b"\x1d")
-            digest.update(b"\x1e")
-
-        if selection_context is None:
-            digest.update(b"context:none")
-        else:
-
-
-            parts = (
-                str(selection_context.session_id or ""),
-                str(selection_context.group_id or ""),
-                "1" if selection_context.is_superuser else "0",
+    ) -> tuple[object, ...]:
+        selection_key = cls._command_tool_selection_cache_key(selection_context)
+        knowledge_identity = cls._command_tool_knowledge_identity(knowledge_base)
+        if knowledge_identity is not None:
+            return (
+                "identity",
+                cls._knowledge_revision,
+                knowledge_identity,
+                selection_key,
             )
-            for part in parts:
-                digest.update(part.encode("utf-8", "ignore"))
-                digest.update(b"\x00")
-        return digest.hexdigest()
+
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(knowledge_base.model_dump_json().encode("utf-8", "ignore"))
+
+        return (
+            "content",
+            cls._knowledge_revision,
+            digest.hexdigest(),
+            selection_key,
+        )
+
+    @classmethod
+    def _command_tool_knowledge_identity(
+        cls,
+        knowledge_base: PluginKnowledgeBase,
+    ) -> tuple[object, ...] | None:
+        for cached_knowledge, _cached_time in cls._cache.values():
+            if cached_knowledge is knowledge_base:
+                return (id(cached_knowledge), "all")
+            positions = {
+                id(plugin): index
+                for index, plugin in enumerate(cached_knowledge.plugins)
+            }
+            projection: list[int] = []
+            for plugin in knowledge_base.plugins:
+                index = positions.get(id(plugin))
+                if (
+                    index is None
+                    or cached_knowledge.plugins[index] is not plugin
+                ):
+                    break
+                projection.append(index)
+            else:
+                return (
+                    id(cached_knowledge),
+                    tuple(projection),
+                    knowledge_base.user_role,
+                )
+        return None
+
+    @classmethod
+    def _command_tool_selection_cache_key(
+        cls,
+        selection_context: PluginSelectionContext | None,
+    ) -> tuple[object, ...]:
+        if selection_context is None:
+            return ("none",)
+        group_id = str(selection_context.group_id or "").strip()
+        return (
+            group_id,
+            bool(selection_context.is_superuser),
+            bool(selection_context.is_private),
+            cls._group_block_cache_signature(group_id),
+            cls._session_override_cache_signature(selection_context.session_id),
+        )
+
+    @classmethod
+    def _session_override_cache_signature(
+        cls,
+        session_id: str | None,
+    ) -> tuple[tuple[str, bool], ...]:
+        """会话级插件开关签名；无覆盖的会话共享同一缓存条目。"""
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return ()
+        overrides = cls._session_plugin_overrides.get(normalized)
+        if not overrides:
+            return ()
+        return tuple(
+            sorted((str(key), bool(value)) for key, value in overrides.items())
+        )
+
+    @staticmethod
+    def _group_block_cache_signature(
+        group_id: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        if not group_id:
+            return (), ()
+        group = GroupMemoryCache.get_if_ready(group_id)
+        if group is None:
+            return (), ()
+
+        def _block_set(raw_name: str, set_name: str) -> tuple[str, ...]:
+            raw = getattr(group, raw_name, "") or ""
+            values = getattr(group, set_name, None)
+            if values is None or (not values and raw):
+                values = _parse_block_modules(raw)
+            return tuple(sorted(str(value) for value in (values or set())))
+
+        return (
+            _block_set("block_plugin", "block_plugin_set"),
+            _block_set("superuser_block_plugin", "superuser_block_plugin_set"),
+        )
 
     @classmethod
     def _clear_command_tool_cache(cls, *, bump_revision: bool = False) -> None:
         cls._command_tool_cache.clear()
         cls._command_tool_cache_order.clear()
+        cls._filter_kb_cache.clear()
+        cls._filter_kb_cache_order.clear()
         if bump_revision:
             cls._knowledge_revision += 1
-
-    @staticmethod
-    def _plugin_info_refresh_ts() -> float:
-        return float(getattr(PluginInfoMemoryCache, "_last_refresh", 0.0) or 0.0)
 
     @classmethod
     async def set_plugin_enabled(
@@ -2273,7 +2976,6 @@ class PluginRegistry:
             normal_cache = await cls.get_plugin_knowledge_base(
                 force_refresh=force_refresh
             )
-            cls._cache["normal_user"] = (normal_cache, datetime.now())
             logger.info(
                 f"ChatInter 知识库缓存预加载完成，"
                 f"共缓存 {len(normal_cache.plugins)} 个插件"

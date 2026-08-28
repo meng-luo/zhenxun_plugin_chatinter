@@ -13,6 +13,9 @@ import json
 from pathlib import Path
 import time
 from typing import Any
+import uuid
+
+from zhenxun.utils.log_sanitizer import sanitize_for_logging
 
 from ..persistence import (
     append_jsonl,
@@ -51,12 +54,48 @@ def record_agent_trajectory(
         latency_ms=latency_ms,
         run_context_extra=run_context_extra,
     )
+    sanitized = sanitize_for_logging(record)
+    if isinstance(sanitized, dict):
+        record = sanitized
     path = trajectory_jsonl_path()
     append_jsonl(path, record)
     write_json(state_path("trajectories", "latest.json"), record)
     if project:
         _record_feedback_projection(record)
         _record_eval_projection(record)
+    return path, record
+
+
+def record_agent_control_trajectory(
+    *,
+    state: AgentRunState,
+    input_message: str,
+    started_at: float,
+    latency_ms: float,
+    control_action: str,
+    control_outcome: str,
+    control_failure_reason: str = "",
+) -> tuple[Path, dict[str, Any]]:
+    record = build_agent_trajectory_record(
+        state=state,
+        input_message=input_message,
+        started_at=started_at,
+        latency_ms=latency_ms,
+        run_context_extra={"control_action": control_action},
+    )
+    record["trace_id"] = uuid.uuid4().hex[:12]
+    record["record_type"] = "agent_control"
+    record["scenario"] = "superuser_agent_control"
+    record["control_action"] = control_action
+    record["control_outcome"] = control_outcome
+    if control_failure_reason:
+        record["control_failure_reason"] = control_failure_reason
+    sanitized = sanitize_for_logging(record)
+    if isinstance(sanitized, dict):
+        record = sanitized
+    path = trajectory_jsonl_path()
+    append_jsonl(path, record)
+    write_json(state_path("trajectories", "latest_control.json"), record)
     return path, record
 
 
@@ -70,9 +109,7 @@ def build_agent_trajectory_record(
 ) -> dict[str, Any]:
     extra = dict(run_context_extra or {})
     selected_tools = _selected_tools(state.metrics)
-    observations = [
-        _observation_payload(item) for item in state.runtime_observations()
-    ]
+    observations = [_observation_payload(item) for item in state.runtime_observations()]
     evaluation = _evaluate_record_fields(
         selected_tools=selected_tools,
         observations=observations,
@@ -127,7 +164,9 @@ def build_agent_trajectory_record(
         "evaluation": evaluation,
         "provider_capability": _json_dict(extra.get("provider_capability")),
         "timeline_digest": _timeline_digest(state.metrics),
+        **_web_stats(state),
         **_side_effect_stats(state),
+        **_subagent_stats(state),
     }
     return _drop_empty(record)
 
@@ -225,8 +264,25 @@ def _model_request_stats(
     state: AgentRunState,
 ) -> dict[str, int]:
     requests = [item for item in timeline if item.kind == "model_request"]
-    main_model_calls = len(requests)
+    usage = [item for item in timeline if item.kind == "model_usage"]
     total_model_calls = max(int(state.budget.model_calls or 0), 0)
+    if any(item.metadata.get("request_kind") for item in usage):
+        main_model_calls = sum(
+            str(item.metadata.get("request_kind", "") or "") == "main"
+            for item in usage
+        )
+        summary_model_calls = sum(
+            str(item.metadata.get("request_kind", "") or "") == "summary"
+            for item in usage
+        )
+        subagent_model_calls = sum(
+            str(item.metadata.get("request_kind", "") or "") == "subagent"
+            for item in usage
+        )
+    else:
+        main_model_calls = len(requests)
+        summary_model_calls = max(total_model_calls - main_model_calls, 0)
+        subagent_model_calls = 0
     return {
         "selected_tool_count": max(
             (
@@ -240,14 +296,41 @@ def _model_request_stats(
         ),
         "model_calls": main_model_calls,
         "main_model_calls": main_model_calls,
-        "summary_model_calls": max(total_model_calls - main_model_calls, 0),
+        "summary_model_calls": summary_model_calls,
+        "subagent_model_calls": subagent_model_calls,
         "total_model_calls": total_model_calls,
+    }
+
+
+def _subagent_stats(state: AgentRunState) -> dict[str, int]:
+    batches = [item for item in state.metrics if item.kind == "subagent_batch"]
+    return {
+        "subagent_tasks": sum(
+            max(int(item.metadata.get("tasks", 0) or 0), 0) for item in batches
+        ),
+        "subagent_completed": sum(
+            max(int(item.metadata.get("completed", 0) or 0), 0) for item in batches
+        ),
+        "subagent_failed": sum(
+            max(int(item.metadata.get("failed", 0) or 0), 0) for item in batches
+        ),
+        "subagent_input_tokens": sum(
+            max(int(item.metadata.get("input_tokens", 0) or 0), 0)
+            for item in batches
+        ),
+        "subagent_output_tokens": sum(
+            max(int(item.metadata.get("output_tokens", 0) or 0), 0)
+            for item in batches
+        ),
+        "subagent_wall_ms": sum(
+            max(int(item.metadata.get("wall_ms", 0) or 0), 0) for item in batches
+        ),
     }
 
 
 def _token_estimate_stats(
     timeline: list[AgentRuntimeTimelineItem],
-) -> dict[str, int | float | str]:
+) -> dict[str, Any]:
     usage = [item for item in timeline if item.kind == "model_usage"]
     if not usage:
         return {}
@@ -265,6 +348,25 @@ def _token_estimate_stats(
     }
     sources.discard("")
     source = next(iter(sources)) if len(sources) == 1 else "mixed"
+    cache_observed = [
+        item for item in usage if bool(item.metadata.get("provider_cache_observed"))
+    ]
+    observed_prompt_tokens = sum(
+        max(int(item.metadata.get("provider_prompt_tokens", 0) or 0), 0)
+        for item in cache_observed
+    )
+    cached_prompt_tokens = sum(
+        min(
+            max(int(item.metadata.get("provider_cached_prompt_tokens", 0) or 0), 0),
+            max(int(item.metadata.get("provider_prompt_tokens", 0) or 0), 0),
+        )
+        for item in cache_observed
+    )
+    cache_phases = Counter(
+        normalize_message_text(str(item.metadata.get("cache_phase", "") or ""))
+        for item in usage
+    )
+    cache_phases.pop("", None)
     return {
         "estimated_prompt_tokens": estimated,
         "provider_prompt_tokens": provider,
@@ -272,15 +374,35 @@ def _token_estimate_stats(
         if provider and sources == {"provider"}
         else None,
         "estimate_source": source or "local",
+        "cached_prompt_tokens": cached_prompt_tokens,
+        "uncached_prompt_tokens": max(
+            observed_prompt_tokens - cached_prompt_tokens,
+            0,
+        ),
+        "weighted_cache_hit_rate": round(
+            cached_prompt_tokens / observed_prompt_tokens,
+            4,
+        )
+        if observed_prompt_tokens
+        else None,
+        "cache_observed_model_calls": len(cache_observed),
+        "cache_unknown_model_calls": len(usage) - len(cache_observed),
+        "cache_phase_model_calls": dict(sorted(cache_phases.items())),
+        "appended_message_tokens": sum(
+            max(int(item.metadata.get("appended_message_tokens", 0) or 0), 0)
+            for item in usage
+        ),
+        "appended_tool_result_tokens": sum(
+            max(int(item.metadata.get("appended_tool_result_tokens", 0) or 0), 0)
+            for item in usage
+        ),
     }
 
 
 def _side_effect_stats(state: AgentRunState) -> dict[str, int]:
     records = list(state.tool_executions)
     executed = [
-        item
-        for item in records
-        if item.status in {"completed", "failed", "cancelled"}
+        item for item in records if item.status in {"completed", "failed", "cancelled"}
     ]
     fingerprints = Counter(
         str(item.fingerprint) for item in executed if str(item.fingerprint or "")
@@ -300,14 +422,39 @@ def _side_effect_stats(state: AgentRunState) -> dict[str, int]:
     }
 
 
+def _web_stats(state: AgentRunState) -> dict[str, Any]:
+    usage = [item for item in state.metrics if item.kind == "model_usage"]
+    observations = state.runtime_observations()
+    return {
+        "native_web_search_exposed": any(
+            bool(item.metadata.get("native_web_search_exposed")) for item in usage
+        ),
+        "web_search_used": any(
+            bool(item.metadata.get("web_search_used")) for item in usage
+        ),
+        "web_fetch_calls": sum(
+            item.kind == "tool_call" and item.tool_name == "web_fetch"
+            for item in state.metrics
+        ),
+        "web_citation_count": sum(
+            max(int(item.metadata.get("web_citation_count", 0) or 0), 0)
+            for item in usage
+        ),
+        "web_fetch_truncated": sum(
+            observation.tool_name == "web_fetch"
+            and bool((observation.output or {}).get("truncated"))
+            for observation in observations
+        ),
+    }
+
+
 def _compression_stats(
     timeline: list[AgentRuntimeTimelineItem],
 ) -> dict[str, int]:
     successful = [
         item
         for item in timeline
-        if item.kind
-        in {"semantic_context_compression", "context_tool_results_pruned"}
+        if item.kind in {"semantic_context_compression", "context_tool_results_pruned"}
     ]
     semantic = [
         item for item in successful if item.kind == "semantic_context_compression"
@@ -352,12 +499,17 @@ def _tool_call_payloads(
     for item in timeline:
         if item.kind != "tool_call":
             continue
+        arguments = (
+            {"url": "<omitted>"}
+            if item.tool_name == "web_fetch"
+            else _compact_value(item.metadata.get("arguments"))
+        )
         payloads.append(
             _drop_empty(
                 {
                     "step": item.metadata.get("step"),
                     "tool_name": item.tool_name,
-                    "arguments": _compact_value(item.metadata.get("arguments")),
+                    "arguments": arguments,
                 }
             )
         )
@@ -394,6 +546,16 @@ def _timeline_digest(
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in timeline[-_MAX_TIMELINE_ITEMS:]:
+        metadata = item.metadata
+        if item.tool_name == "web_fetch":
+            metadata = {
+                "step": item.metadata.get("step"),
+                "status": (
+                    (item.metadata.get("output") or {}).get("status")
+                    if isinstance(item.metadata.get("output"), dict)
+                    else ""
+                ),
+            }
         result.append(
             _drop_empty(
                 {
@@ -401,7 +563,7 @@ def _timeline_digest(
                     "kind": item.kind,
                     "tool_name": item.tool_name,
                     "content": _clip(item.content, limit=240),
-                    "metadata": _compact_value(item.metadata, limit=600),
+                    "metadata": _compact_value(metadata, limit=600),
                 }
             )
         )
@@ -543,6 +705,7 @@ __all__ = [
     "build_agent_trajectory_record",
     "latest_trajectory_record",
     "load_trajectory_records",
+    "record_agent_control_trajectory",
     "record_agent_trajectory",
     "trajectory_jsonl_path",
 ]

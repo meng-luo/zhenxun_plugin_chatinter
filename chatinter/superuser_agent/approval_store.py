@@ -181,9 +181,9 @@ def get_pending_approval(
         _PENDING_APPROVALS.pop(key, None)
         _save_approvals()
         return None
-    if approval.user_id != str(user_id or ""):
+    if not _same_private_identity(approval.user_id, user_id):
         return None
-    if approval.session_key != str(session_key or ""):
+    if not _same_private_identity(approval.session_key, session_key):
         return None
     return approval
 
@@ -198,8 +198,8 @@ def list_pending_approvals(
     return [
         approval
         for approval in _PENDING_APPROVALS.values()
-        if approval.user_id == str(user_id or "")
-        and approval.session_key == str(session_key or "")
+        if _same_private_identity(approval.user_id, user_id)
+        and _same_private_identity(approval.session_key, session_key)
     ]
 
 
@@ -219,9 +219,9 @@ def _pop_pending_approval(
         _PENDING_APPROVALS.pop(key, None)
         _save_approvals()
         return None
-    if approval.user_id != str(user_id or ""):
+    if not _same_private_identity(approval.user_id, user_id):
         return None
-    if approval.session_key != str(session_key or ""):
+    if not _same_private_identity(approval.session_key, session_key):
         return None
     popped = _PENDING_APPROVALS.pop(key, None)
     _save_approvals()
@@ -277,7 +277,22 @@ def _ensure_loaded() -> None:
 def _conversation_key(approval: PendingApproval) -> tuple[str, str, str]:
     payload = approval.payload if isinstance(approval.payload, dict) else {}
     run_id = str(payload.get("run_id") or payload.get("trace_id") or "")
-    return approval.user_id, approval.session_key, run_id
+    return (
+        _private_identity(approval.user_id),
+        _private_identity(approval.session_key),
+        run_id,
+    )
+
+
+def _same_private_identity(left: object, right: object) -> bool:
+    return _private_identity(left) == _private_identity(right)
+
+
+def _private_identity(value: object) -> str:
+    text = str(value or "").strip()
+    if text.casefold().startswith("private:") and text[8:]:
+        return text[8:]
+    return text
 
 
 def _approval_from_payload(

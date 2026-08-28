@@ -13,17 +13,26 @@ instead of binding this layer to one adapter package.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 import inspect
 import re
+import time
 from typing import Any
 
-from zhenxun.services.ai.core.exceptions import ContextLengthExceededException
+from zhenxun.services.ai.core.exceptions import (
+    ContextLengthExceededException,
+    LLMException,
+)
 from zhenxun.services.log import logger
 
 _LOG_COMMAND = "ChatInterFailover"
+
+
+class CandidatePromptNotFitError(ValueError):
+    pass
 
 
 class LLMFailureKind(str, Enum):
@@ -62,6 +71,8 @@ def classify_llm_error(exc: BaseException) -> LLMFailureKind:
     chain = _exception_chain(exc)
     type_names = tuple(type(item).__name__ for item in chain)
     text = "\n".join(f"{type(item).__name__}: {item}" for item in chain)
+    if any(isinstance(item, CandidatePromptNotFitError) for item in chain):
+        return LLMFailureKind.FALLBACK_ELIGIBLE
     if any(isinstance(item, ContextLengthExceededException) for item in chain):
         return LLMFailureKind.CONTEXT_OVERFLOW
     if _CONTEXT_PATTERNS.search(text):
@@ -110,14 +121,95 @@ class FailoverOutcome:
     response: Any
     used_model: str | None
     attempts: list[FailoverAttempt]
+    skipped_models: tuple[str, ...] = ()
 
     @property
     def switched(self) -> bool:
-        return bool(self.attempts)
+        return bool(self.attempts or self.skipped_models)
 
 
 _MAX_TRANSIENT_RETRIES = 2
 _BACKOFF_SECONDS = (1.0, 2.5)
+_PROVIDER_HEALTH_COOLDOWN_SECONDS = 30.0
+_PROVIDER_HEALTH_COOLDOWN_MAX = 64
+_provider_health_cooldowns: OrderedDict[str, float] = OrderedDict()
+
+
+def _candidate_health_key(model: str | None) -> str:
+    return str(model or "<default>").strip().casefold() or "<default>"
+
+
+def _prune_provider_health_cooldowns(now: float) -> None:
+    expired = [
+        key
+        for key, deadline in _provider_health_cooldowns.items()
+        if deadline <= now
+    ]
+    for key in expired:
+        _provider_health_cooldowns.pop(key, None)
+    while len(_provider_health_cooldowns) > _PROVIDER_HEALTH_COOLDOWN_MAX:
+        _provider_health_cooldowns.popitem(last=False)
+
+
+def _mark_provider_unhealthy(model: str | None) -> None:
+    now = time.monotonic()
+    key = _candidate_health_key(model)
+    _prune_provider_health_cooldowns(now)
+    _provider_health_cooldowns.pop(key, None)
+    _provider_health_cooldowns[key] = now + _PROVIDER_HEALTH_COOLDOWN_SECONDS
+    _prune_provider_health_cooldowns(now)
+
+
+def _clear_provider_cooldown(model: str | None) -> None:
+    _provider_health_cooldowns.pop(_candidate_health_key(model), None)
+
+
+def _should_cooldown(exc: BaseException, kind: LLMFailureKind) -> bool:
+    if kind is not LLMFailureKind.TRANSIENT:
+        return False
+    chain = _exception_chain(exc)
+    llm_errors = [item for item in chain if isinstance(item, LLMException)]
+    if llm_errors:
+        return any(item.is_retryable for item in llm_errors)
+    for item in chain:
+        if isinstance(item, PermissionError | TypeError | ValueError | LookupError):
+            return False
+        type_name = type(item).__name__.casefold()
+        if any(
+            marker in type_name
+            for marker in (
+                "validation",
+                "permission",
+                "invalidrequest",
+                "configuration",
+            )
+        ):
+            return False
+    return True
+
+
+def _available_candidate_chain(
+    chain: list[str | None],
+) -> tuple[list[str | None], tuple[str, ...]]:
+    now = time.monotonic()
+    _prune_provider_health_cooldowns(now)
+    available: list[str | None] = []
+    cooling: list[tuple[int, str | None, float]] = []
+    for index, model in enumerate(chain):
+        deadline = _provider_health_cooldowns.get(_candidate_health_key(model))
+        if deadline is None:
+            available.append(model)
+        else:
+            cooling.append((index, model, deadline))
+    if available:
+        return available, tuple(str(model or "<default>") for _, model, _ in cooling)
+    _, probe_model, _ = min(cooling, key=lambda item: (item[2], item[0]))
+    skipped = tuple(
+        str(model or "<default>")
+        for _, model, _ in cooling
+        if model != probe_model
+    )
+    return [probe_model], skipped
 
 
 async def request_with_failover(
@@ -141,6 +233,7 @@ async def request_with_failover(
     """
     attempts: list[FailoverAttempt] = []
     chain: list[str | None] = [primary_model, *fallback_models]
+    chain, skipped_models = _available_candidate_chain(chain)
     compressed_models: set[str] = set()
     max_transient_retries = max(int(transient_retries), 0)
 
@@ -150,10 +243,12 @@ async def request_with_failover(
         while True:
             try:
                 response = await request_fn(model)
+                _clear_provider_cooldown(model)
                 return FailoverOutcome(
                     response=response,
                     used_model=model,
                     attempts=attempts,
+                    skipped_models=skipped_models,
                 )
             except BaseException as exc:
                 if isinstance(exc, asyncio.CancelledError):
@@ -186,6 +281,8 @@ async def request_with_failover(
                         )
                         transient_retry_count += 1
                         continue
+                    if _should_cooldown(exc, kind):
+                        _mark_provider_unhealthy(model)
                 elif kind is LLMFailureKind.CONTEXT_OVERFLOW:
                     model_key = str(model or "<default>")
                     if compress_fn is not None and model_key not in compressed_models:
@@ -194,8 +291,6 @@ async def request_with_failover(
                         if inspect.isawaitable(compressed):
                             await compressed
                         continue
-
-
                 break
         if chain_index + 1 < len(chain):
             logger.info(
@@ -207,6 +302,7 @@ async def request_with_failover(
 
 
 __all__ = [
+    "CandidatePromptNotFitError",
     "FailoverAttempt",
     "FailoverOutcome",
     "LLMFailureKind",

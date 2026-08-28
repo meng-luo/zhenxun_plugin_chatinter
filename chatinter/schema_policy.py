@@ -1,41 +1,10 @@
 from dataclasses import dataclass, field
-import re
 
 from .route_text import normalize_message_text
 from .target_policy import TargetPolicy
 
 _SELF_ONLY_SCOPE = "self_only"
 _AT_SOURCE = "at"
-_MEDIA_TERMS = (
-    "图片",
-    "图",
-    "照片",
-    "头像",
-    "表情",
-    "表情包",
-    "梗图",
-    "image",
-    "img",
-    "photo",
-    "avatar",
-    "meme",
-)
-_USER_TARGET_TERMS = (
-    "@",
-    "at",
-    "user",
-    "member",
-    "target",
-    "nickname",
-    "用户",
-    "成员",
-    "群友",
-    "目标",
-    "对象",
-    "昵称",
-)
-
-
 @dataclass(frozen=True)
 class CommandTargetPolicy:
     actor_scope: str
@@ -45,7 +14,6 @@ class CommandTargetPolicy:
     allow_image: bool = False
     allow_reply_image: bool = False
     media_related_value: bool = False
-    target_missing_message_value: str = ""
     adapter_policy: TargetPolicy = field(default_factory=TargetPolicy)
 
     @property
@@ -74,14 +42,6 @@ class CommandTargetPolicy:
     def require_target_for_third_person(self) -> bool:
         return self.adapter_policy.require_target_for_third_person
 
-    @property
-    def target_missing_message(self) -> str:
-        return (
-            self.target_missing_message_value
-            or self.adapter_policy.target_missing_message
-        )
-
-
 def resolve_command_target_policy(
     schema,
     *,
@@ -102,9 +62,6 @@ def resolve_command_target_policy(
     ).lower()
     if target_requirement not in {"none", "optional", "required"}:
         target_requirement = "none"
-    schema_text = _schema_text(schema)
-    media_related = _contains_any(schema_text, _MEDIA_TERMS)
-    user_target_related = _contains_user_target_term(schema_text)
     try:
         image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
     except Exception:
@@ -126,13 +83,13 @@ def resolve_command_target_policy(
         or (image_max is not None and image_max > 0)
         or bool(requires.get("image"))
         or payload_policy in {"image_only", "text_or_image"}
-        or media_related
     )
     slot_types = {
         normalize_message_text(str(getattr(slot, "type", "") or "")).lower()
         for slot in (getattr(schema, "slots", None) or [])
     }
-    has_target_slot = "at" in slot_types or user_target_related
+    accepts_image_target = accepts_image_target or "image" in slot_types
+    has_target_slot = "at" in slot_types
     if has_target_slot and target_requirement == "none":
         if any(
             bool(getattr(slot, "required", False))
@@ -171,7 +128,6 @@ def resolve_command_target_policy(
             media_related=adapter.media_related,
             allow_image_as_target=adapter.allow_image_as_target,
             allow_reply_image_as_target=adapter.allow_reply_image_as_target,
-            target_missing_message=adapter.target_missing_message,
         )
     return CommandTargetPolicy(
         actor_scope=actor_scope,
@@ -179,14 +135,8 @@ def resolve_command_target_policy(
         target_sources=target_sources,
         allow_at=allow_at,
         allow_image=accepts_image_target,
-        allow_reply_image=accepts_image_target
-        or "reply" in target_sources
-        or bool(requires.get("reply")),
-        media_related_value=media_related or accepts_image_target,
-        target_missing_message_value=_generic_target_missing_message(
-            allow_at=allow_at,
-            allow_image=accepts_image_target,
-        ),
+        allow_reply_image=accepts_image_target,
+        media_related_value=accepts_image_target,
         adapter_policy=adapter,
     )
 
@@ -206,58 +156,4 @@ def _disable_media_target_adapter(adapter: TargetPolicy) -> TargetPolicy:
         allow_image_as_target=False,
         allow_reply_image_as_target=False,
         require_target_for_third_person=False,
-        target_missing_message=adapter.target_missing_message,
     )
-
-
-def _schema_text(schema) -> str:
-    parts: list[str] = [
-        str(getattr(schema, "command", "") or ""),
-        str(getattr(schema, "head", "") or ""),
-        str(getattr(schema, "description", "") or ""),
-        str(getattr(schema, "render", "") or ""),
-        str(getattr(schema, "payload_policy", "") or ""),
-        str(getattr(schema, "command_role", "") or ""),
-    ]
-    parts.extend(str(item or "") for item in (getattr(schema, "params", None) or []))
-    parts.extend(str(item or "") for item in (getattr(schema, "aliases", None) or []))
-    parts.extend(
-        str(item or "") for item in (getattr(schema, "retrieval_phrases", None) or [])
-    )
-    for slot in getattr(schema, "slots", None) or []:
-        parts.append(str(getattr(slot, "name", "") or ""))
-        parts.append(str(getattr(slot, "description", "") or ""))
-        parts.extend(str(item or "") for item in (getattr(slot, "aliases", None) or []))
-    return normalize_message_text(" ".join(parts)).casefold()
-
-
-def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
-    lowered = normalize_message_text(text).casefold()
-    return any(term.casefold() in lowered for term in terms)
-
-
-def _contains_user_target_term(text: str) -> bool:
-    lowered = normalize_message_text(text).casefold()
-    if not lowered:
-        return False
-    if "@" in lowered:
-        return True
-    cjk_terms = tuple(term for term in _USER_TARGET_TERMS if not term.isascii())
-    if _contains_any(lowered, cjk_terms):
-        return True
-    ascii_terms = {
-        term for term in _USER_TARGET_TERMS if term.isascii() and term != "@"
-    }
-    return any(token in ascii_terms for token in re.findall(r"[a-z]+", lowered))
-
-
-def _generic_target_missing_message(*, allow_at: bool, allow_image: bool) -> str:
-    if allow_at and allow_image:
-        return (
-            "这个命令需要明确目标，请重新发送完整命令并@目标成员，或补充图片/回复图片。"
-        )
-    if allow_at:
-        return "这个命令需要明确目标，请重新发送完整命令并@目标成员或写清昵称。"
-    if allow_image:
-        return "这个命令需要图片上下文，请重新发送完整命令并附上图片，或回复一张图片。"
-    return ""

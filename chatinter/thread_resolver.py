@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import time
 
 from .addressee_resolver import AddresseeResult
 from .event_context import ChatInterEventContext
@@ -13,9 +12,6 @@ from .thread_store import (
     get_thread_by_message,
 )
 
-_THREAD_TTL = 20 * 60.0
-_THREAD_CACHE_MAX = 512
-_thread_cache: dict[str, tuple[float, "ThreadContext"]] = {}
 _PENDING_FOLLOWUP_HINTS = (
     "那个",
     "那位",
@@ -53,8 +49,6 @@ async def resolve_thread_context(
     event_context: ChatInterEventContext,
     addressee: AddresseeResult,
 ) -> ThreadContext:
-    now = time.monotonic()
-    _trim_cache(now)
     group_key = event_context.group_id or f"private:{event_context.user_id}"
     participants = _participants(event_context, addressee)
 
@@ -73,7 +67,6 @@ async def resolve_thread_context(
                 pending_entities=stored.pending_entities,
                 entity_hints=stored.entity_hints,
             )
-            _thread_cache[ctx.thread_id] = (now, ctx)
             return ctx
         seed = f"reply:{group_key}:{event_context.reply.message_id}"
         ctx = ThreadContext(
@@ -83,7 +76,6 @@ async def resolve_thread_context(
             related_user_ids=participants,
             topic_key=_topic_key(event_context.normalized_text),
         )
-        _thread_cache[ctx.thread_id] = (now, ctx)
         return ctx
 
     topic_key = _topic_key(event_context.normalized_text)
@@ -102,7 +94,6 @@ async def resolve_thread_context(
             pending_entities=stored.pending_entities,
             entity_hints=stored.entity_hints,
         )
-        _thread_cache[ctx.thread_id] = (now, ctx)
         return ctx
 
     if _is_pending_entity_followup(event_context.normalized_text):
@@ -120,7 +111,6 @@ async def resolve_thread_context(
                 pending_entities=stored.pending_entities,
                 entity_hints=stored.entity_hints,
             )
-            _thread_cache[ctx.thread_id] = (now, ctx)
             return ctx
 
     target_id = addressee.target_user_id or "broadcast"
@@ -132,16 +122,12 @@ async def resolve_thread_context(
         related_user_ids=participants,
         topic_key=topic_key,
     )
-    _thread_cache[ctx.thread_id] = (now, ctx)
     return ctx
 
 
 def format_thread_xml(thread: ThreadContext) -> list[str]:
     lines = ["<thread>"]
-    lines.append(f"thread_id={thread.thread_id}")
-    lines.append(f"source={thread.source}")
-    lines.append(f"confidence={thread.confidence:.2f}")
-    if thread.topic_key:
+    if thread.topic_key and thread.source not in {"topic", "reply"}:
         lines.append(f"topic_key={_xml_escape(thread.topic_key)}")
     if thread.related_user_ids:
         lines.append(f"related_user_ids={','.join(thread.related_user_ids)}")
@@ -149,8 +135,6 @@ def format_thread_xml(thread: ThreadContext) -> list[str]:
         lines.append(
             f"pending_entities={_xml_escape('、'.join(thread.pending_entities))}"
         )
-    if thread.entity_hints:
-        lines.append(f"entity_hints={_xml_escape('、'.join(thread.entity_hints))}")
     lines.append("</thread>")
     return lines
 
@@ -186,20 +170,6 @@ def _is_pending_entity_followup(text: str) -> bool:
 
 def _stable_thread_id(seed: str) -> str:
     return hashlib.blake2s(seed.encode("utf-8"), digest_size=6).hexdigest()
-
-
-def _trim_cache(now: float) -> None:
-    expired = [key for key, (ts, _) in _thread_cache.items() if now - ts > _THREAD_TTL]
-    for key in expired:
-        _thread_cache.pop(key, None)
-    if len(_thread_cache) <= _THREAD_CACHE_MAX:
-        return
-    evict_count = len(_thread_cache) - _THREAD_CACHE_MAX
-    for key in sorted(
-        _thread_cache,
-        key=lambda item: _thread_cache[item][0],
-    )[:evict_count]:
-        _thread_cache.pop(key, None)
 
 
 def _xml_escape(value: str) -> str:

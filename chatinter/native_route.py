@@ -81,6 +81,9 @@ class NativeRouteReport:
             len(candidates),
         )
 
+    def note_tool_choice(self) -> None:
+        self.tool_choice_count += 1
+
     def note_candidate_policy(self, *, reason: str, limit: int) -> None:
         self.candidate_policy_reason = normalize_message_text(reason)[:120]
         self.candidate_policy_limit = max(int(limit or 0), 0)
@@ -193,7 +196,7 @@ def candidate_selection_to_native_route(
         missing.extend(render_missing)
         missing.extend(_missing_context(schema, message_text, has_reply=has_reply))
         missing = list(dict.fromkeys(item for item in missing if item))
-        action = "clarify" if selection.action == "clarify" or missing else "execute"
+        action = "execute"
 
     command = rendered or normalize_message_text(schema.head)
     decision = NativeRouteDecision(

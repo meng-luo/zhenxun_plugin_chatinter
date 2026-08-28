@@ -9,6 +9,8 @@ from pathlib import Path
 import threading
 from typing import Any
 
+from zhenxun.utils.log_sanitizer import sanitize_for_logging
+
 _AUDIT_LOG_PATH = Path("data/log/chatinter_agent_audit.log")
 _MAX_QUERY_LINES = 2000
 _MAX_LOG_BYTES = 2_000_000
@@ -48,6 +50,9 @@ def record_audit_event(
         "payload": _compact_value(payload or {}),
         "result": _compact_value(result or {}),
     }
+    sanitized = sanitize_for_logging(entry)
+    if isinstance(sanitized, dict):
+        entry = sanitized
     try:
         with _AUDIT_LOCK:
             _AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)

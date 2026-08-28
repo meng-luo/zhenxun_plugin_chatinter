@@ -6,8 +6,8 @@ from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
 _INTERNAL_REPLY_BLOCK_PATTERN = re.compile(
-    r"<(response_guidance|persona|event_context|context_layers|"
-    r"current_message_layers|chatroom_history|long_term_memory)\b[^>]*>"
+    r"<(response_guidance|persona|past_actions|event_context|context_layers|"
+    r"current_message_layers|quoted_message|chatroom_history|long_term_memory)\b[^>]*>"
     r".*?</\1>",
     re.IGNORECASE | re.DOTALL,
 )
@@ -17,9 +17,7 @@ _PLACEHOLDER_PATTERN = re.compile(
 )
 _STICKY_TOKEN_PATTERN = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 
-INVOKE_PREFIXES = (
-    "小真寻",
-    "真寻",
+_GENERIC_INVOKE_PREFIXES = (
     "机器人",
     "bot",
     "帮我",
@@ -180,38 +178,6 @@ EXECUTE_WORDS = (
     "发送",
 )
 
-STRONG_EXECUTE_WORDS = (
-    "帮我",
-    "请",
-    "麻烦",
-    "执行",
-    "调用",
-    "给我",
-    "来个",
-    "来一张",
-    "来一个",
-    "再来个",
-    "再来一张",
-    "再来一个",
-    "做个",
-    "做一张",
-    "做一个",
-    "生成",
-    "制作",
-    "发送",
-    "启动",
-    "打开",
-    "关闭",
-    "开启",
-    "禁用",
-    "设置",
-    "查",
-    "查询",
-    "看看",
-    "看下",
-    "点播",
-)
-
 ROUTE_ACTION_WORDS = (
     "帮我",
     "请",
@@ -336,23 +302,6 @@ TEMPLATE_ROUTE_HINT_WORDS = (
     "[image",
     "[@",
 )
-
-KNOWLEDGE_REFRESH_WORDS = (
-    "表情",
-    "梗图",
-    "meme",
-    "命令",
-    "插件",
-    "调用",
-    "怎么用",
-    "如何用",
-    "生成",
-    "制作",
-    "启动",
-    "开关",
-)
-
-
 
 ACTION_REWRITES: tuple[tuple[str, str], ...] = ()
 
@@ -595,8 +544,6 @@ def _find_short_noise_head_boundary(text: str, command: str) -> int | None:
     if not compact_command or len(compact_command) > 4:
         return None
 
-
-
     if len(compact_command) <= 2:
         return None
 
@@ -656,12 +603,13 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
 def invoke_prefix_variants(text: str) -> tuple[str, ...]:
     stripped = normalize_message_text(text)
     variants: list[str] = []
+    prefixes = _invoke_prefixes()
     while stripped:
         variants.append(stripped)
         matched = next(
             (
                 prefix
-                for prefix in INVOKE_PREFIXES
+                for prefix in prefixes
                 if stripped.lower().startswith(prefix.lower())
             ),
             None,
@@ -671,6 +619,61 @@ def invoke_prefix_variants(text: str) -> tuple[str, ...]:
         stripped = normalize_message_text(stripped[len(matched) :])
     variants.append(stripped)
     return tuple(dict.fromkeys(variants))
+
+
+def _invoke_prefixes() -> tuple[str, ...]:
+    return (*_configured_bot_names(), *_GENERIC_INVOKE_PREFIXES)
+
+
+def _configured_bot_names() -> tuple[str, ...]:
+    names: set[str] = set()
+    try:
+        import nonebot
+
+        config = nonebot.get_driver().config
+        configured = getattr(config, "nickname", ()) or ()
+        if isinstance(configured, str):
+            configured = (configured,)
+        names.update(
+            normalized
+            for item in configured
+            if (normalized := normalize_message_text(str(item or "")))
+        )
+        self_nickname = normalize_message_text(
+            str(getattr(config, "self_nickname", "") or "")
+        )
+        if self_nickname:
+            names.add(self_nickname)
+    except (RuntimeError, ValueError):
+        pass
+    return tuple(sorted(names, key=lambda item: (-len(item), item)))
+
+
+def strip_bot_name_prefix(text: str) -> str:
+    """Remove configured bot names without consuming semantic request words."""
+
+    stripped = normalize_message_text(text)
+    while stripped:
+        matched = next(
+            (
+                name
+                for name in _configured_bot_names()
+                if stripped.casefold().startswith(name.casefold())
+                and not (
+                    name[-1:].isascii()
+                    and name[-1:].isalnum()
+                    and len(stripped) > len(name)
+                    and stripped[len(name)].isascii()
+                    and stripped[len(name)].isalnum()
+                )
+            ),
+            None,
+        )
+        if matched is None:
+            break
+        stripped = normalize_message_text(stripped[len(matched) :])
+        stripped = stripped.lstrip(" ,，.。!！?？:：;；、")
+    return stripped
 
 
 def strip_invoke_prefix(text: str) -> str:
@@ -1089,53 +1092,6 @@ def sanitize_template_tail(tail: str) -> str:
     return cleaned
 
 
-def _is_explicit_command_request(text: str, commands: list[str]) -> bool:
-    if not text or not commands:
-        return False
-    normalized = normalize_message_text(normalize_action_phrases(text))
-    stripped = normalize_message_text(strip_invoke_prefix(normalized))
-    lowered = normalized.lower()
-    for command in commands:
-        cmd = normalize_message_text(command)
-        if not cmd:
-            continue
-        if match_command_head_fuzzy(stripped, cmd) or match_command_head_fuzzy(
-            normalized,
-            cmd,
-        ):
-            return True
-        if len(cmd) >= 2 and cmd.lower() in lowered:
-            return True
-    return False
-
-
-def should_force_knowledge_refresh(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> bool:
-    normalized_message = normalize_message_text(message_text)
-    if not normalized_message:
-        return False
-
-    plugin_count = len(knowledge_base.plugins)
-    if plugin_count <= 2 and contains_any(normalized_message, KNOWLEDGE_REFRESH_WORDS):
-        return True
-
-    if plugin_count <= 8 and contains_any(normalized_message, STRONG_EXECUTE_WORDS):
-        all_commands = [
-            cmd.strip()
-            for plugin in knowledge_base.plugins
-            for cmd in plugin.commands
-            if cmd and cmd.strip()
-        ]
-        if all_commands and not _is_explicit_command_request(
-            normalized_message, all_commands
-        ):
-            return True
-
-    return False
-
-
 __all__ = [
     "ROUTE_ACTION_WORDS",
     "RouteCommandMatch",
@@ -1155,7 +1111,6 @@ __all__ = [
     "parse_command_with_head",
     "rewrite_command_with_head",
     "sanitize_template_tail",
-    "should_force_knowledge_refresh",
     "should_try_weak_llm_assist",
     "strip_invoke_prefix",
 ]

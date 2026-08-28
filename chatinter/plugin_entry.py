@@ -9,10 +9,22 @@ ChatInter - AI 意图识别插件
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from functools import wraps
+from typing import Any
 
-from nonebot import get_driver, on_message
+from nonebot import on_message
 from nonebot.adapters import Bot, Event
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import (
+    Bot as OneBotV11Bot,
+)
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    Message,
+    PrivateMessageEvent,
+)
+from nonebot.matcher import Matcher
+from nonebot.message import run_postprocessor
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
@@ -25,20 +37,26 @@ from zhenxun.configs.utils import Command, PluginExtraData
 from zhenxun.models.chat_history import ChatHistory as _ChatHistory  # noqa: F401
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
-from .config import CHATINTER_REGISTER_CONFIGS
+from .config import CHATINTER_REGISTER_CONFIGS, chatinter_available
 from .event_runtime import (
     event_is_private,
     is_already_handled,
     mark_as_handled,
     resolve_superuser,
 )
-from .event_signals import get_event_signal
+from .event_signals import get_event_signal, set_event_signal
 from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
-from .lifecycle import ensure_lifecycle_hooks_registered
+from .history_policy import (
+    history_foreground_arrived,
+    schedule_pending_history_summary_jobs,
+    shutdown_history_summary_tasks,
+)
 from .memory import _chat_memory
+from .mode_gate import MixedTurnAdmission, get_mode_gate
 from .models import chat_history as _chatinter_models  # noqa: F401
 from .plugin_registry import PluginRegistry
 from .reflection_observer import render_reflection_observer_summary
@@ -48,9 +66,52 @@ from .turn_metrics import render_route_observer_summary
 from .turn_queue import get_turn_queue
 from .utils.unimsg_utils import uni_to_text_with_tags
 
-driver = get_driver()
-_DYNAMIC_MATCHER_RESCAN_DELAYS = (8,)
+_DYNAMIC_MATCHER_RESCAN_DELAY_SECONDS = 10.0
 _dynamic_rescan_task: asyncio.Task | None = None
+
+
+def _event_observing_sender(
+    sender: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
+    @wraps(sender)
+    async def observed(bot: Bot, event: Event, message: Any, **kwargs: Any) -> Any:
+        result = await sender(bot, event, message, **kwargs)
+        set_event_signal(event, "_zx_visible_output_sent", True)
+        return result
+
+    setattr(observed, "_chatinter_event_send_observer", True)
+    return observed
+
+
+def _patch_onebot_event_send_observer() -> None:
+    current = OneBotV11Bot.send
+    if getattr(current, "_chatinter_event_send_observer", False):
+        return
+    OneBotV11Bot.send = _event_observing_sender(current)  # type: ignore[method-assign]
+
+
+_patch_onebot_event_send_observer()
+
+
+@run_postprocessor
+async def _observe_rerouted_plugin_execution(
+    matcher: Matcher,
+    event: Event,
+    exception: Exception | None = None,
+) -> None:
+    target_modules = get_event_signal(event, "_ai_route_modules", frozenset())
+    if not isinstance(target_modules, set | frozenset) or not target_modules:
+        return
+    plugin = matcher.plugin
+    identifiers = {
+        str(getattr(plugin, key, "") or "").strip()
+        for key in ("name", "module_name")
+        if str(getattr(plugin, key, "") or "").strip()
+    }
+    if identifiers.intersection(target_modules):
+        set_event_signal(event, "_ai_plugin_execution_started", True)
+        if exception is not None:
+            set_event_signal(event, "_ai_plugin_execution_failed", True)
 
 
 __plugin_meta__ = PluginMetadata(
@@ -61,7 +122,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="Copaan & meng-luo",
-        version="1.4.0",
+        version="1.5.0",
         plugin_type=PluginType.DEPENDANT,
         menu_type="其他",
         ignore_prompt=True,
@@ -198,11 +259,41 @@ _fallback_matcher = on_message(
     block=True,
     rule=to_me(),
 )
+_reaction_observer = on_message(priority=1, block=False)
 
-_turn_followup_matcher = on_message(
-    priority=998,
-    block=False,
-)
+
+@_reaction_observer.handle()
+async def _observe_group_reaction_images(
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    msg: UniMsg,
+) -> None:
+    if session.group is None or session.user is None:
+        return
+    group_id = str(session.group.id)
+    sender_id = str(session.user.id)
+    if not group_id or not sender_id or sender_id == str(bot.self_id):
+        return
+    if not chatinter_available(group_id):
+        return
+    from .reaction_runtime import reaction_settings, schedule_reaction_observation
+
+    settings = reaction_settings()
+    if not settings.enabled or not settings.auto_discovery:
+        return
+    event_id = str(getattr(event, "message_id", "") or "")
+    if not event_id:
+        try:
+            event_id = str(event.get_event_id())
+        except Exception:
+            event_id = ""
+    schedule_reaction_observation(
+        group_id=group_id,
+        sender_id=sender_id,
+        message_id=event_id,
+        message=msg,
+    )
 
 
 def _is_supported_private_message(
@@ -291,6 +382,31 @@ def _extract_raw_message(
     return raw_message
 
 
+async def _process_queued_fallback(
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    raw_message: str,
+    message=None,
+    route_modules: set[str] | None = None,
+    cached_plain_text: str | None = None,
+    queued: bool = False,
+) -> None:
+    try:
+        await handle_fallback(
+            bot,
+            event,
+            session,
+            raw_message,
+            message,
+            route_modules=route_modules,
+            cached_plain_text=cached_plain_text,
+            queued=queued,
+        )
+    finally:
+        schedule_pending_history_summary_jobs()
+
+
 @_fallback_matcher.handle()
 async def _handle_fallback(
     bot: Bot,
@@ -303,7 +419,14 @@ async def _handle_fallback(
 
     当消息未被其他插件处理时，使用 AI 分析用户意图并响应
     """
+    group_id = str(session.group.id) if session.group else None
+    if not chatinter_available(group_id):
+        logger.debug("ChatInter 当前会话未启用")
+        return
     if get_event_signal(event, "_ai_triggered", False):
+        return
+    if get_event_signal(event, "_zx_visible_output_sent", False):
+        logger.debug("earlier matcher produced visible output, skip ChatInter fallback")
         return
 
     state_plain_text = _state_plain_text(state)
@@ -311,7 +434,8 @@ async def _handle_fallback(
     if raw_message is None:
         return
 
-    if is_already_handled(event):
+    handled_session_key = conversation_session_key(session)
+    if is_already_handled(event, session_key=handled_session_key):
         logger.debug("event already handled, skip ChatInter fallback")
         return
 
@@ -349,14 +473,43 @@ async def _handle_fallback(
     if scenario.scenario is ChatInterScenario.SUPERUSER_AGENT:
         from .agents.superuser_entry import handle_superuser_agent_turn
 
-        mark_as_handled(event)
+        mark_as_handled(event, session_key=handled_session_key)
         await handle_superuser_agent_turn(
+            bot=bot,
+            event=event,
             raw_message=raw_message,
             session_key=str(session.group.id)
             if session.group
             else str(session.user.id),
         )
         return
+    mode_admission = await _acquire_private_superuser_mixed_turn(
+        bot=bot,
+        event=event,
+        session=session,
+    )
+    if mode_admission is not None and not mode_admission.accepted:
+        if mode_admission.blocked_by == "agent_active":
+            from .agents.superuser_entry import handle_superuser_agent_turn
+
+            mark_as_handled(event, session_key=handled_session_key)
+            await handle_superuser_agent_turn(
+                bot=bot,
+                event=event,
+                raw_message=raw_message,
+                session_key=str(session.user.id),
+            )
+            return
+        mark_as_handled(event, session_key=handled_session_key)
+        await _send_mode_gate_reply(
+            bot=bot,
+            event=event,
+            text="Agent 模式正在切换，请稍后重试。",
+        )
+        return
+    mode_lease = mode_admission.lease if mode_admission is not None else None
+    summary_session_id = conversation_session_key(session)
+    history_foreground_arrived(summary_session_id)
     accepted = await get_turn_queue().submit(
         bot=bot,
         event=event,
@@ -365,55 +518,13 @@ async def _handle_fallback(
         message=msg,
         route_modules=route_modules,
         cached_plain_text=state_plain_text,
-        processor=handle_fallback,
+        processor=_process_queued_fallback,
+        mode_lease=mode_lease,
     )
+    if not accepted:
+        schedule_pending_history_summary_jobs()
     if accepted:
         logger.info(f"[ChatInter] 收到消息：{raw_message[:50]}...")
-
-
-@_turn_followup_matcher.handle()
-async def _handle_turn_followup(
-    bot: Bot,
-    event: Event,
-    session: Uninfo,
-    msg: UniMsg,
-    state: T_State,
-):
-    """Non-blocking collector for short follow-up messages in an active turn."""
-
-    if get_event_signal(event, "_ai_triggered", False) or bool(
-        getattr(event, "to_me", False)
-    ):
-        return
-    route_modules = _event_route_modules(state)
-    if route_modules:
-        return
-    state_plain_text = _state_plain_text(state)
-    raw_message = _extract_raw_message(event, msg, state_plain_text)
-    if raw_message is None:
-        return
-    scenario = _resolve_entry_scenario(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-        route_modules=route_modules,
-    )
-    if not scenario.should_handle:
-        return
-    accepted = await get_turn_queue().submit(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-        message=msg,
-        route_modules=None,
-        cached_plain_text=state_plain_text,
-        processor=handle_fallback,
-        priority_override=0,
-    )
-    if accepted:
-        logger.debug(f"[ChatInter] 收到连续 turn 补充：{raw_message[:50]}...")
 
 
 async def _try_runtime_control_before_queue(
@@ -424,25 +535,97 @@ async def _try_runtime_control_before_queue(
     raw_message: str,
 ) -> bool:
     user_id = str(session.user.id if session.user else "")
+    handled_session_key = conversation_session_key(session)
     if not event_is_private(event) or not resolve_superuser(bot, user_id):
         return False
     from .superuser_agent.runtime_control import (
         has_runtime_control_intent,
+        parse_runtime_control_command,
         try_handle_runtime_control,
     )
 
     session_key = str(session.group.id) if session.group else user_id
     if not has_runtime_control_intent(raw_message, session_key=session_key):
         return False
-    if not await try_handle_runtime_control(
-        bot=bot,
-        event=event,
-        session=session,
-        raw_message=raw_message,
-    ):
+    intent, _ = parse_runtime_control_command(raw_message)
+    gate = get_mode_gate()
+
+    def active_source() -> bool:
+        return _stored_agent_mode_active(session_key)
+
+    transition = None
+    if intent == "open":
+        transition, blocked_by = await gate.try_begin_agent_transition(
+            session_key,
+            agent_active=active_source,
+        )
+        if transition is None:
+            text = (
+                "当前仍有消息正在处理或排队，请等待完成后再回复 /开启agent。"
+                if blocked_by == "mixed_busy"
+                else "Agent 模式正在切换，请稍后重试。"
+            )
+            await _send_mode_gate_reply(bot=bot, event=event, text=text)
+            mark_as_handled(event, session_key=handled_session_key)
+            return True
+    else:
+        await gate.sync_agent_active(session_key, active=active_source)
+    try:
+        handled = await try_handle_runtime_control(
+            bot=bot,
+            event=event,
+            session=session,
+            raw_message=raw_message,
+        )
+    finally:
+        if transition is not None:
+            await asyncio.shield(transition.finish(agent_active=active_source))
+        else:
+            await asyncio.shield(
+                gate.sync_agent_active(session_key, active=active_source)
+            )
+    if not handled:
         return False
-    mark_as_handled(event)
+    mark_as_handled(event, session_key=handled_session_key)
     return True
+
+
+async def _acquire_private_superuser_mixed_turn(
+    *,
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+) -> MixedTurnAdmission | None:
+    user_id = str(session.user.id if session.user else "")
+    if (
+        not user_id
+        or session.group is not None
+        or not event_is_private(event)
+        or not resolve_superuser(bot, user_id)
+    ):
+        return None
+    return await get_mode_gate().try_acquire_mixed_turn(
+        user_id,
+        agent_active=lambda: _stored_agent_mode_active(user_id),
+    )
+
+
+def _stored_agent_mode_active(session_key: str) -> bool:
+    from .superuser_agent.store import agent_session_is_active
+
+    return bool(agent_session_is_active(session_key))
+
+
+async def _send_mode_gate_reply(*, bot: Bot, event: Event, text: str) -> None:
+    try:
+        await bot.send(event, text)
+        return
+    except Exception:
+        pass
+    try:
+        await MessageUtils.build_message(text).send()
+    except Exception:
+        pass
 
 
 async def _try_runtime_approval_before_queue(
@@ -453,6 +636,7 @@ async def _try_runtime_approval_before_queue(
     raw_message: str,
 ) -> bool:
     user_id = str(session.user.id if session.user else "")
+    handled_session_key = conversation_session_key(session)
     if not event_is_private(event) or not resolve_superuser(bot, user_id):
         return False
     from .superuser_agent.runtime_approval import (
@@ -469,7 +653,7 @@ async def _try_runtime_approval_before_queue(
         raw_message=raw_message,
     ):
         return False
-    mark_as_handled(event)
+    mark_as_handled(event, session_key=handled_session_key)
     return True
 
 
@@ -548,23 +732,80 @@ async def _handle_rebuild_plugin_index():
     ).send()
 
 
-@driver.on_startup
+@PriorityLifecycle.on_startup(priority=60)
 async def _on_startup():
     """插件启动初始化"""
     global _dynamic_rescan_task
 
+    if not chatinter_available():
+        logger.info("ChatInter 插件已关闭")
+        return
+
     from zhenxun.configs.config import BotConfig
 
+    from .persona import ensure_persona_file
+
     logger.info("ChatInter 插件已加载")
-    await ensure_lifecycle_hooks_registered()
+    ensure_persona_file()
     _chat_memory.set_bot_nickname(BotConfig.self_nickname)
     await PluginRegistry.preload_cache()
+    from .reaction_runtime import start_reaction_runtime
+
+    await start_reaction_runtime()
     _dynamic_rescan_task = asyncio.create_task(_rescan_dynamic_matchers_after_startup())
 
 
-@driver.on_shutdown
+@PriorityLifecycle.on_startup(priority=100)
+async def _on_active_tasks_startup():
+    from .config import active_tasks_enabled
+
+    if not active_tasks_enabled():
+        logger.info("ChatInter 主动任务已关闭")
+        return
+    registered = 0
+    failed = 0
+    try:
+        from .superuser_agent.active_tasks import initialize_active_task_schedules
+
+        registered, failed = await initialize_active_task_schedules(
+            _dispatch_scheduled_active_task
+        )
+    except Exception as exc:
+        failed += 1
+        logger.error("ChatInter 主动任务调度初始化失败", e=exc)
+    try:
+        from .superuser_agent.proactive_tasks import (
+            install_active_task_webhook_route,
+        )
+
+        webhook_installed = install_active_task_webhook_route()
+    except Exception as exc:
+        webhook_installed = False
+        logger.error("ChatInter 主动任务 Webhook 初始化失败", e=exc)
+    logger.info(
+        "ChatInter 主动任务已初始化："
+        f"调度 {registered}，失败 {failed}，Webhook {webhook_installed}"
+    )
+
+
+@PriorityLifecycle.on_shutdown(priority=40)
 async def _on_shutdown():
     """Release long-lived ChatInter runtime resources."""
+
+    global _dynamic_rescan_task
+
+    if _dynamic_rescan_task is not None and not _dynamic_rescan_task.done():
+        _dynamic_rescan_task.cancel()
+        await asyncio.gather(_dynamic_rescan_task, return_exceptions=True)
+    _dynamic_rescan_task = None
+    from .reaction_runtime import shutdown_reaction_runtime
+
+    await shutdown_reaction_runtime()
+    await PluginRegistry.shutdown()
+    from .superuser_agent.proactive_tasks import shutdown_proactive_tasks
+
+    await shutdown_proactive_tasks()
+    await shutdown_history_summary_tasks()
 
     from .mcp_runtime import get_mcp_runtime_manager
     from .memory_extractor import drain_memory_extraction_tasks
@@ -572,17 +813,27 @@ async def _on_shutdown():
     await drain_memory_extraction_tasks()
     await get_mcp_runtime_manager().shutdown()
 
+    from .gscore_adapter import get_gscore_adapter
+
+    await get_gscore_adapter().close()
+
+
+async def _dispatch_scheduled_active_task(task, _bot, _context) -> None:
+    from .superuser_agent.proactive_tasks import get_proactive_dispatcher
+
+    await get_proactive_dispatcher().dispatch(
+        task.task_id,
+        {"event": "scheduled_trigger"},
+        source="scheduler",
+        claimed_task=task,
+    )
+
 
 async def _rescan_dynamic_matchers_after_startup():
     """等其它插件 startup 动态 matcher 创建完成后，重建一次知识库。
 
-    大部分插件（包括 nonebot_plugin_memes）在导入期已注册完 matcher；保留
-    一次延迟补扫主要覆盖 parser-lite 这类 startup 阶段动态注册 matcher 的插件。
-    插件开启/关闭状态变化由 PluginInfoMemoryCache refresh 版本驱动缓存失效。
+    这次补扫生成运行期固定快照；之后只在活动插件集合变化或显式重建时更新。
     """
-    for delay_seconds in _DYNAMIC_MATCHER_RESCAN_DELAYS:
-        await asyncio.sleep(delay_seconds)
-        await PluginRegistry.preload_cache(force_refresh=True)
-        logger.info(
-            "ChatInter 已完成 startup 后动态 matcher 补扫：" f"delay={delay_seconds}s"
-        )
+    await asyncio.sleep(_DYNAMIC_MATCHER_RESCAN_DELAY_SECONDS)
+    await PluginRegistry.preload_cache(force_refresh=True)
+    logger.info("ChatInter 已完成启动后 10 秒插件知识快照")

@@ -6,8 +6,17 @@ from tortoise.expressions import F, Q
 from zhenxun.services.db_context import Model, with_db_timeout
 from zhenxun.services.message_load import is_db_unhealthy
 
+from ..sparse_retrieval import BM25FIndex, normalize_sparse_scores
+
 _CHATINTER_DB_TIMEOUT = 2.5
 _MEMORY_RECALL_CANDIDATE_LIMIT = 64
+_MEMORY_SPARSE_FIELDS = {
+    "memory_type": 0.6,
+    "key": 1.2,
+    "value": 1.8,
+    "topic_key": 1.1,
+    "source_message": 0.7,
+}
 _GLOBAL_USER_MEMORY_TYPES = (
     "nickname",
     "correction",
@@ -109,6 +118,28 @@ class ChatInterChatHistory(Model):
         )
 
         return list(reversed(dialogs))
+
+    @classmethod
+    async def get_dialogs_after(
+        cls,
+        session_id: str,
+        after_dialog_id: int,
+        limit: int,
+    ) -> list["ChatInterChatHistory"]:
+        if is_db_unhealthy():
+            return []
+        dialogs = await _db_or_default(
+            cls.filter(
+                session_id=session_id,
+                reset=False,
+                id__gt=max(int(after_dialog_id or 0), 0),
+            )
+            .order_by("id")
+            .limit(max(int(limit or 0), 0)),
+            operation="ChatInterChatHistory.get_dialogs_after",
+            default=[],
+        )
+        return list(dialogs)
 
     @classmethod
     async def migrate_session_id(cls, old_session_id: str, new_session_id: str) -> int:
@@ -231,6 +262,7 @@ class ChatInterChatHistory(Model):
         max_limit: int,
         *,
         reset_limit: int = 32,
+        through_dialog_id: int = 0,
     ):
         """
         删除超出上限的旧对话（保留最近的 N 轮）
@@ -246,10 +278,15 @@ class ChatInterChatHistory(Model):
             operation="ChatInterChatHistory.prune_old_dialogs.count",
             default=0,
         )
-        if total > max_limit:
+        durable_through = max(int(through_dialog_id or 0), 0)
+        if total > max_limit and durable_through > 0:
             to_delete_count = total - max_limit
             to_delete = await _db_or_default(
-                cls.filter(session_id=session_id, reset=False)
+                cls.filter(
+                    session_id=session_id,
+                    reset=False,
+                    id__lte=durable_through,
+                )
                 .order_by("create_time", "id")
                 .limit(to_delete_count),
                 operation="ChatInterChatHistory.prune_old_dialogs.list",
@@ -479,12 +516,6 @@ class ChatInterMemory(Model):
     ) -> list["ChatInterMemory"]:
         if is_db_unhealthy():
             return []
-        query_text = str(query or "")
-        query_tokens = {
-            token
-            for token in query_text.replace("，", " ").replace("。", " ").split()
-            if token
-        }
         participant_set = {str(item) for item in participants if str(item)}
         candidate_limit = min(
             max(int(limit or 0) * 8, int(limit or 0), 1),
@@ -511,6 +542,23 @@ class ChatInterMemory(Model):
             .limit(candidate_limit),
             operation="ChatInterMemory.recall_memories",
             default=[],
+        )
+        sparse_index = BM25FIndex(field_weights=_MEMORY_SPARSE_FIELDS)
+        sparse_index.rebuild(
+            {
+                str(row.id): {
+                    "memory_type": row.memory_type,
+                    "key": row.key,
+                    "value": row.value,
+                    "topic_key": row.topic_key,
+                    "source_message": row.source_message,
+                }
+                for row in rows
+                if row.id
+            }
+        )
+        sparse_scores = normalize_sparse_scores(
+            sparse_index.score_all(str(query or ""))
         )
         scoped: list[ChatInterMemory] = []
         for row in rows:
@@ -539,8 +587,6 @@ class ChatInterMemory(Model):
                     and row_group_id == group_id
                 ):
                     continue
-            value_text = str(row.value or "")
-            key_text = f"{row.memory_type} {row.key} {value_text}"
             score = float(row.confidence or 0.0)
             if row_scope == "thread" or row.memory_type == "group_digest":
                 score -= 0.08
@@ -558,10 +604,11 @@ class ChatInterMemory(Model):
                     score -= 0.1
             if addressee_user_id and addressee_user_id in row_participants:
                 score += 0.18
-            if query_tokens and any(token in key_text for token in query_tokens):
-                score += 0.2
+            sparse_score = sparse_scores.get(str(row.id), 0.0)
+            score += sparse_score * 0.55
             if row_user_id == user_id:
                 score += 0.08
+            setattr(row, "_chatinter_sparse_score", sparse_score)
             setattr(row, "_chatinter_recall_score", score)
             scoped.append(row)
         scoped.sort(

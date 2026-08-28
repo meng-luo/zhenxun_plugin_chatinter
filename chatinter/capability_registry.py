@@ -364,6 +364,9 @@ class CapabilityRegistry:
                 "用户询问上次聊到哪里、之前提到的报错、历史上下文时使用",
                 "需要围绕某条历史消息继续查看上下文时使用",
             ),
+            anti_use_cases=(
+                "查询当前机器人、用户、群组或业务状态时，应调用对应业务工具",
+            ),
             output_mode="text",
             side_effect="query",
             risk_level="low",

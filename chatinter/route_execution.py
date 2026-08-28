@@ -20,23 +20,18 @@ from .models.pydantic_models import PluginKnowledgeBase
 from .native_route import NativeRouteResult
 from .plugin_registry import PluginRegistry
 from .route_text import (
-    ROUTE_ACTION_WORDS,
     collect_placeholders,
     contains_any,
-    is_usage_question,
     normalize_action_phrases,
     normalize_message_text,
-    parse_command_with_head,
 )
 from .schema_policy import resolve_command_target_policy
-from .target_policy import TargetPolicy, get_target_policy
 
 
 @dataclass(frozen=True)
 class RouteExecutionPlan:
     command: str
-    need_followup: bool = False
-    followup_message: str | None = None
+    blocked: bool = False
     feedback_reason: str | None = None
     image_missing: int = 0
     text_missing: int = 0
@@ -130,7 +125,6 @@ def build_invalid_route_observation(
     )
 
 
-_SELF_ONLY_ACTION_KEYWORDS = ("\u7b7e\u5230", "\u6253\u5361", "\u8865\u7b7e")
 _THIRD_PERSON_HINTS = (
     "\u4ed6",
     "\u5979",
@@ -140,93 +134,15 @@ _THIRD_PERSON_HINTS = (
     "\u8fd9\u4e2a\u4eba",
     "\u4e0a\u9762\u90a3\u4f4d",
 )
-_REPLY_REF_HINTS = (
-    "\u56de\u590d",
-    "\u5f15\u7528",
-    "\u4e0a\u9762",
-    "\u8fd9\u6761",
-    "\u8fd9\u5f20",
-    "\u8fd9\u56fe",
-    "\u8fd9\u4e2a\u56fe",
-    "\u8fd9\u5f20\u56fe",
-    "\u7528\u8fd9\u5f20",
-)
 _AT_ID_TOKEN_PATTERN = re.compile(
     r"\[@([^\]\s]+)\]|(?<![0-9A-Za-z_])@(\d{5,20})(?=(?:\s|$|[\u7684\uff0c,\u3002.!！？?]))"
 )
 _PLACEHOLDER_SEGMENT_PATTERN = re.compile(r"\[@[^\]]+\]|\[image(?:#\d+)?\]")
-_REPLY_TAG_PATTERN = re.compile(r"\[reply:[^\]]+\]", re.IGNORECASE)
-
-
-def _is_self_only_action_message(message_text: str) -> bool:
-    normalized = normalize_message_text(message_text or "")
-    if not normalized:
-        return False
-    return any(keyword in normalized for keyword in _SELF_ONLY_ACTION_KEYWORDS)
-
-
-def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
-    heads: set[str] = set()
-    plugins = getattr(knowledge_base, "plugins", None) or []
-    for plugin in plugins:
-        plugin_policy = _get_route_target_policy(
-            plugin_module=getattr(plugin, "module", ""),
-            plugin_name=getattr(plugin, "name", ""),
-        )
-        for meta in getattr(plugin, "command_meta", None) or []:
-            policy = resolve_command_target_policy(
-                meta,
-                adapter_policy=plugin_policy,
-            )
-            image_min = int(getattr(meta, "image_min", 0) or 0)
-            allow_sticky_arg = bool(getattr(meta, "allow_sticky_arg", False))
-            if (
-                not policy.allow_at
-                and not policy.allow_image_as_target
-                and not policy.allow_reply_image_as_target
-                and image_min <= 0
-                and policy.target_requirement == "none"
-                and not allow_sticky_arg
-            ):
-                continue
-            command_text = normalize_message_text(
-                str(getattr(meta, "command", "") or "")
-            )
-            if command_text:
-                heads.add(normalize_message_text(command_text.split(" ", 1)[0]))
-            for alias in getattr(meta, "aliases", None) or []:
-                alias_text = normalize_message_text(str(alias or ""))
-                if alias_text:
-                    heads.add(normalize_message_text(alias_text.split(" ", 1)[0]))
-    return {head for head in heads if head}
-
-
-def _get_route_target_policy(
-    *,
-    plugin_module: str = "",
-    plugin_name: str = "",
-    command_id: str = "",
-) -> TargetPolicy:
-    return get_target_policy(
-        plugin_module=plugin_module,
-        plugin_name=plugin_name,
-        command_id=command_id,
-    )
-
-
-def _route_target_policy_from_result(
-    route_result: NativeRouteResult,
-) -> TargetPolicy:
-    return _get_route_target_policy(
-        plugin_module=route_result.decision.plugin_module,
-        plugin_name=route_result.decision.plugin_name,
-        command_id=route_result.command_id or "",
-    )
 
 
 def _has_adapter_context_hint(
     message_text: str,
-    policy: TargetPolicy,
+    policy: Any,
 ) -> bool:
     hints = tuple(policy.context_hints or ())
     if not hints:
@@ -485,15 +401,6 @@ def _extract_image_tokens(text: str) -> list[str]:
     return tokens
 
 
-def _contains_reply_reference_hint(message_text: str) -> bool:
-    normalized = normalize_message_text(message_text or "")
-    if not normalized:
-        return False
-    if _REPLY_TAG_PATTERN.search(normalized):
-        return True
-    return any(hint in normalized for hint in _REPLY_REF_HINTS)
-
-
 def _contains_third_person_reference(message_text: str) -> bool:
     normalized = normalize_message_text(message_text or "")
     if not normalized:
@@ -519,157 +426,6 @@ def _extract_reply_sender_id(event: Event) -> str | None:
         return None
     text = str(user_id).strip()
     return text if text.isdigit() else None
-
-
-def _build_route_message_with_explicit_context(
-    *,
-    message_text: str,
-    user_id: str,
-    reply_image_count: int,
-    reply_sender_id: str | None,
-    target_policy: TargetPolicy | None = None,
-    command_heads: set[str] | None = None,
-) -> str:
-    policy = target_policy or TargetPolicy()
-    normalized = normalize_message_text(message_text or "")
-    if not normalized:
-        return normalized
-
-    self_target_command_match = _contains_bare_self_target_for_command(
-        normalized,
-        command_heads,
-    )
-    should_enrich = not is_usage_question(normalized) and (
-        contains_any(normalized, ROUTE_ACTION_WORDS)
-        or self_target_command_match
-        or _has_adapter_context_hint(normalized, policy)
-        or "[image" in normalized
-        or "[@" in normalized
-        or _contains_reply_reference_hint(normalized)
-    )
-    if not should_enrich:
-        return normalized
-
-    at_tokens = _extract_at_tokens(normalized)
-    image_tokens = _extract_image_tokens(normalized)
-    enriched = normalized
-    policy_accepts_target = (
-        policy.allow_at_as_target
-        or policy.allow_image_as_target
-        or policy.allow_reply_image_as_target
-        or policy.require_target_for_third_person
-    )
-
-    if (
-        policy_accepts_target
-        and not at_tokens
-        and (
-            _contains_strong_self_reference(normalized)
-            or self_target_command_match
-        )
-    ):
-        enriched = normalize_message_text(f"{enriched} [@{user_id}]")
-        at_tokens.append(f"[@{user_id}]")
-
-    if (
-        policy_accepts_target
-        and not at_tokens
-        and reply_sender_id
-        and _contains_third_person_reference(normalized)
-    ):
-        enriched = normalize_message_text(f"{enriched} [@{reply_sender_id}]")
-        at_tokens.append(f"[@{reply_sender_id}]")
-
-    if (
-        reply_image_count > 0
-        and not image_tokens
-        and (policy.allow_reply_image_as_target or policy.allow_image_as_target)
-        and _contains_reply_reference_hint(normalized)
-    ):
-        suffix = " ".join("[image]" for _ in range(reply_image_count))
-        enriched = normalize_message_text(f"{enriched} {suffix}")
-
-    return enriched
-
-
-def _select_adapter_policy_for_message(
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-) -> TargetPolicy:
-    normalized = normalize_message_text(message_text or "")
-    if not normalized:
-        return TargetPolicy()
-    best_policy = TargetPolicy()
-    best_score = 0
-    for plugin in knowledge_base.plugins:
-        score = 0
-        command_texts: list[str] = []
-        command_texts.extend(str(command or "") for command in plugin.commands)
-        command_texts.extend(str(alias or "") for alias in plugin.aliases)
-        command_policies = []
-        for meta in getattr(plugin, "command_meta", None) or []:
-            command_texts.append(str(getattr(meta, "command", "") or ""))
-            command_texts.append(str(getattr(meta, "description", "") or ""))
-            command_texts.extend(
-                str(alias or "") for alias in getattr(meta, "aliases", None) or []
-            )
-            command_texts.extend(
-                str(param or "") for param in getattr(meta, "params", None) or []
-            )
-            command_texts.extend(
-                str(example or "") for example in getattr(meta, "examples", None) or []
-            )
-            command_policy = resolve_command_target_policy(meta)
-            command_policies.append(command_policy)
-            if command_policy.media_related:
-                score += 1
-            if command_policy.allow_at_as_target:
-                score += 1
-            if command_policy.allow_image_as_target:
-                score += 1
-        if any(
-            text and text in normalized
-            for text in (normalize_message_text(item) for item in command_texts)
-        ):
-            score += 3
-        if score > best_score:
-            best_policy = _merge_command_policies_to_adapter(command_policies)
-            best_score = score
-    return best_policy if best_score > 0 else TargetPolicy()
-
-
-def _merge_command_policies_to_adapter(
-    policies,
-) -> TargetPolicy:
-    context_hints: list[str] = []
-    for hint in (
-        "图片",
-        "头像",
-        "表情",
-        "表情包",
-        "照片",
-        "回复",
-        "@",
-        "昵称",
-        "目标",
-        "对象",
-    ):
-        context_hints.append(hint)
-    allow_at = any(policy.allow_at_as_target for policy in policies)
-    allow_image = any(policy.allow_image_as_target for policy in policies)
-    allow_reply_image = any(policy.allow_reply_image_as_target for policy in policies)
-    target_required = any(
-        policy.target_requirement == "required" for policy in policies
-    )
-    return TargetPolicy(
-        family="general",
-        context_hints=tuple(context_hints),
-        media_related=allow_image,
-        allow_at_as_target=allow_at,
-        allow_image_as_target=allow_image,
-        allow_reply_image_as_target=allow_reply_image,
-        require_target_for_third_person=target_required or allow_at or allow_image,
-    )
 
 
 def _build_reply_image_segments_for_reroute(
@@ -816,68 +572,6 @@ def _contains_self_reference(message_text: str) -> bool:
     )
 
 
-def _contains_strong_self_reference(message_text: str) -> bool:
-    normalized = normalize_message_text(normalize_action_phrases(message_text or ""))
-    if not normalized:
-        return False
-    return any(
-        marker in normalized
-        for marker in ("我的", "我自己", "自己的", "本人", "本人的", "自己")
-    )
-
-
-def _contains_bare_self_target_for_command(
-    message_text: str,
-    command_heads: set[str] | None,
-) -> bool:
-    normalized = normalize_message_text(normalize_action_phrases(message_text or ""))
-    if not normalized or not command_heads:
-        return False
-    for head in sorted(command_heads, key=len, reverse=True):
-        parsed = parse_command_with_head(normalized, head, allow_sticky=True)
-        if parsed is None:
-            continue
-        payload = normalize_message_text(parsed.payload_text).strip(" 的：:,，。.!！？?")
-        if payload in {"我", "自己", "本人", "我自己"}:
-            return True
-    return False
-
-
-def _build_followup_message(
-    *,
-    image_missing: int,
-    text_missing: int,
-    allow_at: bool,
-) -> str:
-    hints: list[str] = []
-    if image_missing > 0:
-        if allow_at:
-            hints.append(f"还需要 {image_missing} 张图片（可发图或@目标）")
-        else:
-            hints.append(f"还需要 {image_missing} 张图片")
-    if text_missing > 0:
-        hints.append(f"还需要 {text_missing} 段文字")
-    joined = "，".join(hints) if hints else "参数不足"
-    return f"这个命令{joined}，请重新发送完整命令。"
-
-
-def _build_target_required_message(schema) -> str:
-    sources = {
-        normalize_message_text(str(item or "")).lower()
-        for item in (getattr(schema, "target_sources", None) or [])
-    }
-    hints: list[str] = []
-    if "at" in sources:
-        hints.append("直接@目标成员")
-    if "reply" in sources:
-        hints.append("回复对方消息并@")
-    if "nickname" in sources:
-        hints.append("补充完整昵称")
-    if not hints:
-        hints = ["补充目标成员（@或昵称）"]
-    return "这个命令需要目标对象，请" + "、".join(hints) + "后重新发送完整命令。"
-
-
 def _find_route_plugin_info(route_result: NativeRouteResult, knowledge_plugins):
     exact_module_plugins = [
         plugin
@@ -890,10 +584,6 @@ def _find_route_plugin_info(route_result: NativeRouteResult, knowledge_plugins):
         if plugin.name == route_result.decision.plugin_name:
             return plugin
     return None
-
-
-def _is_image_related_route(route_result: NativeRouteResult) -> bool:
-    return _route_target_policy_from_result(route_result).media_related
 
 
 def _append_unique_tokens(command: str, tokens: list[str]) -> str:
@@ -941,6 +631,7 @@ def _prepare_route_execution_plan(
     current_message: str,
     ambient_message: str = "",
     user_id: str,
+    reply_image_count: int = 0,
 ) -> RouteExecutionPlan:
     task_message = normalize_message_text(current_message or "")
     ambient_message = normalize_message_text(ambient_message or task_message)
@@ -950,25 +641,6 @@ def _prepare_route_execution_plan(
 
     schema = _find_route_command_schema(route_result, knowledge_plugins)
     if schema is None:
-        if _is_self_only_action_message(command):
-            at_tokens = _extract_at_tokens(command)
-            if at_tokens:
-                command = _remove_tokens_from_command(command, at_tokens)
-            return RouteExecutionPlan(command=command)
-        if not _is_image_related_route(route_result):
-            return RouteExecutionPlan(command=command)
-        merged_at = _extract_at_tokens(task_message) or _extract_at_tokens(
-            ambient_message
-        )
-        if not merged_at and _contains_self_reference(task_message or ambient_message):
-            merged_at.append(f"[@{user_id}]")
-        merged_images = _extract_image_tokens(task_message)
-        for token in _extract_image_tokens(ambient_message):
-            if token not in merged_images:
-                merged_images.append(token)
-        merged_tokens = [*merged_at, *merged_images]
-        if merged_tokens:
-            command = _append_unique_tokens(command, merged_tokens)
         return RouteExecutionPlan(command=command)
 
     schema_head = _schema_command_head(schema)
@@ -982,18 +654,13 @@ def _prepare_route_execution_plan(
         )
 
     image_min = max(int(getattr(schema, "image_min", 0) or 0), 0)
-    image_max_value = getattr(schema, "image_max", None)
-    try:
-        image_max = int(image_max_value) if image_max_value is not None else None
-    except (TypeError, ValueError):
-        image_max = None
     text_min = max(int(getattr(schema, "text_min", 0) or 0), 0)
-    policy = resolve_command_target_policy(
-        schema,
-        adapter_policy=_route_target_policy_from_result(route_result),
-    )
+    policy = resolve_command_target_policy(schema)
     target_requirement = policy.target_requirement
     allow_at = policy.allow_at
+    allow_image = bool(
+        policy.allow_image_as_target or policy.allow_reply_image_as_target
+    )
     if allow_at:
         command_at = _extract_at_tokens(command)
     else:
@@ -1001,11 +668,18 @@ def _prepare_route_execution_plan(
         disallowed_at = _extract_at_tokens(command)
         if disallowed_at:
             command = _remove_tokens_from_command(command, disallowed_at)
-    command_images = _extract_image_tokens(command)
-    message_images = _extract_image_tokens(task_message)
-    for token in _extract_image_tokens(ambient_message):
-        if token not in message_images:
-            message_images.append(token)
+    if allow_image:
+        command_images = _extract_image_tokens(command)
+        message_images = _extract_image_tokens(task_message)
+        for token in _extract_image_tokens(ambient_message):
+            if token not in message_images:
+                message_images.append(token)
+    else:
+        command_images = []
+        message_images = []
+        disallowed_images = _extract_image_tokens(command)
+        if disallowed_images:
+            command = _remove_tokens_from_command(command, disallowed_images)
 
     merged_at: list[str] = []
     if allow_at:
@@ -1016,9 +690,7 @@ def _prepare_route_execution_plan(
         for token in context_at_tokens:
             if token not in merged_at:
                 merged_at.append(token)
-        if (
-            target_requirement == "none" or (image_max is not None and image_max <= 0)
-        ) and merged_at:
+        if target_requirement == "none" and merged_at:
             command = _remove_tokens_from_command(command, merged_at)
             merged_at = []
     merged_images = command_images[:]
@@ -1041,11 +713,7 @@ def _prepare_route_execution_plan(
         else:
             return RouteExecutionPlan(
                 command=_apply_route_command_prefixes(command, schema),
-                need_followup=True,
-                followup_message=(
-                    policy.target_missing_message
-                    or _build_target_required_message(schema)
-                ),
+                blocked=True,
                 feedback_reason=_FEEDBACK_REASON_TARGET_REQUIRED,
                 allow_at=allow_at,
             )
@@ -1054,6 +722,8 @@ def _prepare_route_execution_plan(
         image_count = len(merged_images) + len(merged_at)
     else:
         image_count = len(merged_images)
+    if policy.allow_reply_image_as_target:
+        image_count += max(int(reply_image_count or 0), 0)
     text_count = max(
         _extract_text_token_count(command),
         _fulfilled_text_slot_count(route_result),
@@ -1064,12 +734,7 @@ def _prepare_route_execution_plan(
     if image_missing > 0 or text_missing > 0:
         return RouteExecutionPlan(
             command=_apply_route_command_prefixes(command, schema),
-            need_followup=True,
-            followup_message=_build_followup_message(
-                image_missing=image_missing,
-                text_missing=text_missing,
-                allow_at=allow_at,
-            ),
+            blocked=True,
             feedback_reason=_FEEDBACK_REASON_MISSING_PARAMS,
             image_missing=image_missing,
             text_missing=text_missing,
@@ -1099,15 +764,12 @@ def _apply_route_command_prefixes(command: str, schema) -> str:
     return normalize_message_text(f"{prefixes[0]}{normalized}")
 
 
-collect_target_capable_command_heads = _collect_target_capable_command_heads
 has_adapter_context_hint = _has_adapter_context_hint
 build_target_modules = _build_target_modules
 extract_at_tokens = _extract_at_tokens
 extract_image_tokens = _extract_image_tokens
 contains_third_person_reference = _contains_third_person_reference
 extract_reply_sender_id = _extract_reply_sender_id
-build_route_message_with_explicit_context = _build_route_message_with_explicit_context
-select_adapter_policy_for_message = _select_adapter_policy_for_message
 build_reply_image_segments_for_reroute = _build_reply_image_segments_for_reroute
 contains_self_reference = _contains_self_reference
 prepare_route_execution_plan = _prepare_route_execution_plan
@@ -1117,10 +779,8 @@ __all__ = [
     "RouteExecutionPlan",
     "build_invalid_route_observation",
     "build_reply_image_segments_for_reroute",
-    "build_route_message_with_explicit_context",
     "build_route_observation",
     "build_target_modules",
-    "collect_target_capable_command_heads",
     "contains_self_reference",
     "contains_third_person_reference",
     "extract_at_tokens",
@@ -1129,5 +789,4 @@ __all__ = [
     "find_route_command_schema",
     "has_adapter_context_hint",
     "prepare_route_execution_plan",
-    "select_adapter_policy_for_message",
 ]

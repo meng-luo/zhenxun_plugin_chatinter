@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
+import hashlib
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .llm_compat import ToolResult
 from .main_request_models import (
@@ -14,15 +16,33 @@ from .main_request_models import (
     MainRequestRouteHook,
     MainRequestTimelineItem,
 )
-from .native_executor import NativeCommandExecutionContext, NativeToolExecutionResult
-from .native_route import NativeRouteDecision, NativeRouteReport, NativeRouteResult
+from .native_executor import NativeToolExecutionResult
+from .native_route import (
+    NativeRouteDecision,
+    NativeRouteReport,
+    NativeRouteResult,
+)
+from .plugin_outcome import (
+    PluginOutcome,
+    plugin_results_have_visible_output,
+    plugin_results_own_delivery,
+    plugin_terminal_reply,
+)
+from .response_defaults import (
+    EMPTY_REPLY_TEXT,
+    PLUGIN_FAILURE_REPLY_TEXT,
+    PLUGIN_SUCCESS_REPLY_TEXT,
+)
 from .route_text import normalize_message_text, normalize_reply_text
 
-if TYPE_CHECKING:
-    from .superuser_agent.state import AgentRuntimeResult, AgentRuntimeTimelineItem
-from .task_coverage import TaskCoverageReport
-
 _MAIN_STAGE = "main_request"
+_RECEIPT_OUTCOME_TEXT = {
+    "executed": "已完成",
+    "needs_input": "未执行",
+    "not_executed": "未执行",
+    "uncertain": "结果不确定",
+}
+
 
 def _fallback_result(
     *,
@@ -48,142 +68,6 @@ def _fallback_result(
         output=MainRequestOutput(final_text=reply, memory_text=reply),
     )
 
-def _result_from_agent_runtime(
-    *,
-    report: NativeRouteReport,
-    executions: list[NativeToolExecutionResult],
-    agent_result: AgentRuntimeResult,
-    timeline: list[MainRequestTimelineItem],
-) -> MainRequestResult:
-    stop_reason = agent_result.stop_reason
-    reason = f"main_request:{stop_reason}"
-    if report.final_reason == "init":
-        first_route = _first_route(executions)
-        report.finalize(
-            reason=reason,
-            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
-            plugin_name=first_route.decision.plugin_name
-            if first_route is not None
-            else None,
-            plugin_module=first_route.decision.plugin_module
-            if first_route is not None
-            else None,
-            command=first_route.decision.command if first_route is not None else None,
-        )
-    command_tool_results = [
-        result
-        for result in agent_result.tool_results
-        if not _is_catalog_tool_result(result)
-    ]
-    final_text = normalize_reply_text(agent_result.final_text)
-    should_send = bool(final_text)
-    memory_text = _timeline_memory_text(timeline, fallback=final_text)
-    handled_by_tools = bool(executions or command_tool_results)
-    return MainRequestResult(
-        decision=NativeRouteDecision(
-            action="chat",
-            confidence=0.9 if handled_by_tools else 0.84,
-            reason=reason,
-        ),
-        route_result=_first_route(executions),
-        report=report,
-        executions=tuple(executions),
-        tool_results=tuple(command_tool_results),
-        timeline=tuple(timeline),
-        output=MainRequestOutput(
-            final_text=final_text,
-            memory_text=memory_text,
-            should_send=should_send,
-            outcome="tool_completed" if handled_by_tools else "chat_completed",
-            feedback_kind="tool_completed" if handled_by_tools else "chat_completed",
-            record_chat_feedback=not handled_by_tools,
-            observation_reason="route_success"
-            if any(item.success for item in executions)
-            else "reroute_failed"
-            if handled_by_tools
-            else "chat_completed",
-        ),
-    )
-
-def _result_from_task_execution_queue(
-    *,
-    message_text: str,
-    report: NativeRouteReport,
-    command_context: NativeCommandExecutionContext,
-    task_router_payload: dict[str, Any],
-    task_queue_payload: dict[str, Any],
-    task_coverage_report: TaskCoverageReport,
-    tool_results: list[ToolResult],
-    final_text: str,
-) -> MainRequestResult:
-    executions = list(command_context.executions)
-    reason = "main_request:task_execution_queue"
-    if report.final_reason == "init":
-        first_route = _first_route(executions)
-        report.finalize(
-            reason=reason,
-            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
-            plugin_name=first_route.decision.plugin_name
-            if first_route is not None
-            else None,
-            plugin_module=first_route.decision.plugin_module
-            if first_route is not None
-            else None,
-            command=first_route.decision.command if first_route is not None else None,
-        )
-    timeline: tuple[MainRequestTimelineItem, ...] = (
-        _user_timeline_item(message_text),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_router",
-            metadata=task_router_payload,
-        ),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_execution_queue",
-            metadata=task_queue_payload,
-        ),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_coverage",
-            metadata=task_coverage_report.to_payload(),
-        ),
-    )
-    reply = normalize_reply_text(final_text)
-    return MainRequestResult(
-        decision=NativeRouteDecision(
-            action="execute",
-            confidence=0.94,
-            reason=reason,
-        ),
-        route_result=_first_route(executions),
-        report=report,
-        executions=tuple(executions),
-        tool_results=tuple(tool_results),
-        timeline=timeline,
-        output=MainRequestOutput(
-            final_text=reply,
-            memory_text=_timeline_memory_text(timeline, fallback=reply),
-            should_send=False,
-            outcome="tool_completed"
-            if task_coverage_report.all_completed
-            else "tool_failed",
-            feedback_kind="tool_completed"
-            if task_coverage_report.all_completed
-            else "tool_failed",
-            record_chat_feedback=False,
-            observation_reason="route_success"
-            if task_coverage_report.all_completed
-            else "reroute_failed",
-        ),
-    )
-
-def _is_catalog_tool_result(result: ToolResult) -> bool:
-    output = result.output if isinstance(result.output, dict) else {}
-    return output.get("status") in {
-        "retrieved",
-        "capability_candidates_retrieved",
-    }
 
 async def _finalize_result(
     result: MainRequestResult,
@@ -197,30 +81,65 @@ async def _finalize_result(
             await maybe_awaitable
 
     output = result.output
+    replay_as_assistant = _is_model_chat_result(result)
     if not output.should_send:
-        return result
+        terminal_results = _terminal_tool_results(result)
+        if plugin_results_own_delivery(terminal_results):
+            return result
+        if plugin_results_have_visible_output(terminal_results):
+            return result
+        if output.outcome == "chat_completed" and not terminal_results:
+            final_text = EMPTY_REPLY_TEXT
+        else:
+            final_text = plugin_terminal_reply(
+                _terminal_plugin_outcome(result),
+                terminal_results,
+            )
+        result = replace(
+            result,
+            output=replace(
+                output,
+                final_text=final_text,
+                memory_text=normalize_message_text(output.memory_text) or final_text,
+                should_send=True,
+            ),
+        )
+        output = result.output
 
     final_text = normalize_reply_text(output.final_text)
-    if not final_text:
-        final_text = (
-            _fallback_final_reply(list(result.executions)) or "我暂时没想好怎么回答你。"
-        )
-    if reply_hook is not None:
+    if not final_text and not output.nontext_delivery:
+        final_text = _fallback_final_reply(list(result.executions)) or EMPTY_REPLY_TEXT
+    if reply_hook is not None and final_text:
         maybe_reply = reply_hook(final_text)
         final_text = (
             await maybe_reply if isawaitable(maybe_reply) else str(maybe_reply or "")
         )
     final_text = normalize_reply_text(final_text)
-    if not final_text:
-        final_text = "我暂时没想好怎么回答你。"
+    if not final_text and not output.nontext_delivery:
+        final_text = EMPTY_REPLY_TEXT
+    if not final_text and output.nontext_delivery:
+        return replace(
+            result,
+            output=replace(
+                output,
+                final_text="",
+                memory_text=normalize_message_text(output.memory_text),
+                should_send=True,
+            ),
+        )
     final_timeline = _with_final_timeline(
         result.timeline,
         final_text=final_text,
         should_send=True,
+        replay_as_assistant=replay_as_assistant,
     )
-    memory_text = normalize_message_text(output.memory_text) or _timeline_memory_text(
-        list(final_timeline),
-        fallback=final_text,
+    memory_text = (
+        final_text
+        if replay_as_assistant
+        else _timeline_memory_text(
+            list(final_timeline),
+            include_final_output=False,
+        )
     )
     return replace(
         result,
@@ -233,6 +152,7 @@ async def _finalize_result(
         ),
     )
 
+
 def _first_route(
     executions: list[NativeToolExecutionResult],
 ) -> NativeRouteResult | None:
@@ -240,6 +160,22 @@ def _first_route(
         if execution.route_result is not None:
             return execution.route_result
     return None
+
+
+def _terminal_tool_results(result: MainRequestResult) -> tuple[ToolResult, ...]:
+    return result.tool_results
+
+
+def _terminal_plugin_outcome(result: MainRequestResult) -> PluginOutcome:
+    tool_outcome = normalize_message_text(result.output.tool_outcome).casefold()
+    if tool_outcome == "needs_input":
+        return PluginOutcome("needs_input")
+    if tool_outcome == "uncertain":
+        return PluginOutcome("uncertain")
+    if tool_outcome == "executed" or result.output.outcome == "tool_completed":
+        return PluginOutcome("executed")
+    return PluginOutcome("not_executed", reason=tool_outcome or "not_executed")
+
 
 def _fallback_final_reply(executions: list[NativeToolExecutionResult]) -> str:
     if not executions:
@@ -249,83 +185,217 @@ def _fallback_final_reply(executions: list[NativeToolExecutionResult]) -> str:
     if latest.display_text:
         return latest.display_text
     if success_count:
-        return "处理好了。"
+        return PLUGIN_SUCCESS_REPLY_TEXT
     message = str(latest.output.get("error", "") or latest.reason or "").strip()
-    return message or "这个暂时没处理成功。"
+    return message or PLUGIN_FAILURE_REPLY_TEXT
+
 
 def _timeline_memory_text(
     timeline: list[MainRequestTimelineItem] | tuple[MainRequestTimelineItem, ...],
     *,
     fallback: str = "",
+    include_final_output: bool = True,
 ) -> str:
-    lines: list[str] = []
-    for item in timeline:
-        text = _timeline_item_summary(item)
-        if text:
-            lines.append(text)
-    if fallback:
-        lines.append(normalize_message_text(f"assistant: {fallback}"))
+    lines = list(_timeline_action_receipts(timeline))
+    if include_final_output:
+        for item in timeline:
+            if item.role != "assistant" or item.kind != "final_output":
+                continue
+            text = normalize_message_text(item.content)
+            if text:
+                lines.append(text)
+        fallback_text = normalize_message_text(fallback)
+        if fallback_text and fallback_text not in lines:
+            lines.append(fallback_text)
     return "\n".join(dict.fromkeys(line for line in lines if line))[:4000]
 
-def _timeline_item_summary(item: MainRequestTimelineItem) -> str:
-    role = normalize_message_text(item.role)
-    kind = normalize_message_text(item.kind)
-    prefix = f"{role}/{kind}".strip("/")
-    if item.tool_name:
-        prefix = f"{prefix}:{normalize_message_text(item.tool_name)}"
-    content = normalize_message_text(item.content)
-    if not content:
-        output = (
-            item.metadata.get("output") if isinstance(item.metadata, dict) else None
-        )
-        content = _compact_output_summary(output)
-    if not content:
-        arguments = (
-            item.metadata.get("arguments") if isinstance(item.metadata, dict) else None
-        )
-        content = _compact_output_summary(arguments)
-    if not content:
-        return ""
-    return f"{prefix}: {content}"[:800]
 
-def _compact_output_summary(value: Any) -> str:
-    if not isinstance(value, dict):
-        return normalize_message_text(str(value or ""))[:500]
-    parts: list[str] = []
-    for key in (
-        "status",
-        "ok",
-        "command_id",
-        "rendered_command",
-        "matched_plugin",
-        "task_text",
-        "error",
-        "remaining_task_hint",
-    ):
-        item = value.get(key)
-        if item not in ("", [], {}, None):
-            parts.append(f"{key}={normalize_message_text(str(item))}")
-    messages = value.get("messages_sent")
-    if isinstance(messages, list) and messages:
-        parts.append(
-            "messages_sent="
-            + " | ".join(
-                normalize_message_text(str(message or ""))
-                for message in messages[:3]
-                if normalize_message_text(str(message or ""))
+def _is_model_chat_result(result: MainRequestResult) -> bool:
+    if result.output.outcome != "chat_completed":
+        return False
+    if result.executions or not result.output.record_chat_feedback:
+        return False
+    if any(item.kind == "fallback" for item in result.timeline):
+        return False
+    return bool(normalize_message_text(result.output.final_text))
+
+
+def _sync_visible_chat_result(
+    result: MainRequestResult,
+    *,
+    final_text: str,
+) -> MainRequestResult:
+    if not _is_model_chat_result(result):
+        return result
+    visible_text = normalize_reply_text(final_text)
+    if not visible_text:
+        return result
+    timeline = list(result.timeline)
+    for index in range(len(timeline) - 1, -1, -1):
+        item = timeline[index]
+        if item.role == "assistant" and item.kind == "final_output":
+            metadata = dict(item.metadata)
+            metadata["assistant_history"] = True
+            timeline[index] = replace(
+                item,
+                content=visible_text,
+                metadata=metadata,
+            )
+            break
+    else:
+        timeline.extend(
+            _with_final_timeline(
+                (),
+                final_text=visible_text,
+                should_send=True,
+                replay_as_assistant=True,
             )
         )
-    artifacts = value.get("artifacts")
-    if isinstance(artifacts, list) and artifacts:
-        summaries = [
-            normalize_message_text(str(item.get("summary", "") or ""))
-            for item in artifacts[:3]
-            if isinstance(item, dict)
-            and normalize_message_text(str(item.get("summary", "") or ""))
-        ]
-        if summaries:
-            parts.append("artifacts=" + " | ".join(summaries))
-    return "；".join(parts)[:500]
+    return replace(
+        result,
+        timeline=tuple(timeline),
+        output=replace(
+            result.output,
+            final_text=visible_text,
+            memory_text=visible_text,
+        ),
+    )
+
+
+def _timeline_action_receipts(
+    timeline: Sequence[MainRequestTimelineItem | Mapping[str, Any]],
+    *,
+    requester: str = "",
+) -> tuple[str, ...]:
+    del requester
+    receipts: list[str] = []
+    for item in timeline:
+        if _timeline_item_value(item, "kind") != "tool_result":
+            continue
+        metadata = _timeline_item_metadata(item)
+        output_value = metadata.get("output")
+        output = output_value if isinstance(output_value, Mapping) else {}
+        execution_value = metadata.get("execution")
+        execution = execution_value if isinstance(execution_value, Mapping) else {}
+        if not _is_plugin_action_result(output, execution=execution):
+            continue
+        action = _receipt_action(output, execution=execution)
+        target = _receipt_target(output, execution=execution)
+        outcome = _receipt_outcome(execution=execution)
+        receipts.append(f"用户请求执行{action}；目标：{target}；结果：{outcome}。")
+    return tuple(receipts)
+
+
+def _is_plugin_action_result(
+    output: Mapping[str, Any],
+    *,
+    execution: Mapping[str, Any],
+) -> bool:
+    tool_kind = normalize_message_text(
+        str(execution.get("tool_kind", "") or "")
+    ).casefold()
+    if tool_kind in {"native_command", "skill_dispatch"}:
+        return True
+    if "plugin_outcome" in execution:
+        return True
+    return any(
+        key in output
+        for key in (
+            "matched_plugin",
+            "command_id",
+        )
+    )
+
+
+def _timeline_item_value(
+    item: MainRequestTimelineItem | Mapping[str, Any],
+    key: str,
+) -> str:
+    value = item.get(key, "") if isinstance(item, Mapping) else getattr(item, key, "")
+    return normalize_message_text(str(value or ""))
+
+
+def _timeline_item_metadata(
+    item: MainRequestTimelineItem | Mapping[str, Any],
+) -> Mapping[str, Any]:
+    value = (
+        item.get("metadata", {})
+        if isinstance(item, Mapping)
+        else getattr(item, "metadata", {})
+    )
+    return value if isinstance(value, Mapping) else {}
+
+
+def _receipt_action(
+    output: Mapping[str, Any],
+    *,
+    execution: Mapping[str, Any],
+) -> str:
+    plugin = _receipt_structured_text(output.get("matched_plugin"), limit=120)
+    command_id = _receipt_structured_text(
+        output.get("command_id"),
+        limit=160,
+    )
+    if plugin and command_id:
+        return f"插件“{plugin}”中的命令“{command_id}”"
+    if plugin:
+        return f"插件“{plugin}”"
+    if command_id:
+        return f"命令“{command_id}”"
+    return "插件操作"
+
+
+def _receipt_target(
+    output: Mapping[str, Any],
+    *,
+    execution: Mapping[str, Any],
+) -> str:
+    value = execution.get("resolved_target") or output.get("resolved_target")
+    identities = _resolved_target_identities(value)
+    if not identities:
+        return "未记录"
+    return "、".join(identities)
+
+
+def _resolved_target_identities(value: Any) -> tuple[str, ...]:
+    values = value if isinstance(value, list | tuple) else (value,)
+    identities: list[str] = []
+    for item in values:
+        if not isinstance(item, Mapping):
+            continue
+        raw_identity = item.get("user_id") or item.get("id")
+        identity = _receipt_identity(raw_identity)
+        if identity and identity not in identities:
+            identities.append(identity)
+    return tuple(identities)
+
+
+def _receipt_outcome(
+    *,
+    execution: Mapping[str, Any],
+) -> str:
+    canonical = normalize_message_text(
+        str(execution.get("plugin_outcome", "") or "")
+    ).casefold()
+    return _RECEIPT_OUTCOME_TEXT.get(canonical, "状态未记录")
+
+
+def _receipt_structured_text(value: Any, *, limit: int) -> str:
+    if value in (None, "") or isinstance(value, Mapping | list | tuple | set):
+        return ""
+    text = " ".join(normalize_message_text(str(value)).split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(limit - 1, 1)].rstrip()}…"
+
+
+def _receipt_identity(value: Any) -> str:
+    text = _receipt_structured_text(value, limit=240)
+    if not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    return f"已解析用户#{digest}"
+
 
 def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
     return MainRequestTimelineItem(
@@ -334,25 +404,13 @@ def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
         content=message_text,
     )
 
-def _convert_runtime_timeline(
-    items: tuple[AgentRuntimeTimelineItem, ...],
-) -> list[MainRequestTimelineItem]:
-    return [
-        MainRequestTimelineItem(
-            role=item.role,
-            kind=item.kind,
-            content=item.content,
-            tool_name=item.tool_name,
-            metadata=dict(item.metadata),
-        )
-        for item in items
-    ]
 
 def _with_final_timeline(
     timeline: tuple[MainRequestTimelineItem, ...],
     *,
     final_text: str,
     should_send: bool,
+    replay_as_assistant: bool,
 ) -> tuple[MainRequestTimelineItem, ...]:
     if not final_text and not should_send:
         return timeline
@@ -362,16 +420,18 @@ def _with_final_timeline(
             role="assistant",
             kind="final_output",
             content=final_text,
+            metadata={"assistant_history": replay_as_assistant},
         ),
     )
 
+
 __all__ = [
-    "_convert_runtime_timeline",
     "_fallback_final_reply",
     "_fallback_result",
     "_finalize_result",
-    "_result_from_agent_runtime",
-    "_result_from_task_execution_queue",
+    "_is_model_chat_result",
+    "_sync_visible_chat_result",
+    "_timeline_action_receipts",
     "_timeline_memory_text",
     "_user_timeline_item",
 ]

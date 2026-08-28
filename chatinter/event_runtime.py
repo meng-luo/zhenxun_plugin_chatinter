@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import time
+from collections import OrderedDict
 
 from nonebot import get_driver
 from nonebot.adapters import Bot, Event
@@ -14,29 +14,33 @@ from zhenxun.services import logger
 from .plugin_registry import PluginRegistry
 from .route_text import normalize_message_text
 
-_HANDLED_MESSAGE_IDS: set[str] = set()
+_HANDLED_MESSAGE_IDS: OrderedDict[str, None] = OrderedDict()
 _MAX_HANDLED_CACHE = 1000
-_KNOWLEDGE_REFRESH_COOLDOWN = 30.0
-_last_knowledge_refresh_ts = 0.0
-_ENABLE_PLUGINS_ATTR = "_chatinter_enable_plugins"
 _DISABLE_PLUGINS_ATTR = "_chatinter_disable_plugins"
 
 
-def is_already_handled(event: Event) -> bool:
+def _handled_message_key(event: Event, *, session_key: str) -> str:
     message_id = getattr(event, "message_id", None)
-    if not message_id:
-        return False
-    return str(message_id) in _HANDLED_MESSAGE_IDS
+    normalized_session = str(session_key or "").strip()
+    if not message_id or not normalized_session:
+        return ""
+    return f"{normalized_session}\0{message_id}"
 
 
-def mark_as_handled(event: Event) -> None:
-    message_id = getattr(event, "message_id", None)
-    if not message_id:
+def is_already_handled(event: Event, *, session_key: str) -> bool:
+    key = _handled_message_key(event, session_key=session_key)
+    return bool(key and key in _HANDLED_MESSAGE_IDS)
+
+
+def mark_as_handled(event: Event, *, session_key: str) -> None:
+    normalized_id = _handled_message_key(event, session_key=session_key)
+    if not normalized_id:
         return
-    _HANDLED_MESSAGE_IDS.add(str(message_id))
-    if len(_HANDLED_MESSAGE_IDS) > _MAX_HANDLED_CACHE:
-        for old_id in list(_HANDLED_MESSAGE_IDS)[: len(_HANDLED_MESSAGE_IDS) // 2]:
-            _HANDLED_MESSAGE_IDS.discard(old_id)
+    if normalized_id in _HANDLED_MESSAGE_IDS:
+        return
+    _HANDLED_MESSAGE_IDS[normalized_id] = None
+    while len(_HANDLED_MESSAGE_IDS) > _MAX_HANDLED_CACHE:
+        _HANDLED_MESSAGE_IDS.popitem(last=False)
 
 
 def get_nickname(session: Uninfo) -> str:
@@ -96,22 +100,20 @@ async def apply_runtime_plugin_overrides(
     session_key: str | None,
     group_id: str | None,
 ) -> None:
-    global _last_knowledge_refresh_ts
-
-    enable_modules = iter_runtime_plugin_overrides(event, _ENABLE_PLUGINS_ATTR)
     disable_modules = iter_runtime_plugin_overrides(event, _DISABLE_PLUGINS_ATTR)
-    if not enable_modules and not disable_modules:
+    if not disable_modules:
         return
-
-    now = time.monotonic()
-    if (now - _last_knowledge_refresh_ts) < _KNOWLEDGE_REFRESH_COOLDOWN:
-        return
-    _last_knowledge_refresh_ts = now
-    await PluginRegistry.preload_cache(force_refresh=True)
+    for module in sorted(disable_modules):
+        await PluginRegistry.set_plugin_enabled(
+            plugin_key=module,
+            enabled=False,
+            session_id=session_key,
+            group_id=group_id,
+        )
     logger.debug(
-        "ChatInter 已按运行态插件覆盖刷新知识库: "
+        "ChatInter 已应用运行态插件关闭: "
         f"session={session_key or group_id or 'global'} "
-        f"enable={sorted(enable_modules)} disable={sorted(disable_modules)}"
+        f"disable={sorted(disable_modules)}"
     )
 
 

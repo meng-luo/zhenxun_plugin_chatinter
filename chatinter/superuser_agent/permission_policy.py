@@ -26,6 +26,11 @@ _CURRENT_MODE: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 _CONVERSATION_GRANTS_PATH = state_path("agent_conversation_grants.json")
 _WORKSPACE_SHELL_GRANT = "workspace_non_dangerous_shell"
+_GRANTS_CACHE_PATH: Path | None = None
+_GRANTS_CACHE_SIGNATURE: tuple[int, int] | None = None
+_GRANTS_CACHE: dict[str, list[dict[str, str]]] = {}
+_EFFECTIVE_POLICY_SOURCE: dict[str, Any] | None = None
+_EFFECTIVE_POLICY_CACHE: dict[str, Any] | None = None
 
 _DEFAULT_POLICY: dict[str, Any] = {
     "preset": "python",
@@ -169,16 +174,14 @@ def grant_conversation_permission(
     key = str(grant_key or "").strip()
     if not run or not scope or not key:
         return False
-    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
-    if not isinstance(grants, dict):
-        grants = {}
+    grants = _conversation_grants()
     values = grants.get(run)
     entries = list(values) if isinstance(values, list) else []
     item = {"section": scope, "grant_key": key}
     if item not in entries:
         entries.append(item)
     grants[run] = entries[-100:]
-    write_json(_CONVERSATION_GRANTS_PATH, grants)
+    _save_conversation_grants(grants)
     return True
 
 
@@ -186,19 +189,19 @@ def clear_conversation_permissions(run_id: str) -> None:
     run = str(run_id or "").strip()
     if not run:
         return
-    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
-    if not isinstance(grants, dict) or run not in grants:
+    grants = _conversation_grants()
+    if run not in grants:
         return
     grants.pop(run, None)
-    write_json(_CONVERSATION_GRANTS_PATH, grants)
+    _save_conversation_grants(grants)
 
 
 def conversation_has_workspace_shell_grant(run_id: str) -> bool:
     run = str(run_id or "").strip()
     if not run:
         return False
-    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
-    entries = grants.get(run) if isinstance(grants, dict) else None
+    grants = _conversation_grants()
+    entries = grants.get(run)
     return isinstance(entries, list) and {
         "section": "shell",
         "grant_key": _WORKSPACE_SHELL_GRANT,
@@ -221,6 +224,8 @@ def permission_reason_text(result: PermissionResult) -> str:
     if result.decision == "ask":
         if result.reason == "dangerous_operation":
             return "该命令可能删除、发布或改变系统状态，需要你的确认"
+        if result.reason == "active_task_requires_approval":
+            return "该操作会创建或更改可在未来主动运行的任务，需要你的确认"
         return "该操作会修改文件、进程或外部状态，需要你的确认"
     return "当前权限模式允许该操作"
 
@@ -234,14 +239,18 @@ def decide_shell(
     policy = _effective_policy()
     value = _normalize_text(command)
     permission_mode = _resolve_permission_mode(mode, policy=policy)
+
+    # Deny rules (hard floor, opaque wrappers, explicit deny, dangerous=deny)
+    # are evaluated before any mode short-circuit: full_access must never
+    # permit an unrecoverable-destruction command.
+    denied = _shell_command_deny(command, policy=policy)
+    if denied is not None:
+        return denied
+
     if permission_mode == "full_access":
         return PermissionResult(
             "allow", "full_access_mode_allow", section="shell", grant_key=value
         )
-
-    denied = _shell_command_deny(command, policy=policy)
-    if denied is not None:
-        return denied
 
     cwd_is_safe = _cwd_is_within_workspace(cwd)
     is_readonly = cwd_is_safe and _is_builtin_readonly_shell_command(command)
@@ -285,11 +294,11 @@ def decide_shell(
 def decide_file_read(path: str, *, mode: str | None = None) -> PermissionResult:
     policy = _effective_policy()
     permission_mode = _resolve_permission_mode(mode, policy=policy)
-    if permission_mode == "full_access":
-        return PermissionResult("allow", "full_access_mode_allow")
     denied = _file_path_deny(path, policy=policy)
     if denied is not None:
         return denied
+    if permission_mode == "full_access":
+        return PermissionResult("allow", "full_access_mode_allow")
     matched = _matched_file_rule(path, policy.get("allow", ()))
     if matched:
         return PermissionResult("allow", "matched_allow", matched)
@@ -300,6 +309,9 @@ def decide_file_write(path: str, *, mode: str | None = None) -> PermissionResult
     policy = _effective_policy()
     value = _normalize_path(path)
     permission_mode = _resolve_permission_mode(mode, policy=policy)
+    denied = _file_path_deny(path, policy=policy)
+    if denied is not None:
+        return denied
     if permission_mode == "full_access":
         return PermissionResult(
             "allow", "full_access_mode_allow", section="file", grant_key=value
@@ -308,9 +320,6 @@ def decide_file_write(path: str, *, mode: str | None = None) -> PermissionResult
         return PermissionResult(
             "deny", "read_only_mode_deny", section="file", grant_key=value
         )
-    denied = _file_path_deny(path, policy=policy)
-    if denied is not None:
-        return denied
     matched = _matched_file_rule(path, policy.get("allow", ()))
     if matched:
         return PermissionResult("allow", "matched_allow", matched, "file", matched)
@@ -325,6 +334,44 @@ def decide_file_write(path: str, *, mode: str | None = None) -> PermissionResult
     return _apply_conversation_grant(pending)
 
 
+def decide_active_task(
+    action: str,
+    *,
+    mode: str | None = None,
+) -> PermissionResult:
+    normalized_action = _normalize_text(action).casefold()
+    if normalized_action == "list":
+        return PermissionResult("allow", "read_only_operation")
+    if normalized_action not in {
+        "create",
+        "update",
+        "pause",
+        "resume",
+        "delete",
+        "run_now",
+        "rotate_webhook",
+    }:
+        return PermissionResult("deny", "default_deny", section="active_task")
+    permission_mode = _resolve_permission_mode(mode)
+    if permission_mode == "full_access":
+        return PermissionResult(
+            "allow",
+            "full_access_mode_allow",
+            section="active_task",
+        )
+    if permission_mode == "read_only":
+        return PermissionResult(
+            "deny",
+            "read_only_mode_deny",
+            section="active_task",
+        )
+    return PermissionResult(
+        "ask",
+        "active_task_requires_approval",
+        section="active_task",
+    )
+
+
 def _resolve_permission_mode(
     requested: str | None = None,
     *,
@@ -334,10 +381,12 @@ def _resolve_permission_mode(
     configured_default = str(
         current_policy.get("default_mode", "ask") or "ask"
     ).strip().lower()
-    if configured_default == "full_access":
-        return "full_access"
+    if configured_default not in _PERMISSION_MODES:
+        configured_default = "ask"
+    # Precedence: explicit request > active session mode > configured default.
+    # A full_access default must not override an explicit /只读模式 switch.
     raw = requested
-    if raw is None:
+    if raw is None or not str(raw).strip():
         raw = _CURRENT_MODE.get().strip() or configured_default
     normalized = str(raw or "").strip().lower()
     return normalized if normalized in _PERMISSION_MODES else "ask"  # type: ignore[return-value]
@@ -349,8 +398,7 @@ def _apply_conversation_grant(result: PermissionResult) -> PermissionResult:
     run_id = _CURRENT_RUN_ID.get().strip()
     if not run_id:
         return result
-    grants = read_json(_CONVERSATION_GRANTS_PATH, {})
-    entries = grants.get(run_id) if isinstance(grants, dict) else None
+    entries = _conversation_grants().get(run_id)
     expected = {"section": result.section, "grant_key": result.grant_key}
     if not isinstance(entries, list) or expected not in entries:
         return result
@@ -612,7 +660,11 @@ def _cwd_is_within_workspace(cwd: str | None) -> bool:
 
 
 def _effective_policy() -> dict[str, Any]:
+    global _EFFECTIVE_POLICY_CACHE, _EFFECTIVE_POLICY_SOURCE
+
     raw = _load_policy()
+    if raw == _EFFECTIVE_POLICY_SOURCE and _EFFECTIVE_POLICY_CACHE is not None:
+        return _EFFECTIVE_POLICY_CACHE
     preset_name = str(raw.get("preset", "python") or "python").strip().lower()
     preset = _PRESETS.get(preset_name, _PYTHON_PRESET)
     result = {
@@ -622,7 +674,64 @@ def _effective_policy() -> dict[str, Any]:
     }
     for key in ("allow", "ask", "dangerous", "deny"):
         result[key] = [*_patterns(preset.get(key, ())), *_patterns(raw.get(key, ()))]
+    _EFFECTIVE_POLICY_SOURCE = raw
+    _EFFECTIVE_POLICY_CACHE = result
     return result
+
+
+def _conversation_grants() -> dict[str, list[dict[str, str]]]:
+    global _GRANTS_CACHE, _GRANTS_CACHE_PATH, _GRANTS_CACHE_SIGNATURE
+
+    path = _CONVERSATION_GRANTS_PATH
+    signature = _file_signature(path)
+    if path == _GRANTS_CACHE_PATH and signature == _GRANTS_CACHE_SIGNATURE:
+        return {
+            run_id: [dict(item) for item in entries]
+            for run_id, entries in _GRANTS_CACHE.items()
+        }
+    raw = read_json(path, {})
+    source = raw if isinstance(raw, dict) else {}
+    grants = {
+        str(run_id): [
+            {
+                "section": str(item.get("section", "")),
+                "grant_key": str(item.get("grant_key", "")),
+            }
+            for item in entries
+            if isinstance(item, dict)
+        ]
+        for run_id, entries in source.items()
+        if isinstance(entries, list)
+    }
+    _GRANTS_CACHE_PATH = path
+    _GRANTS_CACHE_SIGNATURE = signature
+    _GRANTS_CACHE = grants
+    return {
+        run_id: [dict(item) for item in entries]
+        for run_id, entries in grants.items()
+    }
+
+
+def _save_conversation_grants(
+    grants: dict[str, list[dict[str, str]]],
+) -> None:
+    global _GRANTS_CACHE, _GRANTS_CACHE_PATH, _GRANTS_CACHE_SIGNATURE
+
+    write_json(_CONVERSATION_GRANTS_PATH, grants)
+    _GRANTS_CACHE_PATH = _CONVERSATION_GRANTS_PATH
+    _GRANTS_CACHE_SIGNATURE = _file_signature(_CONVERSATION_GRANTS_PATH)
+    _GRANTS_CACHE = {
+        run_id: [dict(item) for item in entries]
+        for run_id, entries in grants.items()
+    }
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def _load_policy() -> dict[str, Any]:
@@ -659,6 +768,7 @@ __all__ = [
     "PermissionResult",
     "clear_conversation_permissions",
     "conversation_has_workspace_shell_grant",
+    "decide_active_task",
     "decide_file_read",
     "decide_file_write",
     "decide_shell",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
+import re
 from typing import Any
 
 from .command_index import CommandCandidate
@@ -16,10 +17,17 @@ from .models.pydantic_models import (
     PluginCommandSchema,
 )
 from .route_text import normalize_message_text
-from .task_frame import TASK_TEXT_FIELD
+from .task_frame import (
+    TARGET_REF_FIELD,
+    TARGET_REF_SCHEMA_DESCRIPTION,
+    TARGET_REFS_FIELD,
+    TARGET_REFS_SCHEMA_DESCRIPTION,
+    TASK_TEXT_FIELD,
+)
 
 _TOOL_NAME_PREFIX = "ci_cmd_"
 _TOOL_NAME_DIGEST_SIZE = 5
+_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -35,8 +43,14 @@ class NativeCommandToolBinding:
 class NativeCommandTool:
     """Executable wrapper exposing one plugin command as one native tool."""
 
-    def __init__(self, binding: NativeCommandToolBinding):
+    def __init__(
+        self,
+        binding: NativeCommandToolBinding,
+        *,
+        execution_context: Any | None = None,
+    ):
         self.binding = binding
+        self._execution_context = execution_context
 
     async def get_definition(self) -> ToolDefinition:
         schema = self.binding.candidate.schema
@@ -50,7 +64,7 @@ class NativeCommandTool:
         )
 
     async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        executor = _resolve_native_executor(context)
+        executor = self._execution_context or _resolve_native_executor(context)
         if executor is None:
             return ToolResult(
                 output=build_command_observation(
@@ -79,69 +93,70 @@ class NativeCommandTool:
             )
 
 
-class CompactNativeCommandTool:
-    """Lightweight schema view for first-pass command selection.
-
-    The tool name stays identical to the executable command tool.  The runtime
-    re-queries with the selected full schema before execution, mirroring Astr's
-    skills-like mode while keeping dispatch through the same executor.
-    """
-
-    def __init__(self, executable: NativeCommandTool):
-        self.executable = executable
-        self.binding = executable.binding
-
-    async def get_definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name=self.binding.tool_name,
-            description=_build_compact_tool_description(self.binding.candidate),
-            parameters={
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": False,
-            },
-        )
-
-    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        return await self.executable.execute(context=context, **kwargs)
-
-
 def build_native_command_tools(
     candidates: list[CommandCandidate],
+    *,
+    execution_context: Any | None = None,
 ) -> list[NativeCommandTool]:
     tools: list[NativeCommandTool] = []
     seen_command_ids: set[str] = set()
+    seen_tool_names: set[str] = set()
 
     for candidate in candidates:
         command_id = normalize_message_text(candidate.schema.command_id)
         if not command_id or command_id in seen_command_ids:
             continue
         seen_command_ids.add(command_id)
-        tool_name = _safe_tool_name(command_id)
+        preferred_name = _semantic_tool_name(candidate.tool)
+        tool_name = _safe_tool_name(
+            command_id,
+            preferred_name=(
+                preferred_name if preferred_name not in seen_tool_names else None
+            ),
+        )
+        if tool_name in seen_tool_names:
+            tool_name = _safe_tool_name(command_id)
+        seen_tool_names.add(tool_name)
         binding = NativeCommandToolBinding(
             tool_name=tool_name,
             candidate=candidate,
         )
-        tools.append(NativeCommandTool(binding))
+        tools.append(
+            NativeCommandTool(
+                binding,
+                execution_context=execution_context,
+            )
+        )
 
     return tools
 
 
-def compact_command_tool_view(
-    executable: Any,
-) -> Any:
-    if isinstance(executable, NativeCommandTool):
-        return CompactNativeCommandTool(executable)
-    return executable
-
-
-def _safe_tool_name(command_id: str) -> str:
+def _safe_tool_name(
+    command_id: str,
+    *,
+    preferred_name: str | None = None,
+) -> str:
+    preferred = normalize_message_text(str(preferred_name or ""))
+    if _TOOL_NAME_PATTERN.fullmatch(preferred):
+        return preferred
     digest = hashlib.blake2s(
         command_id.encode("utf-8", errors="ignore"),
         digest_size=_TOOL_NAME_DIGEST_SIZE,
     ).hexdigest()
     return f"{_TOOL_NAME_PREFIX}{digest}"
+
+
+def _semantic_tool_name(snapshot: CommandToolSnapshot | None) -> str:
+    if snapshot is None or not isinstance(snapshot.meta, dict):
+        return ""
+    return normalize_message_text(str(snapshot.meta.get("semantic_tool_name") or ""))
+
+
+def _semantic_contract(snapshot: CommandToolSnapshot | None) -> dict[str, Any]:
+    if snapshot is None or not isinstance(snapshot.meta, dict):
+        return {}
+    contract = snapshot.meta.get("semantic_contract")
+    return dict(contract) if isinstance(contract, dict) else {}
 
 
 def _resolve_native_executor(context: Any | None) -> Any | None:
@@ -157,42 +172,24 @@ def _resolve_native_executor(context: Any | None) -> Any | None:
 def _build_tool_description(candidate: CommandCandidate) -> str:
     schema = candidate.schema
     snapshot = candidate.tool
-    parts = [
-        "ChatInter command tool. 调用此工具会真实触发对应 NoneBot 插件命令。",
-        f"plugin_name: {candidate.plugin_name}",
-        f"plugin_module: {candidate.plugin_module}",
-        f"command_id: {schema.command_id}",
-        f"head: {schema.head}",
-        f"render: {schema.render}",
-        f"role: {schema.command_role}",
-        f"payload_policy: {schema.payload_policy}",
-        f"extra_text_policy: {schema.extra_text_policy}",
-        f"source: {schema.source}",
-        f"confidence: {schema.confidence:.2f}",
-        f"recall_signal: {candidate.reason}",
-        "recall_policy: 本工具来自能力检索候选；rank/score 不是执行决策。",
-    ]
-    description = schema.description or getattr(snapshot, "capability_text", "")
+    contract = _semantic_contract(snapshot)
+    description = normalize_message_text(str(contract.get("description") or ""))
+    description = description or schema.description or getattr(
+        snapshot, "capability_text", ""
+    )
+    parts = [description or f"执行{candidate.plugin_name}的{schema.head}功能。"]
     if description:
-        parts.append(f"description: {description}")
+        parts.append("调用会真实执行对应插件功能并返回实际结果。")
     if snapshot is not None and snapshot.usage:
-        parts.append(f"usage: {snapshot.usage}")
-    if snapshot is not None and snapshot.capability_text:
-        parts.append(f"capability: {snapshot.capability_text}")
-    if snapshot is not None:
-        card_lines = _capability_card_lines(snapshot)
-        if card_lines:
-            parts.extend(card_lines)
-    if snapshot is not None and snapshot.task_verbs:
-        parts.append("task_verbs: " + _join_values(snapshot.task_verbs))
+        parts.append(f"用法：{snapshot.usage}")
     if snapshot is not None and snapshot.input_requirements:
-        parts.append("input_requirements: " + _join_values(snapshot.input_requirements))
+        parts.append("输入：" + _join_values(snapshot.input_requirements))
     if snapshot is not None and snapshot.examples:
-        parts.append("examples: " + _join_values(snapshot.examples))
-    if schema.aliases:
-        parts.append("aliases: " + _join_values(schema.aliases))
-    if schema.retrieval_phrases:
-        parts.append("retrieval_phrases: " + _join_values(schema.retrieval_phrases))
+        parts.append("示例：" + _join_values(snapshot.examples))
+    if snapshot is not None and snapshot.use_cases:
+        parts.append("适用：" + _join_values(snapshot.use_cases))
+    if snapshot is not None and snapshot.anti_use_cases:
+        parts.append("不适用：" + _join_values(snapshot.anti_use_cases))
     if schema.requires:
         requires = [
             key
@@ -200,7 +197,7 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
             if required and normalize_message_text(key)
         ]
         if requires:
-            parts.append("requires_context: " + _join_values(requires))
+            parts.append("所需上下文：" + _join_values(requires))
     target_requirement = normalize_message_text(
         str(getattr(schema, "target_requirement", "") or "")
     )
@@ -210,131 +207,28 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
         if normalize_message_text(str(item or ""))
     ]
     if target_requirement and target_requirement != "none":
-        parts.append(f"target_requirement: {target_requirement}")
+        parts.append(f"目标要求：{target_requirement}")
     if target_sources:
-        parts.append("target_sources: " + _join_values(target_sources))
-    if getattr(schema, "allow_at", None):
-        parts.append("allow_at: true，允许使用 @ 或 [@user_id] 作为目标。")
-    if schema.actor_scope:
-        parts.append(f"actor_scope: {schema.actor_scope}")
+        parts.append("目标来源：" + _join_values(target_sources))
+    target_is_context_owned = any(slot.type == "at" for slot in schema.slots)
+    if target_is_context_owned:
+        parts.append("目标对象由代码从本轮消息、@、回复和群成员上下文中解析。")
     if schema.slots:
         parts.append(
-            "slots: "
+            "参数："
             + _join_values(
                 _slot_signature(slot)
                 for slot in schema.slots
-                if normalize_message_text(slot.name)
+                if normalize_message_text(slot.name) and slot.type != "at"
             )
         )
-    parts.append(
-        "Call policy: 只有用户明确要执行该功能、查询该功能用法，或自然语言需求"
-        "明显对应该命令时才调用。普通闲聊、讨论命令概念、候选不匹配时不要调用。"
-    )
-    parts.append(
-        "Multi-task policy: task_text 是模型对本次工具调用负责内容的标注；"
-        "不要把无关任务写进同一个工具调用。无法明确标注时可传 null。"
-    )
-    return "\n".join(part for part in parts if normalize_message_text(part))
-
-
-def _build_compact_tool_description(candidate: CommandCandidate) -> str:
-    schema = candidate.schema
-    snapshot = candidate.tool
-    description = _clip_text(
-        schema.description or getattr(snapshot, "capability_text", ""), 90
-    )
-    parts = [
-        "Compact capability card; selecting it only asks runtime for full schema.",
-        f"command_id: {schema.command_id}",
-        f"head: {schema.head}",
-        f"role: {schema.command_role}",
-        f"payload_policy: {schema.payload_policy}",
-    ]
-    if description:
-        parts.append(f"description: {description}")
     if snapshot is not None:
-        card_lines = _compact_capability_card_lines(snapshot)
-        if card_lines:
-            parts.extend(card_lines)
-    if schema.aliases:
-        parts.append("aliases: " + _join_values(schema.aliases[:3], limit=80))
-    if schema.retrieval_phrases:
-        parts.append("phrases: " + _join_values(schema.retrieval_phrases[:3], limit=80))
-    if schema.slots:
         parts.append(
-            "slots_summary: "
-            + _join_values(
-                (
-                    f"{slot.name}:{slot.type}:{'req' if slot.required else 'opt'}"
-                    for slot in schema.slots[:4]
-                    if normalize_message_text(slot.name)
-                ),
-                limit=96,
-            )
+            f"输出：{snapshot.output_mode}；副作用：{snapshot.side_effect}；"
+            f"执行策略：{snapshot.execution_policy}。"
         )
     return "\n".join(part for part in parts if normalize_message_text(part))
 
-
-def _capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
-    lines: list[str] = []
-    if snapshot.source_of_truth:
-        lines.append(f"source_of_truth: {snapshot.source_of_truth}")
-    lines.append(
-        "requires_real_tool: " + str(bool(snapshot.requires_real_tool)).lower()
-    )
-    if snapshot.output_mode:
-        lines.append(f"output_mode: {snapshot.output_mode}")
-    if snapshot.entity_scope:
-        lines.append(f"entity_scope: {snapshot.entity_scope}")
-    if snapshot.side_effect:
-        lines.append(f"side_effect: {snapshot.side_effect}")
-    if snapshot.risk:
-        lines.append(f"risk: {snapshot.risk}")
-    elif snapshot.risk_level:
-        lines.append(f"risk: {snapshot.risk_level}")
-    lines.append(f"reliability: {float(snapshot.reliability or 0.0):.2f}")
-    lines.append(f"schema_quality: {float(snapshot.schema_quality or 0.0):.2f}")
-    lines.append(f"soft_tool: {str(bool(snapshot.soft_tool)).lower()}")
-    if snapshot.intent_types:
-        lines.append("intent_types: " + _join_values(snapshot.intent_types))
-    lines.append(
-        "requires_real_result: " + str(bool(snapshot.requires_real_result)).lower()
-    )
-    lines.append(f"generative: {str(bool(snapshot.generative)).lower()}")
-    if snapshot.execution_policy:
-        lines.append(f"execution_policy: {snapshot.execution_policy}")
-    if snapshot.use_cases:
-        lines.append("use_cases: " + _join_values(snapshot.use_cases))
-    if snapshot.anti_use_cases:
-        lines.append("anti_use_cases: " + _join_values(snapshot.anti_use_cases))
-    return lines
-
-
-def _compact_capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
-    lines: list[str] = []
-    if snapshot.source_of_truth:
-        lines.append(f"source_of_truth: {snapshot.source_of_truth}")
-    lines.append(
-        "requires_real_tool: " + str(bool(snapshot.requires_real_tool)).lower()
-    )
-    if snapshot.output_mode:
-        lines.append(f"output_mode: {snapshot.output_mode}")
-    if snapshot.side_effect:
-        lines.append(f"side_effect: {snapshot.side_effect}")
-    risk = snapshot.risk or snapshot.risk_level
-    if risk:
-        lines.append(f"risk: {risk}")
-    if snapshot.intent_types:
-        lines.append(
-            "intent_types: " + _join_values(snapshot.intent_types[:4], limit=80)
-        )
-    if snapshot.use_cases:
-        lines.append("use_cases: " + _join_values(snapshot.use_cases[:2], limit=96))
-    if snapshot.anti_use_cases:
-        lines.append(
-            "anti_use_cases: " + _join_values(snapshot.anti_use_cases[:1], limit=96)
-        )
-    return lines
 
 
 def _build_parameters(
@@ -350,26 +244,44 @@ def _build_parameters(
                 "负责的内容；无法明确标注时传 null。"
             ),
         },
-        "target_hint": {
+        TARGET_REF_FIELD: {
             "type": ["string", "null"],
-            "description": _target_hint_description(schema),
+            "description": TARGET_REF_SCHEMA_DESCRIPTION,
         },
-        "payload_hint": {
-            "type": ["string", "null"],
-            "description": _payload_hint_description(schema),
+        TARGET_REFS_FIELD: {
+            "type": ["array", "null"],
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 2,
+            "maxItems": 4,
+            "uniqueItems": True,
+            "description": TARGET_REFS_SCHEMA_DESCRIPTION,
         },
     }
-    required: list[str] = [TASK_TEXT_FIELD, "target_hint", "payload_hint"]
-    seen: set[str] = {TASK_TEXT_FIELD, "target_hint", "payload_hint"}
+    required: list[str] = [TASK_TEXT_FIELD]
+    seen: set[str] = {TASK_TEXT_FIELD}
     for slot in schema.slots:
         name = normalize_message_text(slot.name)
-        if not name or name in seen:
+        if not name or name in seen or slot.type == "at":
             continue
         seen.add(name)
         properties[name] = _slot_to_property(slot, schema=schema, snapshot=snapshot)
-
-
-        required.append(name)
+        if slot.required:
+            required.append(name)
+    contract = _semantic_contract(snapshot)
+    contract_parameters = contract.get("parameters")
+    if isinstance(contract_parameters, dict):
+        contract_properties = contract_parameters.get("properties")
+        if isinstance(contract_properties, dict):
+            for name, raw_property in contract_properties.items():
+                if name not in properties or not isinstance(raw_property, dict):
+                    continue
+                properties[name].update(
+                    {
+                        key: value
+                        for key, value in raw_property.items()
+                        if key in {"type", "description", "enum", "default"}
+                    }
+                )
     return {
         "type": "object",
         "description": _build_parameter_root_description(schema, snapshot=snapshot),
@@ -463,30 +375,6 @@ def _build_parameter_root_description(
     return "；".join(parts)
 
 
-def _target_hint_description(schema: PluginCommandSchema) -> str:
-    parts = [
-        "目标策略提示，不直接作为插件参数渲染；用于说明本次调用的目标来源。",
-        f"target_requirement={schema.target_requirement}",
-        f"actor_scope={schema.actor_scope}",
-    ]
-    if schema.target_sources:
-        parts.append("target_sources=" + _join_values(schema.target_sources))
-    if schema.allow_at is not None:
-        parts.append(f"allow_at={schema.allow_at}")
-    return "；".join(parts)
-
-
-def _payload_hint_description(schema: PluginCommandSchema) -> str:
-    return "；".join(
-        [
-            "负载策略提示，不直接作为插件参数渲染；用于说明文本/图片/尾巴如何提供。",
-            f"payload_policy={schema.payload_policy}",
-            f"extra_text_policy={schema.extra_text_policy}",
-            "图片上下文请用 [image#N]，目标用户请用 [@user_id]。",
-        ]
-    )
-
-
 def _slot_signature(slot: CommandSlotSpec) -> str:
     parts = [
         slot.name,
@@ -517,9 +405,7 @@ def _clip_text(text: str, limit: int) -> str:
 
 
 __all__ = [
-    "CompactNativeCommandTool",
     "NativeCommandTool",
     "NativeCommandToolBinding",
     "build_native_command_tools",
-    "compact_command_tool_view",
 ]

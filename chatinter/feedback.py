@@ -637,17 +637,6 @@ class FeedbackStore:
         )
         cls._maybe_save_longterm(now)
         cls._prune(now)
-        await cls._record_plugin_rag_feedback(
-            session_id=normalized_session,
-            modules=modules,
-            reason=normalized_reason,
-            route_message=message_text,
-            route_command=command,
-            image_missing=image_missing,
-            text_missing=text_missing,
-            allow_at=allow_at,
-        )
-
     @classmethod
     def inspect_user_followup(
         cls,
@@ -777,47 +766,6 @@ class FeedbackStore:
             session_id=last.session_id,
             message_preview=message_text,
         )
-
-    @classmethod
-    async def _record_plugin_rag_feedback(
-        cls,
-        *,
-        session_id: str,
-        modules: set[str] | list[str] | tuple[str, ...],
-        reason: str,
-        route_message: str,
-        route_command: str,
-        image_missing: int = 0,
-        text_missing: int = 0,
-        allow_at: bool | None = None,
-    ) -> None:
-        normalized_modules = {
-            normalize_message_text(str(module or ""))
-            for module in modules
-            if normalize_message_text(str(module or ""))
-        }
-        if not normalized_modules:
-            return
-        slot_feedback = _build_plugin_slot_feedback(
-            reason=reason,
-            route_message=route_message,
-            route_command=route_command,
-            image_missing=image_missing,
-            text_missing=text_missing,
-            allow_at=allow_at,
-        )
-        try:
-            from .knowledge_rag import PluginRAGService
-
-            await PluginRAGService.update_session_feedback(
-                session_id=session_id,
-                modules=normalized_modules,
-                reward=_plugin_feedback_reward(reason),
-                reason=reason,
-                slot_feedback=slot_feedback or None,
-            )
-        except Exception as exc:
-            logger.debug(f"更新 ChatInter 统一反馈失败: {exc}")
 
     @classmethod
     def _record_memory_feedback(
@@ -2008,75 +1956,6 @@ def _coerce_feedback_kind(reason: str) -> FeedbackKind:
     if normalized == "chat_empty":
         return "chat_empty"
     return "route_success" if normalized == "success" else "reroute_failed"
-
-
-def _build_plugin_slot_feedback(
-    *,
-    reason: str,
-    route_message: str,
-    route_command: str,
-    image_missing: int = 0,
-    text_missing: int = 0,
-    allow_at: bool | None = None,
-) -> dict[str, float]:
-    slot_scores: dict[str, float] = {}
-    has_command_head = bool(_normalize_head(route_command))
-    has_target_signal = bool(_extract_at_tokens(route_message))
-    has_image_signal = bool(_extract_image_tokens(route_message))
-    has_text_signal = _extract_text_token_count(route_command) > 0
-
-    if has_command_head:
-        slot_scores["command_head"] = (
-            1.0 if reason == FEEDBACK_REASON_ROUTE_SUCCESS else -0.6
-        )
-
-    if reason == FEEDBACK_REASON_ROUTE_SUCCESS:
-        if has_target_signal:
-            slot_scores["target"] = 0.35
-        if has_image_signal:
-            slot_scores["image"] = 0.35
-        if has_text_signal:
-            slot_scores["text"] = 0.25
-        return slot_scores
-
-    if reason == FEEDBACK_REASON_SELF_ONLY_BLOCKED:
-        slot_scores["target"] = -0.95
-        return slot_scores
-
-    if reason in {
-        FEEDBACK_REASON_TARGET_REQUIRED,
-        FEEDBACK_REASON_DIRECT_TARGET_REQUIRED,
-        FEEDBACK_REASON_FUZZY_CLARIFY,
-    }:
-        slot_scores["target"] = -0.65
-        return slot_scores
-
-    if reason == FEEDBACK_REASON_MISSING_PARAMS:
-        if image_missing > 0:
-            slot_scores["image"] = -0.90
-        if text_missing > 0:
-            slot_scores["text"] = -0.75
-        if allow_at and not has_target_signal:
-            slot_scores["target"] = -0.55
-        return slot_scores
-
-    if reason == FEEDBACK_REASON_REROUTE_FAILED:
-        slot_scores["command_head"] = -0.85
-        return slot_scores
-
-    return slot_scores
-
-
-def _extract_text_token_count(command_text: str) -> int:
-    normalized = normalize_message_text(command_text)
-    if not normalized:
-        return 0
-    parts = normalized.split(" ", 1)
-    payload = parts[1] if len(parts) > 1 else ""
-    payload = normalize_message_text(_PLACEHOLDER_SEGMENT_PATTERN.sub(" ", payload))
-    if not payload:
-        return 0
-    return len([token for token in payload.split(" ") if token])
 
 
 def _extract_at_tokens(message_text: str) -> tuple[str, ...]:

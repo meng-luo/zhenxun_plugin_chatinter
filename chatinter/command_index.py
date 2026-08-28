@@ -6,12 +6,13 @@ as the final command selector; executable schema choice belongs to the LLM.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import hashlib
 import math
 import re
 from typing import Any
+import unicodedata
 
 from .capability_graph import build_capability_graph_snapshot
 from .feedback import (
@@ -46,8 +47,8 @@ _PLUGIN_SOFT_CAP = 8
 _EXACT_KEEP_LIMIT = 8
 _INDEX_PREFILTER_MIN_TOOLS = 64
 _INDEX_PREFILTER_LIMIT = 160
-_STATIC_BM25_CAP = 8
 _STATIC_BM25_CUT_RATIO = 0.38
+_STATIC_BM25_CUT_MAX_CANDIDATES = 64
 _STATIC_BM25_K1 = 1.2
 _STATIC_BM25_B = 0.55
 _STATIC_BM25_AVGDL = 24.0
@@ -66,9 +67,26 @@ _STATIC_BM25_FIELD_WEIGHTS = {
     "example": 3.5,
     "usage": 3.0,
     "description": 2.8,
+    "retrieval_phrase": 2.4,
     "slot": 1.6,
 }
-_EXPANDED_RELEVANCE_CONTEXT_KEYS = ("has_reply", "multi_task", "is_multi_task")
+_STATIC_BM25_STRONG_FIELDS = frozenset(
+    {
+        "head",
+        "alias",
+        "shortcut",
+        "example",
+        "usage",
+        "description",
+        "retrieval_phrase",
+        "slot",
+    }
+)
+# The version identifies the static BM25 field and identity-channel schema.
+_STATIC_BM25_INDEX_VERSION = 3
+# High-posting single CJK terms are excluded to bound the candidate set.
+_STATIC_SINGLE_CJK_CHAR_MAX_POSTINGS = 8
+_STATIC_SINGLE_CJK_CHAR_SCORE = 72.0
 _MEDIA_CONTEXT_TERMS = (
     "表情",
     "表情包",
@@ -82,6 +100,7 @@ _MEDIA_CONTEXT_TERMS = (
 )
 _MEDIA_ACTION_TERMS = (
     "做",
+    "做成",
     "制作",
     "生成",
     "整",
@@ -90,9 +109,12 @@ _MEDIA_ACTION_TERMS = (
     "发",
     "画",
     "转",
+    "变成",
+    "换成",
     "识别",
     "搜",
 )
+_IDENTITY_VARIATION_PATTERN = re.compile("[\ufe0e\ufe0f]")
 
 
 @dataclass(frozen=True)
@@ -107,6 +129,7 @@ class CommandCandidate:
     reasons: tuple[str, ...] = ()
     exact_protected: bool = False
     features: CommandCandidateFeatures | None = None
+    strict_identity_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,9 +199,11 @@ class _StaticBm25Index:
     postings: dict[str, frozenset[int]]
     exact_identity: dict[str, frozenset[int]]
     single_cjk_prefix: dict[str, frozenset[int]]
+    single_cjk_char: dict[str, frozenset[int]]
     head_prefixes: dict[str, tuple[tuple[str, int], ...]]
     long_identity: tuple[tuple[str, int], ...]
     short_cjk_identity: tuple[tuple[str, int], ...]
+    unicode_identity: tuple[tuple[str, int], ...]
     expanded_shortcut_aliases_by_module: dict[str, frozenset[str]]
 
 
@@ -187,7 +212,12 @@ _INDEX_CACHE_ORDER: list[str] = []
 _INDEX_CACHE_MAX = 8
 _STATIC_BM25_CACHE: dict[tuple[Any, ...], _StaticBm25Index] = {}
 _STATIC_BM25_CACHE_ORDER: list[tuple[Any, ...]] = []
-_STATIC_BM25_CACHE_MAX = 8
+_STATIC_BM25_CACHE_MAX = 32
+_STATIC_BM25_SOURCE_CACHE: OrderedDict[
+    tuple[int, ...],
+    tuple[tuple[CommandToolSnapshot, ...], _StaticBm25Index],
+] = OrderedDict()
+_STATIC_BM25_SOURCE_CACHE_MAX = 32
 
 
 def _empty_features() -> CommandCandidateFeatures:
@@ -195,7 +225,7 @@ def _empty_features() -> CommandCandidateFeatures:
 
 
 def _reason_feature_deltas(reason: str) -> dict[str, float]:
-    if reason in {"exact_head", "exact_alias", "exact_shortcut"}:
+    if reason in {"exact_head", "exact_alias", "exact_shortcut", "unicode_identity"}:
         return {"exact_score": _EXACT_BOOST if reason == "exact_head" else _ALIAS_BOOST}
     if reason in {
         "head_prefix",
@@ -439,6 +469,10 @@ def _static_bm25_field_texts(
         "usage": [tool.usage or ""],
         "description": [schema.description],
         "slot": _slot_texts(schema),
+        # retrieval_phrases 是插件/人工授权的检索专用短语（如 meme tags）。
+        # 其他派生字段（capability_text/use_cases/task_verbs/intent_types）
+        # 是模板生成文本，按 static-metadata-only 契约禁止参与打分。
+        "retrieval_phrase": list(schema.retrieval_phrases or []),
     }
 
 
@@ -476,63 +510,83 @@ def _static_bm25_idf(
 
 
 def _static_bm25_cache_key(tools: list[CommandToolSnapshot]) -> tuple[Any, ...]:
-    return tuple(
-        (
-            tool.command_id,
-            tool.plugin_module,
-            tool.head,
-            tuple(tool.aliases),
-            tool.usage,
-            tuple(tool.examples),
-            tool.description,
-            tuple(
-                (
-                    slot.name,
-                    slot.type,
-                    slot.required,
-                    repr(slot.default),
-                    tuple(slot.aliases),
-                    slot.description,
-                    tuple(slot.choices),
-                )
-                for slot in tool.slots
-            ),
-            tuple(sorted(tool.requires.items())),
-            tool.allow_at,
-            tool.actor_scope,
-            tool.target_requirement,
-            tuple(tool.target_sources),
-            tool.render,
-            tool.payload_policy,
-            tool.extra_text_policy,
-            tool.command_role,
-            tool.source,
-            tool.confidence,
-            tool.matcher_key,
-            tuple(tool.retrieval_phrases),
-            tuple(
-                (
-                    normalize_message_text(str(item.get("alias") or "")),
-                    normalize_message_text(str(item.get("render") or "")),
-                )
-                for item in (
-                    tool.meta.get("shortcut_renders", [])
-                    if isinstance(tool.meta, dict)
-                    else []
-                )
-                if isinstance(item, dict)
-            ),
-        )
-        for tool in tools
+    return (
+        _STATIC_BM25_INDEX_VERSION,
+        tuple(
+            (
+                tool.command_id,
+                tool.plugin_module,
+                tool.head,
+                tuple(tool.aliases),
+                tool.usage,
+                tuple(tool.examples),
+                tool.description,
+                tuple(
+                    (
+                        slot.name,
+                        slot.type,
+                        slot.required,
+                        repr(slot.default),
+                        tuple(slot.aliases),
+                        slot.description,
+                        tuple(slot.choices),
+                    )
+                    for slot in tool.slots
+                ),
+                tuple(sorted(tool.requires.items())),
+                tool.allow_at,
+                tool.allow_sticky_arg,
+                tool.actor_scope,
+                tool.target_requirement,
+                tuple(tool.target_sources),
+                tool.render,
+                tool.payload_policy,
+                tool.extra_text_policy,
+                tool.command_role,
+                tool.output_mode,
+                tool.generative,
+                tuple(tool.intent_types),
+                tool.source,
+                tool.confidence,
+                tool.matcher_key,
+                tuple(tool.retrieval_phrases),
+                tuple(
+                    (
+                        normalize_message_text(str(item.get("alias") or "")),
+                        normalize_message_text(str(item.get("render") or "")),
+                    )
+                    for item in (
+                        tool.meta.get("shortcut_renders", [])
+                        if isinstance(tool.meta, dict)
+                        else []
+                    )
+                    if isinstance(item, dict)
+                ),
+            )
+            for tool in tools
+        ),
     )
 
 
 def _get_static_bm25_index(
     tools: list[CommandToolSnapshot],
 ) -> _StaticBm25Index:
+    source_key = tuple(id(tool) for tool in tools)
+    source_cached = _STATIC_BM25_SOURCE_CACHE.get(source_key)
+    if source_cached is not None:
+        cached_tools, cached_index = source_cached
+        if len(cached_tools) == len(tools) and all(
+            cached is current
+            for cached, current in zip(cached_tools, tools, strict=True)
+        ):
+            _STATIC_BM25_SOURCE_CACHE.move_to_end(source_key)
+            return cached_index
+        _STATIC_BM25_SOURCE_CACHE.pop(source_key, None)
+
     cache_key = _static_bm25_cache_key(tools)
     cached = _STATIC_BM25_CACHE.get(cache_key)
     if cached is not None:
+        _remember_static_bm25_source(source_key, tools, cached)
         return cached
 
     expanded = _expanded_shortcut_aliases_by_module(tools)
@@ -540,9 +594,11 @@ def _get_static_bm25_index(
     postings: dict[str, set[int]] = defaultdict(set)
     exact_identity: dict[str, set[int]] = defaultdict(set)
     single_cjk_prefix: dict[str, set[int]] = defaultdict(set)
+    single_cjk_char: dict[str, set[int]] = defaultdict(set)
     head_prefixes: dict[str, list[tuple[str, int]]] = defaultdict(list)
     long_identity: list[tuple[str, int]] = []
     short_cjk_identity: list[tuple[str, int]] = []
+    unicode_identity: list[tuple[str, int]] = []
     for tool in tools:
         document_index = len(documents)
         schema = _schema_from_tool_snapshot(tool)
@@ -566,7 +622,7 @@ def _get_static_bm25_index(
             field_counts[field] = dict(counts)
             field_lengths[field] = max(sum(counts.values()), 1)
         head_aliases = [schema.head, *schema.aliases]
-        normalized_head = normalize_message_text(schema.head).casefold()
+        normalized_head = _normalize_command_identity(schema.head)
         if normalized_head:
             head_prefixes[normalized_head[0]].append(
                 (normalized_head, document_index)
@@ -576,14 +632,20 @@ def _get_static_bm25_index(
             *_shortcut_texts(schema, ignored_aliases=ignored_aliases),
         ]
         for phrase in identity_phrases:
-            normalized_phrase = normalize_message_text(phrase).casefold()
+            normalized_phrase = _normalize_command_identity(phrase)
             if normalized_phrase:
                 exact_identity[normalized_phrase].add(document_index)
         for phrase in head_aliases:
-            normalized_phrase = normalize_message_text(phrase).casefold()
+            normalized_phrase = _normalize_command_identity(phrase)
+            if _contains_unicode_command_symbol(normalized_phrase):
+                unicode_identity.append((normalized_phrase, document_index))
             cjk_phrase = re.sub(r"[^\u4e00-\u9fff]+", "", normalized_phrase)
             if len(normalized_phrase) == 1 and len(cjk_phrase) == 1:
                 single_cjk_prefix[normalized_phrase].add(document_index)
+            if len(cjk_phrase) >= 2:
+                # 表情包类命令形如「修饰语+动词」，动词在尾部；首字覆盖前缀式命名。
+                single_cjk_char[cjk_phrase[0]].add(document_index)
+                single_cjk_char[cjk_phrase[-1]].add(document_index)
             if 2 <= len(cjk_phrase) <= 4:
                 short_cjk_identity.append((cjk_phrase, document_index))
             if len(cjk_phrase) >= 4:
@@ -613,12 +675,18 @@ def _get_static_bm25_index(
             phrase: frozenset(indexes)
             for phrase, indexes in single_cjk_prefix.items()
         },
+        single_cjk_char={
+            char: frozenset(indexes)
+            for char, indexes in single_cjk_char.items()
+            if 0 < len(indexes) <= _STATIC_SINGLE_CJK_CHAR_MAX_POSTINGS
+        },
         head_prefixes={
             first: tuple(sorted(items, key=lambda item: len(item[0]), reverse=True))
             for first, items in head_prefixes.items()
         },
         long_identity=tuple(long_identity),
         short_cjk_identity=tuple(short_cjk_identity),
+        unicode_identity=tuple(unicode_identity),
         expanded_shortcut_aliases_by_module={
             module: frozenset(aliases) for module, aliases in expanded.items()
         },
@@ -628,7 +696,19 @@ def _get_static_bm25_index(
     while len(_STATIC_BM25_CACHE_ORDER) > _STATIC_BM25_CACHE_MAX:
         old = _STATIC_BM25_CACHE_ORDER.pop(0)
         _STATIC_BM25_CACHE.pop(old, None)
+    _remember_static_bm25_source(source_key, tools, index)
     return index
+
+
+def _remember_static_bm25_source(
+    source_key: tuple[int, ...],
+    tools: list[CommandToolSnapshot],
+    index: _StaticBm25Index,
+) -> None:
+    _STATIC_BM25_SOURCE_CACHE[source_key] = (tuple(tools), index)
+    _STATIC_BM25_SOURCE_CACHE.move_to_end(source_key)
+    while len(_STATIC_BM25_SOURCE_CACHE) > _STATIC_BM25_SOURCE_CACHE_MAX:
+        _STATIC_BM25_SOURCE_CACHE.popitem(last=False)
 
 
 def _static_identity_indexes(
@@ -636,21 +716,31 @@ def _static_identity_indexes(
     *,
     variants: tuple[str, ...],
     router_context: dict[str, Any] | None,
-) -> tuple[set[int], set[int]]:
+) -> tuple[set[int], set[int], set[int], set[int]]:
     matched: set[int] = set()
     longest_prefix_matches: set[int] = set()
-    texts = [text.casefold() for text in variants if text]
+    unicode_matches: set[int] = set()
+    scoped_single_identity_matches: set[int] = set()
+    texts = [_normalize_command_identity(text) for text in variants if text]
     for text in texts:
         matched.update(index.exact_identity.get(text, ()))
         if " " in text:
             matched.update(index.exact_identity.get(text.split(" ", 1)[0], ()))
-        if len(text) > 1:
-            matched.update(index.single_cjk_prefix.get(text[0], ()))
         prefix_matches = [
             (phrase, document_index)
             for phrase, document_index in index.head_prefixes.get(text[:1], ())
             if text.startswith(phrase)
             and len(text) > len(phrase)
+            and (
+                len(phrase) > 1
+                or bool((router_context or {}).get("skill_scoped"))
+                or _allows_global_single_prefix(
+                    text,
+                    index.documents[document_index].tool,
+                    index.documents[document_index].schema,
+                    router_context=router_context,
+                )
+            )
             and _allows_sticky_identity_tail(
                 index.documents[document_index].schema,
                 router_context=router_context,
@@ -663,9 +753,29 @@ def _static_identity_indexes(
                     break
                 matched.add(document_index)
                 longest_prefix_matches.add(document_index)
+    if bool((router_context or {}).get("skill_scoped")):
+        for phrase, document_indexes in index.single_cjk_prefix.items():
+            if any(phrase in text for text in texts):
+                matched.update(document_indexes)
+                scoped_single_identity_matches.update(document_indexes)
     for phrase, document_index in index.long_identity:
         if any(phrase in text for text in texts):
             matched.add(document_index)
+
+    for phrase, document_index in index.unicode_identity:
+        document = index.documents[document_index]
+        if any(
+            _allows_unicode_identity_match(
+                text,
+                phrase,
+                tool=document.tool,
+                schema=document.schema,
+                router_context=router_context,
+            )
+            for text in texts
+        ):
+            matched.add(document_index)
+            unicode_matches.add(document_index)
 
     cjk_query = re.sub(r"[^\u4e00-\u9fff]+", "", variants[0] if variants else "")
     for phrase, document_index in index.short_cjk_identity:
@@ -684,7 +794,100 @@ def _static_identity_indexes(
             and positions[-1] - positions[0] <= len(phrase) + 1
         ):
             matched.add(document_index)
-    return matched, longest_prefix_matches
+    return (
+        matched,
+        longest_prefix_matches,
+        unicode_matches,
+        scoped_single_identity_matches,
+    )
+
+
+def _static_single_cjk_char_indexes(
+    index: _StaticBm25Index,
+    variants: tuple[str, ...],
+) -> set[int]:
+    """Degraded recall channel for single-CJK-verb queries (skill scope only).
+
+    ``_static_bm25_terms`` drops CJK unigrams, so a query like「啃他」produces no
+    regular term at all ("他" is a stop char, "啃" is below the 2-gram floor).
+    Inside a skill scope we fall back to matching the query's single CJK chars
+    against the first/last char of command identities.
+    """
+
+    if not index.single_cjk_char:
+        return set()
+    matched: set[int] = set()
+    seen: set[str] = set()
+    for variant in variants:
+        for char in _normalize_command_identity(variant):
+            if not ("一" <= char <= "鿿"):
+                continue
+            if char in _STATIC_BM25_STOP_CHARS or char in seen:
+                continue
+            seen.add(char)
+            matched.update(index.single_cjk_char.get(char, ()))
+    return matched
+
+
+def _normalize_command_identity(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", normalize_message_text(text))
+    return _IDENTITY_VARIATION_PATTERN.sub("", normalized).casefold()
+
+
+def _contains_unicode_command_symbol(text: str) -> bool:
+    return any(unicodedata.category(char).startswith("S") for char in text)
+
+
+def _allows_unicode_identity_match(
+    text: str,
+    phrase: str,
+    *,
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+    router_context: dict[str, Any] | None,
+) -> bool:
+    if not text or not phrase or phrase not in text:
+        return False
+    if text == phrase:
+        return True
+    if text.startswith(phrase):
+        tail = text[len(phrase) :]
+        if not tail or tail[0].isspace() or tail[0] in "[:：":
+            return True
+    if not _is_media_or_generative_command(tool, schema):
+        return False
+    has_image, has_reply, has_at, has_verified_target = _static_context_state(
+        text,
+        router_context,
+    )
+    return bool(
+        has_image
+        or has_reply
+        or has_at
+        or (
+            has_verified_target
+            and _schema_accepts_verified_target(schema)
+        )
+        or any(term in text for term in _MEDIA_ACTION_TERMS)
+    )
+
+
+def _is_media_or_generative_command(
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+) -> bool:
+    intent_types = {
+        normalize_message_text(str(item or "")).casefold()
+        for item in tool.intent_types
+    }
+    return bool(
+        tool.generative
+        or tool.output_mode == "image"
+        or intent_types & {"generate", "media", "transform"}
+        or schema.payload_policy in {"image_only", "text_or_image"}
+        or bool((schema.requires or {}).get("image"))
+        or any(slot.type == "image" for slot in schema.slots)
+    )
 
 
 def _allows_sticky_identity_tail(
@@ -694,10 +897,61 @@ def _allows_sticky_identity_tail(
 ) -> bool:
     context = router_context or {}
     return bool(
-        context.get("has_image")
+        schema.allow_sticky_arg
+        or context.get("has_image")
         or context.get("has_at")
         or context.get("has_reply")
+        or (
+            context.get("has_verified_target")
+            and _schema_accepts_verified_target(schema)
+        )
         or schema.payload_policy != "none"
+    )
+
+
+def _allows_global_single_prefix(
+    text: str,
+    tool: CommandToolSnapshot,
+    schema: PluginCommandSchema,
+    *,
+    router_context: dict[str, Any] | None,
+) -> bool:
+    if schema.allow_sticky_arg:
+        return True
+    has_image, has_reply, has_at, has_verified_target = _static_context_state(
+        text,
+        router_context,
+    )
+    requires = schema.requires or {}
+    return bool(
+        (
+            has_at
+            and (
+                requires.get("at")
+                or schema.allow_at
+                or "at" in schema.target_sources
+            )
+        )
+        or (
+            has_image
+            and (
+                requires.get("image")
+                or schema.payload_policy in {"image_only", "text_or_image"}
+                or any(slot.type == "image" for slot in schema.slots)
+            )
+        )
+        or (
+            has_reply
+            and (
+                requires.get("reply")
+                or "reply" in schema.target_sources
+            )
+        )
+        or (
+            has_verified_target
+            and _schema_accepts_verified_target(schema)
+            and _is_media_or_generative_command(tool, schema)
+        )
     )
 
 
@@ -1507,6 +1761,7 @@ def _base_score_tool(
         term in lowered for term in _MEDIA_CONTEXT_TERMS if len(term) > 1
     )
     has_at = bool(_AT_PATTERN.search(normalized)) or bool(context.get("has_at"))
+    has_verified_target = bool(context.get("has_verified_target"))
     has_reply = (
         "[reply:" in lowered
         or "[reply:" in stripped_lowered
@@ -1540,6 +1795,9 @@ def _base_score_tool(
     if has_at and requires.get("at"):
         score += 24.0
         reasons.append("at_signal")
+    if has_verified_target and _schema_accepts_verified_target(schema):
+        score += 24.0
+        reasons.append("verified_target_signal")
     if has_reply:
         if requires.get("reply"):
             score += 32.0
@@ -1562,8 +1820,10 @@ def _base_score_tool(
         missing_required_contexts += 1
     if _missing_required_target_context(
         schema,
+        has_image=has_image,
         has_at=has_at,
         has_reply=has_reply,
+        has_verified_target=has_verified_target,
     ):
         missing_required_contexts += 1
     if missing_required_contexts:
@@ -1717,6 +1977,7 @@ def _schema_from_tool_snapshot(tool: CommandToolSnapshot) -> PluginCommandSchema
         render=tool.render or tool.head,
         requires=tool.requires,
         allow_at=tool.allow_at,
+        allow_sticky_arg=tool.allow_sticky_arg,
         actor_scope=tool.actor_scope,
         target_requirement=tool.target_requirement,
         target_sources=list(tool.target_sources),
@@ -1759,45 +2020,69 @@ def _unscored_features(
     )
 
 
-def _is_scored_identity_match(candidate: _ScoredCandidate) -> bool:
-    return candidate.exact_protected or "short_cjk_fuzzy" in candidate.reasons
-
-
 def _score_static_metadata_bm25_tools(
     tools: list[CommandToolSnapshot],
     query: str,
     *,
     router_context: dict[str, Any] | None = None,
 ) -> list[_ScoredCandidate]:
+    pure_sparse = bool((router_context or {}).get("pure_sparse"))
     query_terms = _query_terms_no_single(query)
-    identity_variants = _query_identity_variants(query)
+    identity_variants = (
+        (normalize_message_text(query),)
+        if pure_sparse
+        else _query_identity_variants(query)
+    )
     normalized, stripped = identity_variants[0], identity_variants[-1]
     if not query_terms and not normalize_message_text(stripped):
         return []
 
     index = _get_static_bm25_index(tools)
-    identity_indexes, longest_prefix_matches = _static_identity_indexes(
-        index,
-        variants=identity_variants,
-        router_context=router_context,
-    )
+    if pure_sparse:
+        identity_indexes: set[int] = set()
+        longest_prefix_matches: set[int] = set()
+        unicode_identity_matches: set[int] = set()
+        scoped_single_identity_matches: set[int] = set()
+        for document_index, document in enumerate(index.documents):
+            exact_head, exact_alias = _match_exact_or_alias_variants(
+                identity_variants,
+                document.schema,
+            )
+            exact_command_id = any(
+                _normalize_command_identity(text)
+                == _normalize_command_identity(document.schema.command_id)
+                for text in identity_variants
+                if text
+            )
+            if exact_head or exact_alias or exact_command_id:
+                identity_indexes.add(document_index)
+    else:
+        (
+            identity_indexes,
+            longest_prefix_matches,
+            unicode_identity_matches,
+            scoped_single_identity_matches,
+        ) = _static_identity_indexes(
+            index,
+            variants=identity_variants,
+            router_context=router_context,
+        )
     relevant_indexes = set(identity_indexes)
     for term in query_terms:
         relevant_indexes.update(index.postings.get(term, ()))
-    prepared: list[tuple[int, _StaticBm25Document]] = []
-    blocked_identity_match = False
-    for document_index in sorted(relevant_indexes):
-        document = index.documents[document_index]
-        schema = document.schema
-        if _missing_static_required_context(
-            schema,
-            query=normalized,
-            router_context=router_context,
-        ):
-            if document_index in identity_indexes:
-                blocked_identity_match = True
-            continue
-        prepared.append((document_index, document))
+    single_cjk_char_matches: set[int] = set()
+    if not query_terms and bool((router_context or {}).get("skill_scoped")):
+        # Skill scope only: the global pre-retrieval layer must not degrade to
+        # single CJK chars, or every query would explode across the catalog.
+        single_cjk_char_matches = _static_single_cjk_char_indexes(
+            index,
+            identity_variants,
+        )
+        relevant_indexes.update(single_cjk_char_matches)
+    prepared = [
+        (document_index, index.documents[document_index])
+        for document_index in sorted(relevant_indexes)
+    ]
 
     scored: list[_ScoredCandidate] = []
     for document_index, document in prepared:
@@ -1814,31 +2099,77 @@ def _score_static_metadata_bm25_tools(
             identity_variants,
             schema,
         )
-        exact_shortcut = any(
+        exact_command_id = pure_sparse and any(
+            _normalize_command_identity(text)
+            == _normalize_command_identity(schema.command_id)
+            for text in identity_variants
+            if text
+        )
+        exact_shortcut = (not pure_sparse) and any(
             match_command_head(text, shortcut)
             for text in (normalized, stripped)
             for shortcut in document.shortcut_texts
             if text and shortcut
         )
-        exact_protected = exact_head or exact_alias or exact_shortcut
-        if exact_head:
+        unicode_identity = (
+            not pure_sparse and document_index in unicode_identity_matches
+        )
+        exact_protected = (
+            exact_head
+            or exact_alias
+            or exact_command_id
+            or exact_shortcut
+            or unicode_identity
+        )
+        if exact_command_id or exact_head:
             score += _EXACT_BOOST
-            reasons.append("exact_head")
+            reasons.append("exact_command_id" if exact_command_id else "exact_head")
         elif exact_alias:
             score += _ALIAS_BOOST
             reasons.append("exact_alias")
         elif exact_shortcut:
             score += _ALIAS_BOOST
             reasons.append("exact_shortcut")
+        elif unicode_identity:
+            score += _ALIAS_BOOST
+            reasons.append("unicode_identity")
+            strong_match = True
 
-        if document_index in longest_prefix_matches:
+        if not pure_sparse and bool((router_context or {}).get("skill_scoped")):
+            embedded_lengths = [
+                len(phrase)
+                for raw_phrase in (schema.head, *schema.aliases)
+                if (phrase := _normalize_command_identity(raw_phrase))
+                and len(phrase) >= 2
+                and any(phrase in text for text in identity_variants)
+            ]
+            if embedded_lengths and not (exact_head or exact_alias):
+                score += 144.0 + max(embedded_lengths) * 16.0
+                strong_match = True
+                reasons.append("scoped_embedded_identity")
+
+        if not pure_sparse and document_index in longest_prefix_matches:
             score += 96.0 + min(len(schema.head), 4) * 8.0
             strong_match = True
             reasons.append("head_prefix")
 
-        fuzzy_score = _short_cjk_fuzzy_score(
-            normalized,
-            [schema.head, *list(schema.aliases or [])],
+        if not pure_sparse and document_index in scoped_single_identity_matches:
+            score += 96.0
+            strong_match = True
+            reasons.append("scoped_single_identity")
+
+        if not pure_sparse and document_index in single_cjk_char_matches:
+            score += _STATIC_SINGLE_CJK_CHAR_SCORE
+            strong_match = True
+            reasons.append("scoped_single_cjk_char")
+
+        fuzzy_score = (
+            0.0
+            if pure_sparse
+            else _short_cjk_fuzzy_score(
+                normalized,
+                [schema.head, *list(schema.aliases or [])],
+            )
         )
         if fuzzy_score:
             score += fuzzy_score
@@ -1873,15 +2204,7 @@ def _score_static_metadata_bm25_tools(
                 continue
             score += field_score * _STATIC_BM25_FIELD_WEIGHTS.get(field, 1.0)
             matched_terms[field] = field_matches
-            if field in {
-                "head",
-                "alias",
-                "shortcut",
-                "example",
-                "usage",
-                "description",
-                "slot",
-            }:
+            if field in _STATIC_BM25_STRONG_FIELDS:
                 strong_match = True
             if any(_ASCII_TERM_PATTERN.fullmatch(term) for term in field_matches):
                 ascii_match = True
@@ -1889,16 +2212,19 @@ def _score_static_metadata_bm25_tools(
 
         if ascii_match:
             reasons.append("ascii_token")
-        if score <= 0 or not (exact_protected or strong_match):
+        if score <= 0 or (
+            not pure_sparse and not (exact_protected or strong_match)
+        ):
             continue
 
-        score, context_reasons = _apply_static_context_score(
-            score,
-            schema=schema,
-            query=normalized,
-            router_context=router_context,
-        )
-        reasons.extend(context_reasons)
+        if not pure_sparse:
+            score, context_reasons = _apply_static_context_score(
+                score,
+                schema=schema,
+                query=normalized,
+                router_context=router_context,
+            )
+            reasons.extend(context_reasons)
         if score <= 0:
             continue
 
@@ -1917,17 +2243,23 @@ def _score_static_metadata_bm25_tools(
             )
         )
 
-    if blocked_identity_match and not any(
-        _is_scored_identity_match(item) for item in scored
-    ):
-        return []
+    if bool((router_context or {}).get("exhaustive_sparse")):
+        return sorted(
+            scored,
+            key=lambda item: (
+                not item.exact_protected,
+                -item.score,
+                item.schema.command_id.casefold(),
+                item.schema.command_id,
+            ),
+        )
     return _dynamic_relevance_cut(scored, router_context=router_context)
 
 
 def _static_context_state(
     query: str,
     router_context: dict[str, Any] | None,
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool]:
     context = router_context or {}
     lowered = normalize_message_text(query).casefold()
     try:
@@ -1941,14 +2273,26 @@ def _static_context_state(
     )
     has_reply = "[reply:" in lowered or bool(context.get("has_reply"))
     has_at = bool(_AT_PATTERN.search(lowered)) or bool(context.get("has_at"))
-    return has_image, has_reply, has_at
+    has_verified_target = bool(context.get("has_verified_target"))
+    return has_image, has_reply, has_at, has_verified_target
+
+
+def _schema_accepts_verified_target(schema: PluginCommandSchema) -> bool:
+    sources = set(schema.target_sources or [])
+    return bool(
+        sources & {"at", "nickname", "reply"}
+        or schema.allow_at is True
+        or (schema.requires or {}).get("at")
+    )
 
 
 def _missing_required_target_context(
     schema: PluginCommandSchema,
     *,
+    has_image: bool,
     has_at: bool,
     has_reply: bool,
+    has_verified_target: bool,
 ) -> bool:
     if schema.target_requirement != "required":
         return False
@@ -1960,34 +2304,15 @@ def _missing_required_target_context(
         or requires.get("at")
     )
     accepts_reply = "reply" in sources
-    return not ((accepts_at and has_at) or (accepts_reply and has_reply))
-
-
-def _missing_static_required_context(
-    schema: PluginCommandSchema,
-    *,
-    query: str,
-    router_context: dict[str, Any] | None,
-) -> bool:
-    has_image, has_reply, has_at = _static_context_state(query, router_context)
-    requires = schema.requires or {}
-    required_image_slot = any(
-        slot.type == "image" and slot.required for slot in schema.slots
-    )
-    image_required = (
-        bool(requires.get("image"))
-        or schema.payload_policy == "image_only"
-        or required_image_slot
-    )
-    if image_required and not (has_image or has_reply or has_at):
-        return True
-
-    if requires.get("reply") and not has_reply:
-        return True
-    return _missing_required_target_context(
-        schema,
-        has_at=has_at,
-        has_reply=has_reply,
+    accepts_image = bool(requires.get("image")) or schema.payload_policy in {
+        "image_only",
+        "text_or_image",
+    } or any(slot.type == "image" for slot in schema.slots)
+    return not (
+        (accepts_at and has_at)
+        or (accepts_reply and has_reply)
+        or (accepts_image and has_image)
+        or (has_verified_target and _schema_accepts_verified_target(schema))
     )
 
 
@@ -1998,7 +2323,10 @@ def _apply_static_context_score(
     query: str,
     router_context: dict[str, Any] | None,
 ) -> tuple[float, list[str]]:
-    has_image, has_reply, has_at = _static_context_state(query, router_context)
+    has_image, has_reply, has_at, has_verified_target = _static_context_state(
+        query,
+        router_context,
+    )
     requires = schema.requires or {}
     required_image_slot = any(
         slot.type == "image" and slot.required for slot in schema.slots
@@ -2026,6 +2354,9 @@ def _apply_static_context_score(
     if has_at and requires.get("at"):
         score += 24.0
         reasons.append("at_signal")
+    if has_verified_target and _schema_accepts_verified_target(schema):
+        score += 24.0
+        reasons.append("verified_target_signal")
     if has_reply and requires.get("reply"):
         score += 32.0
         reasons.append("reply_signal")
@@ -2037,8 +2368,10 @@ def _apply_static_context_score(
         missing_required_contexts += 1
     if _missing_required_target_context(
         schema,
+        has_image=has_image,
         has_at=has_at,
         has_reply=has_reply,
+        has_verified_target=has_verified_target,
     ):
         missing_required_contexts += 1
     if missing_required_contexts:
@@ -2069,36 +2402,21 @@ def _dynamic_relevance_cut(
     if top_score <= 0:
         return []
     threshold = top_score * _STATIC_BM25_CUT_RATIO
-    cap = _dynamic_relevance_cap(router_context)
     selected: list[_ScoredCandidate] = []
     previous = top_score
-    for item in candidates[:cap]:
+    for item in candidates:
         if selected and item.score < threshold:
             break
         if len(selected) >= 4 and previous > 0 and item.score < previous * 0.55:
             break
+        if (
+            not item.exact_protected
+            and len(selected) >= _STATIC_BM25_CUT_MAX_CANDIDATES
+        ):
+            break
         selected.append(item)
         previous = item.score
     return selected
-
-
-def _dynamic_relevance_cap(router_context: dict[str, Any] | None) -> int:
-    context = router_context or {}
-    try:
-        reply_image_count = int(context.get("reply_image_count", 0) or 0)
-    except (TypeError, ValueError):
-        reply_image_count = 0
-    try:
-        task_count = int(context.get("task_count", 0) or 0)
-    except (TypeError, ValueError):
-        task_count = 0
-    if (
-        any(bool(context.get(key)) for key in _EXPANDED_RELEVANCE_CONTEXT_KEYS)
-        or reply_image_count > 1
-        or task_count > 1
-    ):
-        return 12
-    return _STATIC_BM25_CAP
 
 
 def _score_all_tools(
@@ -2301,10 +2619,11 @@ def _diversify_candidates(
             continue
         family_count = family_counts.get(item.tool.family, 0)
         plugin_count = plugin_counts.get(item.tool.plugin_module, 0)
-        if family_count >= _FAMILY_SOFT_CAP and len(selected) < max_items // 2:
-            continue
-        if plugin_count >= _PLUGIN_SOFT_CAP and len(selected) < max_items // 2:
-            continue
+        if not item.exact_protected:
+            if family_count >= _FAMILY_SOFT_CAP and len(selected) < max_items // 2:
+                continue
+            if plugin_count >= _PLUGIN_SOFT_CAP and len(selected) < max_items // 2:
+                continue
         selected.append(item)
         seen_ids.add(item.schema.command_id)
         family_counts[item.tool.family] = family_count + 1

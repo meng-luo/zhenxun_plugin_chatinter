@@ -13,12 +13,14 @@ from dataclasses import asdict, dataclass
 from hashlib import blake2s
 import json
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Any, Literal
 
 from .persistence import write_json
 from .route_text import normalize_message_text
+from .token_compat import estimate_text_tokens
 
 ArtifactType = Literal["text", "image", "html", "file", "log", "plugin_output"]
 
@@ -62,28 +64,6 @@ _COMPLEX_VALUE_KEYS = {
     "raw",
     "response",
     "result",
-}
-_REFERENCE_KEYS = {
-    "artifact_id",
-    "approval_id",
-    "command_id",
-    "rendered_command",
-    "matched_plugin",
-    "plugin_module",
-    "task_text",
-    "remaining_task_hint",
-    "status",
-    "ok",
-    "returncode",
-    "retryable",
-    "need_continue",
-    "truncated",
-    "count",
-    "path",
-    "cwd",
-    "command",
-    "args",
-    "instruction",
 }
 
 
@@ -347,11 +327,86 @@ class ArtifactStore:
             return ref, ref.inline_text[start:end]
         if not ref.path:
             return ref, ""
-        try:
-            text = Path(ref.path).read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            text = ""
-        return ref, text[start:end]
+        text, _has_more = _read_text_window(
+            Path(ref.path),
+            offset=start,
+            max_chars=end - start,
+        )
+        return ref, text
+
+    def search_text(
+        self,
+        artifact_id: str,
+        query: str,
+        *,
+        max_matches: int = 6,
+        context_chars: int = 240,
+        scan_chars: int = 120_000,
+        offset: int = 0,
+    ) -> tuple[ArtifactRef, dict[str, Any]] | None:
+        ref = self.get(artifact_id)
+        needle = str(query or "").strip()
+        if ref is None or not needle:
+            return None
+        start = max(int(offset or 0), 0)
+        match_limit = max(1, min(int(max_matches or 6), 20))
+        context_limit = max(20, min(int(context_chars or 240), 2_000))
+        scan_limit = max(1_000, min(int(scan_chars or 120_000), 250_000))
+        overlap = min(max(len(needle) - 1, 0), 512)
+        read_limit = scan_limit + overlap
+        if ref.inline_text:
+            content = ref.inline_text[start : start + read_limit + 1]
+            has_more = start + len(content) < len(ref.inline_text)
+            if len(content) > read_limit:
+                content = content[:read_limit]
+                has_more = True
+        elif ref.path:
+            content, has_more = _read_text_window(
+                Path(ref.path),
+                offset=start,
+                max_chars=read_limit,
+            )
+        else:
+            content = ""
+            has_more = False
+
+        scan_end = min(len(content), scan_limit)
+        pattern = re.compile(re.escape(needle), flags=re.IGNORECASE)
+        matches: list[dict[str, Any]] = []
+        more_matches = False
+        last_match_end = 0
+        for match in pattern.finditer(content):
+            if match.start() >= scan_end:
+                break
+            if len(matches) >= match_limit:
+                more_matches = True
+                break
+            excerpt_start = max(match.start() - context_limit, 0)
+            excerpt_end = min(match.end() + context_limit, len(content))
+            matches.append(
+                {
+                    "offset": start + match.start(),
+                    "match": match.group(0),
+                    "excerpt_offset": start + excerpt_start,
+                    "excerpt": content[excerpt_start:excerpt_end],
+                }
+            )
+            last_match_end = match.end()
+
+        if more_matches:
+            next_offset: int | None = start + max(last_match_end, 1)
+        elif has_more or len(content) > scan_end:
+            next_offset = start + scan_end
+        else:
+            next_offset = None
+        return ref, {
+            "query": needle,
+            "matches": matches,
+            "offset": start,
+            "scanned_chars": scan_end,
+            "next_offset": next_offset,
+            "truncated": next_offset is not None,
+        }
 
     def cleanup_expired(
         self,
@@ -463,10 +518,7 @@ class ArtifactStore:
         try:
             write_json(
                 _MANIFEST_PATH,
-                {
-                    artifact_id: asdict(ref)
-                    for artifact_id, ref in self._items.items()
-                },
+                {artifact_id: asdict(ref) for artifact_id, ref in self._items.items()},
             )
         except Exception:
             return False
@@ -480,6 +532,28 @@ def get_artifact_store() -> ArtifactStore:
     return _STORE
 
 
+def _read_text_window(
+    path: Path,
+    *,
+    offset: int,
+    max_chars: int,
+) -> tuple[str, bool]:
+    start = max(int(offset or 0), 0)
+    limit = max(int(max_chars or 0), 1)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            remaining = start
+            while remaining > 0:
+                skipped = handle.read(min(remaining, 64 * 1024))
+                if not skipped:
+                    return "", False
+                remaining -= len(skipped)
+            content = handle.read(limit + 1)
+    except Exception:
+        return "", False
+    return content[:limit], len(content) > limit
+
+
 def compact_tool_result_output(
     output: Any,
     *,
@@ -487,6 +561,8 @@ def compact_tool_result_output(
     source: str = "tool_result",
     inline_text_limits: dict[str, int] | None = None,
     inline_list_limits: dict[str, int] | None = None,
+    inline_text_token_limits: dict[str, int] | None = None,
+    inline_list_token_limits: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return a model-safe payload and move large values to ArtifactStore."""
 
@@ -499,6 +575,14 @@ def compact_tool_result_output(
         str(key).lower(): max(int(value), 1)
         for key, value in (inline_list_limits or {}).items()
     }
+    text_token_limits = {
+        str(key).lower(): max(int(value), 1)
+        for key, value in (inline_text_token_limits or {}).items()
+    }
+    list_token_limits = {
+        str(key).lower(): max(int(value), 1)
+        for key, value in (inline_list_token_limits or {}).items()
+    }
     if not isinstance(output, dict):
         compact_value = _compact_value(
             output,
@@ -509,6 +593,8 @@ def compact_tool_result_output(
             depth=0,
             inline_text_limits=text_limits,
             inline_list_limits=list_limits,
+            inline_text_token_limits=text_token_limits,
+            inline_list_token_limits=list_token_limits,
         )
         return {
             "ok": False,
@@ -533,6 +619,8 @@ def compact_tool_result_output(
             depth=0,
             inline_text_limits=text_limits,
             inline_list_limits=list_limits,
+            inline_text_token_limits=text_token_limits,
+            inline_list_token_limits=list_token_limits,
         )
     compacted["artifacts"] = _dedupe_artifacts(artifacts)
     return compacted
@@ -555,6 +643,8 @@ def _compact_value(
     depth: int,
     inline_text_limits: dict[str, int],
     inline_list_limits: dict[str, int],
+    inline_text_token_limits: dict[str, int],
+    inline_list_token_limits: dict[str, int],
 ) -> Any:
     if value is None or isinstance(value, bool | int | float):
         return value
@@ -566,6 +656,7 @@ def _compact_value(
             key=key,
             artifacts=artifacts,
             inline_limit=inline_text_limits.get(key.lower()),
+            inline_token_limit=inline_text_token_limits.get(key.lower()),
         )
     if isinstance(value, dict):
         if depth >= _MODEL_DICT_DEPTH:
@@ -594,6 +685,8 @@ def _compact_value(
                 depth=depth + 1,
                 inline_text_limits=inline_text_limits,
                 inline_list_limits=inline_list_limits,
+                inline_text_token_limits=inline_text_token_limits,
+                inline_list_token_limits=inline_list_token_limits,
             )
             for item_key, item_value in value.items()
         }
@@ -607,6 +700,8 @@ def _compact_value(
             depth=depth,
             inline_text_limits=inline_text_limits,
             inline_list_limits=inline_list_limits,
+            inline_text_token_limits=inline_text_token_limits,
+            inline_list_token_limits=inline_list_token_limits,
         )
     return _compact_string(
         str(value),
@@ -615,6 +710,7 @@ def _compact_value(
         key=key,
         artifacts=artifacts,
         inline_limit=inline_text_limits.get(key.lower()),
+        inline_token_limit=inline_text_token_limits.get(key.lower()),
     )
 
 
@@ -626,6 +722,7 @@ def _compact_string(
     key: str,
     artifacts: list[dict[str, Any]],
     inline_limit: int | None = None,
+    inline_token_limit: int | None = None,
 ) -> str:
     raw = str(value or "")
     if not raw:
@@ -653,14 +750,23 @@ def _compact_string(
         )
         artifacts.append(ref.to_dict())
         return f"[image_artifact:{ref.artifact_id}] {ref.summary}"
-    if len(raw) <= limit:
+    if inline_token_limit is not None:
+        if estimate_text_tokens(raw) <= inline_token_limit:
+            return raw
+    elif len(raw) <= limit:
         return raw
     artifact_type: ArtifactType = (
         "log"
         if lowered in {"stdout", "stderr", "log", "logs", "traceback"}
         else "plugin_output"
     )
-    stored_text = raw[limit:] if inline_limit is not None else raw
+    stored_text = (
+        raw
+        if inline_token_limit is not None
+        else raw[limit:]
+        if inline_limit is not None
+        else raw
+    )
     ref = get_artifact_store().store_text(
         stored_text,
         artifact_type=artifact_type,
@@ -670,9 +776,17 @@ def _compact_string(
     )
     if ref is not None:
         artifacts.append(ref.to_dict())
+        if inline_token_limit is not None:
+            return _token_bounded_preview(
+                raw,
+                token_limit=inline_token_limit,
+                artifact_id=ref.artifact_id,
+            )
         if inline_limit is not None:
             return raw[:limit]
         return f"[artifact:{ref.artifact_id}] {ref.summary}"
+    if inline_token_limit is not None:
+        return _token_bounded_preview(raw, token_limit=inline_token_limit)
     if inline_limit is not None:
         return raw[:limit]
     return summarize_artifact_text(raw)
@@ -688,6 +802,8 @@ def _compact_list(
     depth: int,
     inline_text_limits: dict[str, int],
     inline_list_limits: dict[str, int],
+    inline_text_token_limits: dict[str, int],
+    inline_list_token_limits: dict[str, int],
 ) -> list[Any] | dict[str, Any]:
     if not values:
         return []
@@ -696,26 +812,52 @@ def _compact_list(
     except Exception:
         raw_text = str(values)
     inline_limit = inline_list_limits.get(key.lower())
-    item_limit = inline_limit or _MODEL_LIST_ITEMS
-    should_store_full = len(values) > item_limit or (
-        inline_limit is None and len(raw_text) > _MODEL_STRING_LIMIT * 2
+    inline_token_limit = inline_list_token_limits.get(key.lower())
+    item_limit = (
+        inline_limit or len(values)
+        if inline_token_limit
+        else inline_limit or _MODEL_LIST_ITEMS
     )
-    compacted = [
-        _compact_value(
+    compacted: list[Any] = []
+    for item in values[:item_limit]:
+        item_artifacts: list[dict[str, Any]] = []
+        compacted_item = _compact_value(
             item,
             trace_id=trace_id,
             source=source,
             key=key,
-            artifacts=artifacts,
+            artifacts=item_artifacts,
             depth=depth + 1,
             inline_text_limits=inline_text_limits,
             inline_list_limits=inline_list_limits,
+            inline_text_token_limits=inline_text_token_limits,
+            inline_list_token_limits=inline_list_token_limits,
         )
-        for item in values[:item_limit]
-    ]
+        candidate = [*compacted, compacted_item]
+        if (
+            inline_token_limit is not None
+            and estimate_text_tokens(
+                json.dumps(candidate, ensure_ascii=False, default=str)
+            )
+            > inline_token_limit
+        ):
+            break
+        compacted.append(compacted_item)
+        artifacts.extend(item_artifacts)
+    should_store_full = len(compacted) < len(values) or (
+        inline_limit is None
+        and inline_token_limit is None
+        and len(raw_text) > _MODEL_STRING_LIMIT * 2
+    )
     if not should_store_full:
         return compacted
-    stored_values = values[item_limit:] if inline_limit is not None else values
+    stored_values = (
+        values
+        if inline_token_limit is not None
+        else values[item_limit:]
+        if inline_limit is not None
+        else values
+    )
     ref = get_artifact_store().store_text(
         json.dumps(stored_values, ensure_ascii=False, default=str),
         artifact_type="plugin_output",
@@ -732,6 +874,55 @@ def _compact_list(
             "summary": ref.summary,
         }
     return compacted
+
+
+def _token_bounded_preview(
+    text: str,
+    *,
+    token_limit: int,
+    artifact_id: str = "",
+) -> str:
+    raw = str(text or "")
+    limit = max(int(token_limit or 0), 1)
+    if estimate_text_tokens(raw) <= limit:
+        return raw
+
+    def render(retained_chars: int) -> str:
+        head_chars = max(int(retained_chars * 0.7), 0)
+        tail_chars = max(retained_chars - head_chars, 0)
+        omitted = max(len(raw) - head_chars - tail_chars, 0)
+        reference = f"; artifact:{artifact_id}" if artifact_id else ""
+        marker = f"\n...[{omitted} chars omitted{reference}]...\n"
+        head = raw[:head_chars].rstrip()
+        tail = raw[-tail_chars:].lstrip() if tail_chars else ""
+        return f"{head}{marker}{tail}"
+
+    low = 0
+    high = len(raw)
+    best = render(0)
+    while low <= high:
+        retained = (low + high) // 2
+        candidate = render(retained)
+        if estimate_text_tokens(candidate) <= limit:
+            best = candidate
+            low = retained + 1
+        else:
+            high = retained - 1
+    if estimate_text_tokens(best) <= limit:
+        return best
+    return _token_prefix(best, limit)
+
+
+def _token_prefix(text: str, token_limit: int) -> str:
+    low = 0
+    high = len(text)
+    while low <= high:
+        length = (low + high) // 2
+        if estimate_text_tokens(text[:length]) <= token_limit:
+            low = length + 1
+        else:
+            high = length - 1
+    return text[: max(high, 0)]
 
 
 def _should_store_complex_dict(value: dict[Any, Any], *, key: str) -> bool:

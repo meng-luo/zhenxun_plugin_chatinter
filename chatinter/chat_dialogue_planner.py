@@ -197,31 +197,6 @@ class DialogueState:
     last_reply_summary: str = ""
     reason: str = "default"
 
-    def to_xml(self) -> str:
-        return "\n".join(
-            (
-                "<dialogue_state>",
-                f"tone={self.tone}",
-                f"user_emotion={self.user_emotion}",
-                f"dialogue_purpose={self.dialogue_purpose}",
-                f"need_followup={int(self.need_followup)}",
-                f"response_length={self.response_length}",
-                f"topic_hint={_xml_escape(self.topic_hint)}",
-                f"continuity={self.continuity}",
-                f"group_reply_policy={self.group_reply_policy}",
-                f"reply_posture={self.reply_posture}",
-                f"group_atmosphere={self.group_atmosphere}",
-                f"address_mode={self.address_mode}",
-                f"relevant_people_count={self.relevant_people_count}",
-                f"persisted_turns={self.persisted_turns}",
-                f"last_outcome={_xml_escape(self.last_outcome)}",
-                f"last_user_message={_xml_escape(self.last_user_message)}",
-                f"last_reply_summary={_xml_escape(self.last_reply_summary)}",
-                f"reason={self.reason}",
-                "</dialogue_state>",
-            )
-        )
-
     def to_record(self) -> dict[str, Any]:
         return asdict(self)
 

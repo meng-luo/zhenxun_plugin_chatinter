@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html import escape
 import re
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from zhenxun.services.cache import BoundedTTLCache
 
 from .memory_feedback_reranker import MemoryFeedbackReranker
 from .memory_recall_context import (
     MemoryRecallContext,
     join_memory_participants,
-)
-from .memory_vector_index import (
-    MemoryVectorIndex,
-    MemoryVectorMetadata,
-    build_memory_vector_text,
 )
 from .route_text import normalize_message_text
 
@@ -24,7 +22,7 @@ _GROUP_RECALL_THRESHOLD = 0.38
 _GROUP_CONTEXT_RECALL_THRESHOLD = 0.26
 _RECENT_WRITE_CACHE_TTL = 60.0
 _RECENT_WRITE_CACHE_MAX = 512
-_recent_writes: dict[str, float] = {}
+_recent_writes: BoundedTTLCache[str, bool] | None = None
 _TEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _PROFILE_MEMORY_TYPES = {
     "nickname",
@@ -106,7 +104,7 @@ class LayeredMemoryRecall:
             if not values:
                 continue
             lines.append(f"<{tag}>")
-            lines.extend(values)
+            lines.extend(escape(str(value), quote=False) for value in values)
             lines.append(f"</{tag}>")
         return lines
 
@@ -154,144 +152,25 @@ def _write_cache_key(
     )
 
 
-def _remember_recent_write(key: str) -> bool:
-    now = time.monotonic()
-    expired = [item for item, deadline in _recent_writes.items() if deadline <= now]
-    for item in expired:
-        _recent_writes.pop(item, None)
-    if key in _recent_writes:
+async def _remember_recent_write(key: str) -> bool:
+    cache = _recent_write_cache()
+    if await cache.get(key):
         return False
-    if len(_recent_writes) >= _RECENT_WRITE_CACHE_MAX:
-        for item in list(_recent_writes)[:64]:
-            _recent_writes.pop(item, None)
-    _recent_writes[key] = now + _RECENT_WRITE_CACHE_TTL
-    return True
+    return await cache.set(key, True)
 
 
-async def _upsert_vector_if_needed(
-    *,
-    row: Any,
-    memory_type: str,
-    key: str,
-    value: str,
-    session_id: str,
-    user_id: str,
-    group_id: str | None,
-    scope: str,
-    thread_id: str | None,
-    topic_key: str,
-    participants: tuple[str, ...],
-    confidence: float,
-) -> None:
-    if not MemoryVectorIndex.is_indexable_type(memory_type):
-        return
-    memory_id = int(getattr(row, "id", 0) or 0)
-    if memory_id <= 0:
-        return
-    metadata = MemoryVectorMetadata(
-        memory_id=memory_id,
-        session_id=normalize_message_text(session_id),
-        user_id=normalize_message_text(user_id),
-        group_id=normalize_message_text(group_id or "") or None,
-        memory_type=normalize_message_text(memory_type),
-        scope=normalize_message_text(scope),
-        thread_id=normalize_message_text(thread_id or "") or None,
-        topic_key=normalize_message_text(topic_key),
-        participants=tuple(
-            dict.fromkeys(
-                normalize_message_text(item)
-                for item in participants
-                if normalize_message_text(item)
-            )
-        ),
-        confidence=float(confidence or 0.0),
-    )
-    text = build_memory_vector_text(
-        memory_type=memory_type,
-        key=key,
-        value=value,
-        metadata=metadata,
-    )
-    try:
-        await MemoryVectorIndex.upsert_memory_vector(
-            memory_id=memory_id,
-            text=text,
-            metadata=metadata,
+def _recent_write_cache() -> BoundedTTLCache[str, bool]:
+    global _recent_writes
+
+    if _recent_writes is None:
+        from zhenxun.services.cache import BoundedTTLCache
+
+        _recent_writes = BoundedTTLCache(
+            "chatinter_recent_memory_writes",
+            ttl_seconds=_RECENT_WRITE_CACHE_TTL,
+            max_items=_RECENT_WRITE_CACHE_MAX,
         )
-    except Exception as exc:
-        _debug(f"chatinter memory vector upsert skipped: {exc}")
-
-
-async def _merge_vector_memories(
-    *,
-    memory_model: Any,
-    structured_memories: list[Any],
-    vector_results: list[Any],
-    recall_context: MemoryRecallContext,
-    limit: int,
-) -> list[Any]:
-    selected_limit = max(int(limit or 0), 0)
-    if not vector_results:
-        selected = _rerank_with_feedback(
-            structured_memories,
-            recall_context=recall_context,
-            base_scores={
-                int(getattr(memory, "id", 0) or 0): max(1.2 - index * 0.04, 0.0)
-                for index, memory in enumerate(structured_memories)
-            },
-            limit=selected_limit,
-        )
-        _remember_selected_recall(selected, recall_context=recall_context)
-        return selected
-    by_id: dict[int, Any] = {}
-    order_scores: dict[int, float] = {}
-    for index, memory in enumerate(structured_memories):
-        memory_id = int(getattr(memory, "id", 0) or 0)
-        if memory_id <= 0:
-            continue
-        by_id[memory_id] = memory
-        order_scores[memory_id] = max(1.2 - index * 0.04, 0.0)
-
-    missing_ids = [
-        item.memory_id
-        for item in vector_results
-        if int(item.memory_id or 0) > 0 and item.memory_id not in by_id
-    ]
-    if missing_ids:
-        try:
-            rows = await memory_model.filter(id__in=missing_ids, expired=False).all()
-        except Exception:
-            rows = []
-        for row in rows:
-            memory_id = int(getattr(row, "id", 0) or 0)
-            if memory_id > 0:
-                by_id[memory_id] = row
-
-    for item in vector_results:
-        memory_id = int(item.memory_id or 0)
-        if memory_id <= 0 or memory_id not in by_id:
-            continue
-        order_scores[memory_id] = max(
-            order_scores.get(memory_id, 0.0),
-            float(item.score or 0.0) + 0.16,
-        )
-        setattr(by_id[memory_id], "_chatinter_vector_score", float(item.score or 0.0))
-        setattr(by_id[memory_id], "_chatinter_vector_type", item.vector_type)
-
-    selected = _rerank_with_feedback(
-        list(by_id.values()),
-        recall_context=recall_context,
-        base_scores=order_scores,
-        limit=selected_limit,
-    )
-    try:
-        await memory_model.mark_recalled(
-            [int(getattr(row, "id", 0) or 0) for row in selected]
-        )
-    except Exception:
-        pass
-    _remember_selected_recall(selected, recall_context=recall_context)
-    return selected
+    return _recent_writes
 
 
 def _rerank_with_feedback(
@@ -358,20 +237,15 @@ def _memory_relevance_score(
     *,
     recall_context: MemoryRecallContext,
 ) -> float:
-    vector_score = max(
-        min(float(getattr(row, "_chatinter_vector_score", 0.0) or 0.0), 1.0),
+    sparse_score = max(
+        min(float(getattr(row, "_chatinter_sparse_score", 0.0) or 0.0), 1.0),
         0.0,
     )
-    vector_type = str(getattr(row, "_chatinter_vector_type", "") or "")
-    semantic_score = vector_score if vector_type == "embedding" else 0.0
     lexical_score = _lexical_overlap_score(
         recall_context.query,
         _memory_search_text(row),
     )
-    if semantic_score > 0:
-        score = semantic_score * 0.62 + lexical_score * 0.18
-    else:
-        score = lexical_score * 0.56
+    score = sparse_score * 0.48 + lexical_score * 0.22
     score += _scope_relevance(row, recall_context=recall_context)
     score += _context_relevance(row, recall_context=recall_context)
     score += _type_prior(row, query=recall_context.query)
@@ -597,7 +471,7 @@ class ChatMemoryStore:
                 user_id=user_id,
                 candidate=candidate,
             )
-            if not _remember_recent_write(cache_key):
+            if not await _remember_recent_write(cache_key):
                 continue
             try:
                 row = await memory_model.upsert_memory(
@@ -618,20 +492,6 @@ class ChatMemoryStore:
                 )
                 if row is None:
                     continue
-                await _upsert_vector_if_needed(
-                    row=row,
-                    memory_type=candidate.memory_type,
-                    key=candidate.key,
-                    value=candidate.value,
-                    session_id=session_id,
-                    user_id=user_id,
-                    group_id=group_id,
-                    scope=scope,
-                    thread_id=thread_id,
-                    topic_key=topic_key,
-                    participants=participants,
-                    confidence=candidate.confidence,
-                )
                 written += 1
             except Exception as exc:
                 _debug(f"chatinter memory write skipped: {exc}")
@@ -719,18 +579,19 @@ class ChatMemoryStore:
                 participants=resolved_context.participants,
                 addressee_user_id=resolved_context.addressee_user_id,
             )
-            vector_results = await MemoryVectorIndex.search_memory_vectors(
-                query=resolved_context.query or query,
+            selected = _rerank_with_feedback(
+                memories,
                 recall_context=resolved_context,
-                top_k=limit,
+                base_scores={
+                    int(getattr(memory, "id", 0) or 0): float(
+                        getattr(memory, "_chatinter_recall_score", 0.0) or 0.0
+                    )
+                    for memory in memories
+                },
+                limit=max(int(limit or 0), 0),
             )
-            return await _merge_vector_memories(
-                memory_model=memory_model,
-                structured_memories=memories,
-                vector_results=vector_results,
-                recall_context=resolved_context,
-                limit=limit,
-            )
+            _remember_selected_recall(selected, recall_context=resolved_context)
+            return selected
         except Exception as exc:
             _debug(f"chatinter memory recall skipped: {exc}")
             return []

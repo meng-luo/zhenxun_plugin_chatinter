@@ -65,13 +65,6 @@ def resolve_chatinter_scenario(
             reason="empty_message",
             allow_plugin_tools=False,
         )
-    if group_id:
-        return ScenarioRoute(
-            scenario=ChatInterScenario.GROUP_PLUGIN_SELECTOR,
-            reason="group_fallback",
-            allow_plugin_tools=True,
-        )
-
     private_superuser = resolve_superuser(bot, str(user_id)) and event_is_private(event)
     if private_superuser and agent_session_is_active(str(user_id)):
         return ScenarioRoute(
@@ -80,11 +73,28 @@ def resolve_chatinter_scenario(
             allow_plugin_tools=False,
         )
 
+    from .config import mixed_chat_message_should_skip, private_plugin_tools_enabled
+
+    if mixed_chat_message_should_skip(message):
+        return ScenarioRoute(
+            scenario=ChatInterScenario.SKIP,
+            reason="configured_prefix_skip",
+            allow_plugin_tools=False,
+        )
+
+    if group_id:
+        return ScenarioRoute(
+            scenario=ChatInterScenario.GROUP_PLUGIN_SELECTOR,
+            reason="group_fallback",
+            allow_plugin_tools=True,
+        )
+
     return ScenarioRoute(
         scenario=ChatInterScenario.PRIVATE_CHAT,
         reason="private_user_chat",
-        allow_plugin_tools=False,
+        allow_plugin_tools=private_plugin_tools_enabled(),
     )
+
 
 __all__ = [
     "ChatInterScenario",

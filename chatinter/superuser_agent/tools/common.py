@@ -76,6 +76,7 @@ def approval_required_result(
     action: str,
     payload: dict[str, Any],
     permission: PermissionResult,
+    audit_payload: dict[str, Any] | None = None,
 ) -> ToolResult:
     runtime_payload = dict(payload)
     if actor.get("run_id"):
@@ -97,7 +98,10 @@ def approval_required_result(
         user_id=actor["user_id"],
         session_key=actor["session_key"],
         action=action,
-        payload={"approval_id": approval.approval_id, **runtime_payload},
+        payload={
+            "approval_id": approval.approval_id,
+            **(dict(audit_payload) if audit_payload is not None else runtime_payload),
+        },
         result={"permission": permission.__dict__},
     )
     allow_conversation = bool(permission.section and permission.grant_key)

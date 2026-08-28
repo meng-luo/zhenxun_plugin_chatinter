@@ -27,6 +27,7 @@ class ChatIsolationDecision:
     """Whether chat-only state may be exposed to the current model request."""
 
     allow_prompt_profile: bool
+    allow_dialogue_guidance: bool
     allow_memory_profile: bool
     allow_quality_judge: bool
     allow_state_persist: bool
@@ -37,6 +38,7 @@ class ChatIsolationDecision:
 class ChatPromptContext:
     context_xml: str = ""
     tags: dict[str, str] | None = None
+    context_sections: tuple[str, ...] = ()
 
 
 class ChatRuntime:
@@ -50,35 +52,27 @@ class ChatRuntime:
     @staticmethod
     def isolation_for_frame(frame: Any) -> ChatIsolationDecision:
         scenario = normalize_message_text(str(getattr(frame, "scenario", "") or ""))
-        exposure_state = normalize_message_text(
-            str(getattr(frame, "chat_tool_exposure_state", "") or "unknown")
-        )
         if scenario == "private_chat":
             return ChatIsolationDecision(
                 allow_prompt_profile=True,
+                allow_dialogue_guidance=True,
                 allow_memory_profile=True,
                 allow_quality_judge=True,
                 allow_state_persist=True,
                 reason="private_chat",
             )
         if scenario == "group_plugin_selector":
-            if exposure_state in {"unknown", "plugin_tools_exposed"}:
-                return ChatIsolationDecision(
-                    allow_prompt_profile=False,
-                    allow_memory_profile=False,
-                    allow_quality_judge=False,
-                    allow_state_persist=False,
-                    reason=exposure_state or "plugin_tools_exposed",
-                )
             return ChatIsolationDecision(
                 allow_prompt_profile=True,
+                allow_dialogue_guidance=False,
                 allow_memory_profile=True,
                 allow_quality_judge=True,
                 allow_state_persist=True,
-                reason="group_chat_no_tool_exposure",
+                reason="group_unified",
             )
         return ChatIsolationDecision(
             allow_prompt_profile=False,
+            allow_dialogue_guidance=False,
             allow_memory_profile=False,
             allow_quality_judge=False,
             allow_state_persist=False,
@@ -108,7 +102,7 @@ class ChatRuntime:
                     )
                 ),
                 is_group=bool(getattr(frame, "group_id", None)),
-                intent=getattr(frame, "intent_profile", None),
+                intent=ChatRuntime._profile_intent(frame),
                 previous_state=getattr(frame, "previous_dialogue_state", None),
                 dialogue_context_pack=getattr(frame, "dialogue_context_pack", None),
                 thread_context=getattr(frame, "thread_context", None),
@@ -135,29 +129,37 @@ class ChatRuntime:
 
     @staticmethod
     def _profile_fingerprint(frame: Any) -> str:
-        intent = getattr(frame, "intent_profile", None)
-        intent_payload = {
-            "kind": getattr(intent, "kind", ""),
-            "reason": getattr(intent, "reason", ""),
-            "chat_subkind": getattr(intent, "chat_subkind", ""),
-            "chat_target_hint": getattr(intent, "chat_target_hint", ""),
-            "confidence": getattr(intent, "confidence", ""),
+        scenario = normalize_message_text(str(getattr(frame, "scenario", "") or ""))
+        payload: dict[str, Any] = {
+            "message": (
+                getattr(frame, "current_message", "")
+                or getattr(frame, "raw_message", "")
+            ),
+            "scenario": scenario,
+            "group_id": getattr(frame, "group_id", None),
+            "user_id": getattr(frame, "user_id", ""),
         }
+        intent = ChatRuntime._profile_intent(frame)
+        if intent is not None:
+            payload["intent"] = {
+                "kind": getattr(intent, "kind", ""),
+                "reason": getattr(intent, "reason", ""),
+                "chat_subkind": getattr(intent, "chat_subkind", ""),
+                "chat_target_hint": getattr(intent, "chat_target_hint", ""),
+                "confidence": getattr(intent, "confidence", ""),
+            }
         return json.dumps(
-            {
-                "message": (
-                    getattr(frame, "current_message", "")
-                    or getattr(frame, "raw_message", "")
-                ),
-                "scenario": getattr(frame, "scenario", ""),
-                "group_id": getattr(frame, "group_id", None),
-                "user_id": getattr(frame, "user_id", ""),
-                "intent": intent_payload,
-            },
+            payload,
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
+
+    @staticmethod
+    def _profile_intent(frame: Any) -> Any | None:
+        if bool(getattr(frame, "allow_plugin_tools", False)):
+            return None
+        return getattr(frame, "intent_profile", None)
 
     @classmethod
     def memory_dialogue_state(cls, frame: Any) -> DialogueState | None:
@@ -187,6 +189,20 @@ class ChatRuntime:
                 tags={"chat_isolation": "profile_unavailable"},
             )
         context_xml = strip_dialogue_state_context(base_context_xml)
+        persona = (
+            profile.persona_selection.persona
+            if profile.persona_selection is not None
+            else None
+        )
+        if not decision.allow_dialogue_guidance:
+            return ChatPromptContext(
+                context_xml=context_xml,
+                tags={
+                    "chat_isolation": decision.reason,
+                    "chat_prompt_mode": "neutral_unified",
+                    "persona": getattr(persona, "persona_id", ""),
+                },
+            )
         state_prompt = build_dialogue_state_prompt(
             profile.dialogue_state,
             current_message_text=(
@@ -195,23 +211,24 @@ class ChatRuntime:
             ),
         )
         if state_prompt:
+            guidance_section = (
+                "<response_guidance>"
+                f"{_xml_escape(state_prompt, quote=False)}"
+                "</response_guidance>"
+            )
             context_xml = "\n".join(
                 part
                 for part in (
                     context_xml,
-                    "<response_guidance>"
-                    f"{_xml_escape(state_prompt, quote=False)}"
-                    "</response_guidance>",
+                    guidance_section,
                 )
                 if part
             )
-        persona = (
-            profile.persona_selection.persona
-            if profile.persona_selection is not None
-            else None
-        )
+        else:
+            guidance_section = ""
         return ChatPromptContext(
             context_xml=context_xml,
+            context_sections=(guidance_section,) if guidance_section else (),
             tags={
                 "chat_isolation": decision.reason,
                 "chat_kind": profile.dialogue_plan.kind,
@@ -281,14 +298,6 @@ class ChatRuntime:
         return True
 
 
-def replace_dialogue_state_context(
-    context_xml: str,
-    dialogue_state: DialogueState,
-) -> str:
-    del dialogue_state
-    return _strip_dialogue_state_block(context_xml)
-
-
 def strip_dialogue_state_context(context_xml: str) -> str:
     return _strip_dialogue_state_block(context_xml)
 
@@ -309,6 +318,5 @@ __all__ = [
     "ChatIsolationDecision",
     "ChatPromptContext",
     "ChatRuntime",
-    "replace_dialogue_state_context",
     "strip_dialogue_state_context",
 ]

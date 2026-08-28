@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -19,6 +20,39 @@ from ..llm_compat import (
 from ..route_text import normalize_message_text, normalize_reply_text
 
 _TASK_TEXT_FIELD = "task_text"
+_MESSAGE_SOURCE_KEY = "chatinter_message_source"
+_RUNTIME_CONTROL_SOURCE = "runtime_control"
+_GROUP_WITH_NEXT_USER_KEY = "chatinter_group_with_next_user"
+
+
+def runtime_control_message(
+    content: str,
+    *,
+    group_with_next_user: bool = False,
+) -> LLMMessage:
+    metadata = {_MESSAGE_SOURCE_KEY: _RUNTIME_CONTROL_SOURCE}
+    if group_with_next_user:
+        metadata[_GROUP_WITH_NEXT_USER_KEY] = True
+    return LLMMessage(
+        role="user",
+        content=content,
+        metadata=metadata,
+    )
+
+
+def is_runtime_control_message(message: LLMMessage) -> bool:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return (
+        message.role == "user"
+        and metadata.get(_MESSAGE_SOURCE_KEY) == _RUNTIME_CONTROL_SOURCE
+    )
+
+
+def groups_with_next_user_message(message: LLMMessage) -> bool:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return is_runtime_control_message(message) and (
+        metadata.get(_GROUP_WITH_NEXT_USER_KEY) is True
+    )
 
 
 @dataclass(frozen=True)
@@ -56,7 +90,6 @@ class AgentRuntimeMetric:
     observation: AgentObservation | None = None
 
 
-
 AgentRuntimeTimelineItem = AgentRuntimeMetric
 
 
@@ -91,8 +124,6 @@ class AgentObservation:
 
 @dataclass
 class AgentBudgetState:
-    classifier_calls: int = 0
-    hook_calls: int = 0
     tool_calls: int = 0
     tool_batches: int = 0
     run_input_tokens: int = 0
@@ -153,13 +184,12 @@ class AgentRunState:
     paused_reason: str = ""
     pending_approval: str = ""
     artifact_refs: list[str] = field(default_factory=list)
+    plan_items: list[dict[str, str]] = field(default_factory=list)
     tool_executions: list[ToolExecutionRecord] = field(default_factory=list)
     stop_reason: str = "running"
     step: int = 0
     max_steps: int = 5
     cost_checkpoint_tokens: int = 0
-    compression_failure_fingerprint: str = ""
-    compression_failure_count: int = 0
     budget: AgentBudgetState = field(default_factory=AgentBudgetState)
     metrics: list[AgentRuntimeMetric] = field(default_factory=list)
     final_text: str = ""
@@ -219,17 +249,10 @@ class AgentRunState:
             cost_checkpoint_tokens=cost_checkpoint_tokens,
         )
         state.artifact_refs = list(previous.artifact_refs)
-        state.compression_failure_fingerprint = (
-            previous.compression_failure_fingerprint
-        )
-        state.compression_failure_count = previous.compression_failure_count
+        state.plan_items = [dict(item) for item in previous.plan_items]
         state.budget.current_context_tokens = previous.budget.current_context_tokens
-        state.budget.last_usage_message_count = (
-            previous.budget.last_usage_message_count
-        )
-        state.budget.last_usage_schema_tokens = (
-            previous.budget.last_usage_schema_tokens
-        )
+        state.budget.last_usage_message_count = previous.budget.last_usage_message_count
+        state.budget.last_usage_schema_tokens = previous.budget.last_usage_schema_tokens
         state.tool_executions = [
             replace(record)
             for record in previous.tool_executions
@@ -294,6 +317,12 @@ class AgentRunState:
         tool_calls: list[LLMToolCall],
         *,
         response_text: str,
+        response_thought_text: str | None = None,
+        response_content_parts: list[Any] | None = None,
+        source_model: str | None = None,
+        source_api_type: str | None = None,
+        provider_replay_kind: str | None = None,
+        provider_replay_payload: list[dict[str, Any]] | None = None,
     ) -> None:
         history_tool_calls: list[LLMToolCall] = []
         compacted_arguments: list[str] = []
@@ -310,15 +339,26 @@ class AgentRunState:
                     id=tool_call.id,
                     function=LLMToolFunction(
                         name=tool_call.function.name,
-                        arguments=arguments,
+                        arguments=tool_call.function.arguments,
                     ),
                     thought_signature=tool_call.thought_signature,
+                    metadata=(
+                        copy.deepcopy(tool_call.metadata)
+                        if tool_call.metadata
+                        else None
+                    ),
                 )
             )
         self.messages.append(
             LLMMessage.assistant_tool_calls(
                 history_tool_calls,
                 response_text,
+                thought_text=response_thought_text,
+                content_parts=response_content_parts,
+                source_model=source_model,
+                source_api_type=source_api_type,
+                provider_replay_kind=provider_replay_kind,
+                provider_replay_payload=provider_replay_payload,
             )
         )
         for tool_call, arguments in zip(tool_calls, compacted_arguments, strict=True):
@@ -476,7 +516,7 @@ class AgentRunState:
             str(payload.get("message", "") or payload.get("error", ""))
         )
         if as_message:
-            self.messages.append(LLMMessage.user(message or reason))
+            self.messages.append(runtime_control_message(message or reason))
         if not record_timeline:
             return
         self.append_metric(
@@ -493,11 +533,11 @@ class AgentRunState:
     def transition_force_final(self, reason: str) -> None:
         self.stop_reason = reason
         self.messages.append(
-            LLMMessage.user(
+            runtime_control_message(
                 "工具调用已经结束或达到上限。请不要再调用工具，"
-                "根据已有 Observation 直接给用户一个简短最终回复："
+                "根据已有工具结果直接给用户一个简短最终回复："
                 "明确已完成/失败/需要确认；如有 artifact_id 必须列出；"
-                "不要声称完成 Observation 未证明的事项。"
+                "不要声称完成工具结果未证明的事项。"
             )
         )
         self.append_metric(
@@ -589,8 +629,7 @@ class AgentRunState:
             tool_results=tuple(
                 item.observation.result
                 for item in self.metrics
-                if item.observation is not None
-                and item.observation.result is not None
+                if item.observation is not None and item.observation.result is not None
             ),
             timeline=tuple(self.metrics),
             messages=tuple(self.messages),
@@ -603,9 +642,7 @@ class AgentRunState:
 
     def runtime_observations(self) -> list[AgentObservation]:
         return [
-            item.observation
-            for item in self.metrics
-            if item.observation is not None
+            item.observation for item in self.metrics if item.observation is not None
         ]
 
     def _build_observation(
@@ -763,15 +800,25 @@ def repair_interrupted_tool_protocol(
             continue
         if pending:
             flush_pending()
-        repaired.append(message)
-        if message.role == "assistant":
-            pending.update(
-                {
-                    str(tool_call.id): tool_call
-                    for tool_call in message.tool_calls or ()
-                    if str(tool_call.id or "")
-                }
+        tool_calls = (
+            list(message.tool_calls or []) if message.role == "assistant" else []
+        )
+        tool_call_ids = [str(tool_call.id or "") for tool_call in tool_calls]
+        if tool_calls and (
+            any(not tool_call_id for tool_call_id in tool_call_ids)
+            or len(set(tool_call_ids)) != len(tool_call_ids)
+        ):
+            interrupted_calls += len(tool_calls)
+            repaired.append(
+                runtime_control_message(
+                    "此前模型返回的工具调用标识无效，相关调用未自动重放；"
+                    "已持久化的副作用执行记录仍保留。"
+                )
             )
+            continue
+        repaired.append(message)
+        if tool_calls:
+            pending.update(dict(zip(tool_call_ids, tool_calls, strict=True)))
     if pending:
         flush_pending()
 
@@ -789,7 +836,7 @@ def repair_interrupted_tool_protocol(
             )
             output = dict(tool_result.output)
             repaired.append(
-                LLMMessage.user(
+                runtime_control_message(
                     f"工具 {record.tool_name} 的副作用调用状态不确定，"
                     "系统不会自动重放；请先检查外部状态再继续。"
                 )
@@ -970,8 +1017,11 @@ __all__ = [
     "AgentRuntimeResult",
     "AgentRuntimeTimelineItem",
     "ToolExecutionRecord",
+    "groups_with_next_user_message",
+    "is_runtime_control_message",
     "repair_interrupted_tool_protocol",
     "resolve_superuser_agent_run_budget",
+    "runtime_control_message",
     "tool_call_fingerprint",
     "uncertain_tool_execution_result",
 ]

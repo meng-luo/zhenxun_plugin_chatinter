@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .event_context import ChatInterEventContext
+from .member_similarity import (
+    ALIAS_AMBIGUOUS_GAP,
+    ALIAS_AMBIGUOUS_TOP,
+    ALIAS_MATCH_THRESHOLD,
+)
 from .person_registry import (
     AliasCandidate,
     PersonProfile,
@@ -150,6 +155,8 @@ async def _resolve_alias_addressee(
 
     top = candidates[0]
     if top.profile.conflict_state:
+        # Display-confidence cap for the conflict-state branch; not the
+        # ambiguous_top comparison threshold, kept as its own literal.
         names = "、".join(item.profile.display_name for item in candidates[:3])
         return AddresseeResult(
             None,
@@ -161,7 +168,10 @@ async def _resolve_alias_addressee(
         )
     if len(candidates) > 1:
         second = candidates[1]
-        if top.score < 0.92 or (top.score - second.score) < 0.12:
+        if (
+            top.score < ALIAS_AMBIGUOUS_TOP
+            or (top.score - second.score) < ALIAS_AMBIGUOUS_GAP
+        ):
             names = "、".join(item.profile.display_name for item in candidates[:3])
             return AddresseeResult(
                 None,
@@ -171,7 +181,7 @@ async def _resolve_alias_addressee(
                 ambiguous=True,
                 reason="alias_ambiguous",
             )
-    if top.score < 0.86:
+    if top.score < ALIAS_MATCH_THRESHOLD:
         return None
     return AddresseeResult(
         top.profile.user_id,
@@ -191,15 +201,11 @@ def _has_alias_context(text: str) -> bool:
 
 def format_addressee_xml(result: AddresseeResult) -> list[str]:
     lines = ["<addressee>"]
-    lines.append(f"source={result.source}")
-    lines.append(f"confidence={result.confidence:.2f}")
     lines.append(f"ambiguous={int(result.ambiguous)}")
     if result.target_user_id:
         lines.append(f"target_user_id={_xml_escape(result.target_user_id)}")
     if result.target_name:
         lines.append(f"target_name={_xml_escape(result.target_name)}")
-    if result.reason:
-        lines.append(f"reason={_xml_escape(result.reason)}")
     lines.append("</addressee>")
     return lines
 
